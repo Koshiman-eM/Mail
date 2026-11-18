@@ -1,24 +1,33 @@
 import type { Config } from "tailwindcss";
 
+const c = (v: string) => `rgb(var(--${v}) / <alpha-value>)`;
+
 const config: Config = {
-  darkMode: ["class"],
+  darkMode: ["selector", '[data-theme="dark"]'],
   content: ["./src/**/*.{ts,tsx}"],
   theme: {
     extend: {
-      colors: {
-        border: "hsl(var(--border))",
-        input: "hsl(var(--input))",
-        ring: "hsl(var(--ring))",
-        background: "hsl(var(--background))",
-        foreground: "hsl(var(--foreground))",
-        primary: { DEFAULT: "hsl(var(--primary))", foreground: "hsl(var(--primary-foreground))" },
-        secondary: { DEFAULT: "hsl(var(--secondary))", foreground: "hsl(var(--secondary-foreground))" },
-        destructive: { DEFAULT: "hsl(var(--destructive))", foreground: "hsl(var(--destructive-foreground))" },
-        muted: { DEFAULT: "hsl(var(--muted))", foreground: "hsl(var(--muted-foreground))" },
-        accent: { DEFAULT: "hsl(var(--accent))", foreground: "hsl(var(--accent-foreground))" },
-        card: { DEFAULT: "hsl(var(--card))", foreground: "hsl(var(--card-foreground))" },
+      fontFamily: {
+        sans: ['system-ui', '-apple-system', '"Segoe UI"', '"Hiragino Sans"', '"Hiragino Kaku Gothic ProN"', '"Noto Sans JP"', '"Yu Gothic UI"', "Meiryo", "sans-serif"],
       },
-      borderRadius: { lg: "var(--radius)", md: "calc(var(--radius) - 2px)", sm: "calc(var(--radius) - 4px)" },
+      colors: {
+        border: c("border"),
+        input: c("input"),
+        ring: c("ring"),
+        background: c("background"),
+        foreground: c("foreground"),
+        sidebar: c("sidebar"),
+        primary: { DEFAULT: c("primary"), foreground: c("primary-foreground"), soft: c("primary-soft") },
+        secondary: { DEFAULT: c("secondary"), foreground: c("secondary-foreground") },
+        destructive: { DEFAULT: c("destructive"), foreground: c("destructive-foreground"), soft: c("destructive-soft") },
+        success: { DEFAULT: c("success"), soft: c("success-soft") },
+        warning: { DEFAULT: c("warning"), soft: c("warning-soft"), ink: c("warning-ink") },
+        muted: { DEFAULT: c("muted"), foreground: c("muted-foreground") },
+        accent: { DEFAULT: c("accent"), foreground: c("accent-foreground") },
+        card: { DEFAULT: c("card"), foreground: c("card-foreground") },
+      },
+      borderRadius: { xl: "calc(var(--radius) + 4px)", lg: "var(--radius)", md: "calc(var(--radius) - 2px)", sm: "calc(var(--radius) - 4px)" },
+      boxShadow: { card: "0 1px 2px rgb(0 0 0 / 0.04), 0 1px 3px rgb(0 0 0 / 0.04)" },
     },
   },
   plugins: [],

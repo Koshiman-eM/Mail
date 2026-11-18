@@ -12,11 +12,11 @@ export const env = {
   get redisUrl() {
     return process.env.REDIS_URL;
   },
-  get geminiApiKey() {
-    return process.env.GEMINI_API_KEY || undefined;
+  get anthropicApiKey() {
+    return process.env.ANTHROPIC_API_KEY || undefined;
   },
-  get geminiModel() {
-    return process.env.GEMINI_MODEL || "gemini-2.5-flash";
+  get anthropicModel() {
+    return process.env.ANTHROPIC_MODEL || "claude-opus-5-5";
   },
   get supplierAdapter() {
     return (process.env.SUPPLIER_ADAPTER || "mock").toLowerCase();
@@ -38,8 +38,5 @@ export const env = {
   },
   get scraperStorageStatePath() {
     return process.env.SCRAPER_STORAGE_STATE_PATH || undefined;
-  },
-  get operatorName() {
-    return process.env.APP_OPERATOR_NAME || "operator";
   },
 };

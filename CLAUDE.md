@@ -12,7 +12,7 @@ Alibaba.com、1688.com、AliExpress等の海外ECプラットフォームから�
 - **Frontend**: Next.js (App Router), TypeScript, Tailwind CSS, shadcn/ui, TanStack Query
 - **Backend/DB**: Node.js, PostgreSQL, Prisma
 - **Queue/Realtime**: Redis, BullMQ, Server-Sent Events (SSE)
-- **External/AI**: Playwright, Gemini API
+- **External/AI**: Playwright, Claude API (Anthropic)
 
 ---
 
@@ -49,7 +49,7 @@ Claude Code で作業を行う際は、以下のコマンドおよび制約を�
 
 ### 3.3 業者チャットの承認制自動返信（Human-in-the-Loop）
 - **多言語リアルタイム翻訳**: 中国語・英語メッセージを日本語へ自動翻訳し並列表示。
-- **AIドラフト生成**: 交渉ゴール（目標単価、MOQ、OEM等）をコンテキストに含め、Gemini APIで返信案を生成。
+- **AIドラフト生成**: 交渉ゴール（目標単価、MOQ、OEM等）をコンテキストに含め、Claude APIで返信案を生成。
 - **承認ステートマシン**: `RECEIVED` -> `DRAFT_READY` -> `APPROVED` / `REJECTED` -> `SENDING` -> `SENT` の厳格な状態管理。
 
 ---
@@ -72,4 +72,7 @@ Claude Code で作業を行う際は、以下のコマンドおよび制約を�
 - 利益計算: `src/lib/profit/engine.ts` / テスト `tests/profitEngine.test.ts`
 - 承認ガード: `src/lib/chat/service.ts` の `sendApprovedMessage` / テスト `tests/chatApproval.test.ts`
 - 送信アダプター選択: `src/lib/suppliers/index.ts` (production かつ `SUPPLIER_ADAPTER=alibaba` 以外は常に Mock)
-- 追加モデル: `NegotiationGoal` (交渉ゴール), `FxRate` (為替キャッシュ), `ScraperState` (プラットフォーム別停止状態)。`ChatStatus` には送信失敗用の `SEND_FAILED` を追加 (再送は再ドラフト・再承認必須)。
+- AI: Claude API (`@anthropic-ai/sdk`, 既定モデル `claude-opus-5-5`)。構造化出力で JSON を受け取り、拒否時はサーバー側フォールバックを有効化。キー未設定時はスタブ応答: `src/lib/ai/claude.ts`
+- 認証: `src/lib/auth/*`, `src/middleware.ts`。API は `src/app/api/_lib/http.ts` の `handler()` で包むと DB 検証済みユーザーが渡される (ログイン不要な API のみ `publicHandler()`)。監査ログの actor はログインユーザー。
+- スクレイピングのパーサー: `src/lib/scraper/parse.ts`。フィクスチャ (`tests/fixtures/`) は合成データ。
+- 追加モデル: `User`, `Session` (認証), `NegotiationGoal` (交渉ゴール), `FxRate` (為替キャッシュ), `ScraperState` (プラットフォーム別停止状態)。`ChatStatus` には送信失敗用の `SEND_FAILED` を追加 (再送は再ドラフト・再承認必須)。

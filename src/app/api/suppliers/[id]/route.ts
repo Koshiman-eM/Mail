@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { prisma } from "@/lib/db/prisma";
-import { env } from "@/lib/env";
-import { handler } from "../../_lib/http";
+import { actorOf, handler } from "../../_lib/http";
 
 const patchSchema = z.object({
   isBlacklisted: z.boolean().optional(),
@@ -10,7 +9,7 @@ const patchSchema = z.object({
   rating: z.string().regex(/^\d+(\.\d+)?$/).nullable().optional(),
 });
 
-export const PATCH = handler(async (req: Request, { params }: { params: Promise<{ id: string }> }) => {
+export const PATCH = handler(async (req: Request, { params }: { params: Promise<{ id: string }> }, user) => {
   const { id } = await params;
   const data = patchSchema.parse(await req.json());
   const updated = await prisma.$transaction(async (tx) => {
@@ -18,7 +17,7 @@ export const PATCH = handler(async (req: Request, { params }: { params: Promise<
     const after = await tx.supplier.update({ where: { id }, data });
     await tx.auditLog.create({
       data: {
-        actor: env.operatorName,
+        actor: actorOf(user),
         action: "supplier.update",
         entityType: "Supplier",
         entityId: id,

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 import { detectBlock } from "@/lib/scraper/detect";
 import { diffSnapshots } from "@/lib/scraper/diff";
 import { parseProductPage } from "@/lib/scraper/parse";
@@ -77,5 +78,52 @@ describe("ジッター", () => {
   it("0 以上 max 未満", () => {
     expect(jitterMs(1000, () => 0)).toBe(0);
     expect(jitterMs(1000, () => 0.999)).toBe(999);
+  });
+});
+
+describe("プラットフォーム別パーサー (合成フィクスチャ)", () => {
+  const fx = (name: string) => readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8");
+
+  it("Alibaba.com: detailData の段階単価・MOQ・タイトル", () => {
+    const p = parseProductPage(fx("alibaba.html"), "ALIBABA");
+    expect(p.title).toBe("Food Grade Silicone Kitchen Spatula Set");
+    expect(p.currency).toBe("USD");
+    expect(p.moq).toBe(200);
+    expect(p.priceTiers).toEqual([
+      { minQty: 200, unitPrice: "1.85" },
+      { minQty: 1000, unitPrice: "1.62" },
+      { minQty: 5000, unitPrice: "1.40" },
+    ]);
+    expect(p.source).toContain("alibaba:ladder");
+  });
+
+  it("1688: skuRangePrices と SKU 在庫合計 (文字列中の括弧に惑わされない)", () => {
+    const p = parseProductPage(fx("1688.html"), "ALI1688");
+    expect(p.title).toBe("硅胶铲 食品级 厨房用具 套装");
+    expect(p.currency).toBe("CNY");
+    expect(p.moq).toBe(3);
+    expect(p.priceTiers).toEqual([
+      { minQty: 3, unitPrice: "12.50" },
+      { minQty: 50, unitPrice: "11.80" },
+      { minQty: 500, unitPrice: "10.20" },
+    ]);
+    expect(p.stockQty).toBe(155);
+    expect(p.inStock).toBe(true);
+  });
+
+  it("AliExpress: runParams (JS リテラル) から最安 SKU 価格と在庫切れを検出", () => {
+    const p = parseProductPage(fx("aliexpress.html"), "ALIEXPRESS");
+    expect(p.title).toBe("Silicone Spatula 5pcs Set Heat Resistant");
+    expect(p.priceTiers).toEqual([{ minQty: 1, unitPrice: "4.12" }]);
+    expect(p.currency).toBe("USD");
+    expect(p.stockQty).toBe(0);
+    expect(p.inStock).toBe(false);
+  });
+
+  it("固有データがなければ汎用抽出にフォールバック", () => {
+    const html = `<script type="application/ld+json">{"@type":"Product","name":"X","offers":{"priceCurrency":"USD","price":"9.99"}}</script>`;
+    const p = parseProductPage(html, "ALIBABA");
+    expect(p.priceTiers).toEqual([{ minQty: 1, unitPrice: "9.99" }]);
+    expect(p.source).toEqual(["jsonld"]);
   });
 });

@@ -4,7 +4,7 @@ import { prisma } from "@/lib/db/prisma";
 import { env } from "@/lib/env";
 import { PLATFORMS } from "@/lib/scraper/policy";
 import { scrapeQueue } from "@/lib/scraper/queue";
-import { handler } from "../_lib/http";
+import { actorOf, handler } from "../_lib/http";
 
 export const dynamic = "force-dynamic";
 
@@ -19,7 +19,8 @@ export const GET = handler(async () => {
 const resumeSchema = z.object({ platform: z.enum(["ALIBABA", "ALI1688", "ALIEXPRESS"]) });
 
 /** 手動再認証完了後にスクレイピングを再開 */
-export const POST = handler(async (req: Request) => {
+/** 再開は管理者のみ */
+export const POST = handler(async (req: Request, _ctx, user) => {
   const { platform } = resumeSchema.parse(await req.json());
   await prisma.$transaction([
     prisma.scraperState.upsert({
@@ -28,9 +29,9 @@ export const POST = handler(async (req: Request) => {
       update: { paused: false, reason: null, pausedAt: null },
     }),
     prisma.auditLog.create({
-      data: { actor: env.operatorName, action: "scraper.resume", entityType: "ScraperState", entityId: platform },
+      data: { actor: actorOf(user), action: "scraper.resume", entityType: "ScraperState", entityId: platform },
     }),
   ]);
   if (env.redisUrl) await scrapeQueue(platform).resume();
   return NextResponse.json({ platform, paused: false });
-});
+}, { role: "ADMIN" });

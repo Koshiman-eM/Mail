@@ -1,4 +1,13 @@
-/** Gemini へ渡すプロンプトの組み立て (純粋関数・テスト対象) */
+/** Claude へ渡すプロンプトの組み立て (純粋関数・テスト対象)。出力形式は構造化出力のスキーマで指定する。 */
+
+export const TRANSLATION_SYSTEM =
+  "You translate messages from overseas suppliers (Chinese or English) into natural Japanese for a Japanese importer. " +
+  "Keep numbers, prices, currency units, product codes and quantities exactly as written. Do not add commentary.";
+
+export const DRAFT_SYSTEM =
+  "あなたは日本の輸入事業者の購買担当として、海外サプライヤーとの価格交渉の返信文を作成します。" +
+  "作成した返信は人間が確認・承認してから送信されます。" +
+  "礼儀正しく簡潔に、具体的な数値を示して交渉してください。支払いや発注の確定など、承認者が判断すべき事項は約束しないでください。";
 
 export interface NegotiationContext {
   supplierName: string;
@@ -20,10 +29,7 @@ export interface NegotiationContext {
 
 export function buildTranslationPrompt(text: string): string {
   return [
-    "You are a professional translator for Japanese importers negotiating with Chinese suppliers.",
-    "Detect the language of the message below (ISO 639-1 code) and translate it into natural Japanese.",
-    "Keep numbers, prices, currency units, product codes and quantities exactly as written.",
-    'Respond ONLY as JSON: {"lang": "<code>", "translation": "<Japanese>"}',
+    "Detect the language of the message below (ISO 639-1 code) and translate it into Japanese.",
     "",
     "<message>",
     text,
@@ -46,9 +52,6 @@ export function buildDraftPrompt(ctx: NegotiationContext): string {
   const lang = ctx.replyLang === "zh" ? "Simplified Chinese" : "English";
 
   return [
-    "あなたは日本の輸入事業者の購買担当として、海外サプライヤーとの価格交渉の返信文を作成します。",
-    "礼儀正しく簡潔に、具体的な数値を示して交渉してください。確約できない事項 (支払・発注確定) は約束しないこと。",
-    "",
     `サプライヤー: ${ctx.supplierName}`,
     ctx.productTitle ? `商品: ${ctx.productTitle}` : "",
     "交渉ゴール:",
@@ -62,8 +65,7 @@ export function buildDraftPrompt(ctx: NegotiationContext): string {
     ctx.latestMessage,
     "</message>",
     "",
-    `返信本文は ${lang} で作成し、同じ内容の日本語訳も付けてください。`,
-    'JSON のみで回答: {"reply": "<' + lang + ' reply>", "replyJa": "<日本語訳>"}',
+    `返信本文 (reply) は ${lang} で作成し、承認者向けに同じ内容の日本語訳 (replyJa) も付けてください。`,
   ]
     .filter((l) => l !== "")
     .join("\n");

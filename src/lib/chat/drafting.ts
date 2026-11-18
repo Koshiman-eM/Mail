@@ -1,5 +1,5 @@
 import { prisma } from "../db/prisma";
-import { generateReplyDraft } from "../ai/gemini";
+import { generateReplyDraft } from "../ai/claude";
 import { attachDraft } from "./service";
 import type { ChatDb } from "./types";
 

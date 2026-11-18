@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildDraftPrompt } from "@/lib/ai/prompts";
-import { generateReplyDraft, guessLang } from "@/lib/ai/gemini";
+import { generateReplyDraft, guessLang } from "@/lib/ai/claude";
 
 describe("AI ドラフトプロンプト", () => {
   it("交渉ゴールをコンテキストに含める", () => {
@@ -23,7 +23,7 @@ describe("AI ドラフトプロンプト", () => {
   });
 
   it("API キー未設定時はスタブ案を返し、外部呼び出ししない", async () => {
-    delete process.env.GEMINI_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
     const r = await generateReplyDraft({ supplierName: "x", history: [], latestMessage: "你好", replyLang: "zh", targetMoq: 300 });
     expect(r.stub).toBe(true);
     expect(r.reply).toContain("300");

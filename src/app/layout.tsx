@@ -1,21 +1,29 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import "./globals.css";
 import { Providers } from "@/components/providers";
-import { Header } from "@/components/Header";
+import { themeInitScript } from "@/components/theme";
 
 export const metadata: Metadata = {
-  title: "越境せどり支援ツール",
+  title: { default: "越境せどり", template: "%s | 越境せどり" },
   description: "海外仕入れ候補の利益計算・価格監視・業者交渉を一元管理",
+  icons: { icon: "/icon.svg" },
+};
+
+export const viewport: Viewport = {
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#f9f9f7" },
+    { media: "(prefers-color-scheme: dark)", color: "#0d0d0d" },
+  ],
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="ja">
+    <html lang="ja" suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
+      </head>
       <body>
-        <Providers>
-          <Header />
-          <main className="mx-auto max-w-6xl px-4 py-6">{children}</main>
-        </Providers>
+        <Providers>{children}</Providers>
       </body>
     </html>
   );

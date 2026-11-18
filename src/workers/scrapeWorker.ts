@@ -61,7 +61,7 @@ async function processJob(job: Job<ScrapeJobData>) {
   }
   if (page.status >= 500) throw new Error(`HTTP ${page.status}`); // → 指数バックオフでリトライ
 
-  const parsed = parseProductPage(page.html);
+  const parsed = parseProductPage(page.html, platform);
   if (parsed.priceTiers.length === 0) throw new Error("価格情報を抽出できませんでした");
 
   const prev = await prisma.priceSnapshot.findFirst({ where: { productId }, orderBy: { capturedAt: "desc" } });

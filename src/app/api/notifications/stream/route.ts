@@ -1,10 +1,12 @@
 import { subscribeNotifications } from "@/lib/notifications/bus";
+import { getSessionUser } from "@/lib/auth/session";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 /** Server-Sent Events: 新着通知をリアルタイム配信 */
 export async function GET(req: Request) {
+  if (!(await getSessionUser())) return Response.json({ error: "ログインが必要です" }, { status: 401 });
   const encoder = new TextEncoder();
   let cleanup = () => {};
   const stream = new ReadableStream({

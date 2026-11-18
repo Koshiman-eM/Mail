@@ -30,7 +30,11 @@ const createSchema = z.object({
 
 export const GET = handler(async () => {
   const products = await prisma.product.findMany({
-    include: { supplier: true, simulations: { orderBy: { createdAt: "desc" }, take: 1 } },
+    include: {
+      supplier: true,
+      simulations: { orderBy: { createdAt: "desc" }, take: 1 },
+      snapshots: { orderBy: { capturedAt: "desc" }, take: 30, select: { priceTiers: true, capturedAt: true, inStock: true } },
+    },
     orderBy: { updatedAt: "desc" },
   });
   return NextResponse.json(products);

@@ -1,11 +1,10 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { prisma } from "@/lib/db/prisma";
-import { translateToJapanese } from "@/lib/ai/gemini";
+import { translateToJapanese } from "@/lib/ai/claude";
 import { generateDraftFor } from "@/lib/chat/drafting";
 import { notify } from "@/lib/notifications/service";
-import { env } from "@/lib/env";
-import { handler } from "../../_lib/http";
+import { actorOf, handler } from "../../_lib/http";
 
 export const dynamic = "force-dynamic";
 
@@ -27,7 +26,7 @@ const ingestSchema = z.object({
  * 受信メッセージの取り込み: 翻訳 → RECEIVED で保存 → (任意) AI ドラフト生成 → DRAFT_READY。
  * ここでは決して送信しない。送信は人間の承認後に /send からのみ行う。
  */
-export const POST = handler(async (req: Request) => {
+export const POST = handler(async (req: Request, _ctx, user) => {
   const body = ingestSchema.parse(await req.json());
   const supplier = await prisma.supplier.findUniqueOrThrow({ where: { id: body.supplierId } });
   const tr = await translateToJapanese(body.text);
@@ -41,6 +40,9 @@ export const POST = handler(async (req: Request) => {
       translatedText: tr.translation,
       status: "RECEIVED",
     },
+  });
+  await prisma.auditLog.create({
+    data: { actor: actorOf(user), action: "chat.ingest", entityType: "ChatMessage", entityId: msg.id },
   });
   await notify({
     type: "CHAT_RECEIVED",
@@ -68,6 +70,6 @@ export const POST = handler(async (req: Request) => {
       body: e instanceof Error ? e.message : String(e),
       link: `/chat?thread=${encodeURIComponent(body.threadId)}`,
     });
-    return NextResponse.json({ ...msg, draftError: true, operator: env.operatorName }, { status: 201 });
+    return NextResponse.json({ ...msg, draftError: true }, { status: 201 });
   }
 });
