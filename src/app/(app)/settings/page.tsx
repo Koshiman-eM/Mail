@@ -1,9 +1,10 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Ban, Calculator, CircleCheck, CirclePause, FileSearch, Loader2, Play, Radar, ShieldCheck, Store, UserPlus, Users } from "lucide-react";
+import { Ban, Bell, Calculator, CircleCheck, CirclePause, FileSearch, Loader2, Play, Radar, ShieldCheck, Store, UserPlus, Users } from "lucide-react";
 import { ProfitSettingsForm } from "@/components/ProfitSettingsForm";
+import { PushSettings } from "@/components/PushSettings";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input, Label, Select, Textarea } from "@/components/ui/input";
@@ -331,21 +332,28 @@ function ParserTab() {
   );
 }
 
-type Tab = "profit" | "scraper" | "suppliers" | "users" | "parser";
+type Tab = "profit" | "notifications" | "scraper" | "suppliers" | "users" | "parser";
+const TABS: Tab[] = ["profit", "notifications", "scraper", "suppliers", "users", "parser"];
 
 export default function SettingsPage() {
   const { data: me } = useMe();
   const isAdmin = me?.role === "ADMIN";
   const [tab, setTab] = useState<Tab>("profit");
+  // ?tab=notifications などで初期タブを指定できる (通知の案内カードからのリンク用)
+  useEffect(() => {
+    const t = new URLSearchParams(window.location.search).get("tab") as Tab | null;
+    if (t && TABS.includes(t)) setTab(t);
+  }, []);
   return (
     <div>
-      <PageHeader title="設定" description="自動利益計算の既定値、巡回の稼働状態、業者、ユーザーを管理します。" />
+      <PageHeader title="設定" description="自動利益計算の既定値、通知、巡回の稼働状態、業者、ユーザーを管理します。" />
       <div className="mb-6 overflow-x-auto">
         <Tabs<Tab>
           value={tab}
           onChange={setTab}
           items={[
             { value: "profit", label: <><Calculator className="h-4 w-4" /> 利益計算</> },
+            { value: "notifications", label: <><Bell className="h-4 w-4" /> 通知</> },
             { value: "scraper", label: <><Radar className="h-4 w-4" /> 巡回</> },
             { value: "suppliers", label: <><Store className="h-4 w-4" /> 業者</> },
             ...(isAdmin ? [{ value: "users" as Tab, label: <><Users className="h-4 w-4" /> ユーザー</> }] : []),
@@ -354,6 +362,7 @@ export default function SettingsPage() {
         />
       </div>
       {tab === "profit" && <ProfitSettingsForm isAdmin={isAdmin} />}
+      {tab === "notifications" && <PushSettings />}
       {tab === "scraper" && <ScraperTab isAdmin={isAdmin} />}
       {tab === "suppliers" && <SuppliersTab />}
       {tab === "users" && isAdmin && me && <UsersTab meId={me.id} />}

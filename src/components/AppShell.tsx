@@ -3,9 +3,12 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { Calculator, ChevronDown, LayoutDashboard, LogOut, Menu, MessagesSquare, Package, Settings, X } from "lucide-react";
+import { Calculator, ChevronDown, LayoutDashboard, LogOut, MessagesSquare, Package, Settings } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
+import { BottomNav } from "./BottomNav";
+import { InstallButton } from "./InstallPrompt";
 import { NotificationBell } from "./NotificationBell";
+import { PwaSuggestions } from "./PwaSuggestions";
 import { ThemeToggle } from "./theme";
 import { useDashboard, useMe } from "./hooks";
 import { api } from "./api";
@@ -25,16 +28,20 @@ function Logo() {
       <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary text-[13px] font-black text-primary-foreground">越</span>
       <span className="leading-tight">
         <span className="block text-sm font-bold">越境せどり</span>
-        <span className="block text-[11px] text-muted-foreground">仕入れ・交渉管理</span>
+        <span className="block text-[11px] text-muted-foreground max-[379px]:hidden">仕入れ・交渉管理</span>
       </span>
     </Link>
   );
 }
 
-function Nav({ onNavigate }: { onNavigate?: () => void }) {
-  const path = usePathname();
+/** 業者チャットの対応待ち件数 (承認待ち + 送信待ち + 送信失敗) */
+function useChatCount() {
   const { data } = useDashboard();
-  const chatCount = (data?.awaitingApproval ?? 0) + (data?.awaitingSend ?? 0) + (data?.sendFailed ?? 0);
+  return (data?.awaitingApproval ?? 0) + (data?.awaitingSend ?? 0) + (data?.sendFailed ?? 0);
+}
+
+function Nav({ chatCount }: { chatCount: number }) {
+  const path = usePathname();
   return (
     <nav className="flex flex-col gap-0.5">
       {NAV.map(({ href, label, icon: Icon, badge }) => {
@@ -43,7 +50,7 @@ function Nav({ onNavigate }: { onNavigate?: () => void }) {
           <Link
             key={href}
             href={href}
-            onClick={onNavigate}
+            aria-current={active ? "page" : undefined}
             className={cn(
               "group flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors",
               active ? "bg-primary-soft text-primary" : "text-muted-foreground hover:bg-accent hover:text-foreground",
@@ -82,7 +89,13 @@ function UserMenu() {
   if (!me) return <div className="h-9 w-9 animate-pulse rounded-full bg-muted" />;
   return (
     <div className="relative" ref={ref}>
-      <button onClick={() => setOpen((o) => !o)} className="flex items-center gap-2 rounded-lg p-1 pr-2 hover:bg-accent" aria-haspopup="menu" aria-expanded={open}>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="flex min-h-10 items-center gap-2 rounded-lg p-1 hover:bg-accent sm:pr-2"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label={`ユーザーメニュー (${me.name})`}
+      >
         <span className="flex h-7 w-7 items-center justify-center rounded-full bg-secondary text-xs font-bold">{me.name.slice(0, 1)}</span>
         <span className="hidden text-sm font-medium sm:inline">{me.name}</span>
         <ChevronDown className="hidden h-4 w-4 text-muted-foreground sm:inline" />
@@ -104,52 +117,43 @@ function UserMenu() {
 }
 
 export function AppShell({ children }: { children: React.ReactNode }) {
-  const [mobileOpen, setMobileOpen] = useState(false);
+  const chatCount = useChatCount();
   const path = usePathname();
-  useEffect(() => setMobileOpen(false), [path]);
 
   return (
     <div className="min-h-screen">
       {/* デスクトップ: 固定サイドバー */}
       <aside className="fixed inset-y-0 left-0 z-30 hidden w-60 flex-col gap-6 border-r bg-sidebar px-3 py-5 lg:flex">
         <Logo />
-        <Nav />
+        <Nav chatCount={chatCount} />
         <p className="mt-auto px-3 text-[11px] leading-relaxed text-muted-foreground">送信は必ず承認を経て行われます。</p>
       </aside>
 
-      {/* モバイル: ドロワー */}
-      {mobileOpen && (
-        <div className="fixed inset-0 z-50 lg:hidden">
-          <div className="absolute inset-0 bg-black/40" onClick={() => setMobileOpen(false)} />
-          <aside className="absolute inset-y-0 left-0 flex w-64 flex-col gap-6 bg-sidebar px-3 py-5 shadow-xl">
-            <div className="flex items-center justify-between">
-              <Logo />
-              <button onClick={() => setMobileOpen(false)} className="rounded-md p-1.5 hover:bg-accent" aria-label="メニューを閉じる">
-                <X className="h-5 w-5" />
-              </button>
-            </div>
-            <Nav onNavigate={() => setMobileOpen(false)} />
-          </aside>
-        </div>
-      )}
-
       <div className="lg:pl-60">
-        <header className="sticky top-0 z-20 flex h-14 items-center gap-2 border-b bg-background/85 px-4 backdrop-blur sm:px-6">
-          <button className="-ml-1 rounded-md p-2 hover:bg-accent lg:hidden" onClick={() => setMobileOpen(true)} aria-label="メニューを開く">
-            <Menu className="h-5 w-5" />
-          </button>
-          <div className="lg:hidden">
-            <Logo />
-          </div>
-          <div className="ml-auto flex items-center gap-1">
-            <ThemeToggle />
-            <NotificationBell />
-            <div className="mx-1 h-6 w-px bg-border" />
-            <UserMenu />
+        {/* スタンドアロン表示ではステータスバー (ノッチ) 分の余白を確保する */}
+        <header className="sticky top-0 z-20 border-b bg-background/85 pt-[env(safe-area-inset-top)] backdrop-blur">
+          <div className="flex h-14 items-center gap-2 pl-[max(1rem,env(safe-area-inset-left))] pr-[max(0.75rem,env(safe-area-inset-right))] sm:px-6">
+            <div className="min-w-0 lg:hidden">
+              <Logo />
+            </div>
+            <div className="ml-auto flex shrink-0 items-center gap-0.5 sm:gap-1">
+              <InstallButton />
+              <ThemeToggle />
+              <NotificationBell />
+              <div className="mx-1 hidden h-6 w-px bg-border sm:block" />
+              <UserMenu />
+            </div>
           </div>
         </header>
-        <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:py-8">{children}</main>
+        {/* モバイルでは下部タブバーに隠れないよう下余白を確保する */}
+        <main className="mx-auto max-w-7xl px-4 pb-[calc(5.5rem+env(safe-area-inset-bottom))] pt-5 sm:px-6 lg:py-8">
+          {path === "/" && <PwaSuggestions />}
+          {children}
+        </main>
       </div>
+
+      {/* モバイル: 下部タブバー (ドロワーの代わり) */}
+      <BottomNav chatCount={chatCount} />
     </div>
   );
 }

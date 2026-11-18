@@ -1,6 +1,7 @@
 import { PLATFORMS } from "../lib/scraper/policy";
 import { closeFetcher, startScrapeWorkers } from "./scrapeWorker";
 import { startProfitWorker } from "./profitWorker";
+import { flushPendingPushes } from "../lib/push/send";
 
 async function main() {
   const scrapers = startScrapeWorkers(PLATFORMS);
@@ -12,6 +13,8 @@ async function main() {
     console.log("[worker] shutting down...");
     await Promise.all([...scrapers.map((w) => w.close()), profit.worker.close(), profit.queue.close()]);
     await closeFetcher();
+    // バックグラウンドで送信中の Web Push を送り切ってから終了
+    await flushPendingPushes();
     process.exit(0);
   }
   process.on("SIGINT", shutdown);
