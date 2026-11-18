@@ -14,6 +14,7 @@ export interface ChatMessageRow {
   translatedText: string | null;
   draftText: string | null;
   draftTextJa: string | null;
+  draftSource: "AI" | "MANUAL" | null;
   finalText: string | null;
   status: ChatStatus;
   approvedBy: string | null;
@@ -40,6 +41,7 @@ export interface ChatTx {
     findUnique(args: { where: { id: string } }): Promise<ChatMessageRow | null>;
     updateMany(args: { where: Where; data: Where }): Promise<{ count: number }>;
     update(args: { where: { id: string }; data: Where }): Promise<ChatMessageRow>;
+    create(args: { data: Where }): Promise<ChatMessageRow>;
   };
   supplier: {
     findUnique(args: { where: { id: string } }): Promise<SupplierRow | null>;

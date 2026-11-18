@@ -23,7 +23,9 @@ export async function generateDraftFor(messageId: string, actor: string) {
     take: 20,
   });
   const historyLines = history.flatMap((h) => {
-    const lines: { direction: "INBOUND" | "OUTBOUND"; text: string }[] = [{ direction: h.direction, text: h.originalText }];
+    const lines: { direction: "INBOUND" | "OUTBOUND"; text: string }[] = [];
+    // こちらから作成したメッセージは、送信済みのものだけを履歴に含める
+    if (h.direction === "INBOUND") lines.push({ direction: "INBOUND", text: h.originalText });
     if (h.status === "SENT" && h.finalText) lines.push({ direction: "OUTBOUND", text: h.finalText });
     return lines;
   });
@@ -43,5 +45,6 @@ export async function generateDraftFor(messageId: string, actor: string) {
     replyLang: msg.originalLang === "zh" ? "zh" : "en",
   });
 
-  return attachDraft(chatDb(), messageId, { draftText: draft.reply, draftTextJa: draft.replyJa }, actor);
+  if (msg.direction !== "INBOUND") throw new Error("AI 返信案は受信メッセージに対してのみ作成できます");
+  return attachDraft(chatDb(), messageId, { draftText: draft.reply, draftTextJa: draft.replyJa, source: "AI" }, actor);
 }

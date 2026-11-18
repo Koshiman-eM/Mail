@@ -17,6 +17,7 @@ export const profitInputSchema = z.object({
   currency: z.string().length(3),
   fx: z.object({ rate: nonNeg, bufferPercent: nonNeg }),
   localShippingForeign: nonNeg.optional(),
+  localShippingJpy: nonNeg.optional(),
   agentFee: z.object({ percent: nonNeg.optional(), fixedJpy: nonNeg.optional() }).optional(),
   package: z.object({
     unitWeightKg: nonNeg,

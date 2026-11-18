@@ -102,7 +102,7 @@ export function calculateProfit(input: ProfitInput): ProfitResult {
 
   // --- 仕入 ---
   const goods = yen(toJpy(new D(tier.unitPrice).mul(quantity)));
-  const localShipping = yen(toJpy(dec(input.localShippingForeign)));
+  const localShipping = yen(toJpy(dec(input.localShippingForeign)).add(dec(input.localShippingJpy)));
   const agentFee = yen(
     goods.mul(pct(dec(input.agentFee?.percent))).add(dec(input.agentFee?.fixedJpy)),
   );

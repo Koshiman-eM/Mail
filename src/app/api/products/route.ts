@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/db/prisma";
 import { priceTierSchema } from "@/lib/profit";
+import { autoSimulate } from "@/lib/profit/autoService";
 import { handler } from "../_lib/http";
 
 export const dynamic = "force-dynamic";
@@ -26,13 +27,15 @@ const createSchema = z.object({
   heightCm: decStr,
   weightKg: decStr,
   hsCode: z.string().optional(),
+  targetQuantity: z.number().int().positive().optional(),
+  dutyPercent: decStr,
 });
 
 export const GET = handler(async () => {
   const products = await prisma.product.findMany({
     include: {
       supplier: true,
-      simulations: { orderBy: { createdAt: "desc" }, take: 1 },
+      simulations: { orderBy: { createdAt: "desc" }, take: 1, select: { profitJpy: true, roiPercent: true, quantity: true, createdAt: true, auto: true, trigger: true, unitProfitJpy: true, marginPercent: true, totalCostJpy: true, revenueJpy: true, fxRateApplied: true, breakdown: true } },
       snapshots: { orderBy: { capturedAt: "desc" }, take: 30, select: { priceTiers: true, capturedAt: true, inStock: true } },
     },
     orderBy: { updatedAt: "desc" },
@@ -52,5 +55,7 @@ export const POST = handler(async (req: Request) => {
       data: { ...p, supplierId: s.id, priceTiers: priceTiers as unknown as Prisma.InputJsonValue },
     });
   });
-  return NextResponse.json(product, { status: 201 });
+  // 登録と同時に既定値で利益を自動計算 (不足項目があれば理由を記録してスキップ)
+  const auto = await autoSimulate(product.id, "product.create");
+  return NextResponse.json({ ...product, auto }, { status: 201 });
 });

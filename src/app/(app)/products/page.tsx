@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Calculator, ExternalLink, Loader2, Package, Plus, RefreshCw, Search, Trash2 } from "lucide-react";
@@ -12,6 +12,7 @@ import { EmptyState, PageHeader, Sheet, Skeleton } from "@/components/ui/misc";
 import { PriceHistoryChart, Sparkline } from "@/components/charts";
 import { PLATFORM_LABEL, api, relTime, yenFmt } from "@/components/api";
 import type { PriceTier } from "@/lib/profit/types";
+import { AutoProfitPanel, AutoRoiCell, type AutoSim } from "@/components/AutoProfitPanel";
 import { cn } from "@/lib/utils";
 
 interface Product {
@@ -31,8 +32,13 @@ interface Product {
   heightCm: string | null;
   domesticPriceJpy: string | null;
   hsCode: string | null;
+  targetQuantity: number | null;
+  dutyPercent: string | null;
+  autoCalcStatus: string | null;
+  autoCalcNote: string | null;
+  autoCalcAt: string | null;
   supplier: { name: string; isBlacklisted: boolean };
-  simulations: { profitJpy: string; roiPercent: string; quantity: number; createdAt: string }[];
+  simulations: AutoSim[];
   snapshots: { priceTiers: PriceTier[]; capturedAt: string; inStock: boolean }[];
 }
 
@@ -58,6 +64,8 @@ function NewProductForm({ onDone }: { onDone: () => void }) {
     widthCm: "",
     heightCm: "",
     domesticPriceJpy: "",
+    targetQuantity: "",
+    dutyPercent: "",
   });
   const [tiers, setTiers] = useState<PriceTier[]>([{ minQty: 1, unitPrice: "" }]);
   const set = (k: keyof typeof f) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => setF({ ...f, [k]: e.target.value });
@@ -81,6 +89,8 @@ function NewProductForm({ onDone }: { onDone: () => void }) {
           widthCm: opt(f.widthCm),
           heightCm: opt(f.heightCm),
           domesticPriceJpy: opt(f.domesticPriceJpy),
+          targetQuantity: f.targetQuantity ? Number(f.targetQuantity) : undefined,
+          dutyPercent: opt(f.dutyPercent),
         },
       }),
     onSuccess: () => {
@@ -166,7 +176,8 @@ function NewProductForm({ onDone }: { onDone: () => void }) {
       </section>
 
       <section className="space-y-3">
-        <h3 className="text-sm font-semibold">梱包・販売 (利益計算に使用)</h3>
+        <h3 className="text-sm font-semibold">梱包・販売 (利益の自動計算に使用)</h3>
+        <p className="text-xs text-muted-foreground">重量・寸法・国内販売価格を入れると、登録と同時に利益を自動計算します。送料や手数料は「設定 &gt; 利益計算」の既定値を使います。</p>
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
           <div className="space-y-1.5">
             <Label>重量</Label>
@@ -185,9 +196,19 @@ function NewProductForm({ onDone }: { onDone: () => void }) {
             <UnitInput unit="cm" value={f.heightCm} onChange={set("heightCm")} />
           </div>
         </div>
-        <div className="space-y-1.5">
-          <Label>国内販売想定価格</Label>
-          <UnitInput unit="円" value={f.domesticPriceJpy} onChange={set("domesticPriceJpy")} />
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+          <div className="space-y-1.5">
+            <Label>国内販売想定価格</Label>
+            <UnitInput unit="円" value={f.domesticPriceJpy} onChange={set("domesticPriceJpy")} />
+          </div>
+          <div className="space-y-1.5">
+            <Label>想定発注数量 (任意)</Label>
+            <UnitInput unit="個" placeholder="MOQ" value={f.targetQuantity} onChange={set("targetQuantity")} />
+          </div>
+          <div className="space-y-1.5">
+            <Label>関税率 (任意)</Label>
+            <UnitInput unit="%" placeholder="既定値" value={f.dutyPercent} onChange={set("dutyPercent")} />
+          </div>
         </div>
       </section>
 
@@ -209,7 +230,6 @@ function NewProductForm({ onDone }: { onDone: () => void }) {
 function ProductDetail({ p }: { p: Product }) {
   const scrape = useMutation({ mutationFn: () => api(`/api/products/${p.id}/scrape`, { method: "POST" }) });
   const history = p.snapshots.map((s) => ({ at: s.capturedAt, value: minPrice(s.priceTiers) })).filter((h) => Number.isFinite(h.value));
-  const sim = p.simulations[0];
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap items-center gap-2">
@@ -293,31 +313,7 @@ function ProductDetail({ p }: { p: Product }) {
         </Card>
       </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>最新の利益シミュレーション</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {sim ? (
-            <div className="grid grid-cols-3 gap-3 text-center">
-              <div className="rounded-lg bg-muted p-3">
-                <p className="text-xs text-muted-foreground">数量</p>
-                <p className="tabular text-lg font-bold">{sim.quantity.toLocaleString()}</p>
-              </div>
-              <div className="rounded-lg bg-muted p-3">
-                <p className="text-xs text-muted-foreground">利益</p>
-                <p className={cn("tabular text-lg font-bold", Number(sim.profitJpy) < 0 && "text-destructive")}>{yenFmt(sim.profitJpy)}</p>
-              </div>
-              <div className="rounded-lg bg-muted p-3">
-                <p className="text-xs text-muted-foreground">ROI</p>
-                <p className="tabular text-lg font-bold">{sim.roiPercent}%</p>
-              </div>
-            </div>
-          ) : (
-            <p className="text-sm text-muted-foreground">まだ保存されたシミュレーションはありません。</p>
-          )}
-        </CardContent>
-      </Card>
+      <AutoProfitPanel p={p} />
     </div>
   );
 }
@@ -339,6 +335,19 @@ export default function ProductsPage() {
     );
   }, [data, q, platform]);
   const current = data?.find((p) => p.id === selected);
+  // 通知のリンク (/products?id=...) から開いた場合は詳細を表示
+  useEffect(() => {
+    const id = new URLSearchParams(window.location.search).get("id");
+    if (id) setSelected(id);
+  }, []);
+  const qc = useQueryClient();
+  const recalcAll = useMutation({
+    mutationFn: () => api<{ total: number; SKIPPED: number }>("/api/profit/recalculate", { method: "POST" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["products"] });
+      qc.invalidateQueries({ queryKey: ["dashboard"] });
+    },
+  });
 
   return (
     <div>
@@ -346,9 +355,14 @@ export default function ProductsPage() {
         title="仕入れ候補"
         description="登録した商品の価格推移と最新の利益試算を一覧できます。"
         actions={
-          <Button onClick={() => setAdding(true)}>
-            <Plus className="h-4 w-4" /> 商品を追加
-          </Button>
+          <>
+            <Button variant="outline" onClick={() => recalcAll.mutate()} disabled={recalcAll.isPending || !data?.length}>
+              <RefreshCw className={cn("h-4 w-4", recalcAll.isPending && "animate-spin")} /> 全商品を再計算
+            </Button>
+            <Button onClick={() => setAdding(true)}>
+              <Plus className="h-4 w-4" /> 商品を追加
+            </Button>
+          </>
         }
       />
 
@@ -368,6 +382,12 @@ export default function ProductsPage() {
       </div>
 
       {error && <p className="text-sm text-destructive">{error.message}</p>}
+      {recalcAll.data && (
+        <p className="mb-3 text-sm text-success">
+          {recalcAll.data.total} 商品を再計算しました{recalcAll.data.SKIPPED > 0 && `(情報不足 ${recalcAll.data.SKIPPED} 件)`}
+        </p>
+      )}
+      {recalcAll.error && <p className="mb-3 text-sm text-destructive">{recalcAll.error.message}</p>}
       {isLoading ? (
         <Skeleton className="h-64 rounded-xl" />
       ) : rows.length === 0 ? (
@@ -415,7 +435,7 @@ export default function ProductsPage() {
                         <span className="tabular">
                           {minPriceLabel(p.priceTiers)} {p.currency}〜
                         </span>
-                        {sim && <span className="tabular">ROI {sim.roiPercent}%</span>}
+                        {sim ? <span className="tabular">ROI {sim.roiPercent}%</span> : p.autoCalcStatus === "SKIPPED" && <span className="text-warning-ink">利益: 情報不足</span>}
                         {!p.inStock && <span className="text-destructive">在庫切れ</span>}
                       </p>
                     </td>
@@ -427,7 +447,7 @@ export default function ProductsPage() {
                     </td>
                     <td className="tabular hidden px-4 py-3 text-right md:table-cell">{p.moq.toLocaleString()}</td>
                     <td className="tabular hidden px-4 py-3 text-right md:table-cell">
-                      {sim ? <span className={cn("font-semibold", Number(sim.roiPercent) < 0 && "text-destructive")}>{sim.roiPercent}%</span> : <span className="text-muted-foreground">—</span>}
+                      <AutoRoiCell status={p.autoCalcStatus} sim={sim} />
                     </td>
                     <td className="hidden px-4 py-3 md:table-cell">
                       {p.inStock ? <Badge variant="success">あり</Badge> : <Badge variant="destructive">切れ</Badge>}

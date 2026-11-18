@@ -17,7 +17,7 @@ export async function getJpyRate(base: string): Promise<{ rate: Dec; fetchedAt: 
   }
 
   try {
-    const res = await fetch(`https://open.er-api.com/v6/latest/${b}`);
+    const res = await fetch(`https://open.er-api.com/v6/latest/${b}`, { signal: AbortSignal.timeout(8000) });
     if (!res.ok) throw new Error(`FX API ${res.status}`);
     const body = (await res.json()) as { result: string; rates?: Record<string, number> };
     const jpy = body.rates?.JPY;

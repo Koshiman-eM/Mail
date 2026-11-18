@@ -11,10 +11,13 @@ import { Badge } from "@/components/ui/badge";
 import { PageHeader } from "@/components/ui/misc";
 import { CostBreakdownBar } from "@/components/charts";
 import { api, yenFmt } from "@/components/api";
+import { useProfitSettings, type ProfitSettingsData } from "@/components/ProfitSettingsForm";
 import type { PriceTier, ProfitInput, ProfitResult } from "@/lib/profit/types";
 import { cn } from "@/lib/utils";
 
 interface ProductLite {
+  targetQuantity: number | null;
+  dutyPercent: string | null;
   id: string;
   title: string;
   titleJa: string | null;
@@ -35,6 +38,7 @@ const DEFAULTS = {
   fxRate: "150",
   fxBuffer: "3",
   localShipping: "10",
+  localShippingJpy: "0",
   agentPercent: "5",
   agentFixed: "0",
   unitWeight: "0.2",
@@ -58,6 +62,30 @@ const DEFAULTS = {
 };
 type Form = typeof DEFAULTS;
 
+/** 「設定 > 利益計算」の既定値をフォームへ反映 */
+function fromSettings(s: ProfitSettingsData): Partial<Form> {
+  return {
+    fxBuffer: s.fxBufferPercent,
+    localShipping: "0",
+    localShippingJpy: s.localShippingJpy,
+    agentPercent: s.agentFeePercent,
+    agentFixed: s.agentFixedJpy,
+    divisor: String(s.volumetricDivisor) as "5000" | "6000",
+    ratePerKg: s.intlRatePerKgJpy,
+    minCharge: s.intlMinChargeJpy,
+    fuel: s.fuelSurchargePercent,
+    step: s.weightStepKg,
+    duty: s.defaultDutyPercent,
+    consumptionTax: s.consumptionTaxPercent,
+    clearance: s.customsClearanceFeeJpy,
+    jpRounding: s.japanCustomsRounding,
+    feePercent: s.platformFeePercent,
+    fixedFee: s.platformFixedFeePerUnitJpy,
+    domesticShip: s.domesticShippingPerUnitJpy,
+    other: s.otherCostsJpy,
+  };
+}
+
 function toInput(f: Form, tiers: PriceTier[]): ProfitInput {
   return {
     quantity: Number(f.quantity),
@@ -66,6 +94,7 @@ function toInput(f: Form, tiers: PriceTier[]): ProfitInput {
     currency: f.currency.toUpperCase(),
     fx: { rate: f.fxRate, bufferPercent: f.fxBuffer },
     localShippingForeign: f.localShipping,
+    localShippingJpy: f.localShippingJpy,
     agentFee: { percent: f.agentPercent, fixedJpy: f.agentFixed },
     package: { unitWeightKg: f.unitWeight, unitDimensionsCm: { length: f.len, width: f.wid, height: f.hei } },
     international: {
@@ -246,6 +275,14 @@ function CalculatorInner() {
     setF((p) => ({ ...p, [k]: (e.target.type === "checkbox" ? (e.target as HTMLInputElement).checked : e.target.value) as Form[K] }));
 
   const products = useQuery({ queryKey: ["products"], queryFn: () => api<ProductLite[]>("/api/products") });
+  const settings = useProfitSettings();
+  const [settingsApplied, setSettingsApplied] = useState(false);
+  useEffect(() => {
+    if (settings.data && !settingsApplied) {
+      setF((prev) => ({ ...prev, ...fromSettings(settings.data) }));
+      setSettingsApplied(true);
+    }
+  }, [settings.data, settingsApplied]);
 
   useEffect(() => {
     const p = products.data?.find((x) => x.id === productId);
@@ -255,7 +292,8 @@ function CalculatorInner() {
       ...prev,
       currency: p.currency,
       moq: String(p.moq),
-      quantity: String(Math.max(p.moq, Number(prev.quantity) || p.moq)),
+      quantity: String(Math.max(p.moq, p.targetQuantity ?? p.moq)),
+      ...(p.dutyPercent && { duty: p.dutyPercent }),
       ...(p.weightKg && { unitWeight: p.weightKg }),
       ...(p.lengthCm && { len: p.lengthCm }),
       ...(p.widthCm && { wid: p.widthCm }),
@@ -273,7 +311,17 @@ function CalculatorInner() {
 
   return (
     <div>
-      <PageHeader title="利益計算" description="為替・送料・関税・販売手数料まで含めた、発注数量ごとの利益と ROI を算出します。" />
+      <PageHeader
+        title="利益計算"
+        description="条件を変えて試算します。入力欄は「設定 > 利益計算」の既定値から始まります。登録商品の利益は自動で計算され、商品一覧に表示されます。"
+        actions={
+          settings.data && (
+            <Button variant="outline" onClick={() => setF((prev) => ({ ...prev, ...fromSettings(settings.data!) }))}>
+              <RefreshCw className="h-4 w-4" /> 既定値に戻す
+            </Button>
+          )
+        }
+      />
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_400px]">
         <form
           className="space-y-4"
@@ -350,6 +398,9 @@ function CalculatorInner() {
               </Field>
               <Field label="現地国内送料">
                 <UnitInput unit={f.currency} value={f.localShipping} onChange={set("localShipping")} />
+              </Field>
+              <Field label="現地国内送料 (円建て)">
+                <UnitInput unit="円" value={f.localShippingJpy} onChange={set("localShippingJpy")} />
               </Field>
               <Field label="代行手数料">
                 <UnitInput unit="%" value={f.agentPercent} onChange={set("agentPercent")} />

@@ -11,6 +11,7 @@ import { parseProductPage } from "../lib/scraper/parse";
 import { RATE_LIMIT, queueName, type ScrapeJobData } from "../lib/scraper/policy";
 import { redisConnection, scrapeQueue } from "../lib/scraper/queue";
 import type { PriceTier } from "../lib/profit/types";
+import { autoSimulate } from "../lib/profit/autoService";
 
 let fetcherPromise: Promise<PageFetcher> | undefined;
 const getFetcher = () => (fetcherPromise ??= createPlaywrightFetcher());
@@ -96,7 +97,9 @@ async function processJob(job: Job<ScrapeJobData>) {
   for (const e of events) {
     await notify({ type: e.kind, severity: e.severity, title: e.title, body: e.body, link: `/products?id=${productId}` });
   }
-  return { events: events.length };
+  // 価格・MOQ が変わったら利益を自動再計算 (変化が無ければ autoSimulate 側で保存を省略)
+  const auto = await autoSimulate(productId, "price.change");
+  return { events: events.length, auto: auto.status };
 }
 
 export function startScrapeWorkers(platforms: Platform[]) {

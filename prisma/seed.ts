@@ -1,5 +1,6 @@
 import { PrismaClient, type Platform, type Prisma } from "@prisma/client";
-import { calculateProfit, type PriceTier } from "../src/lib/profit";
+import type { PriceTier } from "../src/lib/profit";
+import { recalcAll } from "../src/lib/profit/autoService";
 
 const prisma = new PrismaClient();
 
@@ -31,7 +32,6 @@ const PRODUCTS: {
   { supplier: 1, externalId: "demo-product-4", title: "硅胶冰格 (demo)", titleJa: "シリコン製製氷皿 (デモ)", currency: "CNY", moq: 100, tiers: [{ minQty: 100, unitPrice: "4.80" }, { minQty: 1000, unitPrice: "4.10" }], history: [4.9, 4.9, 4.8], domesticPriceJpy: "880", dims: ["22", "11", "4"], weightKg: "0.12", qty: 1000, duty: "3.4" },
 ];
 
-const FX: Record<string, string> = { USD: "150", CNY: "20.8" };
 
 async function main() {
   const suppliers = [];
@@ -65,6 +65,8 @@ async function main() {
         widthCm: p.dims[1],
         heightCm: p.dims[2],
         weightKg: p.weightKg,
+        targetQuantity: p.qty,
+        dutyPercent: p.duty,
       },
     });
     const day = 24 * 3600 * 1000;
@@ -80,35 +82,7 @@ async function main() {
         },
       });
     }
-    const input = {
-      quantity: p.qty,
-      moq: p.moq,
-      priceTiers: p.tiers,
-      currency: p.currency,
-      fx: { rate: FX[p.currency], bufferPercent: "3" },
-      localShippingForeign: p.currency === "CNY" ? "30" : "8",
-      agentFee: { percent: "5" },
-      package: { unitWeightKg: p.weightKg, unitDimensionsCm: { length: p.dims[0], width: p.dims[1], height: p.dims[2] } },
-      international: { ratePerKgJpy: "700", volumetricDivisor: 6000 as const },
-      importCosts: { customsDutyPercent: p.duty, customsClearanceFeeJpy: "3000" },
-      domestic: { sellingPriceJpy: p.domesticPriceJpy, platformFeePercent: "10", shippingPerUnitJpy: "230" },
-    };
-    const r = calculateProfit(input);
-    await prisma.profitSimulation.create({
-      data: {
-        productId: product.id,
-        quantity: r.quantity,
-        params: input as unknown as Prisma.InputJsonValue,
-        breakdown: { ...r.breakdown },
-        totalCostJpy: r.totalCostJpy,
-        revenueJpy: r.revenueJpy,
-        profitJpy: r.profitJpy,
-        unitProfitJpy: r.unitProfitJpy,
-        roiPercent: r.roiPercent,
-        marginPercent: r.marginPercent,
-        fxRateApplied: r.fxRateApplied,
-      },
-    });
+    void product;
   }
 
   if ((await prisma.chatMessage.count({ where: { threadId: "demo-thread-1" } })) === 0) {
@@ -124,7 +98,15 @@ async function main() {
       },
     });
   }
+  // 既定値で全商品の利益を自動計算
+  console.log("auto profit:", await recalcAll("manual"));
   console.log("seeded");
 }
 
-main().finally(() => prisma.$disconnect());
+main()
+  .finally(() => prisma.$disconnect())
+  // 通知用の Redis 接続が残るため明示的に終了する
+  .then(() => process.exit(0), (e) => {
+    console.error(e);
+    process.exit(1);
+  });

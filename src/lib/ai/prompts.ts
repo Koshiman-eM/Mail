@@ -4,6 +4,14 @@ export const TRANSLATION_SYSTEM =
   "You translate messages from overseas suppliers (Chinese or English) into natural Japanese for a Japanese importer. " +
   "Keep numbers, prices, currency units, product codes and quantities exactly as written. Do not add commentary.";
 
+export const OUTBOUND_TRANSLATION_SYSTEM =
+  "You translate a Japanese importer's message to an overseas supplier. Keep the meaning, tone and every number, price, " +
+  "currency unit, quantity and product code exactly. Write it the way a polite, concise business buyer would. Do not add new content.";
+
+export function buildOutboundTranslationPrompt(textJa: string, to: "zh" | "en"): string {
+  return [`Translate the message below into ${to === "zh" ? "Simplified Chinese" : "English"}.`, "", "<message>", textJa, "</message>"].join("\n");
+}
+
 export const DRAFT_SYSTEM =
   "あなたは日本の輸入事業者の購買担当として、海外サプライヤーとの価格交渉の返信文を作成します。" +
   "作成した返信は人間が確認・承認してから送信されます。" +

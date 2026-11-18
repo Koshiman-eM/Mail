@@ -50,6 +50,30 @@ export class FakeChatDb implements ChatDb {
       }
       return { count };
     },
+    create: async ({ data }) => {
+      const now = new Date();
+      const row = {
+        id: `msg${this.messages.size + 1}`,
+        originalLang: null,
+        translatedText: null,
+        draftText: null,
+        draftTextJa: null,
+        draftSource: null,
+        finalText: null,
+        status: "RECEIVED",
+        approvedBy: null,
+        approvedAt: null,
+        rejectedReason: null,
+        sentAt: null,
+        externalMsgId: null,
+        version: 0,
+        createdAt: now,
+        updatedAt: now,
+        ...data,
+      } as ChatMessageRow;
+      this.messages.set(row.id, row);
+      return { ...row };
+    },
     update: async ({ where, data }) => {
       const r = this.messages.get(where.id);
       if (!r) throw new Error("not found");
@@ -110,6 +134,7 @@ export class FakeChatDb implements ChatDb {
       translatedText: "こんにちは、最低発注数量は500個です。",
       draftText: null,
       draftTextJa: null,
+      draftSource: null,
       finalText: null,
       status: "RECEIVED",
       approvedBy: null,

@@ -21,7 +21,7 @@ export const GET = handler(async () => {
     .map((m) => ({
       threadId: m.threadId,
       supplier: m.supplier,
-      lastText: m.translatedText ?? m.originalText,
+      lastText: m.translatedText ?? m.draftTextJa ?? m.originalText,
       lastAt: m.createdAt,
       pending: pendingMap.get(m.threadId) ?? 0,
     }))

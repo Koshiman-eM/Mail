@@ -88,6 +88,8 @@ export interface ProfitInput {
   fx: FxParams;
   /** 現地国内送料 (外貨建て, 注文あたり) */
   localShippingForeign?: DecInput;
+  /** 現地国内送料 (円建て, 注文あたり)。外貨建てと併用した場合は合算 */
+  localShippingJpy?: DecInput;
   agentFee?: AgentFeeParams;
   package: PackageParams;
   international: InternationalShippingParams;

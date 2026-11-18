@@ -75,7 +75,9 @@ Claude Code で作業を行う際は、以下のコマンドおよび制約を�
 - AI: Claude API (`@anthropic-ai/sdk`, 既定モデル `claude-opus-5-5`)。構造化出力で JSON を受け取り、拒否時はサーバー側フォールバックを有効化。キー未設定時はスタブ応答: `src/lib/ai/claude.ts`
 - 認証: `src/lib/auth/*`, `src/middleware.ts`。API は `src/app/api/_lib/http.ts` の `handler()` で包むと DB 検証済みユーザーが渡される (ログイン不要な API のみ `publicHandler()`)。監査ログの actor はログインユーザー。
 - スクレイピングのパーサー: `src/lib/scraper/parse.ts`。フィクスチャ (`tests/fixtures/`) は合成データ。
-- 追加モデル: `User`, `Session` (認証), `NegotiationGoal` (交渉ゴール), `FxRate` (為替キャッシュ), `ScraperState` (プラットフォーム別停止状態)。`ChatStatus` には送信失敗用の `SEND_FAILED` を追加 (再送は再ドラフト・再承認必須)。
+- 手動返信: `createManualOutbound` / `attachDraft(source: "MANUAL")` / `approveAndSend` (`src/lib/chat/service.ts`)。「承認して送信」も承認記録を残してから `sendApprovedMessage` を通す (ガードを迂回しない)。
+- 利益の自動計算: 入力組み立てと通知判定は純粋関数 `src/lib/profit/auto.ts`、DB 処理・トリガーは `src/lib/profit/autoService.ts`。定期再計算は `src/workers/profitWorker.ts`。
+- 追加モデル: `User`, `Session` (認証), `ProfitSettings` (自動計算の既定値), `NegotiationGoal` (交渉ゴール), `FxRate` (為替キャッシュ), `ScraperState` (プラットフォーム別停止状態)。`ChatStatus` には送信失敗用の `SEND_FAILED` を追加 (再送は再ドラフト・再承認必須)。
 
 ---
 

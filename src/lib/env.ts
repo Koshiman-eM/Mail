@@ -36,6 +36,10 @@ export const env = {
   get scrapeJitterMaxMs() {
     return num(process.env.SCRAPE_JITTER_MAX_MS, 15_000);
   },
+  /** 全商品の利益を自動再計算する間隔 (為替変動の反映)。既定 6 時間 */
+  get profitRecalcIntervalMs() {
+    return num(process.env.PROFIT_RECALC_INTERVAL_MS, 6 * 60 * 60 * 1000);
+  },
   get scraperStorageStatePath() {
     return process.env.SCRAPER_STORAGE_STATE_PATH || undefined;
   },

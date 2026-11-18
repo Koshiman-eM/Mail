@@ -63,26 +63,84 @@ async function audit(tx: ChatTx, actor: string, action: string, id: string, befo
   });
 }
 
-/** AI ドラフトを添付し DRAFT_READY にする。既存の承認情報は必ずクリアする。 */
+/**
+ * 返信本文 (AI 案 または 人が書いた本文) を添付し DRAFT_READY にする。既存の承認情報は必ずクリアする。
+ */
 export async function attachDraft(
   db: ChatDb,
   id: string,
-  draft: { draftText: string; draftTextJa: string },
+  draft: { draftText: string; draftTextJa: string | null; source?: "AI" | "MANUAL" },
   actor: string,
 ): Promise<ChatMessageRow> {
+  const source = draft.source ?? "AI";
+  if (!draft.draftText.trim()) throw new Error("返信本文が空です");
   return db.$transaction(async (tx) => {
     const row = await load(tx, id);
     await casUpdate(tx, row, "DRAFT_READY", {
       draftText: draft.draftText,
       draftTextJa: draft.draftTextJa,
+      draftSource: source,
       finalText: null,
       approvedBy: null,
       approvedAt: null,
       rejectedReason: null,
     });
-    await audit(tx, actor, "chat.draft", id, { status: row.status }, { status: "DRAFT_READY" });
+    await audit(tx, actor, source === "MANUAL" ? "chat.draft.manual" : "chat.draft", id, { status: row.status }, { status: "DRAFT_READY", source });
     return load(tx, id);
   });
+}
+
+/**
+ * 受信メッセージに紐付かない、こちらから送るメッセージ (人が書いた本文) を DRAFT_READY で作成する。
+ * 送信には通常どおり承認 (approveMessage / approveAndSend) が必要。
+ */
+export async function createManualOutbound(
+  db: ChatDb,
+  input: { supplierId: string; threadId: string; text: string; textJa: string | null; lang: string | null },
+  actor: string,
+): Promise<ChatMessageRow> {
+  const text = input.text.trim();
+  if (!text) throw new Error("送信本文が空です");
+  return db.$transaction(async (tx) => {
+    const supplier = await tx.supplier.findUnique({ where: { id: input.supplierId } });
+    if (!supplier) throw new NotFoundError(`Supplier(${input.supplierId})`);
+    const row = await tx.chatMessage.create({
+      data: {
+        supplierId: input.supplierId,
+        threadId: input.threadId,
+        direction: "OUTBOUND",
+        originalText: text,
+        originalLang: input.lang,
+        draftText: text,
+        draftTextJa: input.textJa,
+        draftSource: "MANUAL",
+        status: "DRAFT_READY",
+      },
+    });
+    await audit(tx, actor, "chat.compose", row.id, null, { status: "DRAFT_READY", source: "MANUAL", threadId: input.threadId });
+    return row;
+  });
+}
+
+/**
+ * 「承認して送信」: 本人の確認をもって承認 (承認者・承認日時を記録) し、続けて送信する。
+ * 送信処理は sendApprovedMessage をそのまま通すため、トランザクション内の承認再検証・CAS・
+ * ブラックリスト確認などのガードレールは省略されない。
+ */
+export async function approveAndSend(
+  db: ChatDb,
+  adapter: SupplierAdapter,
+  id: string,
+  opts: { expectedVersion: number; finalText?: string },
+  actor: string,
+): Promise<ChatMessageRow> {
+  // 送れない相手なら承認記録も残さない (送信時にも sendApprovedMessage が再確認する)
+  const row = await db.chatMessage.findUnique({ where: { id } });
+  if (!row) throw new NotFoundError(`ChatMessage(${id})`);
+  const supplier = await db.supplier.findUnique({ where: { id: row.supplierId } });
+  if (supplier?.isBlacklisted) throw new BlacklistedSupplierError(supplier.name);
+  await approveMessage(db, id, opts, actor);
+  return sendApprovedMessage(db, adapter, id, actor);
 }
 
 /**

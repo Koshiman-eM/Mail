@@ -57,7 +57,7 @@ export const GET = handler(async () => {
       threadId: m.threadId,
       supplier: m.supplier.name,
       status: m.status,
-      text: m.translatedText ?? m.originalText,
+      text: m.translatedText ?? m.draftTextJa ?? m.originalText,
       updatedAt: m.updatedAt,
     })),
     recentAlerts,

@@ -3,12 +3,13 @@
 import { Suspense, useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, Ban, Check, Inbox, Languages, Loader2, Plus, RotateCcw, Search, Send, ShieldAlert, Sparkles, Target, Undo2, X } from "lucide-react";
+import { ArrowLeft, Ban, Check, Inbox, Languages, Loader2, PenLine, Plus, RotateCcw, Search, Send, ShieldAlert, Sparkles, Target, Undo2, X } from "lucide-react";
+import { ReplyComposer, type ReplyLang } from "@/components/chat/ReplyComposer";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox, Input, Label, Select, Textarea, UnitInput } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
-import { EmptyState, Skeleton } from "@/components/ui/misc";
+import { EmptyState, Skeleton, Tabs } from "@/components/ui/misc";
 import { PLATFORM_LABEL, api, relTime } from "@/components/api";
 import { CHAT_STATUS, FLOW_STEPS, type ChatStatusKey } from "@/components/chatStatus";
 import { cn } from "@/lib/utils";
@@ -24,6 +25,8 @@ interface Message {
   id: string;
   supplierId: string;
   threadId: string;
+  direction: "INBOUND" | "OUTBOUND";
+  draftSource: "AI" | "MANUAL" | null;
   originalText: string;
   originalLang: string | null;
   translatedText: string | null;
@@ -45,12 +48,19 @@ interface Supplier {
 
 const LANG: Record<string, string> = { zh: "中国語", en: "英語", ja: "日本語" };
 
-function FlowStepper({ status }: { status: ChatStatusKey }) {
-  const idx = FLOW_STEPS.findIndex((s) => s.match.includes(status));
+const OUTBOUND_STEPS: typeof FLOW_STEPS = [
+  { key: "draft", label: "作成", match: ["DRAFT_READY", "REJECTED", "SEND_FAILED", "RECEIVED"] },
+  { key: "approved", label: "承認", match: ["APPROVED", "SENDING"] },
+  { key: "sent", label: "送信", match: ["SENT"] },
+];
+
+function FlowStepper({ status, outbound }: { status: ChatStatusKey; outbound?: boolean }) {
+  const steps = outbound ? OUTBOUND_STEPS : FLOW_STEPS;
+  const idx = steps.findIndex((s) => s.match.includes(status));
   const failed = status === "SEND_FAILED" || status === "REJECTED";
   return (
     <ol className="flex items-center gap-1 text-[11px]" aria-label="承認フロー">
-      {FLOW_STEPS.map((s, i) => {
+      {steps.map((s, i) => {
         const done = i < idx || status === "SENT";
         const current = i === idx && status !== "SENT";
         return (
@@ -66,7 +76,7 @@ function FlowStepper({ status }: { status: ChatStatusKey }) {
               {done && <Check className="h-3 w-3" />}
               {s.label}
             </span>
-            {i < FLOW_STEPS.length - 1 && <span className="h-px w-3 bg-border" />}
+            {i < steps.length - 1 && <span className="h-px w-3 bg-border" />}
           </li>
         );
       })}
@@ -74,7 +84,21 @@ function FlowStepper({ status }: { status: ChatStatusKey }) {
   );
 }
 
-function MessageCard({ m, blacklisted, onChanged }: { m: Message; blacklisted: boolean; onChanged: () => void }) {
+function SourceBadge({ source }: { source: Message["draftSource"] }) {
+  if (!source) return null;
+  return source === "MANUAL" ? (
+    <Badge variant="outline">
+      <PenLine className="h-3 w-3" /> 手動
+    </Badge>
+  ) : (
+    <Badge variant="outline">
+      <Sparkles className="h-3 w-3" /> AI 案
+    </Badge>
+  );
+}
+
+function MessageCard({ m, blacklisted, defaultLang, onChanged }: { m: Message; blacklisted: boolean; defaultLang: ReplyLang; onChanged: () => void }) {
+  const [writing, setWriting] = useState(false);
   const [edit, setEdit] = useState(m.finalText ?? m.draftText ?? "");
   const [reason, setReason] = useState("");
   const [rejecting, setRejecting] = useState(false);
@@ -96,6 +120,7 @@ function MessageCard({ m, blacklisted, onChanged }: { m: Message; blacklisted: b
   return (
     <article className="space-y-3">
       {/* 受信メッセージ */}
+      {m.direction === "INBOUND" && (
       <div className="flex items-start gap-3">
         <div className="min-w-0 flex-1 rounded-2xl rounded-tl-sm border bg-card p-4 shadow-card">
           <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -116,6 +141,7 @@ function MessageCard({ m, blacklisted, onChanged }: { m: Message; blacklisted: b
           </div>
         </div>
       </div>
+      )}
 
       {/* 返信 (送信済み) */}
       {m.status === "SENT" && m.finalText && (
@@ -123,7 +149,7 @@ function MessageCard({ m, blacklisted, onChanged }: { m: Message; blacklisted: b
           <p className="whitespace-pre-wrap text-sm leading-relaxed">{m.finalText}</p>
           {m.draftTextJa && <p className="mt-2 whitespace-pre-wrap border-t border-white/20 pt-2 text-xs opacity-85">{m.draftTextJa}</p>}
           <p className="mt-2 text-[11px] opacity-70">
-            送信 {m.sentAt && new Date(m.sentAt).toLocaleString("ja-JP")} ・ 承認 {m.approvedBy}
+            {m.draftSource === "MANUAL" ? "手動作成" : "AI 案"} ・ 送信 {m.sentAt && new Date(m.sentAt).toLocaleString("ja-JP")} ・ 承認 {m.approvedBy}
           </p>
         </div>
       )}
@@ -131,14 +157,32 @@ function MessageCard({ m, blacklisted, onChanged }: { m: Message; blacklisted: b
       {/* 返信案 (承認フロー) */}
       {m.status !== "SENT" && (
         <div className="ml-auto rounded-2xl rounded-tr-sm border border-dashed border-primary/40 bg-primary-soft/30 p-4 md:ml-10">
-          <div className="mb-2 flex items-center justify-between gap-2">
+          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
             <p className="flex items-center gap-1.5 text-sm font-semibold">
-              <Sparkles className="h-4 w-4 text-primary" /> 返信案
+              {m.direction === "OUTBOUND" ? <PenLine className="h-4 w-4 text-primary" /> : <Sparkles className="h-4 w-4 text-primary" />}
+              {m.direction === "OUTBOUND" ? "送信メッセージ" : "返信"}
+              <SourceBadge source={m.draftSource} />
             </p>
-            <Badge variant={st.variant}>{st.label}</Badge>
+            <span className="flex items-center gap-2">
+              {m.direction === "OUTBOUND" && <FlowStepper status={m.status} outbound />}
+              <Badge variant={st.variant}>{st.label}</Badge>
+            </span>
           </div>
 
-          {m.draftText === null ? (
+          {writing ? (
+            <ReplyComposer
+              target={{ kind: "inbound", messageId: m.id }}
+              defaultLang={defaultLang}
+              initialText={m.draftSource === "MANUAL" ? (m.draftText ?? "") : ""}
+              initialTextJa={m.draftSource === "MANUAL" ? (m.draftTextJa ?? "") : ""}
+              blacklisted={blacklisted}
+              onCancel={() => setWriting(false)}
+              onDone={() => {
+                setWriting(false);
+                onChanged();
+              }}
+            />
+          ) : m.draftText === null ? (
             <p className="text-sm text-muted-foreground">まだ返信案がありません。</p>
           ) : (
             <>
@@ -156,16 +200,35 @@ function MessageCard({ m, blacklisted, onChanged }: { m: Message; blacklisted: b
           {m.status === "REJECTED" && m.rejectedReason && <p className="mt-2 text-xs text-muted-foreground">却下理由: {m.rejectedReason}</p>}
           {m.status === "SEND_FAILED" && <p className="mt-2 text-xs text-destructive">送信に失敗しました。返信案を再生成し、再承認してください。</p>}
 
+          {!writing && (
           <div className="mt-3 flex flex-wrap items-center gap-2">
-            {["RECEIVED", "DRAFT_READY", "REJECTED", "SEND_FAILED"].includes(m.status) && (
-              <Button size="sm" variant="outline" className="bg-card" disabled={busy} onClick={() => act.mutate({ action: "draft" })}>
-                {m.status === "RECEIVED" ? <Sparkles className="h-4 w-4" /> : <RotateCcw className="h-4 w-4" />}
-                {m.status === "RECEIVED" ? "AI 返信案を生成" : "再生成"}
-              </Button>
-            )}
-            {m.status === "DRAFT_READY" && !rejecting && (
+            {["RECEIVED", "DRAFT_READY", "REJECTED", "SEND_FAILED"].includes(m.status) && !rejecting && !confirmSend && (
               <>
-                <Button size="sm" disabled={busy || !edit.trim()} onClick={() => act.mutate({ action: "approve", body: { expectedVersion: m.version, finalText: edit } })}>
+                {m.direction === "INBOUND" && (
+                  <Button size="sm" variant="outline" className="bg-card" disabled={busy} onClick={() => act.mutate({ action: "draft" })}>
+                    {m.status === "RECEIVED" || m.draftSource === "MANUAL" ? <Sparkles className="h-4 w-4" /> : <RotateCcw className="h-4 w-4" />}
+                    {m.status === "RECEIVED" || m.draftSource === "MANUAL" ? "AI 返信案を生成" : "AI 案を再生成"}
+                  </Button>
+                )}
+                <Button size="sm" variant="outline" className="bg-card" disabled={busy} onClick={() => setWriting(true)}>
+                  <PenLine className="h-4 w-4" /> {m.draftText ? "書き直す" : "自分で書く"}
+                </Button>
+              </>
+            )}
+            {m.status === "DRAFT_READY" && !rejecting && !confirmSend && (
+              <>
+                {m.draftSource === "MANUAL" && (
+                  <Button size="sm" disabled={busy || !edit.trim() || blacklisted} onClick={() => setConfirmSend(true)}>
+                    <Send className="h-4 w-4" /> 承認して送信
+                  </Button>
+                )}
+                <Button
+                  size="sm"
+                  variant={m.draftSource === "MANUAL" ? "outline" : "default"}
+                  className={m.draftSource === "MANUAL" ? "bg-card" : undefined}
+                  disabled={busy || !edit.trim()}
+                  onClick={() => act.mutate({ action: "approve", body: { expectedVersion: m.version, finalText: edit } })}
+                >
                   <Check className="h-4 w-4" /> 承認する
                 </Button>
                 <Button size="sm" variant="ghost" disabled={busy} onClick={() => setRejecting(true)}>
@@ -181,6 +244,18 @@ function MessageCard({ m, blacklisted, onChanged }: { m: Message; blacklisted: b
                 </Button>
                 <Button size="sm" variant="ghost" onClick={() => setRejecting(false)}>
                   戻る
+                </Button>
+              </div>
+            )}
+            {m.status === "DRAFT_READY" && confirmSend && (
+              <div className="flex w-full flex-wrap items-center gap-2 rounded-lg bg-warning-soft px-3 py-2">
+                <ShieldAlert className="h-4 w-4 text-warning-ink" />
+                <span className="flex-1 text-xs text-warning-ink">この本文をあなたの承認として記録し、サプライヤーへ送信します。</span>
+                <Button size="sm" disabled={busy} onClick={() => act.mutate({ action: "approve-send", body: { expectedVersion: m.version, finalText: edit } })}>
+                  {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />} 承認して送信する
+                </Button>
+                <Button size="sm" variant="ghost" onClick={() => setConfirmSend(false)}>
+                  やめる
                 </Button>
               </div>
             )}
@@ -209,6 +284,7 @@ function MessageCard({ m, blacklisted, onChanged }: { m: Message; blacklisted: b
               ))}
             {busy && !confirmSend && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
           </div>
+          )}
           {act.error && <p className="mt-2 rounded-md bg-destructive-soft px-3 py-2 text-xs text-destructive">{act.error.message}</p>}
         </div>
       )}
@@ -352,6 +428,16 @@ function ChatInner() {
     qc.invalidateQueries({ queryKey: ["dashboard"] });
   };
   const select = (id: string | null) => router.push(id ? `/chat?thread=${encodeURIComponent(id)}` : "/chat");
+  const [newMode, setNewMode] = useState<"ingest" | "compose">("ingest");
+  const [composeSupplier, setComposeSupplier] = useState("");
+  const suppliers = useQuery({ queryKey: ["suppliers"], queryFn: () => api<(Supplier & { platform: string; isBlacklisted: boolean })[]>("/api/suppliers"), enabled: showNew });
+  const composeTarget = suppliers.data?.find((s) => s.id === composeSupplier);
+  /** 返信言語の既定: スレッド内の最新の受信メッセージの言語 → 1688 は中国語 → それ以外は英語 */
+  const defaultLang: ReplyLang = useMemo(() => {
+    const lastInbound = [...(messages.data ?? [])].reverse().find((m) => m.direction === "INBOUND" && m.originalLang);
+    if (lastInbound) return lastInbound.originalLang === "zh" ? "zh" : "en";
+    return thread?.supplier.platform === "ALI1688" ? "zh" : "en";
+  }, [messages.data, thread]);
 
   return (
     <div className="-my-2 grid grid-cols-1 gap-6 lg:grid-cols-[300px_minmax(0,1fr)]">
@@ -360,17 +446,55 @@ function ChatInner() {
         <div className="flex items-center justify-between">
           <h1 className="text-2xl font-bold tracking-tight">業者チャット</h1>
           <Button size="sm" variant="soft" onClick={() => setShowNew((s) => !s)}>
-            <Plus className="h-4 w-4" /> 取り込み
+            <Plus className="h-4 w-4" /> 新規
           </Button>
         </div>
         {showNew && (
-          <IngestForm
-            onDone={(id) => {
-              setShowNew(false);
-              refresh();
-              select(id);
-            }}
-          />
+          <div className="space-y-3 rounded-xl border bg-card p-4 shadow-card">
+            <Tabs<"ingest" | "compose">
+              value={newMode}
+              onChange={setNewMode}
+              items={[
+                { value: "ingest", label: "受信を取り込む" },
+                { value: "compose", label: "こちらから送る" },
+              ]}
+            />
+            {newMode === "ingest" ? (
+              <IngestForm
+                compact
+                onDone={(id) => {
+                  setShowNew(false);
+                  refresh();
+                  select(id);
+                }}
+              />
+            ) : (
+              <div className="space-y-3">
+                <Select value={composeSupplier} onChange={(e) => setComposeSupplier(e.target.value)} aria-label="送信先の業者">
+                  <option value="">業者を選択</option>
+                  {suppliers.data?.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name}
+                    </option>
+                  ))}
+                </Select>
+                {composeTarget && (
+                  <ReplyComposer
+                    key={composeTarget.id}
+                    target={{ kind: "outbound", supplierId: composeTarget.id }}
+                    defaultLang={composeTarget.platform === "ALI1688" ? "zh" : "en"}
+                    blacklisted={composeTarget.isBlacklisted}
+                    onDone={({ threadId }) => {
+                      setShowNew(false);
+                      setComposeSupplier("");
+                      refresh();
+                      if (threadId) select(threadId);
+                    }}
+                  />
+                )}
+              </div>
+            )}
+          </div>
         )}
         <div className="relative">
           <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
@@ -406,7 +530,7 @@ function ChatInner() {
       <section className={cn(!active && "hidden lg:block")}>
         {!active || !thread ? (
           <EmptyState icon={Inbox} title="スレッドを選択してください">
-            業者から届いたメッセージを取り込むと、日本語訳と AI 返信案が作成されます。送信は必ず人の承認を経て行われます。
+            業者から届いたメッセージを取り込むと日本語訳と AI 返信案が作成されます。「新規」からこちらのメッセージを書いて送ることもできます。送信は必ず承認を経て行われます。
           </EmptyState>
         ) : (
           <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_280px]">
@@ -427,7 +551,19 @@ function ChatInner() {
                 )}
               </div>
               {messages.isLoading && <Skeleton className="h-48" />}
-              {messages.data?.map((m) => <MessageCard key={m.id} m={m} blacklisted={thread.supplier.isBlacklisted} onChanged={refresh} />)}
+              {messages.data?.map((m) => <MessageCard key={m.id} m={m} blacklisted={thread.supplier.isBlacklisted} defaultLang={defaultLang} onChanged={refresh} />)}
+              <div className="rounded-xl border bg-card p-4 shadow-card">
+                <p className="mb-3 flex items-center gap-1.5 text-sm font-semibold">
+                  <PenLine className="h-4 w-4 text-primary" /> メッセージを作成
+                </p>
+                <ReplyComposer
+                  key={`${thread.threadId}-${messages.data?.length ?? 0}`}
+                  target={{ kind: "outbound", supplierId: thread.supplier.id, threadId: thread.threadId }}
+                  defaultLang={defaultLang}
+                  blacklisted={thread.supplier.isBlacklisted}
+                  onDone={refresh}
+                />
+              </div>
               <div className="rounded-xl border bg-card p-4 shadow-card xl:hidden">
                 <p className="mb-2 text-sm font-semibold">新しい受信メッセージ</p>
                 <IngestForm compact threadId={thread.threadId} supplierId={thread.supplier.id} onDone={refresh} />

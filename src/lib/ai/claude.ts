@@ -2,7 +2,15 @@ import Anthropic from "@anthropic-ai/sdk";
 import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import { z } from "zod";
 import { env } from "../env";
-import { DRAFT_SYSTEM, TRANSLATION_SYSTEM, buildDraftPrompt, buildTranslationPrompt, type NegotiationContext } from "./prompts";
+import {
+  DRAFT_SYSTEM,
+  OUTBOUND_TRANSLATION_SYSTEM,
+  TRANSLATION_SYSTEM,
+  buildDraftPrompt,
+  buildOutboundTranslationPrompt,
+  buildTranslationPrompt,
+  type NegotiationContext,
+} from "./prompts";
 
 export interface TranslationResult {
   lang: string;
@@ -19,6 +27,10 @@ export interface DraftResult {
 const TranslationSchema = z.object({
   lang: z.string().describe("ISO 639-1 code of the source message, e.g. zh, en"),
   translation: z.string().describe("Natural Japanese translation"),
+});
+
+const OutboundSchema = z.object({
+  translation: z.string().describe("The message translated into the requested language"),
 });
 
 const DraftSchema = z.object({
@@ -75,6 +87,15 @@ export async function translateToJapanese(text: string): Promise<TranslationResu
   }
   const r = await ask(TranslationSchema, TRANSLATION_SYSTEM, buildTranslationPrompt(text), "low");
   return { lang: r.lang, translation: r.translation, stub: false };
+}
+
+/** 手動返信の補助: 日本語で書いた本文をサプライヤーの言語へ翻訳する */
+export async function translateForSupplier(textJa: string, to: "zh" | "en"): Promise<{ translation: string; stub: boolean }> {
+  if (!aiConfigured()) {
+    return { translation: textJa, stub: true };
+  }
+  const r = await ask(OutboundSchema, OUTBOUND_TRANSLATION_SYSTEM, buildOutboundTranslationPrompt(textJa, to), "low");
+  return { translation: r.translation, stub: false };
 }
 
 export async function generateReplyDraft(ctx: NegotiationContext): Promise<DraftResult> {

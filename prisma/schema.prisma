@@ -49,6 +49,12 @@ enum ChatDirection {
   OUTBOUND
 }
 
+/// 返信本文の作成者
+enum DraftSource {
+  AI
+  MANUAL
+}
+
 model Supplier {
   id            String        @id @default(cuid())
   platform      Platform
@@ -91,6 +97,13 @@ model Product {
   heightCm           Decimal?           @db.Decimal(10, 2)
   weightKg           Decimal?           @db.Decimal(10, 3)
   hsCode             String?
+  /// 自動利益計算の上書き値 (未設定なら既定値: 数量は MOQ、関税率は設定値)
+  targetQuantity     Int?
+  dutyPercent        Decimal?           @db.Decimal(6, 3)
+  /// 直近の自動計算の状態 (OK / SKIPPED / ERROR) と理由
+  autoCalcStatus     String?
+  autoCalcNote       String?
+  autoCalcAt         DateTime?
   inStock            Boolean            @default(true)
   watch              Boolean            @default(true)
   createdAt          DateTime           @default(now())
@@ -117,6 +130,9 @@ model PriceSnapshot {
 
 model ProfitSimulation {
   id              String   @id @default(cuid())
+  /// 自動計算かどうかと、そのきっかけ (product.create / price.change / fx.refresh / settings.change / manual)
+  auto            Boolean  @default(false)
+  trigger         String?
   productId       String
   product         Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
   quantity        Int
@@ -163,6 +179,8 @@ model ChatMessage {
   /// AI 返信案 (日本語の意図 + 送信用原語)
   draftText      String?
   draftTextJa    String?
+  /// 返信本文が AI 案か、人が書いたものか
+  draftSource    DraftSource?
   /// 承認者が最終確定した送信本文
   finalText      String?
   status         ChatStatus    @default(RECEIVED)
@@ -256,4 +274,31 @@ model Session {
   createdAt DateTime @default(now())
 
   @@index([userId])
+}
+
+/// 自動利益計算の既定パラメータ (単一行: id = "default")
+model ProfitSettings {
+  id                         String   @id @default("default")
+  fxBufferPercent            Decimal  @default(3) @db.Decimal(6, 3)
+  /// 為替取得に失敗しキャッシュも無い場合の予備レート (例: {"USD":"150","CNY":"20.8"})
+  fxFallbackRates            Json     @default("{\"USD\":\"150\",\"CNY\":\"20.8\",\"EUR\":\"160\"}")
+  localShippingJpy           Decimal  @default(0) @db.Decimal(14, 2)
+  agentFeePercent            Decimal  @default(5) @db.Decimal(6, 3)
+  agentFixedJpy              Decimal  @default(0) @db.Decimal(14, 2)
+  intlRatePerKgJpy           Decimal  @default(800) @db.Decimal(14, 2)
+  intlMinChargeJpy           Decimal  @default(0) @db.Decimal(14, 2)
+  volumetricDivisor          Int      @default(5000)
+  weightStepKg               Decimal  @default(0.5) @db.Decimal(8, 3)
+  fuelSurchargePercent       Decimal  @default(0) @db.Decimal(6, 3)
+  defaultDutyPercent         Decimal  @default(5) @db.Decimal(6, 3)
+  consumptionTaxPercent      Decimal  @default(10) @db.Decimal(6, 3)
+  customsClearanceFeeJpy     Decimal  @default(3000) @db.Decimal(14, 2)
+  japanCustomsRounding       Boolean  @default(true)
+  platformFeePercent         Decimal  @default(10) @db.Decimal(6, 3)
+  platformFixedFeePerUnitJpy Decimal  @default(0) @db.Decimal(14, 2)
+  domesticShippingPerUnitJpy Decimal  @default(200) @db.Decimal(14, 2)
+  otherCostsJpy              Decimal  @default(0) @db.Decimal(14, 2)
+  /// ROI がこの値 (%) を下回ったら通知
+  roiAlertPercent            Decimal  @default(20) @db.Decimal(8, 2)
+  updatedAt                  DateTime @updatedAt
 }
