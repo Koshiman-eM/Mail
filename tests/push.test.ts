@@ -81,6 +81,10 @@ describe("decideOnFailure: 送信失敗時の購読の扱い", () => {
     expect(decideOnFailure(404, 0)).toEqual({ action: "delete", reason: "gone" });
     expect(decideOnFailure(410, 3)).toEqual({ action: "delete", reason: "gone" });
   });
+  it("401 / 403 (VAPID 設定エラー) は購読を消さず、失敗回数にも数えない", () => {
+    expect(decideOnFailure(401, 0)).toEqual({ action: "config-error" });
+    expect(decideOnFailure(403, MAX_PUSH_FAILURES - 1)).toEqual({ action: "config-error" });
+  });
   it("その他のエラーは失敗回数を加算する", () => {
     expect(decideOnFailure(500, 0)).toEqual({ action: "increment", failures: 1 });
     expect(decideOnFailure(429, 2)).toEqual({ action: "increment", failures: 3 });

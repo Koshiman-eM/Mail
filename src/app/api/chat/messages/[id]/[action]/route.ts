@@ -3,6 +3,8 @@ import { z } from "zod";
 import { approveForSending, approveMessage, attachDraft, rejectMessage, sendApprovedMessage } from "@/lib/chat/service";
 import { chatDb, generateDraftFor } from "@/lib/chat/drafting";
 import { getSupplierAdapter } from "@/lib/suppliers";
+import { deliverNotification } from "@/lib/notifications/service";
+import type { Notification } from "@prisma/client";
 import { actorOf, handler } from "../../../../_lib/http";
 
 const approveSchema = z.object({ expectedVersion: z.number().int().nonnegative(), finalText: z.string().max(10_000).optional() });
@@ -35,8 +37,13 @@ export const POST = handler(async (req: Request, { params }: { params: Promise<{
     }
     case "approve-send":
       return NextResponse.json(await approveForSending(chatDb(), id, approveSchema.parse(await req.json()), actor));
-    case "send":
-      return NextResponse.json(await sendApprovedMessage(chatDb(), getSupplierAdapter(), id, actor));
+    case "send": {
+      // 送信失敗の通知はトランザクション内で保存され、コミット後に SSE / Web Push で配信する
+      const sent = await sendApprovedMessage(chatDb(), getSupplierAdapter(), id, actor, {
+        onNotificationCreated: (n) => deliverNotification(n as Notification),
+      });
+      return NextResponse.json(sent);
+    }
     default:
       return NextResponse.json({ error: "unknown action" }, { status: 404 });
   }

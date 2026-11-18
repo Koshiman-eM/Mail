@@ -4,12 +4,17 @@
  * - 静的アセット (/_next/static/, /icons/) のみキャッシュ (cache-first)
  * - ページ遷移はネットワークのみ。失敗時だけ簡易オフラインページを返す
  *   (ログインが必要な HTML や API レスポンスは一切キャッシュしない)
+ * - 静的アセットのキャッシュは最大 MAX_STATIC_ENTRIES 件。超えたら古いもの (先に入れたもの) から削除する
+ *   (デプロイごとにハッシュ付きファイル名が変わり、古いアセットが溜まり続けるのを防ぐ)
  * - 開発時 (sw.js?dev=1 で登録) はキャッシュを使わない
+ *
+ * VERSION を上げると、activate 時に現在の STATIC_CACHE 以外の sedori-* キャッシュを丸ごと削除する。
  */
 
-const VERSION = "v1";
+const VERSION = "v2";
 const STATIC_CACHE = `sedori-static-${VERSION}`;
 const DEV = new URL(self.location.href).searchParams.get("dev") === "1";
+const MAX_STATIC_ENTRIES = 200;
 
 self.addEventListener("install", () => {
   self.skipWaiting();
@@ -48,6 +53,14 @@ const OFFLINE_HTML = `<!doctype html>
   <button type="button" onclick="location.reload()">再読み込み</button>
 </main></body></html>`;
 
+/** キャッシュに追加し、上限を超えた分を古い順 (cache.keys() は挿入順) に削除する */
+async function putAndPrune(cache, req, res) {
+  await cache.put(req, res);
+  const keys = await cache.keys();
+  const excess = keys.length - MAX_STATIC_ENTRIES;
+  if (excess > 0) await Promise.all(keys.slice(0, excess).map((k) => cache.delete(k)));
+}
+
 function isStaticAsset(url) {
   return url.pathname.startsWith("/_next/static/") || url.pathname.startsWith("/icons/");
 }
@@ -76,7 +89,7 @@ self.addEventListener("fetch", (event) => {
         const hit = await cache.match(req);
         if (hit) return hit;
         const res = await fetch(req);
-        if (res.ok && res.type === "basic") cache.put(req, res.clone()).catch(() => {});
+        if (res.ok && res.type === "basic") event.waitUntil(putAndPrune(cache, req, res.clone()).catch(() => {}));
         return res;
       })(),
     );

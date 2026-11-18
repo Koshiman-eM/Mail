@@ -13,6 +13,9 @@ export interface PushResult {
 
 const EMPTY: PushResult = { sent: 0, removed: 0, failed: 0 };
 
+/** 設定エラー (401/403) のログはプロセスごとに 1 回だけ出す */
+let configErrorLogged = false;
+
 async function deliverOne(sub: PushSubscriptionRow, payload: PushPayload, keys: VapidKeys): Promise<"sent" | "removed" | "failed"> {
   try {
     await webpush.sendNotification({ endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } }, JSON.stringify(payload), {
@@ -25,6 +28,15 @@ async function deliverOne(sub: PushSubscriptionRow, payload: PushPayload, keys: 
   } catch (e) {
     const status = typeof (e as { statusCode?: unknown })?.statusCode === "number" ? (e as { statusCode: number }).statusCode : undefined;
     const decision = decideOnFailure(status, sub.failures);
+    if (decision.action === "config-error") {
+      if (!configErrorLogged) {
+        configErrorLogged = true;
+        console.error(
+          `[push] プッシュサービスが認証エラー (HTTP ${status}) を返しました。VAPID 鍵 (VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY) と VAPID_SUBJECT の設定を確認してください。購読は削除しません`,
+        );
+      }
+      return "failed";
+    }
     if (decision.action === "delete") {
       await prisma.pushSubscription.deleteMany({ where: { id: sub.id } });
       if (decision.reason === "too-many-failures") console.warn(`[push] 連続失敗のため購読を削除しました (${sub.id})`, status ?? e);

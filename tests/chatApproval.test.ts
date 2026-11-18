@@ -113,6 +113,24 @@ describe("承認・送信フロー", () => {
     expect(db.messages.get("msg1")!.status).toBe("APPROVED");
   });
 
+  it("送信失敗の通知はコミット後に onNotificationCreated で配信される (配信失敗は送信結果に影響しない)", async () => {
+    db.seedMessage({ status: "APPROVED", finalText: "hello", approvedAt: new Date() });
+    adapter.failNextWith(new Error("network down"));
+    const delivered: unknown[] = [];
+    await expect(
+      sendApprovedMessage(db, adapter, "msg1", "alice", {
+        onNotificationCreated: (n) => {
+          // 呼ばれた時点で SEND_FAILED が確定している (コミット済み)
+          expect(db.messages.get("msg1")!.status).toBe("SEND_FAILED");
+          delivered.push(n);
+          throw new Error("sse down");
+        },
+      }),
+    ).rejects.toThrow("network down");
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toMatchObject({ type: "SEND_FAILED", severity: "CRITICAL" });
+  });
+
   it("送信失敗時は SEND_FAILED と CRITICAL 通知、再送には再ドラフト・再承認が必要", async () => {
     db.seedMessage({ status: "APPROVED", finalText: "hello", approvedAt: new Date() });
     adapter.failNextWith(new Error("network down"));

@@ -95,6 +95,9 @@ describe("プラットフォーム別パーサー (合成フィクスチャ)", (
       { minQty: 5000, unitPrice: "1.40" },
     ]);
     expect(p.source).toContain("alibaba:ladder");
+    expect(p.supplierName).toBe("Demo Industrial Co.");
+    expect(p.supplierId).toBe("200000001");
+    expect(p.supplierUrl).toBe("https://demo-industrial.en.alibaba.com/company_profile.html");
   });
 
   it("1688: skuRangePrices と SKU 在庫合計 (文字列中の括弧に惑わされない)", () => {
@@ -109,6 +112,10 @@ describe("プラットフォーム別パーサー (合成フィクスチャ)", (
     ]);
     expect(p.stockQty).toBe(155);
     expect(p.inStock).toBe(true);
+    expect(p.supplierName).toBe("示例厨具有限公司");
+    // 安定した memberId を loginId (店舗名で変わりうる) より優先
+    expect(p.supplierId).toBe("b2b-0000000001demo");
+    expect(p.supplierUrl).toBe("https://shop0000demo.1688.com/");
   });
 
   it("AliExpress: runParams (JS リテラル) から最安 SKU 価格と在庫切れを検出", () => {
@@ -118,6 +125,29 @@ describe("プラットフォーム別パーサー (合成フィクスチャ)", (
     expect(p.currency).toBe("USD");
     expect(p.stockQty).toBe(0);
     expect(p.inStock).toBe(false);
+    expect(p.supplierName).toBe("Demo Kitchen Store");
+    expect(p.supplierId).toBe("1100000001");
+    expect(p.supplierUrl).toBe("https://www.aliexpress.com/store/1100000001");
+  });
+
+  it("業者情報: JSON-LD の offers.seller → brand の順にフォールバック", () => {
+    const withSeller = `<script type="application/ld+json">{"@type":"Product","name":"X","brand":{"name":"BrandCo"},"offers":{"price":"1.00","priceCurrency":"USD","seller":{"@type":"Organization","name":"Seller Ltd."}}}</script>`;
+    expect(parseProductPage(withSeller, "ALIBABA")).toMatchObject({ supplierName: "Seller Ltd.", supplierId: null });
+    const brandOnly = `<script type="application/ld+json">{"@type":"Product","name":"X","brand":{"name":"BrandCo"},"offers":{"price":"1.00"}}</script>`;
+    expect(parseProductPage(brandOnly).supplierName).toBe("BrandCo");
+  });
+
+  it("業者情報: 他サイトのショップ URL や不正な ID は採用しない", () => {
+    const html = `<script>window.detailData = {"product":{"subject":"T","companyName":"A Co.","companyId":0,"supplierId":"<x>","companyHomeUrl":"https://evil.example.com/shop"}};</script>`;
+    const p = parseProductPage(html, "ALIBABA");
+    expect(p.supplierName).toBe("A Co.");
+    expect(p.supplierId).toBeNull();
+    expect(p.supplierUrl).toBeNull();
+  });
+
+  it("業者情報が無いページは null", () => {
+    const p = parseProductPage("<html><body>nothing</body></html>", "ALIEXPRESS");
+    expect(p).toMatchObject({ supplierName: null, supplierId: null, supplierUrl: null, priceTiers: [] });
   });
 
   it("固有データがなければ汎用抽出にフォールバック", () => {

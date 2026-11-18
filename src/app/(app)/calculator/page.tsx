@@ -287,7 +287,8 @@ function CalculatorInner() {
   useEffect(() => {
     const p = products.data?.find((x) => x.id === productId);
     if (!p) return;
-    setTiers(p.priceTiers);
+    // 価格未取得 (URL 取り込みで取得失敗) の商品は空の段階を1行用意する
+    setTiers(p.priceTiers.length ? p.priceTiers : [{ minQty: p.moq, unitPrice: "" }]);
     setF((prev) => ({
       ...prev,
       currency: p.currency,

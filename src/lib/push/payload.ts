@@ -70,15 +70,20 @@ export function pushRequestOptions(severity: PushSeverity): { TTL: number; urgen
 /** 連続失敗がこの回数に達した購読は削除する */
 export const MAX_PUSH_FAILURES = 5;
 
-export type FailureAction = { action: "delete"; reason: "gone" | "too-many-failures" } | { action: "increment"; failures: number };
+export type FailureAction =
+  | { action: "delete"; reason: "gone" | "too-many-failures" }
+  | { action: "increment"; failures: number }
+  | { action: "config-error" };
 
 /**
  * 送信失敗時の購読の扱いを決める。
  * - 404 / 410: 購読が失効 (ブラウザ側で解除・アンインストール) → 即削除
+ * - 401 / 403: VAPID 鍵の不整合など送信側の設定エラー → 購読は消さず、失敗回数にも数えない
  * - それ以外: 失敗回数を加算し、連続 MAX_PUSH_FAILURES 回で削除
  */
 export function decideOnFailure(statusCode: number | undefined, currentFailures: number): FailureAction {
   if (statusCode === 404 || statusCode === 410) return { action: "delete", reason: "gone" };
+  if (statusCode === 401 || statusCode === 403) return { action: "config-error" };
   const failures = currentFailures + 1;
   if (failures >= MAX_PUSH_FAILURES) return { action: "delete", reason: "too-many-failures" };
   return { action: "increment", failures };

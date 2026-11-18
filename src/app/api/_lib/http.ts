@@ -5,12 +5,18 @@ import { InvalidTransitionError } from "@/lib/chat/stateMachine";
 import { InvalidProfitInputError, MoqNotMetError } from "@/lib/profit";
 import { AiRefusalError } from "@/lib/ai/claude";
 import { ForbiddenError, UnauthorizedError, requireUser, type SessionUser } from "@/lib/auth/session";
+import { PayloadTooLargeError } from "./body";
 
 /** ドメイン例外を HTTP ステータスへ変換する */
 export function toErrorResponse(e: unknown) {
   if (e instanceof UnauthorizedError) return NextResponse.json({ error: e.message }, { status: 401 });
   if (e instanceof ForbiddenError) return NextResponse.json({ error: e.message }, { status: 403 });
-  if (e instanceof ZodError) return NextResponse.json({ error: "入力が不正です", issues: e.issues }, { status: 400 });
+  if (e instanceof PayloadTooLargeError) return NextResponse.json({ error: e.message, code: e.name }, { status: 413 });
+  if (e instanceof ZodError) {
+    const first = e.issues[0];
+    const detail = first ? `${first.path.length ? `${first.path.join(".")}: ` : ""}${first.message}` : "";
+    return NextResponse.json({ error: detail ? `入力が不正です (${detail})` : "入力が不正です", issues: e.issues }, { status: 400 });
+  }
   if (e instanceof MoqNotMetError || e instanceof InvalidProfitInputError)
     return NextResponse.json({ error: e.message }, { status: 422 });
   if (e instanceof NotFoundError) return NextResponse.json({ error: e.message }, { status: 404 });

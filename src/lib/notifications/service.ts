@@ -1,4 +1,4 @@
-import type { NotificationType, Prisma, Severity } from "@prisma/client";
+import type { Notification, NotificationType, Prisma, Severity } from "@prisma/client";
 import { prisma } from "../db/prisma";
 import { publishNotification } from "./bus";
 import { pushForNotification } from "../push/send";
@@ -21,6 +21,15 @@ export async function notify(input: CreateNotificationInput) {
   const n = await prisma.notification.create({
     data: { ...input, severity: input.severity ?? "INFO" },
   });
+  await deliverNotification(n);
+  return n;
+}
+
+/**
+ * 保存済みの通知を SSE 購読者へ配信し、対象なら Web Push を送る (例外は投げない)。
+ * 他のトランザクション内で通知を作成した場合は、コミット後にこれを呼ぶ。
+ */
+export async function deliverNotification(n: Notification): Promise<void> {
   await publishNotification({
     id: n.id,
     type: n.type,
@@ -31,5 +40,4 @@ export async function notify(input: CreateNotificationInput) {
     createdAt: n.createdAt.toISOString(),
   }).catch((e) => console.error("[notif] publish failed", e));
   void pushForNotification(n).catch((e) => console.error("[notif] push failed", e));
-  return n;
 }

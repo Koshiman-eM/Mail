@@ -262,7 +262,7 @@ function MessageCard({
                 <>
                   <Button
                     size="sm"
-                    className={cn(big, "min-w-0 flex-1 sm:flex-none")}
+                    className={cn(big, "order-first w-full sm:order-none sm:w-auto")}
                     disabled={busy || !edit.trim() || blacklisted}
                     onClick={() => act.mutate({ action: "approve-send", body: { expectedVersion: m.version, finalText: edit } })}
                   >

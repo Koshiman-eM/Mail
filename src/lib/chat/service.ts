@@ -152,9 +152,10 @@ export async function approveAndSend(
   id: string,
   opts: { expectedVersion: number; finalText?: string },
   actor: string,
+  sendOpts: SendOptions = {},
 ): Promise<ChatMessageRow> {
   await approveForSending(db, id, opts, actor);
-  return sendApprovedMessage(db, adapter, id, actor);
+  return sendApprovedMessage(db, adapter, id, actor, sendOpts);
 }
 
 /**
@@ -207,11 +208,20 @@ export async function rejectMessage(
  *  2. 同条件 (status/approvedAt/version) を WHERE に含めた CAS で SENDING へ遷移し、二重送信を防ぐ。
  *  3. 外部送信は DB トランザクション外で行い、結果を別トランザクションで SENT / SEND_FAILED に記録。
  */
+export interface SendOptions {
+  /**
+   * 送信失敗の通知 (SEND_FAILED) をトランザクション内で保存し、コミット後に呼ばれる。
+   * 本番では SSE / Web Push への配信 (deliverNotification) を渡す。例外は握りつぶす (送信結果には影響させない)。
+   */
+  onNotificationCreated?: (notification: unknown) => Promise<void> | void;
+}
+
 export async function sendApprovedMessage(
   db: ChatDb,
   adapter: SupplierAdapter,
   id: string,
   actor: string,
+  opts: SendOptions = {},
 ): Promise<ChatMessageRow> {
   const claimed = await db.$transaction(async (tx) => {
     const row = await load(tx, id);
@@ -255,12 +265,12 @@ export async function sendApprovedMessage(
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    await db.$transaction(async (tx) => {
+    const created = await db.$transaction(async (tx) => {
       const row = await load(tx, id);
-      if (row.status !== "SENDING") return;
+      if (row.status !== "SENDING") return null;
       await casUpdate(tx, row, "SEND_FAILED", {});
       await audit(tx, actor, "chat.send.failure", id, { status: "SENDING" }, { status: "SEND_FAILED", error: message });
-      await tx.notification.create({
+      return tx.notification.create({
         data: {
           type: "SEND_FAILED",
           severity: "CRITICAL",
@@ -271,6 +281,14 @@ export async function sendApprovedMessage(
         },
       });
     });
+    // コミット後に通常の通知経路 (SSE・Web Push) で配信する
+    if (created && opts.onNotificationCreated) {
+      try {
+        await opts.onNotificationCreated(created);
+      } catch (e) {
+        console.error("[chat] SEND_FAILED 通知の配信に失敗しました", e);
+      }
+    }
     throw err;
   }
 }

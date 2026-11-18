@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Calculator, ExternalLink, Loader2, Package, Plus, RefreshCw, Search, Trash2 } from "lucide-react";
+import { Calculator, ExternalLink, Loader2, Package, PencilLine, Plus, RefreshCw, Search, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input, Label, Select, UnitInput } from "@/components/ui/input";
@@ -14,6 +14,7 @@ import { PLATFORM_LABEL, api, relTime, yenFmt } from "@/components/api";
 import type { PriceTier } from "@/lib/profit/types";
 import { AutoProfitPanel, AutoRoiCell, type AutoSim } from "@/components/AutoProfitPanel";
 import { cn } from "@/lib/utils";
+import { FetchStatusBadge, FetchStatusPanel, UrlImportCard, fieldsLabel, needsBasics, type ImportResponse } from "@/components/import/ProductImport";
 
 interface Product {
   id: string;
@@ -37,7 +38,10 @@ interface Product {
   autoCalcStatus: string | null;
   autoCalcNote: string | null;
   autoCalcAt: string | null;
-  supplier: { name: string; isBlacklisted: boolean };
+  fetchStatus: string | null;
+  fetchNote: string | null;
+  lastFetchedAt: string | null;
+  supplier: { id: string; name: string; externalId: string; isBlacklisted: boolean };
   simulations: AutoSim[];
   snapshots: { priceTiers: PriceTier[]; capturedAt: string; inStock: boolean }[];
 }
@@ -48,11 +52,11 @@ const minPriceLabel = (tiers: PriceTier[]) =>
   tiers.length ? tiers.reduce((a, b) => (Number(b.unitPrice) < Number(a.unitPrice) ? b : a)).unitPrice : "—";
 
 /* ------------------------------------------------------------------ */
-function NewProductForm({ onDone }: { onDone: () => void }) {
+function NewProductForm({ onDone, initialUrl = "" }: { onDone: () => void; initialUrl?: string }) {
   const qc = useQueryClient();
   const [f, setF] = useState({
-    platform: "ALIBABA",
-    url: "",
+    platform: /1688\.com/.test(initialUrl) ? "ALI1688" : /aliexpress\./.test(initialUrl) ? "ALIEXPRESS" : /alibaba\.com/.test(initialUrl) || !initialUrl ? "ALIBABA" : "OTHER",
+    url: initialUrl,
     title: "",
     externalId: "",
     supplierName: "",
@@ -227,8 +231,7 @@ function NewProductForm({ onDone }: { onDone: () => void }) {
 }
 
 /* ------------------------------------------------------------------ */
-function ProductDetail({ p }: { p: Product }) {
-  const scrape = useMutation({ mutationFn: () => api(`/api/products/${p.id}/scrape`, { method: "POST" }) });
+function ProductDetail({ p, notice }: { p: Product; notice?: string | null }) {
   const history = p.snapshots.map((s) => ({ at: s.capturedAt, value: minPrice(s.priceTiers) })).filter((h) => Number.isFinite(h.value));
   return (
     <div className="space-y-6">
@@ -236,25 +239,24 @@ function ProductDetail({ p }: { p: Product }) {
         <Badge variant="outline">{PLATFORM_LABEL[p.platform]}</Badge>
         {p.inStock ? <Badge variant="success">在庫あり</Badge> : <Badge variant="destructive">在庫切れ</Badge>}
         {p.supplier.isBlacklisted && <Badge variant="destructive">ブラックリスト業者</Badge>}
+        <FetchStatusBadge status={p.fetchStatus} />
         <span className="text-xs text-muted-foreground">更新 {relTime(p.updatedAt)}</span>
       </div>
-      <div className="flex flex-wrap gap-2">
-        <Button asChild>
+      {notice && <p className="rounded-md bg-primary-soft px-3 py-2 text-sm text-primary">{notice}</p>}
+      <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap">
+        <Button asChild className="h-11 sm:h-9">
           <Link href={`/calculator?productId=${p.id}`}>
             <Calculator className="h-4 w-4" /> 利益計算
           </Link>
         </Button>
-        <Button variant="outline" onClick={() => scrape.mutate()} disabled={scrape.isPending || p.platform === "OTHER"}>
-          <RefreshCw className={cn("h-4 w-4", scrape.isPending && "animate-spin")} /> 価格を再取得
-        </Button>
-        <Button variant="ghost" asChild>
+        <Button variant="outline" asChild className="h-11 sm:h-9">
           <a href={p.url} target="_blank" rel="noreferrer">
             <ExternalLink className="h-4 w-4" /> 商品ページ
           </a>
         </Button>
       </div>
-      {scrape.isSuccess && <p className="text-sm text-success">取得ジョブを登録しました。結果は通知でお知らせします。</p>}
-      {scrape.error && <p className="text-sm text-destructive">{scrape.error.message}</p>}
+
+      <FetchStatusPanel p={p} />
 
       <Card>
         <CardHeader>
@@ -279,6 +281,13 @@ function ProductDetail({ p }: { p: Product }) {
                 </tr>
               </thead>
               <tbody className="tabular">
+                {p.priceTiers.length === 0 && (
+                  <tr className="border-t">
+                    <td colSpan={2} className="py-3 text-center text-muted-foreground">
+                      価格未取得 (「基本情報を入力」から登録できます)
+                    </td>
+                  </tr>
+                )}
                 {p.priceTiers.map((t) => (
                   <tr key={t.minQty} className="border-t">
                     <td className="py-1.5">{t.minQty.toLocaleString()} 個〜</td>
@@ -299,7 +308,7 @@ function ProductDetail({ p }: { p: Product }) {
           <CardContent>
             <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-sm">
               <dt className="text-muted-foreground">業者</dt>
-              <dd>{p.supplier.name}</dd>
+              <dd className="break-all">{p.supplier.name}</dd>
               <dt className="text-muted-foreground">重量</dt>
               <dd className="tabular">{p.weightKg ? `${p.weightKg} kg` : "—"}</dd>
               <dt className="text-muted-foreground">寸法</dt>
@@ -325,6 +334,8 @@ export default function ProductsPage() {
   const [platform, setPlatform] = useState("ALL");
   const [selected, setSelected] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
+  const [manualUrl, setManualUrl] = useState("");
+  const [notice, setNotice] = useState<string | null>(null);
 
   const rows = useMemo(() => {
     const needle = q.trim().toLowerCase();
@@ -336,10 +347,30 @@ export default function ProductsPage() {
   }, [data, q, platform]);
   const current = data?.find((p) => p.id === selected);
   // 通知のリンク (/products?id=...) から開いた場合は詳細を表示
+  // 共有画面から「手入力で追加」(/products?add=manual&url=...) で来た場合はフォームを開く
   useEffect(() => {
-    const id = new URLSearchParams(window.location.search).get("id");
+    const sp = new URLSearchParams(window.location.search);
+    const id = sp.get("id");
     if (id) setSelected(id);
+    if (sp.get("add") === "manual") {
+      setManualUrl(sp.get("url") ?? "");
+      setAdding(true);
+    }
   }, []);
+  const onImported = (r: ImportResponse) => {
+    setNotice(
+      r.existed
+        ? "この商品は登録済みです。"
+        : r.fetch?.status === "OK"
+          ? `登録しました${r.fetch.parsedFields.length ? ` (取得: ${fieldsLabel(r.fetch.parsedFields)})` : ""}`
+          : "URL で登録しました。ページの情報は取得できなかったため、下から再取得・ソース貼り付け・手入力をしてください。",
+    );
+    setSelected(r.product.id);
+  };
+  const closeDetail = () => {
+    setSelected(null);
+    setNotice(null);
+  };
   const qc = useQueryClient();
   const recalcAll = useMutation({
     mutationFn: () => api<{ total: number; SKIPPED: number }>("/api/profit/recalculate", { method: "POST" }),
@@ -359,12 +390,14 @@ export default function ProductsPage() {
             <Button variant="outline" onClick={() => recalcAll.mutate()} disabled={recalcAll.isPending || !data?.length}>
               <RefreshCw className={cn("h-4 w-4", recalcAll.isPending && "animate-spin")} /> 全商品を再計算
             </Button>
-            <Button onClick={() => setAdding(true)}>
-              <Plus className="h-4 w-4" /> 商品を追加
+            <Button variant="outline" onClick={() => setAdding(true)}>
+              <PencilLine className="h-4 w-4" /> 手入力で追加
             </Button>
           </>
         }
       />
+
+      <UrlImportCard onImported={onImported} />
 
       <div className="mb-4 flex flex-col gap-2 sm:flex-row">
         <div className="relative flex-1">
@@ -396,13 +429,13 @@ export default function ProductsPage() {
           title={data?.length ? "条件に一致する商品がありません" : "まだ商品が登録されていません"}
           action={
             !data?.length && (
-              <Button onClick={() => setAdding(true)}>
-                <Plus className="h-4 w-4" /> 最初の商品を追加
+              <Button variant="outline" onClick={() => setAdding(true)}>
+                <PencilLine className="h-4 w-4" /> 手入力で追加
               </Button>
             )
           }
         >
-          {!data?.length && "Alibaba.com・1688.com・AliExpress の商品 URL と価格を登録すると、巡回監視と利益計算ができます。"}
+          {!data?.length && "上の「URL から追加」に Alibaba.com・1688.com・AliExpress の商品 URL を貼り付けると、価格・業者を読み取って登録します。アプリの「共有」からも追加できます。"}
         </EmptyState>
       ) : (
         <div className="overflow-hidden rounded-xl border bg-card shadow-card">
@@ -422,14 +455,16 @@ export default function ProductsPage() {
                 const sim = p.simulations[0];
                 const spark = [...p.snapshots].reverse().map((s) => minPrice(s.priceTiers)).filter(Number.isFinite);
                 return (
-                  <tr key={p.id} className="cursor-pointer transition-colors hover:bg-accent/60" onClick={() => setSelected(p.id)}>
-                    <td className="px-4 py-3">
-                      <p className="line-clamp-1 font-medium">{p.titleJa ?? p.title}</p>
+                  <tr key={p.id} className="cursor-pointer transition-colors hover:bg-accent/60" onClick={() => { setNotice(null); setSelected(p.id); }}>
+                    <td className="px-4 py-3.5">
+                      <p className="line-clamp-2 break-all font-medium md:line-clamp-1">{p.titleJa ?? p.title}</p>
                       <p className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
                         <span>{PLATFORM_LABEL[p.platform]}</span>
                         <span aria-hidden>・</span>
                         <span>{p.supplier.name}</span>
                         {p.supplier.isBlacklisted && <Badge variant="destructive">ブラックリスト</Badge>}
+                        <FetchStatusBadge status={p.fetchStatus} />
+                        {p.fetchStatus !== "FAILED" && needsBasics(p) && <Badge variant="outline">要入力</Badge>}
                       </p>
                       <p className="mt-1 flex gap-3 text-xs md:hidden">
                         <span className="tabular">
@@ -460,11 +495,11 @@ export default function ProductsPage() {
         </div>
       )}
 
-      <Sheet open={!!current} onClose={() => setSelected(null)} title={<span className="line-clamp-1">{current?.titleJa ?? current?.title}</span>}>
-        {current && <ProductDetail p={current} />}
+      <Sheet open={!!current} onClose={closeDetail} title={<span className="line-clamp-1">{current?.titleJa ?? current?.title}</span>}>
+        {current && <ProductDetail p={current} notice={notice} />}
       </Sheet>
-      <Sheet open={adding} onClose={() => setAdding(false)} title="商品を追加">
-        <NewProductForm onDone={() => setAdding(false)} />
+      <Sheet open={adding} onClose={() => setAdding(false)} title="手入力で商品を追加">
+        <NewProductForm key={manualUrl} initialUrl={manualUrl} onDone={() => setAdding(false)} />
       </Sheet>
     </div>
   );

@@ -1,105 +1,41 @@
-import type { Platform, Prisma } from "@prisma/client";
+import type { Platform } from "@prisma/client";
 import { UnrecoverableError, Worker, type Job } from "bullmq";
-import { prisma } from "../lib/db/prisma";
 import { env } from "../lib/env";
-import { notify } from "../lib/notifications/service";
-import { detectBlock } from "../lib/scraper/detect";
-import { diffSnapshots } from "../lib/scraper/diff";
-import { ManualReauthRequiredError } from "../lib/scraper/errors";
-import { createPlaywrightFetcher, type PageFetcher } from "../lib/scraper/fetcher";
-import { parseProductPage } from "../lib/scraper/parse";
+import { ProductNotFoundError, scrapeProduct } from "../lib/jobs/scrapeProduct";
+import { createFetcher, type PageFetcher } from "../lib/scraper/fetcher";
 import { RATE_LIMIT, queueName, type ScrapeJobData } from "../lib/scraper/policy";
 import { redisConnection, scrapeQueue } from "../lib/scraper/queue";
-import type { PriceTier } from "../lib/profit/types";
-import { autoSimulate } from "../lib/profit/autoService";
-
-let fetcherPromise: Promise<PageFetcher> | undefined;
-const getFetcher = () => (fetcherPromise ??= createPlaywrightFetcher());
 
 /**
- * CAPTCHA / セッション切れ検知時の処理:
- * 自動突破はせず、該当プラットフォームのキューを一時停止し、手動再認証を促す CRITICAL 通知を出す。
- * 当該ジョブは停止中のキューへ再投入し、再開後に処理されるようにする。
+ * BullMQ ワーカー (REDIS_URL 設定時のみ)。取得〜保存の本体は lib/jobs/scrapeProduct (Redis なしの定期ジョブと共用)。
+ * ここではジッター (投入時)・同時実行数・レート制限・指数バックオフ (BullMQ の attempts/backoff) を担う。
  */
-async function pauseForReauth(platform: Platform, err: ManualReauthRequiredError, job: Job<ScrapeJobData>) {
-  const q = scrapeQueue(platform);
-  await q.pause();
-  await prisma.scraperState.upsert({
-    where: { platform },
-    create: { platform, paused: true, reason: err.message, pausedAt: new Date() },
-    update: { paused: true, reason: err.message, pausedAt: new Date() },
-  });
-  await q.add("scrape", job.data);
-  await notify({
-    type: "REAUTH_REQUIRED",
-    severity: "CRITICAL",
-    title: `${platform}: 手動での再認証が必要です`,
-    body: `${err.message}\nブラウザでログイン/認証を完了し、セッションを更新してから「再開」を押してください。`,
-    link: "/settings",
-    meta: { platform, kind: err.kind },
-  });
-}
+let fetcherPromise: Promise<PageFetcher> | undefined;
+const getFetcher = () => (fetcherPromise ??= createFetcher(undefined, "playwright"));
 
 async function processJob(job: Job<ScrapeJobData>) {
-  const { productId, url, platform } = job.data;
-  const state = await prisma.scraperState.findUnique({ where: { platform } });
-  if (state?.paused) {
-    // 停止中に紛れ込んだジョブはリトライを消費させず再投入
-    await scrapeQueue(platform).add("scrape", job.data);
-    return { skipped: "paused" };
+  const { productId, platform } = job.data;
+  let result;
+  try {
+    result = await scrapeProduct(productId, await getFetcher());
+  } catch (e) {
+    if (e instanceof ProductNotFoundError) throw new UnrecoverableError(e.message);
+    throw e;
   }
 
-  const product = await prisma.product.findUnique({ where: { id: productId } });
-  if (!product) throw new UnrecoverableError(`Product ${productId} not found`);
-
-  const fetcher = await getFetcher();
-  const page = await fetcher.fetch(url);
-  const block = detectBlock({ url: page.finalUrl, html: page.html, status: page.status });
-  if (block) {
-    const err = new ManualReauthRequiredError(block, page.finalUrl);
-    await pauseForReauth(platform, err, job);
-    throw new UnrecoverableError(err.message);
+  if (result.status === "blocked") {
+    // DB 上の停止 (ScraperState) と再認証通知は scrapeProduct 済み。キューも止め、ジョブは再開後に処理されるよう再投入する
+    const q = scrapeQueue(platform);
+    await q.pause();
+    await q.add("scrape", job.data);
+    if (result.kind === "paused") return { skipped: "paused" }; // 停止中に紛れ込んだジョブはリトライを消費させない
+    throw new UnrecoverableError(result.note);
   }
-  if (page.status >= 500) throw new Error(`HTTP ${page.status}`); // → 指数バックオフでリトライ
-
-  const parsed = parseProductPage(page.html, platform);
-  if (parsed.priceTiers.length === 0) throw new Error("価格情報を抽出できませんでした");
-
-  const prev = await prisma.priceSnapshot.findFirst({ where: { productId }, orderBy: { capturedAt: "desc" } });
-  const next = {
-    priceTiers: parsed.priceTiers,
-    moq: parsed.moq ?? product.moq,
-    inStock: parsed.inStock,
-  };
-
-  await prisma.$transaction([
-    prisma.priceSnapshot.create({
-      data: {
-        productId,
-        currency: parsed.currency ?? product.currency,
-        priceTiers: next.priceTiers as unknown as Prisma.InputJsonValue,
-        moq: next.moq,
-        inStock: next.inStock,
-        stockQty: parsed.stockQty,
-      },
-    }),
-    prisma.product.update({
-      where: { id: productId },
-      data: { priceTiers: next.priceTiers as unknown as Prisma.InputJsonValue, moq: next.moq, inStock: next.inStock },
-    }),
-  ]);
-
-  const events = diffSnapshots(
-    prev ? { priceTiers: prev.priceTiers as unknown as PriceTier[], moq: prev.moq, inStock: prev.inStock } : null,
-    next,
-    product.titleJa ?? product.title,
-  );
-  for (const e of events) {
-    await notify({ type: e.kind, severity: e.severity, title: e.title, body: e.body, link: `/products?id=${productId}` });
+  if (result.status === "failed") {
+    if (result.retryable) throw new Error(result.note); // → 指数バックオフでリトライ
+    throw new UnrecoverableError(result.note);
   }
-  // 価格・MOQ が変わったら利益を自動再計算 (変化が無ければ autoSimulate 側で保存を省略)
-  const auto = await autoSimulate(productId, "price.change");
-  return { events: events.length, auto: auto.status };
+  return { events: result.events, auto: result.auto };
 }
 
 export function startScrapeWorkers(platforms: Platform[]) {
