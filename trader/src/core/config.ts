@@ -76,6 +76,13 @@ const EnvSchema = z.object({
   INTEL_LOOP_MS: num(900_000),
   LEARN_LOOP_MS: num(3_600_000),
   DASHBOARD_PORT: num(8787),
+  /** ダッシュボードの bind 先 (既定はローカルのみ) */
+  DASHBOARD_HOST: str("127.0.0.1"),
+  /** DexScreener のトレンドから条件を満たすミームを自動で監視に追加する (既定 false) */
+  AUTO_MEME_WATCH: z
+    .string()
+    .optional()
+    .transform((v) => ["1", "true", "yes", "on"].includes((v ?? "").trim().toLowerCase())),
 });
 
 export type Env = z.infer<typeof EnvSchema>;

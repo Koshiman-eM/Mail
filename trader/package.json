@@ -9,6 +9,9 @@
     "trader": "tsx --env-file-if-exists=.env.local --env-file-if-exists=.env src/cli.ts",
     "start": "npm run trader -- run",
     "backtest": "npm run trader -- backtest",
+    "simulate": "npm run trader -- simulate",
+    "report": "npm run trader -- report",
+    "status": "npm run trader -- status",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"

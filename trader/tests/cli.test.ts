@@ -1,0 +1,168 @@
+import { describe, expect, it, vi } from "vitest";
+import { buildReportText, CliError, HELP, main, parseArgs, parseBacktestArgs, parseSimulateArgs, resumeTrading } from "../src/cli";
+import { loadConfig } from "../src/core/config";
+import type { Candle } from "../src/core/types";
+import { fetchCandlesPaged, formatBacktestRows, runBacktestCommand } from "../src/engine/backtestCommand";
+import { exitFxRates, formatTable, strWidth, summarizeByStrategy } from "../src/engine/report";
+import { formatSimulationReport, runSimulation } from "../src/engine/simulate";
+import { RiskManager } from "../src/risk/manager";
+import { MemoryStore } from "../src/storage/memory";
+
+const io = () => {
+  const out: string[] = [];
+  const err: string[] = [];
+  return { out, err, io: { out: (s: string) => out.push(s), err: (s: string) => err.push(s) } };
+};
+
+describe("CLI の引数解析", () => {
+  it("コマンド・--key value・--key=value・真偽フラグ・位置引数", () => {
+    expect(parseArgs(["simulate", "x", "--days", "2", "--seed=7", "--verbose"])).toEqual({
+      command: "simulate",
+      flags: { days: "2", seed: "7", verbose: true },
+      positionals: ["x"],
+    });
+    expect(parseArgs([]).command).toBe("help");
+    expect(parseArgs(["-h"]).flags.help).toBe(true);
+    expect(parseArgs(["run", "--a", "--b", "1"]).flags).toEqual({ a: true, b: "1" });
+    expect(parseArgs(["backtest", "--", "--x"]).positionals).toEqual(["--x"]);
+  });
+
+  it("simulate の既定値と検証", () => {
+    expect(parseSimulateArgs({})).toEqual({ days: 3, hours: 0, seed: 1, db: "memory", stepMs: 15_000 });
+    expect(parseSimulateArgs({ days: "1", seed: "9", db: "./data/sim.db", step: "30" })).toEqual({ days: 1, hours: 0, seed: 9, db: "./data/sim.db", stepMs: 30_000 });
+    expect(parseSimulateArgs({ hours: "6" })).toMatchObject({ days: 0, hours: 6 });
+    expect(() => parseSimulateArgs({ days: "abc" })).toThrow(CliError);
+    expect(() => parseSimulateArgs({ days: "-1" })).toThrow(/0 以上/);
+    expect(() => parseSimulateArgs({ seed: "1.5" })).toThrow(/整数/);
+    expect(() => parseSimulateArgs({ db: true })).toThrow(/値を指定/);
+  });
+
+  it("backtest の既定値と検証", () => {
+    expect(parseBacktestArgs({ strategy: "all" })).toEqual({ strategy: "all", days: 30, source: "synthetic", seed: 1 });
+    expect(parseBacktestArgs({ strategy: "short_ema_trend", symbol: "BTC/JPY", days: "7", source: "ccxt", seed: "3" })).toEqual({
+      strategy: "short_ema_trend", symbol: "BTC/JPY", days: 7, source: "ccxt", seed: 3,
+    });
+    expect(() => parseBacktestArgs({})).toThrow(/--strategy/);
+    expect(() => parseBacktestArgs({ strategy: "nope" })).toThrow(/未知の戦略/);
+    expect(() => parseBacktestArgs({ strategy: "all", source: "csv" })).toThrow(/--source/);
+  });
+
+  it("main: help / 未知のコマンド / 引数エラーの終了コード", async () => {
+    const a = io();
+    expect(await main(["help"], a.io)).toBe(0);
+    expect(a.out.join("\n")).toBe(HELP);
+    const b = io();
+    expect(await main(["dance"], b.io)).toBe(2);
+    expect(b.err[0]).toMatch(/未知のコマンド/);
+    const c = io();
+    expect(await main(["simulate", "--days", "x"], c.io)).toBe(2);
+    expect(c.err[0]).toMatch(/^エラー: --days/);
+  });
+});
+
+describe("simulate コマンド", () => {
+  it("仮想数時間の短時間実行が例外なく終わり、日本語のレポートを出す", async () => {
+    const a = io();
+    const code = await main(["simulate", "--hours", "4", "--step", "30", "--seed", "1"], a.io);
+    expect(a.err.filter((l) => l.startsWith("エラー"))).toEqual([]);
+    expect(code).toBe(0);
+    const text = a.out.join("\n");
+    expect(text).toContain("シミュレーション結果");
+    expect(text).toContain("戦略別の成績");
+    expect(text).toContain("学習の動き");
+    expect(text).toContain("損益要因の集計");
+  }, 60_000);
+
+  it("runSimulation: レポートの中身 (paper のみ・要因分析済み)", async () => {
+    const store = new MemoryStore();
+    const progress = vi.fn();
+    const { report, runtime } = await runSimulation({ hours: 3, stepMs: 30_000, seed: 2, store, onProgress: progress, progressEveryMs: 3_600_000 });
+    expect(runtime.brokerSet.mode).toBe("paper");
+    expect(report.ticks).toBe(3 * 120 + 1);
+    expect(report.trades).toBe(store.listTrades().length);
+    expect(report.attributedTrades).toBe(report.trades);
+    expect(report.learning.learningRuns).toBe(3);
+    expect(report.plans).toBeGreaterThanOrEqual(12);
+    expect(report.finalEquity).toBeGreaterThan(0);
+    expect(progress).toHaveBeenCalled();
+    expect(formatSimulationReport(report)).toContain(`取引数: ${report.trades}`);
+  }, 60_000);
+});
+
+describe("backtest コマンド", () => {
+  it("合成データで単一戦略と all (板必須は対象外)", async () => {
+    const one = await runBacktestCommand({ strategy: "short_ema_trend", days: 3, source: "synthetic", seed: 1 });
+    expect(one).toHaveLength(1);
+    expect(one[0].baseTimeframe).toBe("15m");
+    expect(one[0].metrics).toBeDefined();
+    const all = await runBacktestCommand({ strategy: "all", days: 1, source: "synthetic", seed: 1 });
+    expect(all.map((r) => r.strategyId)).toContain("long_momentum");
+    expect(all.find((r) => r.strategyId === "scalp_obi")?.note).toMatch(/板情報/);
+    const table = formatBacktestRows(all);
+    expect(table).toContain("勝率");
+    expect(table.split("\n")).toHaveLength(all.length + 2);
+    await expect(runBacktestCommand({ strategy: "nope", days: 1, source: "synthetic", seed: 1 })).rejects.toThrow(/未知の戦略/);
+  }, 60_000);
+
+  it("ccxt の履歴はページングして取得する", async () => {
+    const all: Candle[] = Array.from({ length: 2500 }, (_, i) => ({ ts: i * 60_000, open: 1, high: 1, low: 1, close: 1, volume: 1 }));
+    const fetchCandles = vi.fn(async (_s: string, _tf: string, limit: number, since?: number) => all.filter((c) => c.ts >= (since ?? 0)).slice(0, limit));
+    const out = await fetchCandlesPaged({ fetchCandles }, "BTC/USDT", "1m", 0, 2500 * 60_000, { pageLimit: 1000 });
+    expect(out).toHaveLength(2500);
+    expect(fetchCandles).toHaveBeenCalledTimes(3);
+    expect(out[2499].ts).toBe(2499 * 60_000);
+  });
+});
+
+describe("report / resume", () => {
+  it("DB の成績と学習の状態を日本語で表示する", async () => {
+    const store = new MemoryStore();
+    await runSimulation({ hours: 2, stepMs: 30_000, seed: 2, store });
+    const config = loadConfig({ NODE_ENV: "test", DB_PATH: "memory" });
+    const text = buildReportText(config, store, Date.UTC(2026, 0, 6));
+    expect(text).toContain("評価額 (paper)");
+    expect(text).toContain("戦略別の成績");
+    expect(text).toContain("腕の成績");
+    expect(text).toContain("有効な教訓");
+    expect(text).toContain("最近のパラメータ調整");
+    expect(text).toContain("情報源の信頼度");
+    expect(text).toContain("損益要因の集計");
+  }, 60_000);
+
+  it("resume: キルスイッチを解除して監査ログに残す", () => {
+    const store = new MemoryStore();
+    const config = loadConfig({ NODE_ENV: "test", DB_PATH: "memory" });
+    expect(resumeTrading(config, store).resumed).toBe(false);
+    const risk = new RiskManager(config.risk, store);
+    risk.trip("テスト", 1000);
+    store.saveEquity({ ts: 1000, equity: 900_000, mode: "paper" });
+    const r = resumeTrading(config, store, 2000);
+    expect(r.resumed).toBe(true);
+    expect(r.message).toMatch(/キルスイッチ/);
+    expect(new RiskManager(config.risk, store).state().killSwitch).toBeUndefined();
+    const audit = store.listAudit({ type: "risk.resume" });
+    expect(audit).toHaveLength(1);
+    expect(audit[0].data.by).toBe("cli");
+  });
+
+  it("戦略別の成績は決済時点の為替で換算する (記録が無ければ現在のレート)", () => {
+    const store = new MemoryStore();
+    const t = (id: string, netPnl: number) =>
+      ({ id, strategyId: "s", symbol: "BTC/USDT", netPnl, fees: 1, rMultiple: 1 }) as unknown as import("../src/core/types").TradeRecord;
+    store.audit({ ts: 1, type: "engine.exit", data: { tradeId: "a", fxRate: 100 } });
+    const rates = exitFxRates(store);
+    expect(rates.get("a")).toBe(100);
+    const [s] = summarizeByStrategy([t("a", 10), t("b", 10)], () => 150, undefined, rates);
+    expect(s.netPnl).toBe(10 * 100 + 10 * 150);
+    expect(s.fees).toBe(100 + 150);
+  });
+
+  it("表の整形は全角幅をそろえる", () => {
+    expect(strWidth("勝率a")).toBe(5);
+    const t = formatTable(["戦略", "件数"], [["abc", 1], ["日本", 20]]);
+    const lines = t.split("\n");
+    expect(lines[0]).toBe("戦略  件数");
+    expect(lines[2]).toBe("abc      1");
+    expect(lines[3]).toBe("日本    20");
+  });
+});
