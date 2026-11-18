@@ -24,8 +24,8 @@ export interface NotificationLike {
   link?: string | null;
 }
 
-/** INFO でもプッシュする通知種別 (業者からの受信・返信案の準備完了) */
-const INFO_PUSH_TYPES = new Set(["CHAT_RECEIVED", "DRAFT_READY"]);
+/** INFO でもプッシュする通知種別 (業者からの受信・返信案の準備完了・自動探索の結果) */
+const INFO_PUSH_TYPES = new Set(["CHAT_RECEIVED", "DRAFT_READY", "DISCOVERY"]);
 
 /** この通知を端末へプッシュすべきか */
 export function shouldPush(n: Pick<NotificationLike, "type" | "severity">): boolean {

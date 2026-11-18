@@ -5,8 +5,12 @@ import { env } from "../env";
 import {
   DRAFT_SYSTEM,
   OUTBOUND_TRANSLATION_SYSTEM,
+  SEARCH_KEYWORD_SYSTEM,
+  TITLE_FILTER_SYSTEM,
   TRANSLATION_SYSTEM,
   buildDraftPrompt,
+  buildSearchKeywordPrompt,
+  buildTitleFilterPrompt,
   buildOutboundTranslationPrompt,
   buildTranslationPrompt,
   type NegotiationContext,
@@ -31,6 +35,14 @@ const TranslationSchema = z.object({
 
 const OutboundSchema = z.object({
   translation: z.string().describe("The message translated into the requested language"),
+});
+
+const KeywordSchema = z.object({
+  query: z.string().describe("The search query in the requested language"),
+});
+
+const TitleFilterSchema = z.object({
+  keep: z.array(z.number().int()).describe("Indices of listings that match the keyword"),
 });
 
 const DraftSchema = z.object({
@@ -113,4 +125,21 @@ export async function generateReplyDraft(ctx: NegotiationContext): Promise<Draft
   }
   const r = await ask(DraftSchema, DRAFT_SYSTEM, buildDraftPrompt(ctx), "medium");
   return { reply: r.reply, replyJa: r.replyJa, stub: false };
+}
+
+/**
+ * 自動探索: 日本語キーワードを海外サイトの検索語へ翻訳する (Alibaba / AliExpress は英語、1688 は簡体字中国語)。
+ * キー未設定時は日本語のまま返す (stub: true)。
+ */
+export async function translateSearchKeyword(keywordJa: string, to: "en" | "zh"): Promise<{ text: string; stub: boolean }> {
+  if (!aiConfigured()) return { text: keywordJa, stub: true };
+  const r = await ask(KeywordSchema, SEARCH_KEYWORD_SYSTEM, buildSearchKeywordPrompt(keywordJa, to), "low");
+  const text = r.query.replace(/\s+/g, " ").trim().slice(0, 100);
+  return text ? { text, stub: false } : { text: keywordJa, stub: true };
+}
+
+/** 自動探索: 国内の販売例のうちキーワードと明らかに一致しないものを除くため、残す添字を返す (キー設定時のみ使う) */
+export async function filterDomesticTitles(keywordJa: string, titles: string[]): Promise<number[]> {
+  const r = await ask(TitleFilterSchema, TITLE_FILTER_SYSTEM, buildTitleFilterPrompt(keywordJa, titles), "low");
+  return [...new Set(r.keep.filter((i) => Number.isInteger(i) && i >= 0 && i < titles.length))];
 }

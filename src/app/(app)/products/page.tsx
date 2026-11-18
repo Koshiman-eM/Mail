@@ -393,6 +393,12 @@ export default function ProductsPage() {
             <Button variant="outline" onClick={() => setAdding(true)}>
               <PencilLine className="h-4 w-4" /> 手入力で追加
             </Button>
+            {/* モバイルの下部タブには利益計算が無いため、ここから開けるようにする */}
+            <Button variant="outline" asChild>
+              <Link href="/calculator">
+                <Calculator className="h-4 w-4" /> 利益計算
+              </Link>
+            </Button>
           </>
         }
       />

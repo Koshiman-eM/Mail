@@ -2,13 +2,14 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Calculator, LayoutDashboard, MessagesSquare, Package, Settings } from "lucide-react";
+import { LayoutDashboard, MessagesSquare, Package, Settings, Telescope } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const TABS = [
   { href: "/", label: "ホーム", full: "ダッシュボード", icon: LayoutDashboard },
   { href: "/products", label: "仕入れ", full: "仕入れ候補", icon: Package },
-  { href: "/calculator", label: "利益計算", full: "利益計算", icon: Calculator },
+  // 利益計算は仕入れ候補画面のボタン・デスクトップのサイドバーから開ける
+  { href: "/discover", label: "探索", full: "自動探索", icon: Telescope },
   { href: "/chat", label: "チャット", full: "業者チャット", icon: MessagesSquare, badge: true },
   { href: "/settings", label: "設定", full: "設定", icon: Settings },
 ];

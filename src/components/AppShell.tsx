@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { Calculator, ChevronDown, LayoutDashboard, LogOut, MessagesSquare, Package, Settings } from "lucide-react";
+import { Calculator, ChevronDown, LayoutDashboard, LogOut, MessagesSquare, Package, Settings, Telescope } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { BottomNav } from "./BottomNav";
 import { InstallButton } from "./InstallPrompt";
@@ -17,6 +17,7 @@ import { cn } from "@/lib/utils";
 const NAV = [
   { href: "/", label: "ダッシュボード", icon: LayoutDashboard },
   { href: "/products", label: "仕入れ候補", icon: Package },
+  { href: "/discover", label: "自動探索", icon: Telescope },
   { href: "/calculator", label: "利益計算", icon: Calculator },
   { href: "/chat", label: "業者チャット", icon: MessagesSquare, badge: "chat" as const },
   { href: "/settings", label: "設定", icon: Settings },

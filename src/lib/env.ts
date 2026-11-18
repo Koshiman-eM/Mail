@@ -65,4 +65,32 @@ export const env = {
   get scraperStorageStatePath() {
     return process.env.SCRAPER_STORAGE_STATE_PATH || undefined;
   },
+  /**
+   * 楽天市場 商品検索 API (2026 年の新 API: openapi.rakuten.co.jp)。applicationId と accessKey、登録したサイト URL の Referer が必要。
+   * エンドポイント・パラメーター名は公開情報からの推測で未検証のため、RAKUTEN_ITEM_SEARCH_URL で上書きできる。
+   */
+  get rakutenApplicationId() {
+    return process.env.RAKUTEN_APPLICATION_ID?.trim() || undefined;
+  },
+  get rakutenAccessKey() {
+    return process.env.RAKUTEN_ACCESS_KEY?.trim() || undefined;
+  },
+  /** 楽天 API に送る Referer (Rakuten Developers に登録したサイト URL)。未設定なら APP_URL / RENDER_EXTERNAL_URL */
+  get rakutenReferer() {
+    return process.env.RAKUTEN_REFERER?.trim() || process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || undefined;
+  },
+  get rakutenItemSearchUrl() {
+    return process.env.RAKUTEN_ITEM_SEARCH_URL?.trim() || undefined;
+  },
+  /** accessKey の渡し方: param (クエリ) / header (Authorization: Bearer) / both (既定: 両方) */
+  get rakutenAccessKeyMode(): "param" | "header" | "both" {
+    const v = (process.env.RAKUTEN_ACCESS_KEY_MODE || "").toLowerCase();
+    return v === "param" || v === "header" ? v : "both";
+  },
+  /** 定期ジョブで自動探索に使える時間 (分)。既定 8 分 */
+  get discoveryBudgetMinutes() {
+    const raw = process.env.JOBS_DISCOVERY_BUDGET_MIN;
+    const n = Number(raw);
+    return raw && raw.trim() !== "" && Number.isFinite(n) && n >= 0 ? n : 8;
+  },
 };

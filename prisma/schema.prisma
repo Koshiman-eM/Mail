@@ -31,6 +31,7 @@ enum NotificationType {
   DRAFT_READY
   SEND_FAILED
   SYSTEM
+  DISCOVERY
 }
 
 /// 承認ステートマシン: RECEIVED -> DRAFT_READY -> APPROVED / REJECTED -> SENDING -> SENT
@@ -116,6 +117,8 @@ model Product {
   updatedAt          DateTime           @updatedAt
   snapshots          PriceSnapshot[]
   simulations        ProfitSimulation[]
+  /// 自動探索から追加された場合の探索結果 (識別用。監査ログ discovery.auto_add / discovery.add にも記録)
+  discoveredItems    DiscoveredItem[]
 
   @@unique([platform, externalId])
 }
@@ -331,4 +334,107 @@ model ProfitSettings {
   /// ROI がこの値 (%) を下回ったら通知
   roiAlertPercent            Decimal  @default(20) @db.Decimal(8, 2)
   updatedAt                  DateTime @updatedAt
+}
+
+/// 自動探索の結果ステータス
+enum DiscoveryStatus {
+  /// 条件を満たし自動で仕入れ候補に追加した
+  AUTO_ADDED
+  /// 利用者が手動で追加した
+  ADDED
+  /// 条件を満たすが追加していない (自動追加オフ・1回の上限超過)
+  QUALIFIED
+  BELOW_THRESHOLD
+  NO_DOMESTIC_PRICE
+  /// 同じ商品が仕入れ候補に登録済み
+  DUPLICATE
+  /// 利用者が除外した (再探索でも復活させない)
+  DISMISSED
+  ERROR
+}
+
+/// 自動探索の検索条件
+model DiscoveryWatch {
+  id                String           @id @default(cuid())
+  name              String
+  /// 国内価格の検索キーワード (日本語)
+  keywordJa         String
+  /// 海外サイト別の検索キーワード { ALIBABA?, ALIEXPRESS?, ALI1688? }。空なら keywordJa を翻訳して使う
+  foreignKeywords   Json             @default("{}")
+  /// 翻訳したキーワードのキャッシュ { ALIBABA: { source, text, stub } ... }
+  autoKeywords      Json?
+  platforms         Platform[]
+  enabled           Boolean          @default(true)
+  /// 試算の前提 (1 個あたり)
+  estWeightKg       Decimal          @db.Decimal(10, 3)
+  estLengthCm       Decimal?         @db.Decimal(10, 2)
+  estWidthCm        Decimal?         @db.Decimal(10, 2)
+  estHeightCm       Decimal?         @db.Decimal(10, 2)
+  targetQuantity    Int              @default(1)
+  /// 自動追加の条件
+  minRoiPercent     Decimal          @db.Decimal(9, 2)
+  minProfitJpy      Decimal?         @db.Decimal(14, 2)
+  maxMoq            Int?
+  maxUnitPriceJpy   Decimal?         @db.Decimal(14, 2)
+  autoAdd           Boolean          @default(true)
+  maxAutoAddPerRun  Int              @default(5)
+  /// 直近の実行 (RUNNING / OK / PARTIAL / FAILED) と概要
+  lastRunAt         DateTime?
+  lastRunStatus     String?
+  lastRunNote       String?
+  createdById       String?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+  items             DiscoveredItem[]
+}
+
+/// 自動探索で見つかった商品 (海外サイトの検索結果 1 件)
+model DiscoveredItem {
+  id                 String          @id @default(cuid())
+  watchId            String
+  watch              DiscoveryWatch  @relation(fields: [watchId], references: [id], onDelete: Cascade)
+  platform           Platform
+  externalId         String
+  url                String
+  title              String
+  imageUrl           String?
+  currency           String          @db.VarChar(3)
+  /// 最安段階の単価 (外貨)
+  unitPrice          Decimal         @db.Decimal(14, 4)
+  /// 段階的単価: [{ minQty, unitPrice }]
+  priceTiers         Json
+  moq                Int             @default(1)
+  supplierName       String?
+  supplierExternalId String?
+  shopUrl            String?
+  /// 国内販売価格の採用値 (円) と根拠
+  domesticPriceJpy   Decimal?        @db.Decimal(14, 2)
+  domesticEvidence   Json?
+  estProfitJpy       Decimal?        @db.Decimal(14, 2)
+  estRoiPercent      Decimal?        @db.Decimal(9, 2)
+  /// 試算の詳細 (数量・円換算単価・為替など)
+  estimate           Json?
+  status             DiscoveryStatus
+  statusNote         String?
+  productId          String?
+  product            Product?        @relation(fields: [productId], references: [id], onDelete: SetNull)
+  firstSeenAt        DateTime        @default(now())
+  lastSeenAt         DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+
+  @@unique([watchId, platform, externalId])
+  @@index([status, lastSeenAt])
+  @@index([watchId, lastSeenAt])
+}
+
+/// 国内価格の検索結果キャッシュ (24 時間)
+model DomesticPriceCache {
+  id        String   @id @default(cuid())
+  provider  String
+  keyword   String
+  /// { items: [{ title, priceJpy, url, shop }] }
+  result    Json
+  fetchedAt DateTime @default(now())
+
+  @@unique([provider, keyword])
 }

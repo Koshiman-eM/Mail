@@ -88,6 +88,50 @@ function ScraperTab({ isAdmin }: { isAdmin: boolean }) {
   );
 }
 
+interface ProviderInfo {
+  providers: { id: string; label: string; configured: boolean; note: string }[];
+  translation: boolean;
+}
+
+/** 自動探索で使う国内価格の取得元 (環境変数から判定・読み取り専用) */
+function DomesticProvidersCard() {
+  const q = useQuery({ queryKey: ["discover-providers"], queryFn: () => api<ProviderInfo>("/api/discover/providers") });
+  return (
+    <Card className="mt-6">
+      <CardHeader>
+        <CardTitle>国内価格の取得元 (自動探索)</CardTitle>
+        <CardDescription>
+          サーバーの環境変数で設定します (この画面からは変更できません)。楽天は Rakuten Developers で発行した applicationId・accessKey と、登録したサイト URL
+          (Referer) が必要です。手順は docs/DEPLOY.md を参照してください。
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {q.error && <p className="text-sm text-destructive">{q.error.message}</p>}
+        {q.data?.providers.map((p) => (
+          <div key={p.id} className="rounded-lg border p-4">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="font-medium">{p.label}</span>
+              {p.configured ? <Badge variant="success">設定済み</Badge> : p.id === "rakuten" ? <Badge variant="warning">未設定</Badge> : <Badge variant="outline">未対応</Badge>}
+            </div>
+            <p className="mt-1 break-all text-xs leading-relaxed text-muted-foreground">{p.note}</p>
+          </div>
+        ))}
+        {q.data && (
+          <div className="rounded-lg border p-4">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="font-medium">キーワード翻訳 (Claude)</span>
+              {q.data.translation ? <Badge variant="success">設定済み</Badge> : <Badge variant="outline">未設定</Badge>}
+            </div>
+            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+              未設定の場合、海外サイト用キーワードが空欄の探索条件は日本語のまま検索します。国内の販売例の絞り込み (無関係な商品の除外) も行いません。
+            </p>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 function SuppliersTab() {
   const qc = useQueryClient();
   const suppliers = useQuery({ queryKey: ["suppliers"], queryFn: () => api<Supplier[]>("/api/suppliers") });
@@ -363,7 +407,12 @@ export default function SettingsPage() {
       </div>
       {tab === "profit" && <ProfitSettingsForm isAdmin={isAdmin} />}
       {tab === "notifications" && <PushSettings />}
-      {tab === "scraper" && <ScraperTab isAdmin={isAdmin} />}
+      {tab === "scraper" && (
+        <>
+          <ScraperTab isAdmin={isAdmin} />
+          <DomesticProvidersCard />
+        </>
+      )}
       {tab === "suppliers" && <SuppliersTab />}
       {tab === "users" && isAdmin && me && <UsersTab meId={me.id} />}
       {tab === "parser" && <ParserTab />}
