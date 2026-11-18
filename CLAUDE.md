@@ -76,3 +76,9 @@ Claude Code で作業を行う際は、以下のコマンドおよび制約を�
 - 認証: `src/lib/auth/*`, `src/middleware.ts`。API は `src/app/api/_lib/http.ts` の `handler()` で包むと DB 検証済みユーザーが渡される (ログイン不要な API のみ `publicHandler()`)。監査ログの actor はログインユーザー。
 - スクレイピングのパーサー: `src/lib/scraper/parse.ts`。フィクスチャ (`tests/fixtures/`) は合成データ。
 - 追加モデル: `User`, `Session` (認証), `NegotiationGoal` (交渉ゴール), `FxRate` (為替キャッシュ), `ScraperState` (プラットフォーム別停止状態)。`ChatStatus` には送信失敗用の `SEND_FAILED` を追加 (再送は再ドラフト・再承認必須)。
+
+---
+
+## 6. エージェント運用ルール
+
+@.claude/agent-rules.md
