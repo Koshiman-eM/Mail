@@ -1,0 +1,69 @@
+# 定期ジョブ: 仕入れ候補の価格・在庫の巡回と、利益の再計算 (為替の反映)
+# リポジトリの Settings > Secrets and variables > Actions に DATABASE_URL を登録すると動きます。
+name: 定期ジョブ (価格巡回・利益再計算)
+
+on:
+  schedule:
+    # 4 時間ごと (UTC。毎時 0 分は混雑するためずらしています)
+    - cron: "23 */4 * * *"
+  workflow_dispatch:
+    inputs:
+      max_products:
+        description: "巡回する商品数の上限 (空欄で制限なし)"
+        required: false
+
+concurrency:
+  group: scheduled-jobs
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 設定の確認
+        id: check
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "DATABASE_URL が未登録のためスキップします (docs/DEPLOY.md 参照)"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.check.outputs.skip != 'true'
+
+      - uses: actions/setup-node@v4
+        if: steps.check.outputs.skip != 'true'
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 依存関係のインストール
+        if: steps.check.outputs.skip != 'true'
+        run: npm ci
+
+      - name: 巡回と再計算
+        if: steps.check.outputs.skip != 'true'
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # ランナーに入っている Google Chrome を使う
+          SCRAPER_MODE: playwright
+          CHROMIUM_PATH: /usr/bin/google-chrome
+          SUPPLIER_ADAPTER: handoff
+          # 入力値はスクリプトに直接埋め込まず環境変数で渡す (コマンド注入対策)
+          MAX_PRODUCTS: ${{ github.event.inputs.max_products }}
+        run: |
+          if [ -n "$MAX_PRODUCTS" ]; then
+            case "$MAX_PRODUCTS" in
+              *[!0-9]*) echo "max_products は数字で指定してください"; exit 1 ;;
+            esac
+            npm run jobs:once -- --max-products "$MAX_PRODUCTS"
+          else
+            npm run jobs:once
+          fi

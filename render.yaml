@@ -1,0 +1,32 @@
+# Render Blueprint: Web アプリ (無料プラン) を作成します。
+# データベースは Neon (無料) を使い、定期ジョブ (価格巡回・利益の再計算) は GitHub Actions で動かします。
+# 手順は docs/DEPLOY.md を参照してください。
+services:
+  - type: web
+    name: sedori
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm ci && npm run build
+    # 起動時にデータベースのマイグレーションを適用してから起動
+    startCommand: npm run start:prod
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      # Neon の接続文字列 (直接接続。?sslmode=require 付き) を入力
+      - key: DATABASE_URL
+        sync: false
+      # Claude API キー (翻訳・AI 返信案)。未入力でも動作します
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ANTHROPIC_MODEL
+        value: claude-opus-5-5
+      # 業者への送信は自動で行わず、業者アプリで送る方式
+      - key: SUPPLIER_ADAPTER
+        value: handoff
+      # 無料プランにはブラウザが無いため、Web アプリ内の商品ページ取得は HTTP で行う
+      - key: SCRAPER_MODE
+        value: http
+      - key: FX_DEFAULT_BUFFER_PERCENT
+        value: "3"

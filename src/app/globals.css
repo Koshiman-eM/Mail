@@ -1,0 +1,109 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * カラートークンは RGB の三つ組で定義し、Tailwind の不透明度修飾子 (bg-primary/10 等) を使えるようにする。
+ * 中立色・チャート色は dataviz 参照パレット (検証済み) に準拠。
+ */
+@layer base {
+  :root {
+    color-scheme: light;
+    --background: 249 249 247;
+    --foreground: 11 11 11;
+    --card: 255 255 255;
+    --card-foreground: 11 11 11;
+    --sidebar: 255 255 255;
+    --primary: 37 106 191;
+    --primary-foreground: 255 255 255;
+    --primary-soft: 229 239 252;
+    --secondary: 240 239 236;
+    --secondary-foreground: 11 11 11;
+    --muted: 243 242 239;
+    --muted-foreground: 82 81 78;
+    --accent: 240 239 236;
+    --accent-foreground: 11 11 11;
+    --destructive: 208 59 59;
+    --destructive-foreground: 255 255 255;
+    --destructive-soft: 252 234 234;
+    --success: 0 99 0;
+    --success-soft: 228 244 228;
+    --warning: 250 178 25;
+    --warning-soft: 254 244 220;
+    --warning-ink: 122 80 0;
+    --border: 225 224 217;
+    --input: 210 209 202;
+    --ring: 42 120 214;
+    --radius: 0.625rem;
+
+    /* チャート (参照パレット: categorical slot 1-5, ink, grid) */
+    --chart-1: #2a78d6;
+    --chart-2: #eb6834;
+    --chart-3: #1baf7a;
+    --chart-4: #eda100;
+    --chart-5: #e87ba4;
+    --chart-surface: #fcfcfb;
+    --chart-grid: #e1e0d9;
+    --chart-axis: #c3c2b7;
+    --chart-muted: #898781;
+  }
+
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --background: 13 13 13;
+    --foreground: 240 239 236;
+    --card: 26 26 25;
+    --card-foreground: 240 239 236;
+    --sidebar: 20 20 19;
+    --primary: 57 135 229;
+    --primary-foreground: 255 255 255;
+    --primary-soft: 22 40 64;
+    --secondary: 44 44 42;
+    --secondary-foreground: 240 239 236;
+    --muted: 35 35 34;
+    --muted-foreground: 195 194 183;
+    --accent: 44 44 42;
+    --accent-foreground: 240 239 236;
+    --destructive: 230 103 103;
+    --destructive-foreground: 11 11 11;
+    --destructive-soft: 58 26 26;
+    --success: 12 163 12;
+    --success-soft: 20 48 20;
+    --warning: 250 178 25;
+    --warning-soft: 56 42 10;
+    --warning-ink: 250 178 25;
+    --border: 44 44 42;
+    --input: 60 60 57;
+    --ring: 57 135 229;
+
+    --chart-1: #3987e5;
+    --chart-2: #d95926;
+    --chart-3: #199e70;
+    --chart-4: #c98500;
+    --chart-5: #d55181;
+    --chart-surface: #1a1a19;
+    --chart-grid: #2c2c2a;
+    --chart-axis: #383835;
+    --chart-muted: #898781;
+  }
+
+  * {
+    @apply border-border;
+  }
+  html,
+  body {
+    @apply bg-background text-foreground antialiased;
+  }
+  body {
+    font-feature-settings: "palt";
+  }
+}
+
+@layer utilities {
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+  .scrollbar-thin {
+    scrollbar-width: thin;
+  }
+}
