@@ -1,0 +1,29 @@
+{
+  "name": "auto-trader",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "自己学習型マルチアセット自動売買ツール (仮想通貨・ミームコイン・FX・株式 / スキャルピング・短期中心)",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "trader": "tsx --env-file-if-exists=.env.local --env-file-if-exists=.env src/cli.ts",
+    "start": "npm run trader -- run",
+    "backtest": "npm run trader -- backtest",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.10.0",
+    "ccxt": "^4.5.93",
+    "decimal.js": "^10.6.0",
+    "fast-xml-parser": "^5.12.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^5.1.1"
+  }
+}
