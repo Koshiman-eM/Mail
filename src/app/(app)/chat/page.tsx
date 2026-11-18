@@ -3,8 +3,11 @@
 import { Suspense, useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, Ban, Check, Inbox, Languages, Loader2, PenLine, Plus, RotateCcw, Search, Send, ShieldAlert, Sparkles, Target, Undo2, X } from "lucide-react";
+import { ArrowLeft, Ban, Check, ExternalLink, Inbox, Languages, Link2, Loader2, PenLine, Pencil, Plus, RotateCcw, Search, Send, Sparkles, Target, X } from "lucide-react";
 import { ReplyComposer, type ReplyLang } from "@/components/chat/ReplyComposer";
+import { HandoffActions, HandoffText, type HandoffSupplier } from "@/components/chat/HandoffPanel";
+import { ChatUrlEditor } from "@/components/chat/ChatUrlEditor";
+import { useAutoGrow, useSendMode, type SendMode } from "@/components/chat/hooks";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox, Input, Label, Select, Textarea, UnitInput } from "@/components/ui/input";
@@ -16,7 +19,7 @@ import { cn } from "@/lib/utils";
 
 interface Thread {
   threadId: string;
-  supplier: { id: string; name: string; platform: string; isBlacklisted: boolean };
+  supplier: { id: string; name: string; platform: string; isBlacklisted: boolean; chatUrl: string | null };
   lastText: string;
   lastAt: string;
   pending: number;
@@ -38,6 +41,7 @@ interface Message {
   approvedAt: string | null;
   rejectedReason: string | null;
   sentAt: string | null;
+  externalMsgId: string | null;
   version: number;
   createdAt: string;
 }
@@ -97,18 +101,33 @@ function SourceBadge({ source }: { source: Message["draftSource"] }) {
   );
 }
 
-function MessageCard({ m, blacklisted, defaultLang, onChanged }: { m: Message; blacklisted: boolean; defaultLang: ReplyLang; onChanged: () => void }) {
+function MessageCard({
+  m,
+  supplier,
+  sendMode,
+  defaultLang,
+  stickyOnMobile,
+  onChanged,
+}: {
+  m: Message;
+  supplier: HandoffSupplier;
+  sendMode: SendMode;
+  defaultLang: ReplyLang;
+  /** モバイルでは操作ボタンを画面下部の固定バーに出す */
+  stickyOnMobile: boolean;
+  onChanged: () => void;
+}) {
+  const blacklisted = supplier.isBlacklisted;
   const [writing, setWriting] = useState(false);
   const [edit, setEdit] = useState(m.finalText ?? m.draftText ?? "");
   const [reason, setReason] = useState("");
   const [rejecting, setRejecting] = useState(false);
-  const [confirmSend, setConfirmSend] = useState(false);
   useEffect(() => setEdit(m.finalText ?? m.draftText ?? ""), [m.finalText, m.draftText, m.version]);
+  const editRef = useAutoGrow(edit, 360);
 
   const act = useMutation({
     mutationFn: ({ action, body }: { action: string; body?: unknown }) => api(`/api/chat/messages/${m.id}/${action}`, { method: "POST", json: body ?? {} }),
     onSettled: () => {
-      setConfirmSend(false);
       setRejecting(false);
       onChanged();
     },
@@ -116,60 +135,81 @@ function MessageCard({ m, blacklisted, defaultLang, onChanged }: { m: Message; b
   const busy = act.isPending;
   const edited = m.draftText !== null && edit.trim() !== m.draftText.trim();
   const st = CHAT_STATUS[m.status];
+  const handoffSent = m.externalMsgId?.startsWith("handoff:") ?? false;
+  const big = "h-11 lg:h-8";
 
   return (
-    <article className="space-y-3">
+    <article id={`msg-${m.id}`} className="scroll-mt-20 space-y-3">
       {/* 受信メッセージ */}
       {m.direction === "INBOUND" && (
-      <div className="flex items-start gap-3">
-        <div className="min-w-0 flex-1 rounded-2xl rounded-tl-sm border bg-card p-4 shadow-card">
-          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-            <FlowStepper status={m.status} />
-            <span className="text-[11px] text-muted-foreground">{new Date(m.createdAt).toLocaleString("ja-JP")}</span>
-          </div>
-          <div className="grid gap-3 md:grid-cols-2">
-            <div>
-              <p className="mb-1 text-[11px] font-medium text-muted-foreground">原文 ({LANG[m.originalLang ?? ""] ?? m.originalLang ?? "不明"})</p>
-              <p className="whitespace-pre-wrap text-sm leading-relaxed">{m.originalText}</p>
+        <div className="flex items-start gap-3">
+          <div className="min-w-0 flex-1 rounded-2xl rounded-tl-sm border bg-card p-3 shadow-card sm:p-4">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <FlowStepper status={m.status} />
+              <span className="text-[11px] text-muted-foreground">{new Date(m.createdAt).toLocaleString("ja-JP")}</span>
             </div>
-            <div className="border-t pt-3 md:border-l md:border-t-0 md:pl-3 md:pt-0">
-              <p className="mb-1 flex items-center gap-1 text-[11px] font-medium text-muted-foreground">
-                <Languages className="h-3 w-3" /> 日本語訳
-              </p>
-              <p className="whitespace-pre-wrap text-sm leading-relaxed">{m.translatedText ?? "—"}</p>
+            <div className="grid gap-3 md:grid-cols-2">
+              <div className="min-w-0">
+                <p className="mb-1 text-[11px] font-medium text-muted-foreground">原文 ({LANG[m.originalLang ?? ""] ?? m.originalLang ?? "不明"})</p>
+                <p className="whitespace-pre-wrap break-words text-sm leading-relaxed">{m.originalText}</p>
+              </div>
+              <div className="min-w-0 border-t pt-3 md:border-l md:border-t-0 md:pl-3 md:pt-0">
+                <p className="mb-1 flex items-center gap-1 text-[11px] font-medium text-muted-foreground">
+                  <Languages className="h-3 w-3" /> 日本語訳
+                </p>
+                <p className="whitespace-pre-wrap break-words text-sm leading-relaxed">{m.translatedText ?? "—"}</p>
+              </div>
             </div>
           </div>
         </div>
-      </div>
       )}
 
       {/* 返信 (送信済み) */}
       {m.status === "SENT" && m.finalText && (
-        <div className="ml-auto max-w-[90%] rounded-2xl rounded-tr-sm bg-primary p-4 text-primary-foreground shadow-card md:max-w-[75%]">
-          <p className="whitespace-pre-wrap text-sm leading-relaxed">{m.finalText}</p>
-          {m.draftTextJa && <p className="mt-2 whitespace-pre-wrap border-t border-white/20 pt-2 text-xs opacity-85">{m.draftTextJa}</p>}
+        <div className="ml-auto max-w-[90%] rounded-2xl rounded-tr-sm bg-primary p-3 text-primary-foreground shadow-card sm:p-4 md:max-w-[75%]">
+          <p className="whitespace-pre-wrap break-words text-sm leading-relaxed">{m.finalText}</p>
+          {m.draftTextJa && <p className="mt-2 whitespace-pre-wrap break-words border-t border-white/20 pt-2 text-xs opacity-85">{m.draftTextJa}</p>}
           <p className="mt-2 text-[11px] opacity-70">
-            {m.draftSource === "MANUAL" ? "手動作成" : "AI 案"} ・ 送信 {m.sentAt && new Date(m.sentAt).toLocaleString("ja-JP")} ・ 承認 {m.approvedBy}
+            {handoffSent ? (
+              <>
+                業者アプリで送信 ・ 記録 {m.sentAt && new Date(m.sentAt).toLocaleString("ja-JP")} ・ 承認 {m.approvedBy}
+              </>
+            ) : (
+              <>
+                {m.draftSource === "MANUAL" ? "手動作成" : "AI 案"} ・ 送信 {m.sentAt && new Date(m.sentAt).toLocaleString("ja-JP")} ・ 承認 {m.approvedBy}
+              </>
+            )}
           </p>
         </div>
       )}
 
       {/* 返信案 (承認フロー) */}
       {m.status !== "SENT" && (
-        <div className="ml-auto rounded-2xl rounded-tr-sm border border-dashed border-primary/40 bg-primary-soft/30 p-4 md:ml-10">
+        <div
+          className={cn(
+            "ml-auto min-w-0 rounded-2xl rounded-tr-sm border border-dashed p-3 sm:p-4 md:ml-10",
+            m.status === "APPROVED" ? "border-primary/60 bg-primary-soft/50" : "border-primary/40 bg-primary-soft/30",
+          )}
+        >
           <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-            <p className="flex items-center gap-1.5 text-sm font-semibold">
-              {m.direction === "OUTBOUND" ? <PenLine className="h-4 w-4 text-primary" /> : <Sparkles className="h-4 w-4 text-primary" />}
+            <p className="flex min-w-0 items-center gap-1.5 text-sm font-semibold">
+              {m.direction === "OUTBOUND" ? <PenLine className="h-4 w-4 shrink-0 text-primary" /> : <Sparkles className="h-4 w-4 shrink-0 text-primary" />}
               {m.direction === "OUTBOUND" ? "送信メッセージ" : "返信"}
               <SourceBadge source={m.draftSource} />
             </p>
-            <span className="flex items-center gap-2">
+            <span className="flex flex-wrap items-center gap-2">
               {m.direction === "OUTBOUND" && <FlowStepper status={m.status} outbound />}
               <Badge variant={st.variant}>{st.label}</Badge>
             </span>
           </div>
 
-          {writing ? (
+          {m.status === "APPROVED" ? (
+            <>
+              <HandoffText m={m} supplier={supplier} />
+              <HandoffActions m={m} supplier={supplier} sendMode={sendMode} onChanged={onChanged} className={cn("mt-3", stickyOnMobile && "hidden lg:block")} />
+              {stickyOnMobile && <p className="mt-2 text-xs text-primary lg:hidden">画面下のボタンからコピー/共有して送信してください。</p>}
+            </>
+          ) : writing ? (
             <ReplyComposer
               target={{ kind: "inbound", messageId: m.id }}
               defaultLang={defaultLang}
@@ -186,109 +226,104 @@ function MessageCard({ m, blacklisted, defaultLang, onChanged }: { m: Message; b
             <p className="text-sm text-muted-foreground">まだ返信案がありません。</p>
           ) : (
             <>
-              <Textarea value={edit} onChange={(e) => setEdit(e.target.value)} disabled={m.status !== "DRAFT_READY" || busy} rows={4} aria-label="送信される本文" className="bg-card" />
-              {m.draftTextJa && <p className="mt-2 whitespace-pre-wrap rounded-md bg-card/70 px-3 py-2 text-xs leading-relaxed text-muted-foreground">訳: {m.draftTextJa}</p>}
+              <Textarea
+                ref={editRef}
+                value={edit}
+                onChange={(e) => setEdit(e.target.value)}
+                disabled={m.status !== "DRAFT_READY" || busy}
+                rows={3}
+                aria-label="送信される本文"
+                className="resize-none bg-card text-base lg:text-sm"
+              />
+              {m.draftTextJa && <p className="mt-2 whitespace-pre-wrap break-words rounded-md bg-card/70 px-3 py-2 text-xs leading-relaxed text-muted-foreground">訳: {m.draftTextJa}</p>}
               {edited && m.status === "DRAFT_READY" && <p className="mt-1.5 text-xs text-warning-ink">本文を編集しました。この内容で承認されます (日本語訳は元の案のものです)。</p>}
             </>
           )}
 
-          {m.status === "APPROVED" && (
-            <p className="mt-2 text-xs text-muted-foreground">
-              {m.approvedBy} が {m.approvedAt && new Date(m.approvedAt).toLocaleString("ja-JP")} に承認。送信ボタンを押すまで送信されません。
-            </p>
-          )}
           {m.status === "REJECTED" && m.rejectedReason && <p className="mt-2 text-xs text-muted-foreground">却下理由: {m.rejectedReason}</p>}
-          {m.status === "SEND_FAILED" && <p className="mt-2 text-xs text-destructive">送信に失敗しました。返信案を再生成し、再承認してください。</p>}
+          {m.status === "SEND_FAILED" && <p className="mt-2 text-xs text-destructive">送信の記録に失敗しました。返信案を再生成または書き直し、再承認してください。</p>}
 
-          {!writing && (
-          <div className="mt-3 flex flex-wrap items-center gap-2">
-            {["RECEIVED", "DRAFT_READY", "REJECTED", "SEND_FAILED"].includes(m.status) && !rejecting && !confirmSend && (
-              <>
-                {m.direction === "INBOUND" && (
-                  <Button size="sm" variant="outline" className="bg-card" disabled={busy} onClick={() => act.mutate({ action: "draft" })}>
-                    {m.status === "RECEIVED" || m.draftSource === "MANUAL" ? <Sparkles className="h-4 w-4" /> : <RotateCcw className="h-4 w-4" />}
-                    {m.status === "RECEIVED" || m.draftSource === "MANUAL" ? "AI 返信案を生成" : "AI 案を再生成"}
+          {!writing && m.status !== "APPROVED" && (
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              {["RECEIVED", "DRAFT_READY", "REJECTED", "SEND_FAILED"].includes(m.status) && !rejecting && (
+                <>
+                  {m.direction === "INBOUND" && (
+                    <Button size="sm" variant="outline" className={cn(big, "bg-card")} disabled={busy} onClick={() => act.mutate({ action: "draft" })}>
+                      {m.status === "RECEIVED" || m.draftSource === "MANUAL" ? <Sparkles className="h-4 w-4" /> : <RotateCcw className="h-4 w-4" />}
+                      {m.status === "RECEIVED" || m.draftSource === "MANUAL" ? "AI 返信案を生成" : "AI 案を再生成"}
+                    </Button>
+                  )}
+                  <Button size="sm" variant="outline" className={cn(big, "bg-card")} disabled={busy} onClick={() => setWriting(true)}>
+                    <PenLine className="h-4 w-4" /> {m.draftText ? "書き直す" : "自分で書く"}
                   </Button>
-                )}
-                <Button size="sm" variant="outline" className="bg-card" disabled={busy} onClick={() => setWriting(true)}>
-                  <PenLine className="h-4 w-4" /> {m.draftText ? "書き直す" : "自分で書く"}
-                </Button>
-              </>
-            )}
-            {m.status === "DRAFT_READY" && !rejecting && !confirmSend && (
-              <>
-                {m.draftSource === "MANUAL" && (
-                  <Button size="sm" disabled={busy || !edit.trim() || blacklisted} onClick={() => setConfirmSend(true)}>
-                    <Send className="h-4 w-4" /> 承認して送信
+                </>
+              )}
+              {m.status === "DRAFT_READY" && !rejecting && (
+                <>
+                  <Button
+                    size="sm"
+                    className={cn(big, "min-w-0 flex-1 sm:flex-none")}
+                    disabled={busy || !edit.trim() || blacklisted}
+                    onClick={() => act.mutate({ action: "approve-send", body: { expectedVersion: m.version, finalText: edit } })}
+                  >
+                    {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />} 承認する
                   </Button>
-                )}
-                <Button
-                  size="sm"
-                  variant={m.draftSource === "MANUAL" ? "outline" : "default"}
-                  className={m.draftSource === "MANUAL" ? "bg-card" : undefined}
-                  disabled={busy || !edit.trim()}
-                  onClick={() => act.mutate({ action: "approve", body: { expectedVersion: m.version, finalText: edit } })}
-                >
-                  <Check className="h-4 w-4" /> 承認する
-                </Button>
-                <Button size="sm" variant="ghost" disabled={busy} onClick={() => setRejecting(true)}>
-                  <X className="h-4 w-4" /> 却下
-                </Button>
-              </>
-            )}
-            {rejecting && (
-              <div className="flex w-full flex-wrap items-center gap-2">
-                <Input className="h-8 min-w-0 flex-1 bg-card" placeholder="却下理由 (任意)" value={reason} onChange={(e) => setReason(e.target.value)} autoFocus />
-                <Button size="sm" variant="destructive" disabled={busy} onClick={() => act.mutate({ action: "reject", body: { expectedVersion: m.version, reason: reason || undefined } })}>
-                  却下する
-                </Button>
-                <Button size="sm" variant="ghost" onClick={() => setRejecting(false)}>
-                  戻る
-                </Button>
-              </div>
-            )}
-            {m.status === "DRAFT_READY" && confirmSend && (
-              <div className="flex w-full flex-wrap items-center gap-2 rounded-lg bg-warning-soft px-3 py-2">
-                <ShieldAlert className="h-4 w-4 text-warning-ink" />
-                <span className="flex-1 text-xs text-warning-ink">この本文をあなたの承認として記録し、サプライヤーへ送信します。</span>
-                <Button size="sm" disabled={busy} onClick={() => act.mutate({ action: "approve-send", body: { expectedVersion: m.version, finalText: edit } })}>
-                  {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />} 承認して送信する
-                </Button>
-                <Button size="sm" variant="ghost" onClick={() => setConfirmSend(false)}>
-                  やめる
-                </Button>
-              </div>
-            )}
-            {m.status === "APPROVED" &&
-              (confirmSend ? (
-                <div className="flex w-full flex-wrap items-center gap-2 rounded-lg bg-warning-soft px-3 py-2">
-                  <ShieldAlert className="h-4 w-4 text-warning-ink" />
-                  <span className="flex-1 text-xs text-warning-ink">承認済みの本文をサプライヤーへ送信します。</span>
-                  <Button size="sm" disabled={busy} onClick={() => act.mutate({ action: "send" })}>
-                    {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />} 送信する
+                  <Button size="sm" variant="ghost" className={big} disabled={busy} onClick={() => setRejecting(true)}>
+                    <X className="h-4 w-4" /> 却下
                   </Button>
-                  <Button size="sm" variant="ghost" onClick={() => setConfirmSend(false)}>
-                    やめる
+                  {blacklisted && <span className="w-full text-xs text-destructive">ブラックリスト業者には送信できません</span>}
+                </>
+              )}
+              {rejecting && (
+                <div className="flex w-full flex-wrap items-center gap-2">
+                  <Input className="h-11 min-w-0 flex-1 basis-40 bg-card lg:h-8" placeholder="却下理由 (任意)" value={reason} onChange={(e) => setReason(e.target.value)} autoFocus />
+                  <Button size="sm" variant="destructive" className={big} disabled={busy} onClick={() => act.mutate({ action: "reject", body: { expectedVersion: m.version, reason: reason || undefined } })}>
+                    却下する
+                  </Button>
+                  <Button size="sm" variant="ghost" className={big} onClick={() => setRejecting(false)}>
+                    戻る
                   </Button>
                 </div>
-              ) : (
-                <>
-                  <Button size="sm" disabled={busy || blacklisted} onClick={() => setConfirmSend(true)}>
-                    <Send className="h-4 w-4" /> 送信
-                  </Button>
-                  <Button size="sm" variant="ghost" disabled={busy} onClick={() => act.mutate({ action: "reject", body: { expectedVersion: m.version, reason: "承認取消" } })}>
-                    <Undo2 className="h-4 w-4" /> 承認を取り消す
-                  </Button>
-                  {blacklisted && <span className="text-xs text-destructive">ブラックリスト業者には送信できません</span>}
-                </>
-              ))}
-            {busy && !confirmSend && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
-          </div>
+              )}
+              {busy && m.status !== "DRAFT_READY" && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
+            </div>
           )}
           {act.error && <p className="mt-2 rounded-md bg-destructive-soft px-3 py-2 text-xs text-destructive">{act.error.message}</p>}
         </div>
       )}
     </article>
+  );
+}
+
+/**
+ * モバイル (< lg) 用: 会話中の「いま操作すべき」メッセージの操作を画面下部 (ボトムナビの上) に固定表示する。
+ * APPROVED → 手渡し操作 (コピー/共有/チャット/送信しました)、DRAFT_READY → 該当カードへ移動。
+ */
+function PendingActionBar({ m, supplier, sendMode, onChanged }: { m: Message; supplier: HandoffSupplier; sendMode: SendMode; onChanged: () => void }) {
+  const jump = () => document.getElementById(`msg-${m.id}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  return (
+    <div className="sticky bottom-[calc(64px+env(safe-area-inset-bottom))] z-20 -mx-1 rounded-xl border bg-card p-3 shadow-lg lg:hidden">
+      {m.status === "APPROVED" ? (
+        <>
+          <button type="button" onClick={jump} className="mb-2 flex w-full min-w-0 items-center gap-1.5 text-left text-xs font-semibold">
+            <Send className="h-3.5 w-3.5 shrink-0 text-primary" />
+            <span className="shrink-0">承認済み・未送信</span>
+            <span className="truncate font-normal text-muted-foreground">{m.finalText}</span>
+          </button>
+          <HandoffActions m={m} supplier={supplier} sendMode={sendMode} onChanged={onChanged} compact />
+        </>
+      ) : (
+        <div className="flex items-center gap-2">
+          <p className="min-w-0 flex-1 text-xs">
+            <span className="font-semibold">承認待ちの返信があります</span>
+            <span className="block truncate text-muted-foreground">{m.draftTextJa ?? m.draftText}</span>
+          </p>
+          <Button className="h-11 shrink-0" onClick={jump}>
+            <Check className="h-4 w-4" /> 確認する
+          </Button>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -430,6 +465,14 @@ function ChatInner() {
   const select = (id: string | null) => router.push(id ? `/chat?thread=${encodeURIComponent(id)}` : "/chat");
   const [newMode, setNewMode] = useState<"ingest" | "compose">("ingest");
   const [composeSupplier, setComposeSupplier] = useState("");
+  const [editingUrl, setEditingUrl] = useState(false);
+  useEffect(() => setEditingUrl(false), [active]);
+  const sendMode = useSendMode();
+  /** モバイルで画面下部に固定表示するメッセージ: 最新の承認済み (未送信) → なければ最新の承認待ち */
+  const stickyMsg = useMemo(() => {
+    const list = [...(messages.data ?? [])].reverse();
+    return list.find((m) => m.status === "APPROVED") ?? list.find((m) => m.status === "DRAFT_READY" && m.draftText !== null) ?? null;
+  }, [messages.data]);
   const suppliers = useQuery({ queryKey: ["suppliers"], queryFn: () => api<(Supplier & { platform: string; isBlacklisted: boolean })[]>("/api/suppliers"), enabled: showNew });
   const composeTarget = suppliers.data?.find((s) => s.id === composeSupplier);
   /** 返信言語の既定: スレッド内の最新の受信メッセージの言語 → 1688 は中国語 → それ以外は英語 */
@@ -530,29 +573,70 @@ function ChatInner() {
       <section className={cn(!active && "hidden lg:block")}>
         {!active || !thread ? (
           <EmptyState icon={Inbox} title="スレッドを選択してください">
-            業者から届いたメッセージを取り込むと日本語訳と AI 返信案が作成されます。「新規」からこちらのメッセージを書いて送ることもできます。送信は必ず承認を経て行われます。
+            業者から届いたメッセージを取り込むと日本語訳と AI 返信案が作成されます。「新規」からこちらのメッセージを書くこともできます。承認した本文はコピー/共有して業者アプリから送り、「送信しました」で記録します。
           </EmptyState>
         ) : (
-          <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_280px]">
+          <div className="grid grid-cols-1 gap-6 pb-24 lg:pb-0 xl:grid-cols-[minmax(0,1fr)_280px]">
             <div className="min-w-0 space-y-5">
-              <div className="flex items-center gap-3 border-b pb-4">
-                <Button variant="ghost" size="icon-sm" className="lg:hidden" onClick={() => select(null)} aria-label="一覧に戻る">
-                  <ArrowLeft className="h-5 w-5" />
-                </Button>
-                <span className="flex h-10 w-10 items-center justify-center rounded-full bg-secondary font-bold">{thread.supplier.name.slice(0, 1)}</span>
-                <div className="min-w-0">
-                  <h2 className="truncate font-semibold">{thread.supplier.name}</h2>
-                  <p className="text-xs text-muted-foreground">{PLATFORM_LABEL[thread.supplier.platform]}</p>
+              <div className="space-y-2 border-b pb-3">
+                <div className="flex items-center gap-2 sm:gap-3">
+                  <Button variant="ghost" size="icon" className="-ml-2 h-11 w-11 shrink-0 lg:hidden" onClick={() => select(null)} aria-label="一覧に戻る">
+                    <ArrowLeft className="h-5 w-5" />
+                  </Button>
+                  <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-secondary font-bold">{thread.supplier.name.slice(0, 1)}</span>
+                  <div className="min-w-0 flex-1">
+                    <h2 className="truncate font-semibold">{thread.supplier.name}</h2>
+                    <p className="flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
+                      {PLATFORM_LABEL[thread.supplier.platform]}
+                      {thread.supplier.isBlacklisted && (
+                        <Badge variant="destructive">
+                          <Ban className="h-3 w-3" /> ブラックリスト
+                        </Badge>
+                      )}
+                    </p>
+                  </div>
+                  {thread.supplier.chatUrl && (
+                    <Button asChild size="sm" variant="outline" className="h-10 shrink-0 px-2.5 lg:h-8">
+                      <a href={thread.supplier.chatUrl} target="_blank" rel="noopener noreferrer">
+                        <ExternalLink className="h-4 w-4" />
+                        <span className="hidden min-[400px]:inline">チャットを開く</span>
+                        <span className="min-[400px]:hidden">開く</span>
+                      </a>
+                    </Button>
+                  )}
+                  {thread.supplier.chatUrl && (
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      className="h-10 w-10 shrink-0 lg:h-8 lg:w-8"
+                      aria-label="業者チャットの URL を編集"
+                      onClick={() => setEditingUrl((v) => !v)}
+                    >
+                      <Pencil className="h-4 w-4" />
+                    </Button>
+                  )}
                 </div>
-                {thread.supplier.isBlacklisted && (
-                  <Badge variant="destructive" className="ml-auto">
-                    <Ban className="h-3 w-3" /> ブラックリスト
-                  </Badge>
+                {!thread.supplier.chatUrl && !editingUrl && (
+                  <button type="button" className="inline-flex min-h-8 items-center gap-1 text-xs text-primary underline-offset-4 hover:underline" onClick={() => setEditingUrl(true)}>
+                    <Link2 className="h-3.5 w-3.5" /> 業者チャットの URL を登録
+                  </button>
                 )}
+                {editingUrl && <ChatUrlEditor key={thread.supplier.id} supplierId={thread.supplier.id} chatUrl={thread.supplier.chatUrl} onClose={() => setEditingUrl(false)} />}
               </div>
               {messages.isLoading && <Skeleton className="h-48" />}
-              {messages.data?.map((m) => <MessageCard key={m.id} m={m} blacklisted={thread.supplier.isBlacklisted} defaultLang={defaultLang} onChanged={refresh} />)}
-              <div className="rounded-xl border bg-card p-4 shadow-card">
+              {messages.data?.map((m) => (
+                <MessageCard
+                  key={m.id}
+                  m={m}
+                  supplier={thread.supplier}
+                  sendMode={sendMode}
+                  defaultLang={defaultLang}
+                  stickyOnMobile={stickyMsg?.id === m.id}
+                  onChanged={refresh}
+                />
+              ))}
+              {stickyMsg && <PendingActionBar key={`${stickyMsg.id}-${stickyMsg.version}`} m={stickyMsg} supplier={thread.supplier} sendMode={sendMode} onChanged={refresh} />}
+              <div className="rounded-xl border bg-card p-3 shadow-card sm:p-4">
                 <p className="mb-3 flex items-center gap-1.5 text-sm font-semibold">
                   <PenLine className="h-4 w-4 text-primary" /> メッセージを作成
                 </p>

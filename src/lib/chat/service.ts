@@ -123,7 +123,26 @@ export async function createManualOutbound(
 }
 
 /**
- * 「承認して送信」: 本人の確認をもって承認 (承認者・承認日時を記録) し、続けて送信する。
+ * 送信前提の承認: ブラックリスト業者なら承認記録を残さずに拒否し、そうでなければ承認 (APPROVED) する。
+ * 手渡し送信 (handoff) ではここで止め、ユーザーが業者アプリで送ったと報告した時点で
+ * sendApprovedMessage (承認再検証・CAS・ブラックリスト確認・監査ログ) を通して SENT を記録する。
+ */
+export async function approveForSending(
+  db: ChatDb,
+  id: string,
+  opts: { expectedVersion: number; finalText?: string },
+  actor: string,
+): Promise<ChatMessageRow> {
+  // 送れない相手なら承認記録も残さない (送信時にも sendApprovedMessage が再確認する)
+  const row = await db.chatMessage.findUnique({ where: { id } });
+  if (!row) throw new NotFoundError(`ChatMessage(${id})`);
+  const supplier = await db.supplier.findUnique({ where: { id: row.supplierId } });
+  if (supplier?.isBlacklisted) throw new BlacklistedSupplierError(supplier.name);
+  return approveMessage(db, id, opts, actor);
+}
+
+/**
+ * 「承認して送信」(アプリから送信できるアダプター向け): 本人の確認をもって承認 (承認者・承認日時を記録) し、続けて送信する。
  * 送信処理は sendApprovedMessage をそのまま通すため、トランザクション内の承認再検証・CAS・
  * ブラックリスト確認などのガードレールは省略されない。
  */
@@ -134,12 +153,7 @@ export async function approveAndSend(
   opts: { expectedVersion: number; finalText?: string },
   actor: string,
 ): Promise<ChatMessageRow> {
-  // 送れない相手なら承認記録も残さない (送信時にも sendApprovedMessage が再確認する)
-  const row = await db.chatMessage.findUnique({ where: { id } });
-  if (!row) throw new NotFoundError(`ChatMessage(${id})`);
-  const supplier = await db.supplier.findUnique({ where: { id: row.supplierId } });
-  if (supplier?.isBlacklisted) throw new BlacklistedSupplierError(supplier.name);
-  await approveMessage(db, id, opts, actor);
+  await approveForSending(db, id, opts, actor);
   return sendApprovedMessage(db, adapter, id, actor);
 }
 

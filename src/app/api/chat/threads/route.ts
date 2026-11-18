@@ -9,7 +9,7 @@ export const GET = handler(async () => {
   const latest = await prisma.chatMessage.findMany({
     distinct: ["threadId"],
     orderBy: [{ threadId: "asc" }, { createdAt: "desc" }],
-    include: { supplier: { select: { id: true, name: true, platform: true, isBlacklisted: true } } },
+    include: { supplier: { select: { id: true, name: true, platform: true, isBlacklisted: true, chatUrl: true } } },
   });
   const pending = await prisma.chatMessage.groupBy({
     by: ["threadId"],

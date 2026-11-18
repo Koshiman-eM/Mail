@@ -2,8 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { prisma } from "@/lib/db/prisma";
 import { chatDb } from "@/lib/chat/drafting";
-import { BlacklistedSupplierError, approveAndSend, createManualOutbound } from "@/lib/chat/service";
-import { getSupplierAdapter } from "@/lib/suppliers";
+import { BlacklistedSupplierError, approveForSending, createManualOutbound } from "@/lib/chat/service";
 import { actorOf, handler } from "../../_lib/http";
 
 const schema = z.object({
@@ -13,7 +12,10 @@ const schema = z.object({
   text: z.string().min(1).max(10_000),
   textJa: z.string().max(10_000).nullable().optional(),
   lang: z.enum(["zh", "en", "ja"]).nullable().optional(),
-  /** true: 作成と同時に「承認して送信」 */
+  /**
+   * true: 作成と同時に承認する (送信前提の承認)。送信はしない: APPROVED の行を返し、
+   * UI の手渡しパネルから業者アプリで送ったのち /api/chat/messages/:id/send で記録する。
+   */
   send: z.boolean().default(false),
 });
 
@@ -26,5 +28,5 @@ export const POST = handler(async (req: Request, _ctx, user) => {
   const actor = actorOf(user);
   const row = await createManualOutbound(chatDb(), { supplierId: b.supplierId, threadId, text: b.text, textJa: b.textJa ?? null, lang: b.lang ?? null }, actor);
   if (!b.send) return NextResponse.json(row, { status: 201 });
-  return NextResponse.json(await approveAndSend(chatDb(), getSupplierAdapter(), row.id, { expectedVersion: row.version }, actor), { status: 201 });
+  return NextResponse.json(await approveForSending(chatDb(), row.id, { expectedVersion: row.version }, actor), { status: 201 });
 });

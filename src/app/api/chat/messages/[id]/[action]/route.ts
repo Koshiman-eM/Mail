@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { approveAndSend, approveMessage, attachDraft, rejectMessage, sendApprovedMessage } from "@/lib/chat/service";
+import { approveForSending, approveMessage, attachDraft, rejectMessage, sendApprovedMessage } from "@/lib/chat/service";
 import { chatDb, generateDraftFor } from "@/lib/chat/drafting";
 import { getSupplierAdapter } from "@/lib/suppliers";
 import { actorOf, handler } from "../../../../_lib/http";
@@ -13,9 +13,11 @@ const rejectSchema = z.object({ expectedVersion: z.number().int().nonnegative(),
  * POST /api/chat/messages/:id/draft   AI 返信案を (再) 生成
  * POST /api/chat/messages/:id/approve 承認 (送信本文確定)
  * POST /api/chat/messages/:id/reject  却下
- * POST /api/chat/messages/:id/send    承認済みを送信 (トランザクション内で承認状態を再検証)
+ * POST /api/chat/messages/:id/send    承認済みを送信/送信済みとして記録 (トランザクション内で承認状態を再検証)。
+ *                                     手渡し送信 (handoff) では「業者アプリで送信しました」の報告にあたる
  * POST /api/chat/messages/:id/manual  自分で書いた返信本文を設定 (DRAFT_READY, source=MANUAL)
- * POST /api/chat/messages/:id/approve-send  本人確認をもって承認し、続けて送信 (送信は通常のガードを通る)
+ * POST /api/chat/messages/:id/approve-send  送信前提の承認 (ブラックリスト業者は承認せず拒否)。
+ *                                     送信はしない: APPROVED の行を返し、UI が手渡しパネルを表示 → /send で記録する
  */
 export const POST = handler(async (req: Request, { params }: { params: Promise<{ id: string; action: string }> }, user) => {
   const { id, action } = await params;
@@ -32,7 +34,7 @@ export const POST = handler(async (req: Request, { params }: { params: Promise<{
       return NextResponse.json(await attachDraft(chatDb(), id, { draftText: b.draftText, draftTextJa: b.draftTextJa ?? null, source: "MANUAL" }, actor));
     }
     case "approve-send":
-      return NextResponse.json(await approveAndSend(chatDb(), getSupplierAdapter(), id, approveSchema.parse(await req.json()), actor));
+      return NextResponse.json(await approveForSending(chatDb(), id, approveSchema.parse(await req.json()), actor));
     case "send":
       return NextResponse.json(await sendApprovedMessage(chatDb(), getSupplierAdapter(), id, actor));
     default:
