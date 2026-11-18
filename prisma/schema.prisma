@@ -64,6 +64,8 @@ model Supplier {
   country       String?
   rating        Decimal?      @db.Decimal(4, 2)
   yearsActive   Int?
+  /// 業者とのチャット画面の URL (送信時に開く。任意)
+  chatUrl       String?
   isBlacklisted Boolean       @default(false)
   blacklistNote String?
   createdAt     DateTime      @default(now())
@@ -104,6 +106,10 @@ model Product {
   autoCalcStatus     String?
   autoCalcNote       String?
   autoCalcAt         DateTime?
+  /// 商品ページからの情報取得の状態 (PENDING / OK / FAILED) と理由
+  fetchStatus        String?
+  fetchNote          String?
+  lastFetchedAt      DateTime?
   inStock            Boolean            @default(true)
   watch              Boolean            @default(true)
   createdAt          DateTime           @default(now())
@@ -262,6 +268,30 @@ model User {
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
   sessions     Session[]
+  pushSubscriptions PushSubscription[]
+}
+
+/// Web Push の購読 (端末ごと)
+model PushSubscription {
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  endpoint   String    @unique
+  p256dh     String
+  auth       String
+  userAgent  String?
+  failures   Int       @default(0)
+  lastUsedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+}
+
+/// アプリが自動生成して保持する鍵 (例: Web Push の VAPID 鍵)。環境変数で指定された場合はそちらを優先
+model AppSecret {
+  key       String   @id
+  value     String
+  createdAt DateTime @default(now())
 }
 
 /// ログインセッション。id にはトークンの SHA-256 ハッシュを保存し、生トークンは Cookie のみに置く

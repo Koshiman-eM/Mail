@@ -40,6 +40,28 @@ export const env = {
   get profitRecalcIntervalMs() {
     return num(process.env.PROFIT_RECALC_INTERVAL_MS, 6 * 60 * 60 * 1000);
   },
+  /**
+   * 商品ページの取得方法: "http" (通常の HTTP 取得。軽量で無料サーバーでも動く) / "playwright" (ヘッドレスブラウザ)。
+   * 未設定時は Redis ワーカー・定期ジョブでは playwright、Web アプリ内の即時取得では http を使う。
+   */
+  get scraperMode(): "http" | "playwright" | undefined {
+    const v = (process.env.SCRAPER_MODE || "").toLowerCase();
+    return v === "http" || v === "playwright" ? v : undefined;
+  },
+  /** Web Push (VAPID)。未設定ならアプリが鍵を自動生成して DB (AppSecret) に保存する */
+  get vapidPublicKey() {
+    return process.env.VAPID_PUBLIC_KEY || undefined;
+  },
+  get vapidPrivateKey() {
+    return process.env.VAPID_PRIVATE_KEY || undefined;
+  },
+  get vapidSubject() {
+    return process.env.VAPID_SUBJECT || "mailto:admin@example.invalid";
+  },
+  /** 公開 URL (通知のリンク等に使用。例: https://sedori.onrender.com) */
+  get appUrl() {
+    return process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || undefined;
+  },
   get scraperStorageStatePath() {
     return process.env.SCRAPER_STORAGE_STATE_PATH || undefined;
   },
