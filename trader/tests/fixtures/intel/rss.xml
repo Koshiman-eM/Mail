@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>Sample Feed</title>
+    <item>
+      <title><![CDATA[Bitcoin surges to record high as ETF inflows grow]]></title>
+      <link>https://news.example.com/a1</link>
+      <guid isPermaLink="false">guid-a1</guid>
+      <pubDate>Mon, 03 Nov 2025 10:00:00 GMT</pubDate>
+      <description><![CDATA[<p>BTC rallied &amp; ether followed.</p>]]></description>
+    </item>
+    <item>
+      <title>Exchange hacked, Solana token delisted</title>
+      <link>https://news.example.com/a2</link>
+      <pubDate>Mon, 03 Nov 2025 11:30:00 GMT</pubDate>
+      <description>Funds drained.</description>
+    </item>
+    <item><title></title><link>https://news.example.com/empty</link></item>
+  </channel>
+</rss>

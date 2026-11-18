@@ -1,0 +1,4 @@
+{"results":[
+ {"id":101,"title":"Ethereum upgrade lands smoothly","published_at":"2025-11-03T09:00:00Z","instruments":[{"code":"ETH"}],"votes":{"positive":30,"negative":2,"important":10,"liked":5,"disliked":0,"toxic":0}},
+ {"id":102,"title":"Mystery token collapses","published_at":"2025-11-03T09:30:00Z","instruments":[],"votes":{"positive":0,"negative":0}}
+]}

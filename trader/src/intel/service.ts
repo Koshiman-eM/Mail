@@ -1,0 +1,111 @@
+/** 情報収集サービス: 全情報源取得 → 保存 → 分析 → ブリーフ保存 */
+import type { AiOptions } from "../core/ai";
+import { createLogger, type Logger } from "../core/logger";
+import type { EconEvent, IntelItem, MarketBrief, SourceReliability, Store } from "../core/types";
+import { analyzeIntelDetailed } from "./analyzer";
+import type { TagOptions } from "./assetTagger";
+import { createCoinGeckoSource } from "./sources/coingecko";
+import type { FetchJsonFn, FetchTextFn, IntelSource } from "./sources/common";
+import { createCryptoPanicSource } from "./sources/cryptopanic";
+import { createDexScreenerSource } from "./sources/dexscreener";
+import { createEconCalendarSource } from "./sources/econCalendar";
+import { createFearGreedSource } from "./sources/fearGreed";
+import { createRssSources } from "./sources/rss";
+
+/** 学習側が書き込む情報源信頼度の KV キー */
+export const RELIABILITY_KV_KEY = "intel:sourceReliability";
+const EVENTS_KV_KEY = "intel:events";
+
+export interface IntelServiceOptions {
+  store: Store;
+  sources: IntelSource[];
+  ai?: AiOptions;
+  /** 既定は store.kvGet(RELIABILITY_KV_KEY) */
+  getReliability?: () => Record<string, SourceReliability>;
+  /** 分析対象にする過去の範囲 (既定 24 時間) */
+  lookbackMs?: number;
+  halfLifeMs?: number;
+  logger?: Logger;
+}
+
+export class IntelService {
+  private readonly log: Logger;
+  private events: EconEvent[];
+  /** LLM 分析済み項目のキャッシュ (再分析によるコスト増を避ける) */
+  private readonly aiCache = new Map<string, Pick<IntelItem, "sentiment" | "importance" | "assets">>();
+
+  constructor(private readonly opts: IntelServiceOptions) {
+    this.log = opts.logger ?? createLogger("intel.service");
+    this.events = opts.store.kvGet<EconEvent[]>(EVENTS_KV_KEY) ?? [];
+  }
+
+  async refresh(now: number = Date.now()): Promise<MarketBrief> {
+    const { store, sources } = this.opts;
+    const results = await Promise.allSettled(sources.map((s) => s.fetch(now)));
+    const fetched: IntelItem[] = [];
+    results.forEach((r, i) => {
+      if (r.status === "fulfilled") fetched.push(...r.value);
+      else this.log.warn("情報源の取得に失敗", { source: sources[i].id, error: r.reason instanceof Error ? r.reason.message : String(r.reason) });
+    });
+    // 成功した情報源の経済指標で更新 (失敗時は前回分を保持)
+    sources.forEach((s, i) => {
+      if (results[i].status === "fulfilled" && s.events) {
+        const ev = s.events();
+        if (ev.length > 0) this.events = ev;
+      }
+    });
+    if (this.events.length > 0) store.kvSet(EVENTS_KV_KEY, this.events);
+
+    const unique = [...new Map(fetched.map((it) => [it.id, it])).values()];
+    if (unique.length > 0) store.saveIntel(unique);
+
+    const lookback = this.opts.lookbackMs ?? 24 * 3_600_000;
+    const stored = store.listIntel({ since: now - lookback, limit: 1000 });
+    const merged = [...new Map([...stored, ...unique].map((it) => [it.id, it])).values()].map((it) => {
+      const c = this.aiCache.get(it.id);
+      return c ? { ...it, ...c } : it;
+    });
+
+    const reliability = this.opts.getReliability?.() ?? store.kvGet<Record<string, SourceReliability>>(RELIABILITY_KV_KEY) ?? {};
+    const lessons = store.listLessons({ status: "active", limit: 50 });
+    const { brief, items, aiAnalyzedIds } = await analyzeIntelDetailed(merged, {
+      now,
+      reliability,
+      lessons,
+      ai: this.opts.ai,
+      events: this.events,
+      halfLifeMs: this.opts.halfLifeMs,
+    });
+    const analyzed = new Map(items.map((i) => [i.id, i]));
+    for (const id of aiAnalyzedIds) {
+      const it = analyzed.get(id);
+      if (it) this.aiCache.set(id, { sentiment: it.sentiment, importance: it.importance, assets: it.assets });
+    }
+    store.saveBrief(brief);
+    return brief;
+  }
+
+  latestBrief(): MarketBrief | undefined {
+    return this.opts.store.latestBrief();
+  }
+
+  latestEvents(): EconEvent[] {
+    return this.events;
+  }
+}
+
+/** 既定の情報源一式 (CRYPTOPANIC_TOKEN 未設定なら cryptopanic は含まれない) */
+export function createDefaultSources(
+  opts: { env?: Record<string, string | undefined>; fetchText?: FetchTextFn; fetchJson?: FetchJsonFn; tag?: TagOptions } = {},
+): IntelSource[] {
+  const env = opts.env ?? process.env;
+  const list: (IntelSource | undefined)[] = [
+    ...createRssSources({ env: env.NEWS_RSS_FEEDS, fetchText: opts.fetchText, tag: opts.tag }),
+    createFearGreedSource({ fetchJson: opts.fetchJson }),
+    createCryptoPanicSource({ token: env.CRYPTOPANIC_TOKEN, fetchJson: opts.fetchJson }),
+    createDexScreenerSource({ fetchJson: opts.fetchJson }),
+    createCoinGeckoSource({ fetchJson: opts.fetchJson }),
+    createEconCalendarSource({ fetchJson: opts.fetchJson }),
+  ];
+  return list.filter((s): s is IntelSource => Boolean(s));
+}

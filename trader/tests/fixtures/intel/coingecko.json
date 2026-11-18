@@ -1,0 +1,4 @@
+{"coins":[
+ {"item":{"id":"pepe-like","name":"Pepe Like","symbol":"plk","market_cap_rank":150,"data":{"price_change_percentage_24h":{"usd":40}}}},
+ {"item":{"id":"bitcoin","name":"Bitcoin","symbol":"btc","market_cap_rank":1,"data":{"price_change_percentage_24h":{"usd":-2}}}}
+]}
