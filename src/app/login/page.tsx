@@ -15,6 +15,17 @@ const FEATURES = [
   { icon: MessagesSquare, title: "承認制の業者チャット", desc: "AI 返信案を確認・編集してから送信" },
 ];
 
+/** ログイン後の遷移先: 同一オリジンのパスのみ許可 (/\evil.com や /%09/evil.com 等のオープンリダイレクトを防ぐ) */
+function safeNext(next: string | null): string {
+  if (!next || !next.startsWith("/")) return "/";
+  try {
+    const u = new URL(next, window.location.origin);
+    return u.origin === window.location.origin ? `${u.pathname}${u.search}${u.hash}` : "/";
+  } catch {
+    return "/";
+  }
+}
+
 function LoginForm() {
   const router = useRouter();
   const sp = useSearchParams();
@@ -31,7 +42,7 @@ function LoginForm() {
     setError(null);
     try {
       await api(setup ? "/api/auth/setup" : "/api/auth/login", { method: "POST", json: setup ? form : { email: form.email, password: form.password } });
-      router.replace(next && next.startsWith("/") && !next.startsWith("//") ? next : "/");
+      router.replace(safeNext(next));
       router.refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));

@@ -56,9 +56,14 @@ jobs:
           SCRAPER_MODE: playwright
           CHROMIUM_PATH: /usr/bin/google-chrome
           SUPPLIER_ADAPTER: handoff
+          # 入力値はスクリプトに直接埋め込まず環境変数で渡す (コマンド注入対策)
+          MAX_PRODUCTS: ${{ github.event.inputs.max_products }}
         run: |
-          if [ -n "${{ github.event.inputs.max_products }}" ]; then
-            npm run jobs:once -- --max-products "${{ github.event.inputs.max_products }}"
+          if [ -n "$MAX_PRODUCTS" ]; then
+            case "$MAX_PRODUCTS" in
+              *[!0-9]*) echo "max_products は数字で指定してください"; exit 1 ;;
+            esac
+            npm run jobs:once -- --max-products "$MAX_PRODUCTS"
           else
             npm run jobs:once
           fi

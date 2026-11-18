@@ -27,6 +27,15 @@ prisma/schema.prisma      データモデル
 tests/                    vitest 単体テスト
 ```
 
+## クラウドへの設置・Android での利用
+
+無料構成 (Render + Neon + GitHub Actions) での設置手順と、Android での使い方は [docs/DEPLOY.md](./docs/DEPLOY.md) を参照してください。
+
+- ホーム画面にインストールできる PWA です。画面下のタブで操作し、価格変動・赤字の見込み・業者からの新着などはプッシュ通知で届きます。
+- Alibaba / 1688 / AliExpress のアプリから「共有 → 越境せどり」で、商品の登録や業者メッセージの取り込みができます。
+- 業者への返信はアプリから自動送信しません。承認後に本文をコピー/共有して業者アプリで送り、「送信しました」で記録します。
+- デモデータは本番に入りません (ローカル確認用は `npm run db:seed:demo`)。
+
 ## セットアップ
 
 前提: Node.js 20+, PostgreSQL, Redis
@@ -35,7 +44,7 @@ tests/                    vitest 単体テスト
 npm install
 cp .env.example .env.local        # DATABASE_URL / REDIS_URL などを設定
 npm run db:migrate                # = prisma migrate dev (.env.local を読み込む)
-npm run db:seed                   # デモ用の業者・商品・受信メッセージ
+npm run db:seed:demo              # (任意) ローカル確認用のデモデータ
 npm run dev                       # http://localhost:3000 → 初回は「初期管理者を作成」画面
 npm run worker                    # 別ターミナルでスクレイピングワーカー
 ```
