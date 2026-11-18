@@ -1,0 +1,129 @@
+import type {
+  Candle,
+  EquityPoint,
+  Instrument,
+  IntelBias,
+  OrderBook,
+  Params,
+  Signal,
+  Strategy,
+  Timeframe,
+  TradePrint,
+  TradeRecord,
+} from "../core/types";
+import type { RegimeOptions } from "../regime/detect";
+
+export interface SizerArgs {
+  /** 現在の評価額 (クオート通貨) */
+  equity: number;
+  /** 想定エントリー価格 */
+  price: number;
+  stopLoss: number;
+  riskPerTrade: number;
+  riskMultiplier: number;
+  /** 1 単位あたりの契約サイズ */
+  contractSize: number;
+  signal: Signal;
+  instrument: Instrument;
+}
+
+/** 数量を返す (刻み・最小数量への丸めはエンジン側で行う) */
+export type Sizer = (a: SizerArgs) => number;
+
+/** 固定のバイアス、または時刻 → バイアスの関数 */
+export type IntelSource = IntelBias | ((ts: number) => IntelBias | undefined);
+
+export interface MarketExtras {
+  book?: OrderBook;
+  prints?: TradePrint[];
+}
+
+export interface BacktestOptions {
+  strategy: Strategy;
+  instrument: Instrument;
+  /** 基準足 (確定足・昇順) */
+  candles: Candle[];
+  /** 基準足の時間足 (省略時は足間隔から推定) */
+  baseTimeframe?: Timeframe;
+  /** defaultParams への上書き */
+  params?: Params;
+  /** 初期評価額 (既定 1,000,000) */
+  initialEquity?: number;
+  /** 1 トレードのリスク (評価額比, 既定は config の RISK_PER_TRADE) */
+  riskPerTrade?: number;
+  /** 計画上のリスク倍率 (既定 1) */
+  riskMultiplier?: number;
+  /** 1 ポジションの建玉上限 (評価額比, 既定は config の MAX_POSITION_PCT。0 以下で上限なし) */
+  maxPositionPct?: number;
+  /** スプレッド (bps, 全幅)。既定は資産クラス別 */
+  spreadBps?: number;
+  /** 成行・逆指値のスリッページ (bps, 片道)。既定は資産クラス別 */
+  slippageBps?: number;
+  /** サイズ計算の差し替え */
+  sizer?: Sizer;
+  /** インテル (固定 or 時刻 → バイアス) */
+  intel?: IntelSource;
+  /** バーごとの板・約定 (scalp_obi 等の検証用) */
+  marketExtras?: (bar: Candle, now: number) => MarketExtras | undefined;
+  /** レジーム判定の設定上書き */
+  regime?: Partial<RegimeOptions>;
+  /** expectedEdgeBps がコストの何倍未満なら見送るか (既定 0 = フィルターなし) */
+  minEdgeToCostRatio?: number;
+  /** エグジット後の値動きを測る本数 (主時間足, 既定 10) */
+  postExitBars?: number;
+  /** 戦略へ渡す各時間足の最大本数 (既定 max(300, warmup + 100)) */
+  historyBars?: number;
+  /** true なら主時間足の確定を待たず基準足ごとに判定する (既定 false) */
+  evaluateEveryBar?: boolean;
+  /** この時刻以降の足からトレードを開始する (それ以前はウォームアップ専用) */
+  tradeFromTs?: number;
+  /** 終了時に保有中ポジションを最終足の終値で決済する (既定 true, exitReason "manual") */
+  closeAtEnd?: boolean;
+  /** 評価額曲線の記録間隔 (既定 max(主時間足, 1h)) */
+  equitySampleMs?: number;
+  /** TradeRecord.id の接頭辞 (既定 "bt") */
+  idPrefix?: string;
+}
+
+export interface BacktestMetrics {
+  netPnl: number;
+  /** netPnl / 初期評価額 */
+  returnPct: number;
+  /** 年率換算 (評価額曲線の記録間隔ベース, 24/365 前提) */
+  sharpe: number;
+  sortino: number;
+  /** 最大ドローダウン (ピーク比, 0.1 = 10%) */
+  maxDrawdown: number;
+  winRate: number;
+  /** 総利益 / 総損失 (損失 0 なら 100 で頭打ち) */
+  profitFactor: number;
+  /** R 倍数の平均 */
+  expectancyR: number;
+  trades: number;
+  avgHoldMs: number;
+  /** 手数料合計 */
+  fees: number;
+  grossPnl: number;
+  finalEquity: number;
+}
+
+export interface BacktestStats {
+  /** 戦略を評価した回数 */
+  evaluations: number;
+  /** エントリーシグナル数 */
+  entrySignals: number;
+  entries: number;
+  /** 反転 (flat) シグナルによる決済数 */
+  signalExits: number;
+  /** 見送り理由ごとの件数 (size / edge / short / equity) */
+  skipped: Record<string, number>;
+}
+
+export interface BacktestResult {
+  trades: TradeRecord[];
+  equityCurve: EquityPoint[];
+  metrics: BacktestMetrics;
+  params: Params;
+  baseTimeframe: Timeframe;
+  stats: BacktestStats;
+}
