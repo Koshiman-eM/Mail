@@ -1,0 +1,9 @@
+{
+  "BTC/USDT": {"symbol":"BTC/USDT","base":"BTC","quote":"USDT","spot":true,"active":true,"taker":0.001,"maker":0.0008,
+    "precision":{"amount":0.00001,"price":0.01},"limits":{"amount":{"min":0.0001},"cost":{"min":5}}},
+  "PEPE/USDT": {"symbol":"PEPE/USDT","base":"PEPE","quote":"USDT","spot":true,"active":true,
+    "precision":{"amount":1,"price":1e-9},"limits":{"amount":{"min":1000},"cost":{"min":1}}},
+  "ETH/USDT:USDT": {"symbol":"ETH/USDT:USDT","base":"ETH","quote":"USDT","spot":false,"swap":true,"active":true,"contractSize":0.01,"taker":0.0005,"maker":0.0002,
+    "precision":{"amount":1,"price":0.05},"limits":{"amount":{"min":1}}},
+  "OLD/USDT": {"symbol":"OLD/USDT","base":"OLD","quote":"USDT","spot":true,"active":false,"precision":{"amount":1,"price":1}}
+}
