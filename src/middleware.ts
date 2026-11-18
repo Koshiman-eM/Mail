@@ -1,4 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
+import { isSameOrigin } from "./lib/http/origin";
 
 const SESSION_COOKIE = "sedori_sid";
 const PUBLIC_PATHS = ["/login", "/api/auth/login", "/api/auth/setup", "/api/auth/status"];
@@ -13,8 +14,13 @@ export function middleware(req: NextRequest) {
   const isApi = pathname.startsWith("/api/");
 
   if (isApi && !["GET", "HEAD", "OPTIONS"].includes(req.method)) {
-    const origin = req.headers.get("origin");
-    if (origin && origin !== req.nextUrl.origin) {
+    const ok = isSameOrigin(req.headers.get("origin"), {
+      requestOrigin: req.nextUrl.origin,
+      host: req.headers.get("host"),
+      forwardedHost: req.headers.get("x-forwarded-host"),
+      publicUrls: [process.env.APP_URL, process.env.RENDER_EXTERNAL_URL],
+    });
+    if (!ok) {
       return NextResponse.json({ error: "不正なオリジンからのリクエストです" }, { status: 403 });
     }
   }
