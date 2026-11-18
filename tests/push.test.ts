@@ -21,6 +21,7 @@ describe("shouldPush: どの通知を端末へプッシュするか", () => {
   it("INFO は業者チャットの受信と返信案準備だけプッシュする", () => {
     expect(shouldPush({ type: "CHAT_RECEIVED", severity: "INFO" })).toBe(true);
     expect(shouldPush({ type: "DRAFT_READY", severity: "INFO" })).toBe(true);
+    expect(shouldPush({ type: "DISCOVERY", severity: "INFO" })).toBe(true);
     expect(shouldPush({ type: "PRICE_CHANGE", severity: "INFO" })).toBe(false);
     expect(shouldPush({ type: "SYSTEM", severity: "INFO" })).toBe(false);
   });

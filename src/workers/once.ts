@@ -3,18 +3,23 @@
  * Redis / BullMQ は不要。
  *   1. 停止中でないプラットフォームについて、watch=true かつ最終取得から SCRAPE_MIN_INTERVAL_HOURS (既定 6) 以上経った商品を
  *      ランダムな順序・ランダムな間隔で 1 件ずつ取得 (CAPTCHA 等を検知したらそのプラットフォームは停止して打ち切り)
- *      取得は JOBS_SCRAPE_BUDGET_MIN (既定 18 分) までで打ち切り、残りは次回に回す (ワークフローの 30 分制限内に収めるため)
- *   2. 全商品の利益を再計算 (為替の反映)。取得が想定外のエラーで止まっても必ず実行する
+ *      取得は JOBS_SCRAPE_BUDGET_MIN (既定 18 分) までで打ち切り、残りは次回に回す (ワークフローの 40 分制限内に収めるため)
+ *   2. 自動探索 (有効な探索条件ごとに海外サイトの検索結果 1 ページ + 国内価格 → 条件を満たす商品を自動追加)
+ *      JOBS_DISCOVERY_BUDGET_MIN (既定 8 分) までで打ち切る。失敗しても再計算は行う
+ *   3. 全商品の利益を再計算 (為替の反映)。取得が想定外のエラーで止まっても必ず実行する
  * 一部の商品が失敗しても終了コードは 0。想定外のクラッシュ時のみ 1。
  *
  * オプション: --max-products N  (1 回の実行で取得する最大件数。安全のため)
  *            --skip-recalc      (利益の再計算を行わない)
+ *            --skip-discovery   (自動探索を行わない)
  */
 import { prisma } from "../lib/db/prisma";
 import { env } from "../lib/env";
 import { pausedPlatforms } from "../lib/jobs/pause";
 import { backoffMs, formatSummary, parseJobArgs, requestDelayMs, runScheduledScrape, scrapeBudgetMinutes, selectDueProducts } from "../lib/jobs/runner";
 import { scrapeProduct } from "../lib/jobs/scrapeProduct";
+import { formatDiscoverySummary, runDiscovery } from "../lib/discovery/run";
+import { defaultDiscoveryDeps } from "../lib/discovery/service";
 import { recalcAll } from "../lib/profit/autoService";
 import { flushPendingPushes } from "../lib/push/send";
 import { createFetcher, type PageFetcher } from "../lib/scraper/fetcher";
@@ -39,8 +44,7 @@ async function scrapeDue(args: { maxProducts?: number }, deadline: number): Prom
   if (dueCount > 0) {
     const mode = env.scraperMode ?? "playwright";
     console.log(`[jobs] 取得方法: ${mode} / 取得の制限時間: ${Math.round((deadline - Date.now()) / 60_000)} 分`);
-    const f = await createFetcher(mode);
-    resources.fetcher = f;
+    const f = await getFetcher();
     const summaries = await runScheduledScrape(groups, {
       scrape: (id) => scrapeProduct(id, f),
       sleep,
@@ -56,8 +60,25 @@ async function scrapeDue(args: { maxProducts?: number }, deadline: number): Prom
   }
 }
 
+/** 巡回で作ったブラウザがあれば共用し、無ければここで作る */
+async function getFetcher(): Promise<PageFetcher> {
+  resources.fetcher ??= await createFetcher(env.scraperMode ?? "playwright");
+  return resources.fetcher;
+}
+
+async function discover(): Promise<void> {
+  const deadline = Date.now() + env.discoveryBudgetMinutes * 60_000;
+  if (env.discoveryBudgetMinutes <= 0) {
+    console.log("[jobs] 自動探索: JOBS_DISCOVERY_BUDGET_MIN=0 のためスキップ");
+    return;
+  }
+  const summary = await runDiscovery({}, defaultDiscoveryDeps({ getFetcher, shouldStop: () => Date.now() >= deadline, actor: "system:jobs" }));
+  console.log(formatDiscoverySummary(summary));
+}
+
 async function main() {
   const args = parseJobArgs(process.argv.slice(2));
+  const skipDiscovery = process.argv.includes("--skip-discovery");
   const started = Date.now();
   const deadline = started + scrapeBudgetMinutes() * 60_000;
   let scrapeError: unknown;
@@ -68,6 +89,16 @@ async function main() {
       // 取得で想定外のエラーが起きても、利益の再計算と通知送信は行う (終了コードは最後に 1 にする)
       scrapeError = e;
       console.error("[jobs] 巡回中に想定外のエラー:", e);
+    }
+
+    if (!skipDiscovery) {
+      try {
+        await discover();
+      } catch (e) {
+        // 自動探索の失敗で再計算を止めない (終了コードは最後に 1 にする)
+        scrapeError ??= e;
+        console.error("[jobs] 自動探索中に想定外のエラー:", e);
+      }
     }
 
     if (!args.skipRecalc) {

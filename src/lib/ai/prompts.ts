@@ -78,3 +78,31 @@ export function buildDraftPrompt(ctx: NegotiationContext): string {
     .filter((l) => l !== "")
     .join("\n");
 }
+
+/* ------------------------------------------------------------------ */
+/* 自動探索                                                           */
+/* ------------------------------------------------------------------ */
+export const SEARCH_KEYWORD_SYSTEM =
+  "You convert a Japanese product keyword into a short search query for a B2B/B2C wholesale site. " +
+  "Return only the product words a seller would use in listing titles (2-6 words). No quotes, no brand names unless given, no extra commentary.";
+
+export function buildSearchKeywordPrompt(keywordJa: string, to: "en" | "zh"): string {
+  const lang = to === "zh" ? "Simplified Chinese (as used on 1688.com)" : "English (as used on Alibaba.com / AliExpress)";
+  return [`Write a search query in ${lang} for the Japanese keyword below.`, "", "<keyword>", keywordJa, "</keyword>"].join("\n");
+}
+
+export const TITLE_FILTER_SYSTEM =
+  "You check Japanese marketplace listings against a product keyword. Keep a listing only if it is clearly the same kind of product " +
+  "sold as a single unit (or a normal small set). Exclude accessories, replacement parts, unrelated products and large multi-pack / bulk listings.";
+
+export function buildTitleFilterPrompt(keywordJa: string, titles: string[]): string {
+  return [
+    "Keyword:",
+    keywordJa,
+    "",
+    "Listings (index: title):",
+    ...titles.map((t, i) => `${i}: ${t.slice(0, 200)}`),
+    "",
+    "Return the indices of the listings to keep.",
+  ].join("\n");
+}

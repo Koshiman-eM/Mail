@@ -161,7 +161,7 @@ export function formatSummary(summaries: PlatformSummary[]): string {
     .join("\n");
 }
 
-/** 取得に使える時間 (分)。`JOBS_SCRAPE_BUDGET_MIN` (既定 18 分。ワークフローの 30 分制限内で再計算・通知送信まで終えるため) */
+/** 取得に使える時間 (分)。`JOBS_SCRAPE_BUDGET_MIN` (既定 18 分。ワークフローの 40 分制限内で自動探索・再計算・通知送信まで終えるため) */
 export function scrapeBudgetMinutes(raw: string | undefined = process.env.JOBS_SCRAPE_BUDGET_MIN): number {
   const n = Number(raw);
   return raw && raw.trim() !== "" && Number.isFinite(n) && n >= 0 ? n : 18;

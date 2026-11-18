@@ -77,6 +77,8 @@ Claude Code で作業を行う際は、以下のコマンドおよび制約を�
 - スクレイピングのパーサー: `src/lib/scraper/parse.ts`。フィクスチャ (`tests/fixtures/`) は合成データ。
 - 手動返信: `createManualOutbound` / `attachDraft(source: "MANUAL")` / `approveAndSend` (`src/lib/chat/service.ts`)。「承認して送信」も承認記録を残してから `sendApprovedMessage` を通す (ガードを迂回しない)。
 - 利益の自動計算: 入力組み立てと通知判定は純粋関数 `src/lib/profit/auto.ts`、DB 処理・トリガーは `src/lib/profit/autoService.ts`。定期再計算は `src/workers/profitWorker.ts`。
+- 自動探索: `src/lib/discovery/` (検索 URL `searchUrl.ts` / 検索結果パーサー `searchParse.ts` / 国内価格 `domestic/` (楽天 API・Amazon スタブ・集計 `aggregate.ts`) / 判定 `decide.ts` (純粋関数) / 実行 `run.ts` (DB は `DiscoveryStore` で注入。実装 `store.ts`) / API 用 `service.ts`)。画面 `/discover`、API `/api/discover/*`、定期実行は `src/workers/once.ts`。商品登録は URL 取り込みと共通の `src/lib/jobs/createProduct.ts`、監査ログ `discovery.auto_add` / `discovery.add`。テスト `tests/discovery*.test.ts`。
+- 追加モデル: `DiscoveryWatch` (探索条件), `DiscoveredItem` (探索結果), `DomesticPriceCache` (国内価格 24 時間キャッシュ)。
 - 追加モデル: `User`, `Session` (認証), `ProfitSettings` (自動計算の既定値), `NegotiationGoal` (交渉ゴール), `FxRate` (為替キャッシュ), `ScraperState` (プラットフォーム別停止状態)。`ChatStatus` には送信失敗用の `SEND_FAILED` を追加 (再送は再ドラフト・再承認必須)。
 
 ---

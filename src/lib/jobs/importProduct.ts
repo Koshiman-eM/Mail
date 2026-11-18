@@ -1,22 +1,12 @@
-import { Prisma, type Platform } from "@prisma/client";
+import type { Platform } from "@prisma/client";
 import { prisma } from "../db/prisma";
 import { autoSimulate } from "../profit/autoService";
 import { detectBlock } from "../scraper/detect";
 import { parseProductPage, type ParsedProduct } from "../scraper/parse";
 import type { FetchedPage, PageFetcher } from "../scraper/types";
 import { analyzeProductUrl, canonicalFromHtml, extractUrlFromText, type AnalyzedUrl } from "../scraper/url";
-import {
-  NO_PRICE_NOTE,
-  PLACEHOLDER_SUPPLIER_NAME,
-  blockNote,
-  classifyStatus,
-  defaultCurrency,
-  isTransientError,
-  parsedFieldsOf,
-  placeholderSupplierId,
-  shortError,
-  statusNote,
-} from "./common";
+import { NO_PRICE_NOTE, blockNote, classifyStatus, isTransientError, parsedFieldsOf, shortError, statusNote } from "./common";
+import { createProductRecord } from "./createProduct";
 
 /** 対応外の URL / URL が見つからない (HTTP 422) */
 export class UnsupportedUrlError extends Error {
@@ -111,70 +101,22 @@ export async function importProduct(input: ImportInput, deps: { fetcher: PageFet
     parsedFields: parsed ? parsedFieldsOf(parsed) : [],
   };
 
-  // 4) 業者・商品を登録
-  const supplierExternalId = parsed?.supplierId ?? placeholderSupplierId(platform, externalId);
-  const tiers = parsed?.priceTiers ?? [];
-  let product;
-  try {
-    product = await prisma.$transaction(async (tx) => {
-      // 同じ業者の商品を同時に取り込んでも一意制約違反にならないよう upsert (INSERT ... ON CONFLICT) で作成/取得する
-      const supplier = await tx.supplier.upsert({
-        where: { platform_externalId: { platform, externalId: supplierExternalId } },
-        create: { platform, externalId: supplierExternalId, name: parsed?.supplierName ?? PLACEHOLDER_SUPPLIER_NAME, shopUrl: parsed?.supplierUrl ?? null },
-        update: {},
-      });
-      const fill: Prisma.SupplierUpdateInput = {};
-      if (!supplier.shopUrl && parsed?.supplierUrl) fill.shopUrl = parsed.supplierUrl;
-      if (supplier.name === PLACEHOLDER_SUPPLIER_NAME && parsed?.supplierName) fill.name = parsed.supplierName;
-      if (Object.keys(fill).length) await tx.supplier.update({ where: { id: supplier.id }, data: fill });
-      const moq = parsed?.moq ?? tiers[0]?.minQty ?? 1;
-      const p = await tx.product.create({
-        data: {
-          platform,
-          externalId,
-          url: analyzed.canonicalUrl,
-          title: parsed?.title ?? analyzed.canonicalUrl,
-          currency: (parsed?.currency ?? defaultCurrency(platform)).toUpperCase().slice(0, 3),
-          moq: moq > 0 ? moq : 1,
-          priceTiers: tiers as unknown as Prisma.InputJsonValue,
-          inStock: parsed?.inStock ?? true,
-          supplierId: supplier.id,
-          fetchStatus: fetch.status,
-          fetchNote: fetch.note,
-          lastFetchedAt: page || failNote ? new Date() : null,
-        },
-      });
-      if (tiers.length) {
-        await tx.priceSnapshot.create({
-          data: {
-            productId: p.id,
-            currency: p.currency,
-            priceTiers: tiers as unknown as Prisma.InputJsonValue,
-            moq: p.moq,
-            inStock: p.inStock,
-            stockQty: parsed?.stockQty ?? null,
-          },
-        });
-      }
-      await tx.auditLog.create({
-        data: {
-          actor: deps.actor,
-          action: "product.import",
-          entityType: "Product",
-          entityId: p.id,
-          after: { url: p.url, source: pasted ? "pasted-html" : "http", fetchStatus: fetch.status, fetchNote: fetch.note, parsedFields: fetch.parsedFields },
-        },
-      });
-      return p;
-    });
-  } catch (e) {
-    // 同時に同じ商品を取り込んだ場合は既存を返す
-    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
-      const existing = await findExisting(platform, externalId);
-      if (existing) return { product: existing, existed: true as const };
-    }
-    throw e;
-  }
+  // 4) 業者・商品を登録 (自動探索と共通の処理)
+  const created = await createProductRecord({
+    platform,
+    externalId,
+    canonicalUrl: analyzed.canonicalUrl,
+    parsed,
+    fetch,
+    fetchedAt: page || failNote ? new Date() : null,
+    actor: deps.actor,
+    audit: {
+      action: "product.import",
+      after: { url: analyzed.canonicalUrl, source: pasted ? "pasted-html" : "http", fetchStatus: fetch.status, fetchNote: fetch.note, parsedFields: fetch.parsedFields },
+    },
+  });
+  if (created.existed) return { product: created.product, existed: true as const };
+  const product = created.product;
 
   await autoSimulate(product.id, "product.create");
   const full = await prisma.product.findUniqueOrThrow({ where: { id: product.id }, include: { supplier: true } });

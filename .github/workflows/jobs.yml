@@ -1,6 +1,6 @@
-# 定期ジョブ: 仕入れ候補の価格・在庫の巡回と、利益の再計算 (為替の反映)
+# 定期ジョブ: 仕入れ候補の価格・在庫の巡回、自動探索、利益の再計算 (為替の反映)
 # リポジトリの Settings > Secrets and variables > Actions に DATABASE_URL を登録すると動きます。
-name: 定期ジョブ (価格巡回・利益再計算)
+name: 定期ジョブ (価格巡回・自動探索・利益再計算)
 
 on:
   schedule:
@@ -22,7 +22,8 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 巡回 (最大 18 分) + 自動探索 (最大 8 分) + 再計算・セットアップ
+    timeout-minutes: 40
     steps:
       - name: 設定の確認
         id: check
@@ -47,11 +48,17 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         run: npm ci
 
-      - name: 巡回と再計算
+      - name: 巡回・自動探索・再計算
         if: steps.check.outputs.skip != 'true'
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # 自動探索の国内価格 (楽天市場 API)。未登録なら国内価格なしで動作します
+          RAKUTEN_APPLICATION_ID: ${{ secrets.RAKUTEN_APPLICATION_ID }}
+          RAKUTEN_ACCESS_KEY: ${{ secrets.RAKUTEN_ACCESS_KEY }}
+          # 楽天に登録したサイト URL (Render の公開 URL)。楽天 API は Referer を検証するため必須
+          RAKUTEN_REFERER: ${{ secrets.RAKUTEN_REFERER }}
+          RAKUTEN_ITEM_SEARCH_URL: ${{ secrets.RAKUTEN_ITEM_SEARCH_URL }}
           # ランナーに入っている Google Chrome を使う
           SCRAPER_MODE: playwright
           CHROMIUM_PATH: /usr/bin/google-chrome

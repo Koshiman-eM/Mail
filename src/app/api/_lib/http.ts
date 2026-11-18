@@ -5,6 +5,7 @@ import { InvalidTransitionError } from "@/lib/chat/stateMachine";
 import { InvalidProfitInputError, MoqNotMetError } from "@/lib/profit";
 import { AiRefusalError } from "@/lib/ai/claude";
 import { ForbiddenError, UnauthorizedError, requireUser, type SessionUser } from "@/lib/auth/session";
+import { DiscoveryActionError, DiscoveryCooldownError, DiscoveryNotFoundError } from "@/lib/discovery/errors";
 import { PayloadTooLargeError } from "./body";
 
 /** ドメイン例外を HTTP ステータスへ変換する */
@@ -19,7 +20,10 @@ export function toErrorResponse(e: unknown) {
   }
   if (e instanceof MoqNotMetError || e instanceof InvalidProfitInputError)
     return NextResponse.json({ error: e.message }, { status: 422 });
-  if (e instanceof NotFoundError) return NextResponse.json({ error: e.message }, { status: 404 });
+  if (e instanceof NotFoundError || e instanceof DiscoveryNotFoundError) return NextResponse.json({ error: e.message }, { status: 404 });
+  if (e instanceof DiscoveryCooldownError)
+    return NextResponse.json({ error: e.message, code: e.name }, { status: 429, headers: { "Retry-After": String(Math.max(1, e.retryAfterSec)) } });
+  if (e instanceof DiscoveryActionError) return NextResponse.json({ error: e.message, code: e.name }, { status: 422 });
   if (
     e instanceof ApprovalGuardError ||
     e instanceof InvalidTransitionError ||

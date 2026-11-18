@@ -30,3 +30,14 @@ services:
         value: http
       - key: FX_DEFAULT_BUFFER_PERCENT
         value: "3"
+      # 自動探索: 楽天市場 API (国内価格)。Rakuten Developers で発行した値を入力。未入力なら国内価格なしで動作します
+      - key: RAKUTEN_APPLICATION_ID
+        sync: false
+      - key: RAKUTEN_ACCESS_KEY
+        sync: false
+      # Rakuten Developers に登録したサイト URL (未入力なら Render の公開 URL を使用)
+      - key: RAKUTEN_REFERER
+        sync: false
+      # 楽天 API のエンドポイントの上書き (通常は空欄。仕様が変わった場合のみ)
+      - key: RAKUTEN_ITEM_SEARCH_URL
+        sync: false
