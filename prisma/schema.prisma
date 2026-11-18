@@ -1,0 +1,229 @@
+// 海外通販せどり支援ツール コアデータモデル
+// 金額はすべて Decimal で保持し、浮動小数点誤差を防ぐ。
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Platform {
+  ALIBABA
+  ALI1688
+  ALIEXPRESS
+  OTHER
+}
+
+enum Severity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+enum NotificationType {
+  PRICE_CHANGE
+  STOCK_CHANGE
+  REAUTH_REQUIRED
+  CHAT_RECEIVED
+  DRAFT_READY
+  SEND_FAILED
+  SYSTEM
+}
+
+/// 承認ステートマシン: RECEIVED -> DRAFT_READY -> APPROVED / REJECTED -> SENDING -> SENT
+enum ChatStatus {
+  RECEIVED
+  DRAFT_READY
+  APPROVED
+  REJECTED
+  SENDING
+  SENT
+  SEND_FAILED
+}
+
+enum ChatDirection {
+  INBOUND
+  OUTBOUND
+}
+
+model Supplier {
+  id            String        @id @default(cuid())
+  platform      Platform
+  externalId    String
+  name          String
+  shopUrl       String?
+  country       String?
+  rating        Decimal?      @db.Decimal(4, 2)
+  yearsActive   Int?
+  isBlacklisted Boolean       @default(false)
+  blacklistNote String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  products      Product[]
+  messages      ChatMessage[]
+  goals         NegotiationGoal[]
+
+  @@unique([platform, externalId])
+}
+
+model Product {
+  id                 String             @id @default(cuid())
+  supplierId         String
+  supplier           Supplier           @relation(fields: [supplierId], references: [id])
+  platform           Platform
+  externalId         String
+  url                String
+  title              String
+  titleJa            String?
+  currency           String             @db.VarChar(3)
+  /// MOQ (最小発注数量)
+  moq                Int                @default(1)
+  /// 段階的単価: [{ minQty: number, unitPrice: string }]
+  priceTiers         Json
+  /// 国内比較対象 (例: Amazon ASIN / JAN)
+  domesticRefId      String?
+  domesticPriceJpy   Decimal?           @db.Decimal(14, 2)
+  lengthCm           Decimal?           @db.Decimal(10, 2)
+  widthCm            Decimal?           @db.Decimal(10, 2)
+  heightCm           Decimal?           @db.Decimal(10, 2)
+  weightKg           Decimal?           @db.Decimal(10, 3)
+  hsCode             String?
+  inStock            Boolean            @default(true)
+  watch              Boolean            @default(true)
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+  snapshots          PriceSnapshot[]
+  simulations        ProfitSimulation[]
+
+  @@unique([platform, externalId])
+}
+
+model PriceSnapshot {
+  id         String   @id @default(cuid())
+  productId  String
+  product    Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  currency   String   @db.VarChar(3)
+  priceTiers Json
+  moq        Int
+  inStock    Boolean
+  stockQty   Int?
+  capturedAt DateTime @default(now())
+
+  @@index([productId, capturedAt])
+}
+
+model ProfitSimulation {
+  id              String   @id @default(cuid())
+  productId       String
+  product         Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  quantity        Int
+  /// 計算に用いた全パラメータ (再現性のため丸ごと保存)
+  params          Json
+  /// 費目別内訳 (円)
+  breakdown       Json
+  totalCostJpy    Decimal  @db.Decimal(14, 2)
+  revenueJpy      Decimal  @db.Decimal(14, 2)
+  profitJpy       Decimal  @db.Decimal(14, 2)
+  unitProfitJpy   Decimal  @db.Decimal(14, 2)
+  roiPercent      Decimal  @db.Decimal(9, 2)
+  marginPercent   Decimal  @db.Decimal(9, 2)
+  fxRateApplied   Decimal  @db.Decimal(14, 6)
+  createdAt       DateTime @default(now())
+}
+
+model NegotiationGoal {
+  id               String   @id @default(cuid())
+  supplierId       String
+  supplier         Supplier @relation(fields: [supplierId], references: [id])
+  productId        String?
+  targetUnitPrice  Decimal? @db.Decimal(14, 4)
+  currency         String?  @db.VarChar(3)
+  targetMoq        Int?
+  wantsOem         Boolean  @default(false)
+  notes            String?
+  active           Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}
+
+model ChatMessage {
+  id             String        @id @default(cuid())
+  supplierId     String
+  supplier       Supplier      @relation(fields: [supplierId], references: [id])
+  threadId       String
+  direction      ChatDirection
+  /// 原文 (中国語 / 英語)
+  originalText   String
+  originalLang   String?
+  /// 日本語訳
+  translatedText String?
+  /// AI 返信案 (日本語の意図 + 送信用原語)
+  draftText      String?
+  draftTextJa    String?
+  /// 承認者が最終確定した送信本文
+  finalText      String?
+  status         ChatStatus    @default(RECEIVED)
+  approvedBy     String?
+  approvedAt     DateTime?
+  rejectedReason String?
+  sentAt         DateTime?
+  externalMsgId  String?
+  /// 楽観ロック用バージョン
+  version        Int           @default(0)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@index([threadId, createdAt])
+  @@index([status])
+}
+
+model Notification {
+  id        String           @id @default(cuid())
+  type      NotificationType
+  severity  Severity         @default(INFO)
+  title     String
+  body      String?
+  link      String?
+  meta      Json?
+  readAt    DateTime?
+  createdAt DateTime         @default(now())
+
+  @@index([readAt, createdAt])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actor      String
+  action     String
+  entityType String
+  entityId   String
+  before     Json?
+  after      Json?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+}
+
+/// 為替レートキャッシュ
+model FxRate {
+  id        String   @id @default(cuid())
+  base      String   @db.VarChar(3)
+  quote     String   @db.VarChar(3)
+  rate      Decimal  @db.Decimal(14, 6)
+  source    String
+  fetchedAt DateTime @default(now())
+
+  @@index([base, quote, fetchedAt])
+}
+
+/// スクレイピング対象のプラットフォーム別稼働状態 (CAPTCHA検知時に一時停止)
+model ScraperState {
+  platform  Platform @id
+  paused    Boolean  @default(false)
+  reason    String?
+  pausedAt  DateTime?
+  updatedAt DateTime @updatedAt
+}

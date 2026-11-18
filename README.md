@@ -1,103 +1,80 @@
-# MessageHub
+# 越境せどり支援ツール
 
-LINE と Gmail のメッセージを一つの受信トレイに集約し、本文から日時を自動検出して Google カレンダーに予定を登録するアプリケーションです。
+Alibaba.com / 1688.com / AliExpress の仕入れ候補について、輸入諸経費込みの利益計算・価格/在庫の巡回監視・
+サプライヤー交渉チャットの承認制自動返信を一元管理する Web アプリです。仕様の詳細は [CLAUDE.md](./CLAUDE.md) を参照。
 
-## 仕組み
+## 構成
 
 ```
-Gmail  ──(OAuth2 / Gmail API)──┐
-                                ├─▶ 統合メッセージストア ─▶ 日時検出 ─▶ Google カレンダーに登録
-LINE   ──(Webhook)─────────────┘        (SQLite)         (chrono-node)      (Calendar API)
+src/
+  app/                    Next.js App Router (画面 + API Route Handlers)
+    calculator/ products/ chat/ settings/
+    api/                  profit, fx, products, suppliers, chat, notifications(+SSE), scraper
+  components/             shadcn/ui 互換 UI, 通知ベル (SSE + 重要度フィルタ)
+  lib/
+    profit/               利益計算エンジン (decimal.js)
+    chat/                 承認ステートマシン + 送信ガードレール + AI ドラフト生成
+    suppliers/            送信アダプター (MockSupplierAdapter / 実送信は未実装)
+    scraper/              CAPTCHA 検知, ページ解析, 差分検知, BullMQ キュー設定
+    notifications/        通知永続化 + Redis Pub/Sub → SSE
+    ai/                   Gemini API (翻訳・返信案)。キー未設定時はスタブ
+    fx/                   為替レート取得 (1時間キャッシュ)
+  workers/                BullMQ スクレイピングワーカー (Playwright)
+prisma/schema.prisma      データモデル
+tests/                    vitest 単体テスト
 ```
-
-- **server/** — Express + TypeScript の API サーバー。Gmail/LINE からメッセージを取り込み、
-  [chrono-node](https://github.com/wanasit/chrono) で日時・場所を抽出し、検出した予定を
-  Google カレンダーに自動登録します。永続化には Node.js 標準の `node:sqlite` を使用しており、
-  追加のネイティブ依存やDBサーバーなしで動きます。
-- **client/** — React + Vite のフロントエンド。「受信トレイ」「予定」「設定」の3タブ構成です。
-
-### メッセージ処理パイプライン
-
-1. Gmail は `POST /api/sync/gmail`（設定画面の「今すぐ同期」ボタン）で直近7日分を取得します。
-   LINE は Webhook (`POST /webhook/line`) でリアルタイムに受信します。
-2. 新規メッセージごとに本文（+ Gmail は件名）を日時抽出にかけます（`server/src/services/scheduleExtractor.ts`）。
-   - 日本語・英語どちらの表現にも対応（例:「8月10日 14時」「August 12th at 3pm」）。
-   - タイムゾーンは既定で JST(UTC+9) として解釈します。
-   - 「場所：〜」等のラベルや「〜で開催」等のパターンから場所も抽出を試みます。
-3. 日時が検出できたら `events` テーブルに `pending` として記録し、`AUTO_CREATE_EVENTS=true`
-   （既定）なら即座に Google カレンダーへ登録します。失敗時は `failed` として記録し、
-   「予定」タブから手動で再登録・却下できます。
-4. LINE 経由で予定登録に成功した場合は、返信メッセージで登録結果を通知します。
 
 ## セットアップ
 
-```bash
-npm install          # ルートで一括インストール（server / client のワークスペース）
-cp .env.example .env # 値は空のままでもアプリは起動します
-```
-
-### 開発サーバーの起動
+前提: Node.js 20+, PostgreSQL, Redis
 
 ```bash
-npm run dev:server   # http://localhost:4000
-npm run dev:client   # http://localhost:5173 (Vite; /api, /auth は自動的に4000へプロキシ)
+npm install
+cp .env.example .env.local        # DATABASE_URL / REDIS_URL などを設定
+npm run db:migrate                # = prisma migrate dev (.env.local を読み込む)
+npm run db:seed                   # デモ用の業者・商品・受信メッセージ
+npm run dev                       # http://localhost:3000
+npm run worker                    # 別ターミナルでスクレイピングワーカー
 ```
 
-`http://localhost:5173` を開き、「設定」タブの「デモデータを投入」を押すと、実際の
-Gmail/LINE 連携なしでメッセージ統合〜予定検出の一連の動作を確認できます。
+> `npx prisma migrate dev` を直接使う場合、Prisma CLI は `.env` しか読まないため `DATABASE_URL` を `.env` にも置くか、
+> `npm run db:migrate` を使ってください。
 
-### テスト
+| コマンド | 内容 |
+|---|---|
+| `npm test` | 単体テスト (利益計算・承認ガード・スクレイピング検知・プロンプト) |
+| `npm run build` | 本番ビルド |
+| `npm run typecheck` | 型チェック |
 
-```bash
-npm test             # server: 日時抽出ロジックの単体テスト (vitest)
-```
+## 主な機能
 
-日時抽出ロジックはネットワークアクセスなしで決定論的にテストされています
-（`server/test/scheduleExtractor.test.ts`）。
+### 利益計算 (`/calculator`, `POST /api/profit/calculate`)
+- 為替: 最新レート (`/api/fx`) × (1 + バッファ%)
+- MOQ チェックと数量別段階単価の自動選択
+- 国際送料: 実重量と容積重量 (縦×横×高さ / 5000 or 6000) の大きい方を刻み単位で切り上げ、最低料金・燃油サーチャージ対応
+- 現地送料・代行手数料・関税・輸入消費税・通関手数料・販売手数料・国内送料を合算
+- 関税/消費税は CIF 課税。既定で日本の税関端数処理 (課税標準1,000円未満・税額100円未満切捨て) を適用
+- 利益・ROI・利益率・損益分岐販売単価を算出。登録商品に対してはシミュレーションとして保存可能
 
-## 実際の連携を有効にする
+### スクレイピングと通知
+- プラットフォーム別 BullMQ キュー。ジッター付き投入、同時実行数・レート制限、指数バックオフリトライ
+- CAPTCHA / ログイン要求 / ブロックを検知すると**自動突破せず**そのプラットフォームのキューを一時停止し、
+  CRITICAL 通知で手動再認証を促す (`/settings` から再開)
+- 価格変動 (既定 3% 以上)・在庫切れ/復活・MOQ 変更を通知
+- 通知は DB に保存し、Redis Pub/Sub 経由で SSE (`/api/notifications/stream`) に配信。ヘッダーのベルに未読バッジと重要度フィルタ
+- ページ解析 (`src/lib/scraper/parse.ts`) は JSON-LD と埋め込み ladder price を読む汎用実装です。各サイトの DOM に合わせた調整が必要になる可能性があります
 
-### Gmail / Google カレンダー
+### 業者チャット (`/chat`)
+- 受信メッセージを取り込むと Gemini で日本語訳を作成し、原文と並べて表示
+- 交渉ゴール (目標単価・MOQ・OEM 等) を含めて AI 返信案を生成
+- `RECEIVED → DRAFT_READY → APPROVED / REJECTED → SENDING → SENT` (失敗時 `SEND_FAILED` → 再ドラフト・再承認)
+- 送信時はトランザクション内で `status = APPROVED` かつ `approvedAt != null` を再検証し、同条件付き CAS 更新で `SENDING` に遷移。
+  不一致なら `ApprovalGuardError` (HTTP 409)。ブラックリスト業者への送信も拒否
+- 全操作を `AuditLog` に記録
 
-1. [Google Cloud Console](https://console.cloud.google.com/) でプロジェクトを作成し、
-   **Gmail API** と **Google Calendar API** を有効化します。
-2. 「APIとサービス > 認証情報」で OAuth クライアント ID（ウェブアプリケーション）を作成し、
-   承認済みリダイレクト URI に `http://localhost:4000/auth/google/callback` を追加します。
-3. 取得した値を `.env` の `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` に設定します。
-4. サーバーを再起動し、「設定」タブの「Googleアカウントを連携」からOAuth同意画面を通します。
-5. 連携後は「Gmailを今すぐ同期」で取り込み、または定期実行（cronなど）で
-   `POST /api/sync/gmail` を呼び出してください。
-
-### LINE
-
-1. [LINE Developers Console](https://developers.line.biz/) で Messaging API チャネルを作成します。
-2. チャネルシークレットとチャネルアクセストークンを `.env` の
-   `LINE_CHANNEL_SECRET` / `LINE_CHANNEL_ACCESS_TOKEN` に設定します。
-3. Webhook URL に `https://<公開URL>/webhook/line` を設定します（ローカル開発では
-   [ngrok](https://ngrok.com/) 等でトンネリングしてください）。
-4. Webhookの利用をオンにし、応答メッセージ機能はオフにしておくことを推奨します
-   （本アプリが予定登録の結果を自動返信するため）。
-
-## API 概要
-
-| メソッド | パス | 説明 |
-| --- | --- | --- |
-| GET | `/api/messages` | 統合済みメッセージ一覧 |
-| GET | `/api/events` | 検出された予定一覧 |
-| POST | `/api/events/:id/create` | 保留中/失敗した予定を手動でカレンダー登録 |
-| POST | `/api/events/:id/dismiss` | 予定候補を却下 |
-| GET | `/api/accounts` | 連携状態（Gmail/LINE） |
-| POST | `/api/sync/gmail` | Gmailの手動同期 |
-| POST | `/webhook/line` | LINEからのWebhook受信 |
-| GET | `/auth/google`, `/auth/google/callback` | Google OAuth フロー |
-| POST | `/api/dev/seed` | デモデータ投入（`ENABLE_DEV_SEED=false`で無効化可） |
-
-## 既知の制約
-
-- Google のアクセストークンは自動更新（refresh_token 利用）を想定した設計ですが、
-  期限切れ時の明示的な再認証フローは実装していません。エラー時は「設定」画面から
-  再連携してください。
-- 日時抽出はヒューリスティックであり、曖昧な表現や複数日時が並記された文面では
-  誤検出・見落としが起こり得ます。「予定」タブで確認・却下できる設計にしています。
-- LINE のグループ/ルームメッセージも取り込み対象ですが、送信者の表示名解決はせず
-  内部IDをそのまま表示します。
+## 安全上の注意
+- 送信アダプターは `NODE_ENV=production` **かつ** `SUPPLIER_ADAPTER=alibaba` の場合のみ実アダプターを返します。
+  それ以外は常に `MockSupplierAdapter` で、外部送信は発生しません。実アダプター (`AlibabaSupplierAdapter`) は意図的に未実装です。
+- 受信メッセージの取り込みは現状、画面からの手動貼り付け (`POST /api/chat/messages`) です。
+- 認証機能は未実装です。操作者名は `APP_OPERATOR_NAME` で設定します。外部公開する前に認証を追加してください。
+- API キー・セッション情報 (`SCRAPER_STORAGE_STATE_PATH`) は `.env.local` で管理し、リポジトリにコミットしないでください。
