@@ -18,6 +18,7 @@ import type { LearningService, PeriodicResult } from "../learning/service";
 import type { DexScreenerFeed } from "../market/feeds/dexscreener";
 import type { MarketHub } from "../market/hub";
 import { detectRegime, regimeOptionsFor } from "../regime/detect";
+import { clearResumeRequest, peekResumeRequest } from "../risk/resumeRequest";
 import { costBps, type RiskManager, type RiskPosition } from "../risk/manager";
 import { ALL_STRATEGIES, resolveParams } from "../strategies/registry";
 import {
@@ -401,6 +402,19 @@ export class TradingEngine {
 
     // 3. 評価額 → リスク判定。kill switch が新たに発動したら全決済
     let account = await this.account(now, Boolean(this.brokerSet.paper));
+    // 別プロセスの CLI `resume` からの再開要求 (kv) を毎ティック確認し、あれば適用して消す
+    const resumeReq = peekResumeRequest(this.store);
+    if (resumeReq) {
+      const was = this.risk.state();
+      this.risk.resume({ equity: account.equity, now, by: resumeReq.by });
+      clearResumeRequest(this.store);
+      this.log.warn("再開要求を適用しました", { by: resumeReq.by, requestedAt: resumeReq.at });
+      this.store.audit({
+        ts: now,
+        type: "engine.resume_request_applied",
+        data: { by: resumeReq.by, requestedAt: resumeReq.at, wasKillSwitch: Boolean(was.killSwitch), wasHalted: was.haltedUntil !== undefined },
+      });
+    }
     const wasKilled = Boolean(this.risk.state().killSwitch);
     const r = this.risk.onEquity(account.equity, now);
     let exits = 0;
@@ -959,6 +973,8 @@ export class TradingEngine {
   async start(): Promise<void> {
     if (this.running) return;
     this.stopped = false;
+    // エンジン停止中に書かれた古い再開要求は捨てる (起動後に作動した停止を意図せず解除しない)
+    clearResumeRequest(this.store);
     await this.init();
     await this.safeTick();
     void this.runIntel(this.clock.now());

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { CauseCode, EntryContext, IntelBias, TradeRecord } from "../src/core/types";
-import { attributeTrade, type AttributionOptions } from "../src/learning/attribution";
+import { ATTRIBUTION_THRESHOLDS, attributeTrade, type AttributionOptions } from "../src/learning/attribution";
 
 /**
  * 基準トレード: ロング 100 → 損切り 98 (ストップ幅 2%)、コスト 10bps (0.1%)、レジーム range。
@@ -118,6 +118,20 @@ describe("attributeTrade", () => {
     expect(codes(mk({ entryPrice: 99.5, intendedEntryPrice: 100, exitPrice: 102.5 }))).not.toContain("slippage");
     // コスト見積り内なら問題にしない
     expect(codes(mk({ entryPrice: 100.1, intendedEntryPrice: 100, exitPrice: 103.1 }))).not.toContain("slippage");
+  });
+
+  it("slippage: 閾値は max(6bps, costBps × 1.0)。PaperBroker 既定の往復 4bps 程度は想定内", () => {
+    expect(ATTRIBUTION_THRESHOLDS.slippageMinBps).toBe(6);
+    expect(ATTRIBUTION_THRESHOLDS.slippageCostMult).toBe(1);
+    // at(エントリーずれ bps, エグジットずれ bps, 想定コスト bps)
+    const at = (entry: number, exit: number, costBps: number) =>
+      codes(mk({ entryPrice: 100 * (1 + entry / 1e4), intendedEntryPrice: 100, exitPrice: 103 * (1 - exit / 1e4), intendedExitPrice: 103 }, { costBps }));
+    expect(at(2, 2, 1)).not.toContain("slippage"); // 往復 4bps
+    expect(at(3, 2.9, 1)).not.toContain("slippage"); // 6bps 以下
+    expect(at(4, 4, 1)).toContain("slippage"); // 8bps
+    // costBps が大きければ costBps × 1.0 が閾値 (costBps 20 に対し 8bps は想定内、25bps は超過)
+    expect(at(4, 4, 20)).not.toContain("slippage");
+    expect(at(13, 12, 20)).toContain("slippage");
   });
 
   it("stop_too_tight: 刈られた後にストップ幅以上戻った", () => {

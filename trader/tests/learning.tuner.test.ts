@@ -200,6 +200,54 @@ describe("ParamTuner", () => {
     expect(t2.currentParams("s1", "fx", INFO.defaultParams).entryThreshold).toBe(0.5);
   });
 
+  it("run: 直近 7 日以内に同じ rejected / proposed があれば同じ案を作らない (7 日超なら再度作る)", async () => {
+    const store = new MemoryStore();
+    seed(store, many("stop_too_tight", 25));
+    const reject: ParamValidator = async () => ({ score: 1, trades: 50 }); // 改善なし → rejected
+    const tuner = new ParamTuner({ store, getStrategy, validate: reject });
+    const [first] = await tuner.run(NOW);
+    expect(first.status).toBe("rejected");
+    // 調整後に同じ傾向のトレードがたまっても、同じ案は作らない
+    seed(store, many("stop_too_tight", 25), NOW + 1000);
+    const t2 = new ParamTuner({ store, getStrategy, validate: reject });
+    expect(await t2.run(NOW + 2 * DAY)).toEqual([]);
+    expect(await t2.run(NOW + 6 * DAY)).toEqual([]);
+    expect(store.listAdjustments()).toHaveLength(1);
+    // 7 日を超えたら再度記録してよい
+    const again = await t2.run(NOW + 8 * DAY);
+    expect(again).toHaveLength(1);
+    expect(store.listAdjustments()).toHaveLength(2);
+    // proposed (検証器なし) も同様
+    const store2 = new MemoryStore();
+    seed(store2, many("stop_too_tight", 25));
+    const t3 = new ParamTuner({ store: store2, getStrategy });
+    expect((await t3.run(NOW))[0].status).toBe("proposed");
+    seed(store2, many("stop_too_tight", 25), NOW + 1000);
+    expect(await t3.run(NOW + 2 * DAY)).toEqual([]);
+  });
+
+  it("propose: 直近 7 日以内に同じ proposed / rejected があれば作らない。applied や別の値は対象外", async () => {
+    const store = new MemoryStore();
+    seed(store, many("good", 5));
+    const reject: ParamValidator = async () => ({ score: 1, trades: 50 });
+    const tuner = new ParamTuner({ store, getStrategy, validate: reject });
+    const req = { strategyId: "s1", assetClass: "crypto" as const, param: "tpAtr", direction: "down" as const, reason: "x" };
+    expect((await tuner.propose(req, NOW))?.status).toBe("rejected");
+    expect(await tuner.propose(req, NOW + DAY)).toBeUndefined();
+    // 別の戦略パラメータ・別の資産クラスは対象外
+    expect((await tuner.propose({ ...req, param: "entryThreshold", direction: "up" }, NOW + DAY))?.status).toBe("rejected");
+    expect((await tuner.propose({ ...req, assetClass: "fx" }, NOW + DAY))?.status).toBe("rejected");
+    // 7 日超なら再度作る
+    expect((await tuner.propose(req, NOW + 8 * DAY))?.status).toBe("rejected");
+    expect(store.listAdjustments()).toHaveLength(4);
+    // applied は重複扱いにしない (現行値が変わるので同じ to にはならないが、記録の抑止対象ではない)
+    const store2 = new MemoryStore();
+    seed(store2, many("good", 5));
+    const accept: ParamValidator = async (_s, _a, p) => ({ score: 10 - 3 * p.tpAtr, trades: 40 });
+    const t2 = new ParamTuner({ store: store2, getStrategy, validate: accept });
+    expect((await t2.propose(req, NOW))?.status).toBe("applied");
+  });
+
   it("nextValue: 10% 刻み・maxHoldBars は整数・0 は範囲幅で動かす・上下限でクランプ", () => {
     const tuner = new ParamTuner({ store: new MemoryStore(), getStrategy });
     expect(tuner.nextValue("stopAtr", 1.5, "up", [1, 3])).toBe(1.65);

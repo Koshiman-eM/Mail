@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { RESUME_REQUEST_KEY } from "../src/risk/resumeRequest";
 import { buildReportText, CliError, HELP, main, parseArgs, parseBacktestArgs, parseSimulateArgs, resumeTrading } from "../src/cli";
 import { loadConfig } from "../src/core/config";
 import type { Candle } from "../src/core/types";
@@ -143,6 +144,15 @@ describe("report / resume", () => {
     const audit = store.listAudit({ type: "risk.resume" });
     expect(audit).toHaveLength(1);
     expect(audit[0].data.by).toBe("cli");
+    // 実行中のエンジンへ伝えるための再開要求が kv に残る
+    expect(store.kvGet(RESUME_REQUEST_KEY)).toEqual({ at: 2000, by: "cli" });
+  });
+
+  it("resume: 停止状態でなければ再開要求を書かない", () => {
+    const store = new MemoryStore();
+    const config = loadConfig({ NODE_ENV: "test", DB_PATH: "memory" });
+    expect(resumeTrading(config, store, 2000).resumed).toBe(false);
+    expect(store.kvGet(RESUME_REQUEST_KEY)).toBeUndefined();
   });
 
   it("戦略別の成績は決済時点の為替で換算する (記録が無ければ現在のレート)", () => {

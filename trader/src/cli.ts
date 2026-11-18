@@ -19,6 +19,7 @@ import { TradeJournal } from "./learning/journal";
 import { LearningService } from "./learning/service";
 import { CcxtFeed } from "./market/feeds/ccxt";
 import { RiskManager } from "./risk/manager";
+import { requestResume } from "./risk/resumeRequest";
 import { createStore } from "./storage";
 import { getStrategy } from "./strategies/registry";
 import type { ExitReason } from "./core/types";
@@ -355,6 +356,8 @@ export function resumeTrading(config: AppConfig, store: Store, now: number = Dat
   if (!st.killSwitch && st.haltedUntil === undefined) return { resumed: false, message: "停止状態ではありません (変更なし)" };
   const last = store.listEquity().at(-1);
   risk.resume({ ...(last ? { equity: last.equity } : {}), now, by });
+  // 別プロセスで動作中のエンジンはメモリ上の状態を持つので、kv の再開要求でも依頼する (エンジンが次のティックで適用)
+  requestResume(store, { at: now, by });
   const what = st.killSwitch ? `キルスイッチ (${st.killSwitch.reason})` : `日次停止 (${fmtTime(st.haltedUntil)} まで)`;
   return { resumed: true, message: `${what} を解除しました。監査ログに記録しました。` };
 }
@@ -365,7 +368,7 @@ function cmdResume(io: Io): number {
   try {
     const r = resumeTrading(config, store);
     io.out(r.message);
-    if (r.resumed) io.out("※ 実行中のエンジンには反映されません。エンジンを再起動してください。");
+    if (r.resumed) io.out("※ 実行中のエンジンへは再開要求として伝えました。次のティックで自動的に反映されます (再起動は不要)。エンジンが停止中なら次回起動時の状態から再開します。");
     return 0;
   } finally {
     store.close();

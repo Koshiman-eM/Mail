@@ -22,13 +22,13 @@ export interface SyntheticOptions {
   /** 開始時刻 (既定 2024-01-01T00:00Z, 月曜) */
   startTs?: number;
   startPrice?: number;
-  /** 1 本あたりの対数リターン標準偏差 (既定 0.002) */
+  /** 1 本あたりの対数リターン標準偏差 (既定 0.0008。1 分足で日次 約 3%、年率 約 60% の暗号資産相当) */
   vol?: number;
-  /** トレンド時の 1 本あたりドリフト (既定 vol × 0.25) */
+  /** トレンド時の 1 本あたりドリフト (既定 vol × 0.03。トレンドが 1 日続いても日次ボラ程度に収める) */
   trendDrift?: number;
   /** レンジ時のアンカーへの引き戻し強さ (1 本あたり, 既定 0.08) */
   rangeReversion?: number;
-  /** 高ボラ時のボラ倍率 (既定 3) */
+  /** 高ボラ時のボラ倍率 (既定 2) */
   highVolMult?: number;
   /** レジーム列を明示する。省略時はランダムに切り替える */
   segments?: SyntheticSegment[];
@@ -100,10 +100,10 @@ export function generateSynthetic(opts: SyntheticOptions = {}): SyntheticResult 
   const rng = createRng(opts.seed ?? 1);
   const tfMs = TIMEFRAME_MS[opts.timeframe ?? "1m"];
   const startTs = opts.startTs ?? Date.UTC(2024, 0, 1);
-  const vol = opts.vol ?? 0.002;
-  const trendDrift = opts.trendDrift ?? vol * 0.25;
+  const vol = opts.vol ?? 0.0008;
+  const trendDrift = opts.trendDrift ?? vol * 0.03;
   const kappa = opts.rangeReversion ?? 0.08;
-  const highVolMult = opts.highVolMult ?? 3;
+  const highVolMult = opts.highVolMult ?? 2;
   const baseVolume = opts.baseVolume ?? 1000;
   const sub = Math.max(1, Math.round(opts.subSteps ?? 6));
 

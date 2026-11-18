@@ -11,9 +11,12 @@ export const ATTRIBUTION_THRESHOLDS = {
   /** 手数料がグロス損益の絶対値のこの割合を超えたら fee_drag */
   feeShareOfGross: 0.5,
   /** 不利方向スリッページ (bps) が想定コスト (costBps) のこの倍数を超えたら slippage */
-  slippageCostMult: 1.5,
-  /** slippage と判定する最小値 (bps)。コスト見積りが 0 の時の誤検知防止 */
-  slippageMinBps: 2,
+  slippageCostMult: 1.0,
+  /**
+   * slippage と判定する最小値 (bps)。PaperBroker の既定は片道 2bps (往復 4bps) なので、
+   * 想定内のずれを拾わないよう、それを超える水準 (6bps) にする。コスト見積りが 0 の時の誤検知防止も兼ねる
+   */
+  slippageMinBps: 6,
   /** late_exit の対象となる「十分な含み益」: MFE がコストのこの倍数以上 */
   lateExitMfeCostMult: 2,
   /**

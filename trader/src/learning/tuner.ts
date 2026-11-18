@@ -50,6 +50,8 @@ export interface TunerOptions {
   revertMarginR: number;
   /** 集計対象のトレードを遡る期間 */
   lookbackMs: number;
+  /** 同じ (戦略, 資産クラス, パラメータ, 変更後の値) の proposed / rejected がこの期間内にあれば再度作らない */
+  dedupeMs: number;
 }
 
 export const DEFAULT_TUNER_OPTIONS: TunerOptions = {
@@ -64,6 +66,7 @@ export const DEFAULT_TUNER_OPTIONS: TunerOptions = {
   minReviewSamples: 20,
   revertMarginR: 0.05,
   lookbackMs: 30 * 86_400_000,
+  dedupeMs: 7 * 86_400_000,
 };
 
 export interface ParamTunerDeps {
@@ -188,6 +191,17 @@ export class ParamTuner {
     return adjs.some((a) => a.status === "applied" && !this.deps.store.kvGet<AdjustmentMeta>(metaKey(a.id))?.reviewed);
   }
 
+  /** 直近 dedupeMs 以内に同じ内容の proposed / rejected があるか (同じ案の繰り返し記録を防ぐ) */
+  private isDuplicate(adjs: ParamAdjustment[], param: string, to: number, now: number): boolean {
+    return adjs.some(
+      (a) =>
+        (a.status === "proposed" || a.status === "rejected") &&
+        a.param === param &&
+        Math.abs(a.to - to) < 1e-12 &&
+        now - a.createdAt <= this.opts.dedupeMs,
+    );
+  }
+
   /** 要因の重みの合計 / 件数 */
   causeShares(trades: TradeRecord[]): Partial<Record<CauseCode, number>> {
     const sums: Partial<Record<CauseCode, number>> = {};
@@ -229,6 +243,7 @@ export class ParamTuner {
         const from = current[pick.param];
         const to = this.nextValue(pick.param, from, pick.direction, bounds);
         if (to === undefined) continue;
+        if (this.isDuplicate(adjs, pick.param, to, now)) continue; // 直近に同じ案がある
         const causeText = rule.codes.map((c) => `${c}(${CAUSE_LABEL[c]})`).join("+");
         const reason = `[rule] 直近 ${recent.length} 件で ${causeText} の比率 ${pct(share)} → ${pick.param} を ${from} → ${to}`;
         out.push(
@@ -261,6 +276,10 @@ export class ParamTuner {
     const from = current[p.param];
     const to = this.nextValue(p.param, from, p.direction, bounds);
     if (to === undefined) return undefined;
+    if (this.isDuplicate(adjs, p.param, to, now)) {
+      log.info("直近に同じ調整案があるため提案を見送り", { strategyId: p.strategyId, assetClass: p.assetClass, param: p.param, to });
+      return undefined;
+    }
     const preTrades = this.deps.store
       .listTrades({ strategyId: p.strategyId, assetClass: p.assetClass, until: now, limit: this.opts.window });
     const reason = `[proposal] ${p.reason} → ${p.param} を ${from} → ${to}`;

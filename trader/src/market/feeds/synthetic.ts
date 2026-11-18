@@ -34,11 +34,14 @@ const seedOf = (seed: number, s: string) => {
 interface SymbolSpec {
   instrument: Instrument;
   startPrice: number;
-  /** 1 秒あたりのボラティリティ (対数収益率の標準偏差) */
+  /** 1 秒あたりのボラティリティ (対数収益率の標準偏差)。年率からは annualToSecSigma で換算 */
   sigma: number;
   spreadBps: number;
   baseVolume: number;
 }
+
+/** 年率ボラティリティ → 1 秒あたりの標準偏差 (365 日連続で動く合成市場として換算) */
+export const annualToSecSigma = (annual: number): number => annual / Math.sqrt(365 * 86_400);
 
 export function defaultSyntheticSpecs(venue = "paper"): SymbolSpec[] {
   const mk = (
@@ -52,32 +55,51 @@ export function defaultSyntheticSpecs(venue = "paper"): SymbolSpec[] {
     startPrice, sigma, spreadBps, baseVolume,
   });
   return [
-    mk("BTC/USDT", "crypto", "BTC", "USDT", 0.01, 0.0001, 5, 0.001, false, 65_000, 0.0003, 1.5, 0.05),
-    mk("ETH/USDT", "crypto", "ETH", "USDT", 0.01, 0.001, 5, 0.001, false, 3_200, 0.0004, 2, 0.8),
-    mk("PEPE/USDT", "meme", "PEPE", "USDT", 1e-9, 1, 5, 0.001, false, 0.000012, 0.0009, 12, 5_000_000, { meta: { liquidityUsd: 2_000_000 } }),
-    mk("USD/JPY", "fx", "USD", "JPY", 0.001, 1, undefined, 0, true, 150, 0.00005, 0.7, 1_000, { contractSize: 1 }),
-    mk("AAPL", "stock", "AAPL", "USD", 0.01, 1, undefined, 0, true, 190, 0.00012, 2, 100),
+    mk("BTC/USDT", "crypto", "BTC", "USDT", 0.01, 0.0001, 5, 0.001, false, 65_000, annualToSecSigma(0.6), 1.5, 0.05),
+    mk("ETH/USDT", "crypto", "ETH", "USDT", 0.01, 0.001, 5, 0.001, false, 3_200, annualToSecSigma(0.75), 2, 0.8),
+    mk("PEPE/USDT", "meme", "PEPE", "USDT", 1e-9, 1, 5, 0.001, false, 0.000012, annualToSecSigma(1.6), 12, 5_000_000, { meta: { liquidityUsd: 2_000_000 } }),
+    mk("USD/JPY", "fx", "USD", "JPY", 0.001, 1, undefined, 0, true, 150, annualToSecSigma(0.1), 0.7, 1_000, { contractSize: 1 }),
+    mk("AAPL", "stock", "AAPL", "USD", 0.01, 1, undefined, 0, true, 190, annualToSecSigma(0.3), 2, 100),
   ];
 }
 
-type Regime = { drift: number; volMul: number; revert: number };
+/**
+ * レジーム。drift は「そのレジーム中の 1 秒あたりドリフト = sigma × driftSigmaMul」。
+ * 0.004 は 1 日続いても日次ボラの 1 倍程度 (BTC 数%、FX 約 0.5%、株 約 2%) に収まる大きさ。
+ * 上昇と下降は対称で、期待ドリフトはゼロ (効率的な市場に近づけ、戦略に人工的なエッジを与えない)。
+ */
+type Regime = { driftSigmaMul: number; volMul: number; revert: number };
 const REGIMES: Regime[] = [
-  { drift: 0.00004, volMul: 1, revert: 0 }, // 上昇
-  { drift: -0.00004, volMul: 1, revert: 0 }, // 下降
-  { drift: 0, volMul: 0.6, revert: 0.02 }, // レンジ
-  { drift: 0, volMul: 2.5, revert: 0 }, // 高ボラ
+  { driftSigmaMul: 0.004, volMul: 1, revert: 0 }, // 上昇
+  { driftSigmaMul: -0.004, volMul: 1, revert: 0 }, // 下降
+  { driftSigmaMul: 0, volMul: 0.7, revert: 0.02 }, // レンジ
+  { driftSigmaMul: 0, volMul: 1.8, revert: 0 }, // 高ボラ
 ];
+
+/** バースト (値動きと出来高の同時急増): 1 秒あたりの発生確率・継続秒数・ボラ倍率・出来高倍率 */
+const BURST_PROB = 1 / 1800;
+const BURST_MIN_SEC = 20;
+const BURST_SPAN_SEC = 100;
+const BURST_VOL_MUL = 3;
+const BURST_VOLUME_MUL = 2.5;
 
 class Path {
   /** 1 秒刻みの価格 (index 0 = t0) */
   prices: number[];
+  /** 1 秒刻みの出来高 (index 0 は平常値)。同じ秒の |リターン| と連動する */
+  volumes: number[];
+  /** 1 秒刻みの標準化リターン (現在の足の方向。板の弱い傾きに使う) */
+  zs: number[];
   private rng: () => number;
   private regime = REGIMES[2];
   private anchor: number;
   private regimeLeft = 0;
+  private burstLeft = 0;
   constructor(readonly spec: SymbolSpec, seed: number) {
     this.rng = mulberry32(seedOf(seed, spec.instrument.symbol));
     this.prices = [spec.startPrice];
+    this.volumes = [spec.baseVolume * 0.1];
+    this.zs = [0];
     this.anchor = spec.startPrice;
   }
   private gauss(): number {
@@ -92,10 +114,20 @@ class Path {
         this.anchor = this.prices[this.prices.length - 1];
       }
       this.regimeLeft--;
+      // バースト: 同じ秒の値動きと出来高を同時に増やす (将来は予告しない)
+      if (this.burstLeft <= 0 && this.rng() < BURST_PROB) this.burstLeft = BURST_MIN_SEC + Math.floor(this.rng() * BURST_SPAN_SEC);
+      const burst = this.burstLeft > 0;
+      if (burst) this.burstLeft--;
       const p = this.prices[this.prices.length - 1];
       const pull = this.regime.revert * Math.log(this.anchor / p);
-      const r = this.regime.drift + pull + this.spec.sigma * this.regime.volMul * this.gauss();
+      const z = this.gauss();
+      const sig = this.spec.sigma * this.regime.volMul * (burst ? BURST_VOL_MUL : 1);
+      const r = this.spec.sigma * this.regime.driftSigmaMul + pull + sig * z;
       this.prices.push(Math.max(p * Math.exp(r), this.spec.instrument.tickSize));
+      this.zs.push(z);
+      // 出来高: 基本ノイズ × (1 + |z|) × バースト。|リターン| が大きい秒ほど増える
+      const noise = 0.3 + 0.7 * this.rng();
+      this.volumes.push(this.spec.baseVolume * 0.1 * noise * (1 + 0.7 * Math.abs(z)) * (burst ? BURST_VOLUME_MUL : 1));
     }
   }
 }
@@ -165,11 +197,14 @@ export class SyntheticFeed implements MarketDataFeed {
     const p = this.path(symbol);
     const tick = p.spec.instrument.tickSize;
     const idx = this.idxAt(q.ts);
+    this.priceAtIdx(p, idx);
+    // 不均衡は主にノイズ。現在の足の方向 (確定済みの z) と弱く連動するだけで、将来の値動きとは無関係
+    const tilt = 0.1 * Math.max(-2, Math.min(2, p.zs[idx] ?? 0));
     const bids: [number, number][] = [];
     const asks: [number, number][] = [];
     for (let i = 0; i < depth; i++) {
-      bids.push([q.bid - i * tick, p.spec.baseVolume * (0.3 + hash01(symbol + "b", idx * 100 + i))]);
-      asks.push([q.ask + i * tick, p.spec.baseVolume * (0.3 + hash01(symbol + "a", idx * 100 + i))]);
+      bids.push([q.bid - i * tick, p.spec.baseVolume * (0.3 + hash01(symbol + "b", idx * 100 + i)) * (1 + tilt)]);
+      asks.push([q.ask + i * tick, p.spec.baseVolume * (0.3 + hash01(symbol + "a", idx * 100 + i)) * (1 - tilt)]);
     }
     return { ts: q.ts, bids, asks };
   }
@@ -185,7 +220,7 @@ export class SyntheticFeed implements MarketDataFeed {
       out.push({
         ts: this.t0 + i * 1000,
         price,
-        size: p.spec.baseVolume * 0.1 * (0.2 + hash01(symbol + "t", i)),
+        size: p.volumes[i],
         side: price >= prev ? "buy" : "sell",
       });
     }
@@ -214,7 +249,7 @@ export class SyntheticFeed implements MarketDataFeed {
         high = Math.max(high, px);
         low = Math.min(low, px);
         close = px;
-        vol += p.spec.baseVolume * 0.1 * (0.2 + hash01(symbol + "t", i));
+        vol += p.volumes[i];
       }
       out.push({ ts: b, open, high, low, close, volume: vol });
     }

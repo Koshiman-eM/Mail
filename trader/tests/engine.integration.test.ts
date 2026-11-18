@@ -7,6 +7,7 @@ import { buildRuntime, type RuntimeOptions } from "../src/engine/setup";
 import { PaperBroker } from "../src/execution/paper";
 import { defaultSyntheticSpecs, mulberry32, SyntheticFeed } from "../src/market/feeds/synthetic";
 import { MemoryStore } from "../src/storage/memory";
+import { RESUME_REQUEST_KEY, requestResume } from "../src/risk/resumeRequest";
 
 const MIN = 60_000;
 const HOUR = 3_600_000;
@@ -115,6 +116,32 @@ describe("TradingEngine 統合 (合成データ + 仮想時計 + MemoryStore)", 
     expect(rt.brokerSet.mode).toBe("paper");
     expect([...rt.brokerSet.brokers.values()].every((b) => b instanceof PaperBroker)).toBe(true);
   });
+
+  it("kv の再開要求 (CLI resume) を次のティックで適用し、要求を消して audit に残す", async () => {
+    const { rt, clock, store } = await runtime({}, { strategies: [fixedStrategy("noop", { classes: ["crypto"] })] });
+    await rt.engine.tick(START);
+    rt.risk.trip("テスト停止", START);
+    expect(rt.risk.state().killSwitch).toBeDefined();
+    // 要求が無ければ解除されない
+    clock.t = START + 15_000;
+    await rt.engine.tick(clock.t);
+    expect(rt.risk.state().killSwitch).toBeDefined();
+    // 別プロセスの CLI が書いた要求
+    requestResume(store, { at: clock.t, by: "cli" });
+    clock.t += 15_000;
+    await rt.engine.tick(clock.t);
+    expect(rt.risk.state().killSwitch).toBeUndefined();
+    expect(store.kvGet(RESUME_REQUEST_KEY)).toBeUndefined();
+    const applied = store.listAudit({ type: "engine.resume_request_applied" });
+    expect(applied).toHaveLength(1);
+    expect(applied[0].data).toMatchObject({ by: "cli", wasKillSwitch: true });
+    expect(store.listAudit({ type: "risk.resume" })).toHaveLength(1);
+    // 要求は 1 回だけ適用される (再度停止しても勝手に解除されない)
+    rt.risk.trip("再停止", clock.t);
+    clock.t += 15_000;
+    await rt.engine.tick(clock.t);
+    expect(rt.risk.state().killSwitch).toBeDefined();
+  }, 60_000);
 
   it("kill switch が新たに発動したら全ポジションを決済し、以後は新規エントリーしない", async () => {
     const strat = fixedStrategy("always_long", { classes: ["crypto"] });

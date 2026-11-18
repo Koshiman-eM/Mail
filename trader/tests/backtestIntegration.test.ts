@@ -41,8 +41,8 @@ describe("synthetic", () => {
   it("レジーム指定どおりに動く (上昇は上がり、下降は下がり、高ボラは振れが大きい)", () => {
     const up = generateSynthetic({ seed: 3, segments: [{ regime: "trend_up", bars: 1000 }] });
     const down = generateSynthetic({ seed: 3, segments: [{ regime: "trend_down", bars: 1000 }] });
-    expect(up.candles[999].close).toBeGreaterThan(up.candles[0].open * 1.1);
-    expect(down.candles[999].close).toBeLessThan(down.candles[0].open * 0.9);
+    expect(up.candles[999].close).toBeGreaterThan(up.candles[0].open * 1.01); // 現実的なドリフトなので 1000 本で +1% 超を要求
+    expect(down.candles[999].close).toBeLessThan(down.candles[0].open * 0.99);
     expect(up.regimes.every((r) => r === "trend_up")).toBe(true);
     const range = (cs: Candle[]) => cs.reduce((a, c) => a + (c.high - c.low) / c.close, 0) / cs.length;
     const hv = generateSynthetic({ seed: 3, segments: [{ regime: "high_vol", bars: 500 }] }).candles;
