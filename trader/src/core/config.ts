@@ -28,8 +28,8 @@ const EnvSchema = z.object({
   NODE_ENV: str("development"),
   TRADING_MODE: str("paper"),
   LIVE_TRADING_CONFIRM: str(),
-  /** 有効にする発注先 (カンマ区切り)。例: "ccxt:bitflyer,oanda,alpaca" */
-  VENUES: str("paper"),
+  /** 使う取引先 (カンマ区切り): synthetic, ccxt, oanda, alpaca, dex */
+  VENUES: str("synthetic"),
   /** 監視銘柄 (カンマ区切り、"venue|symbol|assetClass")。空なら既定のデモ銘柄 */
   WATCHLIST: str(),
   BASE_CURRENCY: str("JPY"),
