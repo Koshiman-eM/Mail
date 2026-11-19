@@ -58,6 +58,12 @@ nav#tabs { display: flex; gap: 4px; padding: 6px 8px; background: var(--card); b
 nav#tabs button { flex: 1 0 auto; padding: 8px 12px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); font: inherit; font-weight: 600; cursor: pointer; }
 nav#tabs button[aria-selected="true"] { background: var(--chip); color: var(--accent); }
 section[hidden] { display: none; }
+.ctl { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 6px; }
+.ctl select { font: inherit; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--fg); }
+.seg { display: inline-flex; flex-wrap: wrap; gap: 2px; background: var(--chip); border-radius: 8px; padding: 2px; }
+.seg button { border: 0; background: transparent; color: var(--muted); font: inherit; font-size: 13px; font-weight: 600; padding: 5px 10px; border-radius: 6px; cursor: pointer; }
+.seg button[aria-pressed="true"] { background: var(--card); color: var(--accent); }
+#candles svg { height: 300px; }
 @media (max-width: 600px) { .dbar { min-width: 56px; } .tone { min-width: 0; } main { padding: 8px; gap: 8px; } .big { font-size: 22px; } th, td { padding: 4px; } }
 </style>
 </head>
@@ -93,6 +99,15 @@ section[hidden] { display: none; }
   <section data-tab="market">
     <h2>計画・情報</h2>
     <div id="plan"></div>
+  </section>
+  <section class="wide" data-tab="overview">
+    <h2>チャート</h2>
+    <div class="ctl">
+      <select id="chartSymbol" aria-label="銘柄"></select>
+      <div id="chartTfs" class="seg" role="group" aria-label="時間足"></div>
+    </div>
+    <div id="candles"></div>
+    <div id="candleInfo" class="muted"></div>
   </section>
   <section class="wide" data-tab="overview">
     <h2>評価額の推移</h2>
@@ -243,7 +258,115 @@ section[hidden] { display: none; }
     set("sentiment", '<div class="scroll">' + h + "</div>");
   }
 
+  // ───── 監視銘柄のチャート (銘柄と時間足はこの端末に記憶する) ─────
+  var CHART_KEY = "dashboard.chart";
+  var chartSel = { symbol: null, tf: null };
+  try { var cs = JSON.parse(localStorage.getItem(CHART_KEY) || "null"); if (cs) chartSel = cs; } catch (e) { /* 既定に戻す */ }
+  var lastStatus = null, lastCandles = null;
+  function saveChartSel() { try { localStorage.setItem(CHART_KEY, JSON.stringify(chartSel)); } catch (e) { /* 無視 */ } }
+  var TF_LABEL = { "1m": "1分", "5m": "5分", "15m": "15分", "1h": "1時間", "4h": "4時間", "1d": "日足" };
+  function syncSymbols(s) {
+    var sel = document.getElementById("chartSymbol");
+    var syms = s.watched.map(function (w) { return w.symbol; });
+    if (sel.options.length !== syms.length || syms.some(function (x, i) { return sel.options[i].value !== x; })) {
+      sel.innerHTML = syms.map(function (x) { return '<option value="' + esc(x) + '">' + esc(x) + "</option>"; }).join("");
+    }
+    if (!chartSel.symbol || syms.indexOf(chartSel.symbol) < 0) chartSel.symbol = syms[0] || null;
+    sel.value = chartSel.symbol || "";
+  }
+  function syncTfs(tfs) {
+    if (!chartSel.tf || tfs.indexOf(chartSel.tf) < 0) chartSel.tf = tfs[0] || null;
+    set("chartTfs", tfs.map(function (tf) {
+      return '<button type="button" data-tf="' + esc(tf) + '" aria-pressed="' + (tf === chartSel.tf ? "true" : "false") + '">' + esc(TF_LABEL[tf] || tf) + "</button>";
+    }).join(""));
+  }
+  function candleChart(cs, lines) {
+    if (!cs || cs.length < 2) return '<p class="muted">足がたまるとチャートを表示します</p>';
+    // 実際の表示幅で描く (縦横比を崩さず、スマホでも文字がつぶれないように)
+    var W = Math.max(300, Math.round(document.getElementById("candles").clientWidth || 800)), H = 300, L = 4, R = 96, T = 8, VOL = 46, B = 22;
+    var ph = H - T - B - VOL - 6;
+    var lo = Infinity, hi = -Infinity, vmax = 0;
+    cs.forEach(function (c) { lo = Math.min(lo, c.low); hi = Math.max(hi, c.high); vmax = Math.max(vmax, c.volume || 0); });
+    lines.forEach(function (l) { if (l.v > lo - (hi - lo) && l.v < hi + (hi - lo)) { lo = Math.min(lo, l.v); hi = Math.max(hi, l.v); } });
+    if (hi === lo) { hi += 1; lo -= 1; }
+    var pad = (hi - lo) * 0.05; lo -= pad; hi += pad;
+    var n = cs.length, step = (W - L - R) / n, bw = Math.max(1, step * 0.7);
+    function X(i) { return L + step * i + step / 2; }
+    function Y(v) { return T + (1 - (v - lo) / (hi - lo)) * ph; }
+    var g = "";
+    for (var k = 0; k <= 4; k++) {
+      var v = lo + (hi - lo) * k / 4, y = Y(v).toFixed(1);
+      g += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + y + '" y2="' + y + '" stroke="var(--line)" />' +
+        '<text x="' + (W - R + 4) + '" y="' + y + '" dominant-baseline="middle" font-size="11" fill="var(--muted)">' + esc(num(v)) + "</text>";
+    }
+    var vy0 = H - B, body = "";
+    cs.forEach(function (c, i) {
+      var up = c.close >= c.open, col = up ? "var(--pos)" : "var(--neg)", x = X(i);
+      var y1 = Y(Math.max(c.open, c.close)), y2 = Y(Math.min(c.open, c.close));
+      body += '<line x1="' + x.toFixed(1) + '" x2="' + x.toFixed(1) + '" y1="' + Y(c.high).toFixed(1) + '" y2="' + Y(c.low).toFixed(1) + '" stroke="' + col + '" />' +
+        '<rect x="' + (x - bw / 2).toFixed(1) + '" y="' + y1.toFixed(1) + '" width="' + bw.toFixed(1) + '" height="' + Math.max(1, y2 - y1).toFixed(1) + '" fill="' + col + '" />';
+      if (vmax > 0 && c.volume > 0) {
+        var vh = (c.volume / vmax) * VOL;
+        body += '<rect x="' + (x - bw / 2).toFixed(1) + '" y="' + (vy0 - vh).toFixed(1) + '" width="' + bw.toFixed(1) + '" height="' + vh.toFixed(1) + '" fill="' + col + '" fill-opacity="0.35" />';
+      }
+    });
+    var ov = "";
+    lines.forEach(function (l) {
+      if (l.v < lo || l.v > hi) return;
+      var y = Y(l.v).toFixed(1);
+      ov += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + y + '" y2="' + y + '" stroke="' + l.color + '" stroke-dasharray="' + (l.dash || "4 3") + '" />' +
+        '<rect x="' + (W - R + 1) + '" y="' + (Number(y) - 8) + '" width="' + (R - 2) + '" height="16" rx="3" fill="' + l.color + '" />' +
+        '<text x="' + (W - R + 4) + '" y="' + y + '" dominant-baseline="middle" font-size="10" fill="#fff">' + esc(l.label + " " + num(l.v)) + "</text>";
+    });
+    var t0 = time(cs[0].ts), t1 = time(cs[n - 1].ts);
+    return '<svg viewBox="0 0 ' + W + " " + H + '" role="img" aria-label="ローソク足チャート">' + g + body + ov +
+      '<text x="' + L + '" y="' + (H - 6) + '" font-size="11" fill="var(--muted)">' + esc(t0) + "</text>" +
+      '<text x="' + (W - R) + '" y="' + (H - 6) + '" text-anchor="end" font-size="11" fill="var(--muted)">' + esc(t1) + "</text></svg>";
+  }
+  function renderCandles() {
+    var data = lastCandles;
+    if (!data || data.symbol !== chartSel.symbol || data.tf !== chartSel.tf) return;
+    var cs = data.candles, lines = [];
+    var last = cs.length ? cs[cs.length - 1] : null;
+    if (last) lines.push({ v: last.close, label: "現在", color: "var(--accent)", dash: "2 2" });
+    (lastStatus ? lastStatus.positions : []).forEach(function (p) {
+      if (p.symbol !== data.symbol) return;
+      lines.push({ v: p.entryPrice, label: "建値", color: "#6b7280" });
+      lines.push({ v: p.stop, label: "損切", color: "var(--neg)" });
+      if (p.takeProfit != null) lines.push({ v: p.takeProfit, label: "利確", color: "var(--pos)" });
+    });
+    set("candles", candleChart(cs, lines));
+    var chg = cs.length > 1 ? (last.close - cs[0].open) / cs[0].open : null;
+    set("candleInfo", last ? esc(data.symbol) + " " + esc(TF_LABEL[data.tf] || data.tf) + " / 現在 " + esc(num(last.close)) +
+      (chg != null ? ' / 表示期間 <span class="' + cls(chg) + '">' + esc((chg > 0 ? "+" : "") + pct(chg)) + "</span>" : "") +
+      " / " + esc(cs.length) + " 本" + (cs.every(function (c) { return !c.volume; }) ? " (出来高なし)" : "") : "");
+  }
+  function loadCandles() {
+    if (!chartSel.symbol) return Promise.resolve();
+    var q = "/api/candles?limit=120&symbol=" + encodeURIComponent(chartSel.symbol) + (chartSel.tf ? "&tf=" + encodeURIComponent(chartSel.tf) : "");
+    return fetch(q, { cache: "no-store" }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); }).then(function (res) {
+      if (res.j && res.j.timeframes) syncTfs(res.j.timeframes);
+      if (!res.ok) { set("candles", '<p class="muted">' + esc(res.j && res.j.error || "チャートを取得できません") + "</p>"); set("candleInfo", ""); return; }
+      lastCandles = res.j;
+      if (!chartSel.tf) chartSel.tf = res.j.tf;
+      renderCandles();
+    });
+  }
+  document.getElementById("chartSymbol").addEventListener("change", function (ev) {
+    chartSel.symbol = ev.target.value; saveChartSel(); set("candles", '<p class="muted">読み込み中…</p>'); loadCandles();
+  });
+  document.getElementById("chartTfs").addEventListener("click", function (ev) {
+    var b = ev.target && ev.target.closest ? ev.target.closest("button[data-tf]") : null;
+    if (!b) return;
+    chartSel.tf = b.getAttribute("data-tf"); saveChartSel();
+    var bs = document.querySelectorAll("#chartTfs button");
+    for (var i = 0; i < bs.length; i++) bs[i].setAttribute("aria-pressed", bs[i] === b ? "true" : "false");
+    set("candles", '<p class="muted">読み込み中…</p>'); loadCandles();
+  });
+
   function renderStatus(s) {
+    lastStatus = s;
+    syncSymbols(s);
     renderSentiment(s);
     var ccy = s.baseCurrency;
     var m = document.getElementById("mode");
@@ -344,7 +467,7 @@ section[hidden] { display: none; }
     if (t) { showTab(t.getAttribute("data-tab")); window.scrollTo(0, 0); }
   });
   function fitHeader() { document.documentElement.style.setProperty("--hdr", document.querySelector("header").offsetHeight + "px"); }
-  window.addEventListener("resize", fitHeader);
+  window.addEventListener("resize", function () { fitHeader(); if (typeof renderCandles === "function") renderCandles(); });
   fitHeader();
   var saved = null;
   try { saved = localStorage.getItem(TAB_KEY); } catch (e) { saved = null; }
@@ -359,6 +482,7 @@ section[hidden] { display: none; }
   function refresh() {
     Promise.all([get("/api/status"), get("/api/trades?limit=50"), get("/api/learning")]).then(function (res) {
       renderStatus(res[0]); renderTrades(res[1]); renderLearning(res[2]);
+      loadCandles().catch(function () { /* チャートだけ失敗しても他の表示は続ける */ });
       document.getElementById("updated").textContent = new Date().toLocaleTimeString("ja-JP");
       document.getElementById("error").textContent = "";
     }).catch(function (e) {

@@ -237,6 +237,18 @@ export class MarketHub {
     return this.symbols.get(symbol)?.lastError;
   }
 
+  /** 保持している時間足 (短い順) */
+  timeframes(): Timeframe[] {
+    return [...this.tfs].sort((a, b) => TIMEFRAME_MS[a] - TIMEFRAME_MS[b]);
+  }
+
+  /** 表示用のローソク足 (形成中の足を含む・昇順・直近 limit 本のコピー)。未登録の銘柄・時間足は undefined */
+  chartCandles(symbol: string, tf: Timeframe, limit = 200): Candle[] | undefined {
+    const s = this.symbols.get(symbol);
+    if (!s || !this.tfs.includes(tf)) return undefined;
+    return (s.candles[tf] ?? []).slice(-Math.max(1, limit)).map((c) => ({ ...c }));
+  }
+
   latestQuote(symbol: string): Quote | undefined {
     return this.symbols.get(symbol)?.quote;
   }

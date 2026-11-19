@@ -43,10 +43,30 @@ async function deps(): Promise<DashboardDeps> {
     baseCurrency: "JPY",
     toAccount: (c) => rt.fx.toAccount(c),
     quoteCurrencyOf: (s) => rt.hub.instrument(s)?.quoteCurrency,
+    chartTimeframes: () => rt.hub.timeframes(),
+    candles: (s, tf, n) => ((rt.hub.timeframes() as string[]).includes(tf) ? rt.hub.chartCandles(s, tf as never, n) : undefined),
   };
 }
 
 describe("ダッシュボード (listen せずにハンドラーを呼ぶ)", () => {
+  it("GET /api/candles: 監視銘柄のローソク足を時間足ごとに返し、監視外の銘柄・時間足は 404", async () => {
+    const d = await deps();
+    const r = await routeDashboard(d, "GET", "/api/candles?symbol=" + encodeURIComponent("BTC/USDT") + "&tf=1m&limit=30");
+    expect(r.status).toBe(200);
+    const body = JSON.parse(r.body);
+    expect(body.timeframes).toContain("1m");
+    expect(body.candles.length).toBeGreaterThan(0);
+    expect(body.candles.length).toBeLessThanOrEqual(30);
+    const c = body.candles.at(-1);
+    expect(c.high).toBeGreaterThanOrEqual(Math.max(c.open, c.close));
+    expect(body.candles.every((x: { ts: number }, i: number, a: { ts: number }[]) => i === 0 || a[i - 1].ts < x.ts)).toBe(true);
+    // 既定の時間足は最も短いもの
+    const def = JSON.parse((await routeDashboard(d, "GET", "/api/candles?symbol=" + encodeURIComponent("BTC/USDT"))).body);
+    expect(def.tf).toBe(body.timeframes[0]);
+    expect((await routeDashboard(d, "GET", "/api/candles?symbol=NOPE&tf=1m")).status).toBe(404);
+    expect((await routeDashboard(d, "GET", "/api/candles?symbol=" + encodeURIComponent("BTC/USDT") + "&tf=3w")).status).toBe(404);
+  });
+
   it("GET /api/status: モード・評価額・リスク・ポジション・計画とブリーフの要約", async () => {
     const d = await deps();
     const r = await routeDashboard(d, "GET", "/api/status");

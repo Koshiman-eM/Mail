@@ -25,7 +25,7 @@ import { RiskManager } from "./risk/manager";
 import { requestResume } from "./risk/resumeRequest";
 import { createStore } from "./storage";
 import { getStrategy } from "./strategies/registry";
-import type { ExitReason } from "./core/types";
+import type { ExitReason, Timeframe } from "./core/types";
 
 // ───────── 引数解析 ─────────
 
@@ -214,6 +214,8 @@ async function cmdRun(io: Io): Promise<number> {
         baseCurrency: config.env.BASE_CURRENCY,
         toAccount: (c) => rt.fx.toAccount(c),
         quoteCurrencyOf: (s) => rt.hub.instrument(s)?.quoteCurrency,
+        chartTimeframes: () => rt.hub.timeframes(),
+        candles: (s, tf, n) => (rt.hub.timeframes() as string[]).includes(tf) ? rt.hub.chartCandles(s, tf as Timeframe, n) : undefined,
       },
       { host: config.env.DASHBOARD_HOST, port: config.env.DASHBOARD_PORT },
     );

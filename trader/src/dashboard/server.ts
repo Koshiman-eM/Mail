@@ -24,6 +24,10 @@ export interface DashboardDeps {
   toAccount?: (ccy: string) => number;
   /** シンボル → クオート通貨 (省略時はシンボルから推定) */
   quoteCurrencyOf?: (symbol: string) => string | undefined;
+  /** チャート用: 選べる時間足 (短い順) */
+  chartTimeframes?: () => string[];
+  /** チャート用: 監視銘柄のローソク足。監視していない銘柄・時間足は undefined (404) */
+  candles?: (symbol: string, tf: string, limit: number) => { ts: number; open: number; high: number; low: number; close: number; volume: number }[] | undefined;
 }
 
 export interface DashboardResponse {
@@ -122,6 +126,14 @@ export async function routeDashboard(deps: DashboardDeps, method: string, rawUrl
         return json(200, await deps.status());
       case "/api/trades":
         return json(200, tradesPayload(deps, parseLimit(url.searchParams.get("limit"))));
+      case "/api/candles": {
+        const symbol = url.searchParams.get("symbol") ?? "";
+        const tfs = deps.chartTimeframes?.() ?? [];
+        const tf = url.searchParams.get("tf") || tfs[0] || "";
+        const candles = deps.candles && symbol ? deps.candles(symbol, tf, parseLimit(url.searchParams.get("limit"), 150, 500)) : undefined;
+        if (!candles) return json(404, { error: "その銘柄・時間足のチャートはありません", timeframes: tfs });
+        return json(200, { symbol, tf, timeframes: tfs, candles });
+      }
       case "/api/learning":
         return json(200, { ...deps.learning.snapshot({ now }), causeLabels: CAUSE_LABEL });
       default:
