@@ -4,6 +4,7 @@
  * DNS rebinding 対策として Host ヘッダーを検証し、許可外は 403 にする。
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { redactSecrets } from "../core/http";
 import { createLogger } from "../core/logger";
 import { systemClock, type Clock, type Store } from "../core/types";
 import { quoteCurrencyOfSymbol } from "../engine/fx";
@@ -110,6 +111,49 @@ export function tradesPayload(deps: DashboardDeps, limit: number) {
   };
 }
 
+/** ライブ画面に出す監査ログの種類 (それ以外は出さない) */
+const EVENT_KIND: Record<string, string> = {
+  "engine.entry": "entry", "engine.exit": "exit", "engine.skip_summary": "skip", "engine.plan": "plan",
+  "engine.order_rejected": "order", "engine.order_error": "order", "engine.order_cancel": "order", "order.unknown_escalated": "order",
+  "order.resolved_by_position": "order", "order.manual_resolve": "order", "engine.entries_paused": "risk", "engine.entries_resumed": "risk",
+  "risk.halt_daily": "risk", "risk.kill_switch": "risk", "risk.resume": "risk", "engine.kill_switch_close": "risk", "engine.account_degraded": "risk",
+  "learning.param_adjust": "learning", "learning.param_revert": "learning", "learning.reflect": "learning", "engine.learning": "learning",
+  "engine.start": "system", "engine.stop": "system", "engine.intel_error": "intel", "reconcile.external_close": "order",
+};
+/** 表示してよい項目だけを取り出す (文字列は伏せ字処理を通す) */
+const EVENT_FIELDS = ["symbol", "strategyId", "direction", "reason", "price", "exitPrice", "netPnl", "rMultiple", "qty", "riskOn", "status", "estimated", "param", "from", "to"];
+
+export interface LiveEvent {
+  ts: number;
+  type: string;
+  kind: string;
+  data: Record<string, string | number | boolean>;
+}
+
+/** 監査ログをライブ画面用に変換する (新しい順。since より後だけ) */
+export function liveEvents(store: Store, opts: { since?: number; limit: number }): LiveEvent[] {
+  const out: LiveEvent[] = [];
+  for (const e of store.listAudit({ ...(opts.since !== undefined ? { since: opts.since } : {}), limit: opts.limit * 4 }).slice().sort((a, b) => b.ts - a.ts)) {
+    const kind = EVENT_KIND[e.type];
+    if (!kind || (opts.since !== undefined && e.ts <= opts.since)) continue;
+    const data: Record<string, string | number | boolean> = {};
+    for (const k of EVENT_FIELDS) {
+      const v = (e.data as Record<string, unknown>)[k];
+      if (typeof v === "number" && Number.isFinite(v)) data[k] = v;
+      else if (typeof v === "boolean") data[k] = v;
+      else if (typeof v === "string") data[k] = redactSecrets(v).slice(0, 120);
+    }
+    if (e.type === "engine.skip_summary" && e.data.reasons && typeof e.data.reasons === "object") {
+      const top = Object.entries(e.data.reasons as Record<string, { count?: number }>).slice(0, 3).map(([k, v]) => `${redactSecrets(k).slice(0, 40)}×${Number(v?.count) || 0}`);
+      data.reason = top.join(" / ");
+    }
+    if (e.type === "engine.plan" && Array.isArray(e.data.activeSymbols)) data.active = e.data.activeSymbols.length;
+    out.push({ ts: e.ts, type: e.type, kind, data });
+    if (out.length >= opts.limit) break;
+  }
+  return out;
+}
+
 /** ルーティング (listen せずにテストから呼べる) */
 export async function routeDashboard(deps: DashboardDeps, method: string, rawUrl: string): Promise<DashboardResponse> {
   if (method !== "GET" && method !== "HEAD") {
@@ -133,6 +177,10 @@ export async function routeDashboard(deps: DashboardDeps, method: string, rawUrl
         const candles = deps.candles && symbol ? deps.candles(symbol, tf, parseLimit(url.searchParams.get("limit"), 150, 500)) : undefined;
         if (!candles) return json(404, { error: "その銘柄・時間足のチャートはありません", timeframes: tfs });
         return json(200, { symbol, tf, timeframes: tfs, candles });
+      }
+      case "/api/events": {
+        const sinceRaw = Number(url.searchParams.get("since"));
+        return json(200, { events: liveEvents(deps.store, { ...(Number.isFinite(sinceRaw) && sinceRaw > 0 ? { since: sinceRaw } : {}), limit: parseLimit(url.searchParams.get("limit"), 30, 100) }) });
       }
       case "/api/learning":
         return json(200, { ...deps.learning.snapshot({ now }), causeLabels: CAUSE_LABEL });

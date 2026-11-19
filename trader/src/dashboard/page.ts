@@ -58,6 +58,26 @@ nav#tabs { display: flex; gap: 4px; padding: 6px 8px; background: var(--card); b
 nav#tabs button { flex: 1 0 auto; padding: 8px 12px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); font: inherit; font-weight: 600; cursor: pointer; }
 nav#tabs button[aria-selected="true"] { background: var(--chip); color: var(--accent); }
 section[hidden] { display: none; }
+section.live { background: #05070d; border-color: #1b2233; color: #cfd8ea; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Noto Sans JP", monospace; }
+.lv-top { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; font-size: 12px; margin-bottom: 6px; }
+.lv-dot { width: 8px; height: 8px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 8px #22c55e; animation: lvBlink 1.2s infinite; align-self: center; }
+.lv-tag { color: #22c55e; font-weight: 700; letter-spacing: .1em; }
+.lv-k { color: #64748b; letter-spacing: .08em; }
+.lv-v { color: #f8fafc; font-weight: 700; font-variant-numeric: tabular-nums; }
+.lv-v.up { color: #4ade80; text-shadow: 0 0 8px rgba(74,222,128,.6); } .lv-v.down { color: #f87171; text-shadow: 0 0 8px rgba(248,113,113,.6); }
+.lv-stage { position: relative; border: 1px solid #1b2233; border-radius: 8px; overflow: hidden; background: radial-gradient(ellipse at center, #0b1224 0%, #05070d 70%); }
+#lvCanvas { display: block; width: 100%; height: 420px; }
+.lv-toast { position: absolute; left: 50%; top: 10px; transform: translateX(-50%); font-size: 12px; padding: 3px 10px; border-radius: 6px; background: rgba(15,23,42,.85); border: 1px solid #334155; color: #e2e8f0; opacity: 0; transition: opacity .3s; pointer-events: none; white-space: nowrap; }
+.lv-toast.on { opacity: 1; }
+.lv-legend { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11px; margin: 6px 0 2px; }
+.lv-h { color: #64748b; letter-spacing: .1em; font-size: 12px !important; margin-top: 10px !important; }
+.lv-trace { list-style: none; margin: 0; padding: 0; max-height: 260px; overflow-y: auto; font-size: 12px; }
+.lv-trace li { display: grid; grid-template-columns: 44px 64px 1fr; gap: 6px; padding: 4px 2px; border-bottom: 1px dashed #1b2233; animation: lvIn .5s ease-out; }
+.lv-trace .t { color: #64748b; } .lv-trace .k { font-weight: 700; } .lv-trace .d { color: #cbd5e1; overflow-wrap: anywhere; }
+@keyframes lvBlink { 50% { opacity: .25; } }
+@keyframes lvIn { from { opacity: 0; transform: translateX(-12px); background: rgba(56,189,248,.18); } to { opacity: 1; transform: none; background: transparent; } }
+@media (max-width: 600px) { #lvCanvas { height: 360px; } }
+@media (prefers-reduced-motion: reduce) { .lv-dot, .lv-trace li { animation: none; } }
 .ctl { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 6px; }
 .ctl select { font: inherit; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--fg); }
 .seg { display: inline-flex; flex-wrap: wrap; gap: 2px; background: var(--chip); border-radius: 8px; padding: 2px; }
@@ -76,6 +96,7 @@ section[hidden] { display: none; }
   <span id="error" class="err"></span>
 </header>
 <nav id="tabs" role="tablist">
+  <button type="button" data-tab="live">ライブ</button>
   <button type="button" data-tab="overview">概要</button>
   <button type="button" data-tab="market">強気・弱気</button>
   <button type="button" data-tab="positions">ポジション</button>
@@ -83,6 +104,19 @@ section[hidden] { display: none; }
   <button type="button" data-tab="learning">学習</button>
 </nav>
 <main>
+  <section class="wide live" data-tab="live">
+    <div class="lv-top">
+      <span class="lv-dot"></span><span class="lv-tag">LIVE</span>
+      <span class="lv-k">評価額</span><span id="lvEquity" class="lv-v">-</span>
+      <span class="lv-k">損益</span><span id="lvPnl" class="lv-v">-</span>
+      <span class="lv-k">市場</span><span id="lvRisk" class="lv-v">-</span>
+      <span class="lv-k">TICK</span><span id="lvTick" class="lv-v">-</span>
+    </div>
+    <div class="lv-stage"><canvas id="lvCanvas" aria-label="判断の流れのアニメーション"></canvas><div id="lvToast" class="lv-toast"></div></div>
+    <div class="lv-legend"><span style="color:#38bdf8">● 情報源</span><span style="color:#f59e0b">● 銘柄</span><span style="color:#a78bfa">● 戦略</span><span style="color:#f472b6">● リスク管理</span><span style="color:#34d399">● 取引所</span></div>
+    <h2 class="lv-h">TRACE ― 判断の記録</h2>
+    <ul id="lvTrace" class="lv-trace"></ul>
+  </section>
   <section data-tab="overview">
     <h2>評価額</h2>
     <div id="equity" class="big">-</div>
@@ -364,8 +398,286 @@ section[hidden] { display: none; }
     set("candles", '<p class="muted">読み込み中…</p>'); loadCandles();
   });
 
+  // ───── ライブ: 判断の流れをネットワークのアニメーションで表示する ─────
+  var LV = (function () {
+    var STRATS = ["scalp_obi", "scalp_vwap_revert", "scalp_momentum_burst", "short_ema_trend", "short_rsi_revert", "short_breakout", "mid_trend_follow", "long_momentum", "meme_momentum"];
+    var SLABEL = { scalp_obi: "板の偏り", scalp_vwap_revert: "VWAP逆張り", scalp_momentum_burst: "急騰ブレイク", short_ema_trend: "EMAトレンド", short_rsi_revert: "RSI逆張り", short_breakout: "ブレイクアウト", mid_trend_follow: "中期トレンド", long_momentum: "長期モメンタム", meme_momentum: "ミーム" };
+    var SOURCES = ["ニュース", "Fear&Greed", "CoinGecko", "DexScreener", "経済指標"];
+    var C = { src: "#38bdf8", sym: "#f59e0b", strat: "#a78bfa", risk: "#f472b6", ex: "#34d399", core: "#e2e8f0", up: "#4ade80", down: "#f87171" };
+    var cv = document.getElementById("lvCanvas"), ctx = cv.getContext("2d");
+    var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    var W = 0, H = 0, dpr = 1, nodes = {}, edges = [], dendrites = [], dust = [], particles = [], visible = true, raf = 0, last = 0;
+    var state = { symbols: [], sentiment: {}, enabled: {}, weights: {}, venue: "取引所", riskOn: 0 };
+    function rand(a, b) { return a + Math.random() * (b - a); }
+    function node(id, label, kind, x, y, r, color) {
+      var n = nodes[id] || { pulse: 0, flash: null };
+      n.id = id; n.label = label; n.kind = kind; n.x = x; n.y = y; n.r = r; n.color = color;
+      nodes[id] = n; return n;
+    }
+    function edge(a, b, color) { edges.push({ a: a, b: b, color: color, bend: rand(-0.25, 0.25) }); }
+    function layout() {
+      var rect = cv.getBoundingClientRect();
+      dpr = Math.min(2, window.devicePixelRatio || 1);
+      W = Math.max(280, rect.width); H = Math.max(260, rect.height);
+      cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      var cx = W / 2, cy = H * 0.5, R = Math.min(W, H) * 0.42, small = W < 500;
+      var keep = {}; edges = [];
+      function arc(list, a0, a1, rr, f, sx) {
+        list.forEach(function (it, i) {
+          var t = list.length === 1 ? 0.5 : i / (list.length - 1), a = a0 + (a1 - a0) * t;
+          f(it, cx + Math.cos(a) * rr * (sx != null ? sx : small ? 1.05 : 1.25), cy + Math.sin(a) * rr);
+        });
+      }
+      var core = node("core", "AI エンジン", "core", cx, cy, small ? 22 : 28, C.core); keep.core = 1;
+      arc(SOURCES, Math.PI * 0.76, Math.PI * 1.24, R, function (n, x, y) { node("src:" + n, n, "src", x, y, 7, C.src); keep["src:" + n] = 1; edge("src:" + n, "core", C.src); });
+      var syms = state.symbols.length ? state.symbols : ["-"];
+      var spread = Math.min(0.12, 0.04 * syms.length);
+      arc(syms, Math.PI * (1.5 - spread), Math.PI * (1.5 + spread), R * 0.92, function (n, x, y) {
+        var sv = state.sentiment[n], col = sv == null ? C.sym : sv > 0.1 ? C.up : sv < -0.1 ? C.down : C.sym;
+        node("sym:" + n, n, "sym", x, y, 9, col); keep["sym:" + n] = 1; edge("sym:" + n, "core", C.sym);
+      }, small ? 1.3 : 1.6);
+      arc(STRATS, -Math.PI * 0.2, Math.PI * 0.22, R, function (n, x, y) {
+        var w = state.weights[n] != null ? state.weights[n] : 1;
+        node("st:" + n, SLABEL[n] || n, "strat", x, y, 4 + 4 * Math.min(1.5, w), C.strat); keep["st:" + n] = 1;
+        edge("core", "st:" + n, C.strat); edge("st:" + n, "risk", C.strat);
+      });
+      node("risk", "リスク管理", "risk", cx + R * 0.22, cy + R * 0.86, 12, C.risk); keep.risk = 1;
+      node("ex", state.venue, "ex", cx - R * 0.32, cy + R * 0.86, 13, C.ex); keep.ex = 1;
+      edge("risk", "ex", C.risk); edge("ex", "core", C.ex);
+      Object.keys(nodes).forEach(function (k) { if (!keep[k]) delete nodes[k]; });
+      // 中心から伸びる樹状の光 (飾り)
+      dendrites = [];
+      function grow(x, y, a, len, depth, col) {
+        if (depth <= 0 || len < 4) return;
+        var x2 = x + Math.cos(a) * len, y2 = y + Math.sin(a) * len;
+        dendrites.push([x, y, x2, y2, col, depth]);
+        grow(x2, y2, a + rand(-0.6, 0.1), len * rand(0.62, 0.8), depth - 1, col);
+        if (Math.random() < 0.7) grow(x2, y2, a + rand(0.1, 0.7), len * rand(0.5, 0.72), depth - 1, col);
+      }
+      var cols = [C.src, C.sym, C.strat, C.risk, C.ex];
+      for (var i = 0; i < (small ? 10 : 16); i++) grow(cx, cy, (i / (small ? 10 : 16)) * Math.PI * 2 + rand(-0.2, 0.2), R * rand(0.18, 0.3), 5, cols[i % cols.length]);
+      dust = [];
+      for (var j = 0; j < (small ? 70 : 140); j++) dust.push({ x: rand(0, W), y: rand(0, H), r: rand(0.3, 1.3), v: rand(0.02, 0.12), p: rand(0, 6) });
+      void core;
+    }
+    function ctrl(e) {
+      var a = nodes[e.a], b = nodes[e.b];
+      var mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2, dx = b.x - a.x, dy = b.y - a.y;
+      return { a: a, b: b, cx: mx - dy * e.bend, cy: my + dx * e.bend };
+    }
+    function qp(c, t) {
+      var u = 1 - t;
+      return { x: u * u * c.a.x + 2 * u * t * c.cx + t * t * c.b.x, y: u * u * c.a.y + 2 * u * t * c.cy + t * t * c.b.y };
+    }
+    function findEdge(a, b) { for (var i = 0; i < edges.length; i++) if (edges[i].a === a && edges[i].b === b) return edges[i]; return null; }
+    function shoot(a, b, color, size, delay, then) {
+      var e = findEdge(a, b); if (!e || !nodes[a] || !nodes[b]) return;
+      particles.push({ e: e, t: -(delay || 0), sp: rand(0.5, 0.8), color: color || e.color, size: size || 2.2, then: then, trail: [] });
+    }
+    function pulse(id, color) { var n = nodes[id]; if (n) { n.pulse = 1; n.flash = color || null; } }
+    function toast(text, color) {
+      var el = document.getElementById("lvToast");
+      el.textContent = text; el.style.color = color || "#e2e8f0"; el.className = "lv-toast on";
+      clearTimeout(toast._t); toast._t = setTimeout(function () { el.className = "lv-toast"; }, 3500);
+    }
+    function ambient(dt) {
+      if (reduce) return;
+      var rate = 2.2 * dt;
+      while (Math.random() < rate) {
+        rate -= 1;
+        var e = edges[(Math.random() * edges.length) | 0];
+        if (e) particles.push({ e: e, t: 0, sp: rand(0.25, 0.45), color: e.color, size: rand(0.8, 1.5), trail: [] });
+      }
+    }
+    function draw(ts) {
+      raf = 0;
+      if (!visible) return;
+      var dt = last ? Math.min(0.1, (ts - last) / 1000) : 0.016; last = ts;
+      ctx.clearRect(0, 0, W, H);
+      ctx.globalCompositeOperation = "lighter";
+      dust.forEach(function (d) {
+        d.y -= d.v; d.p += dt * 2; if (d.y < 0) { d.y = H; d.x = rand(0, W); }
+        ctx.fillStyle = "rgba(148,163,184," + (0.15 + 0.15 * Math.sin(d.p)) + ")";
+        ctx.beginPath(); ctx.arc(d.x, d.y, d.r, 0, 7); ctx.fill();
+      });
+      var breathe = 0.55 + 0.25 * Math.sin(ts / 900);
+      dendrites.forEach(function (l) {
+        ctx.strokeStyle = l[4]; ctx.globalAlpha = 0.08 + 0.05 * l[5] * breathe; ctx.lineWidth = 0.4 + l[5] * 0.25;
+        ctx.beginPath(); ctx.moveTo(l[0], l[1]); ctx.lineTo(l[2], l[3]); ctx.stroke();
+      });
+      edges.forEach(function (e) {
+        var c = ctrl(e);
+        ctx.strokeStyle = e.color; ctx.globalAlpha = 0.16; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(c.a.x, c.a.y); ctx.quadraticCurveTo(c.cx, c.cy, c.b.x, c.b.y); ctx.stroke();
+      });
+      ctx.globalAlpha = 1;
+      ambient(dt);
+      for (var i = particles.length - 1; i >= 0; i--) {
+        var p = particles[i]; p.t += dt * p.sp;
+        if (p.t < 0) continue;
+        var c = ctrl(p.e), pt = qp(c, Math.min(1, p.t));
+        p.trail.push(pt); if (p.trail.length > 10) p.trail.shift();
+        for (var k = 0; k < p.trail.length; k++) {
+          var q = p.trail[k], f = (k + 1) / p.trail.length;
+          ctx.globalAlpha = 0.5 * f; ctx.fillStyle = p.color;
+          ctx.beginPath(); ctx.arc(q.x, q.y, p.size * f, 0, 7); ctx.fill();
+        }
+        ctx.globalAlpha = 1; ctx.shadowColor = p.color; ctx.shadowBlur = 10;
+        ctx.beginPath(); ctx.arc(pt.x, pt.y, p.size, 0, 7); ctx.fill(); ctx.shadowBlur = 0;
+        if (p.t >= 1) { particles.splice(i, 1); if (p.then) p.then(); else if (p.size > 1.8) pulse(p.e.b); }
+      }
+      Object.keys(nodes).forEach(function (id) {
+        var n = nodes[id], col = n.flash || n.color, r = n.r * (n.kind === "core" ? 1 + 0.06 * Math.sin(ts / 500) : 1);
+        var g = ctx.createRadialGradient(n.x, n.y, 0, n.x, n.y, r * 3.2);
+        g.addColorStop(0, col); g.addColorStop(0.35, col + "55"); g.addColorStop(1, "rgba(0,0,0,0)");
+        ctx.globalAlpha = 0.9; ctx.fillStyle = g; ctx.beginPath(); ctx.arc(n.x, n.y, r * 3.2, 0, 7); ctx.fill();
+        ctx.globalAlpha = n.kind === "strat" && state.enabled[n.id.slice(3)] === false ? 0.35 : 1;
+        ctx.fillStyle = n.kind === "core" ? "#f8fafc" : col; ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, 7); ctx.fill();
+        if (n.pulse > 0) {
+          ctx.globalAlpha = n.pulse; ctx.strokeStyle = col; ctx.lineWidth = 2;
+          ctx.beginPath(); ctx.arc(n.x, n.y, r + (1 - n.pulse) * 26, 0, 7); ctx.stroke();
+          n.pulse = Math.max(0, n.pulse - dt * 1.2); if (n.pulse === 0) n.flash = null;
+        }
+        ctx.globalAlpha = 1;
+      });
+      ctx.globalCompositeOperation = "source-over";
+      ctx.font = (W < 500 ? 9 : 11) + "px ui-monospace, Menlo, monospace"; ctx.textAlign = "center";
+      Object.keys(nodes).forEach(function (id) {
+        var n = nodes[id];
+        if (n.kind === "core") {
+          ctx.fillStyle = "#0b1224"; ctx.font = "bold " + (W < 500 ? 11 : 13) + "px ui-monospace, Menlo, monospace"; ctx.fillText("AI", n.x, n.y + 4);
+          ctx.font = (W < 500 ? 9 : 11) + "px ui-monospace, Menlo, monospace"; ctx.fillStyle = "#cbd5e1"; ctx.fillText(n.label, n.x, n.y + n.r + 14);
+          return;
+        }
+        ctx.fillStyle = n.kind === "strat" && state.enabled[n.id.slice(3)] === false ? "#64748b" : "#e2e8f0";
+        var lx = n.x, ly = n.y + n.r + 12;
+        if (n.kind === "strat") { ctx.textAlign = "right"; lx = n.x - n.r - 5; ly = n.y + 3; }
+        if (n.kind === "src") { ctx.textAlign = "left"; lx = n.x + n.r + 5; ly = n.y + 3; }
+        ctx.lineWidth = 3; ctx.strokeStyle = "rgba(5,7,13,0.85)"; ctx.strokeText(n.label, lx, ly);
+        ctx.fillText(n.label, lx, ly); ctx.textAlign = "center";
+      });
+      if (!reduce || particles.length) raf = requestAnimationFrame(draw);
+    }
+    function start() { if (!raf && visible) { last = 0; raf = requestAnimationFrame(draw); } }
+    var api = {
+      setVisible: function (v) { visible = v; if (v) { layout(); start(); } },
+      update: function (s, learn) {
+        var syms = s.watched.map(function (w) { return w.symbol; });
+        var sent = {};
+        if (s.brief) s.brief.biases.forEach(function (b) { sent[String(b.asset).toUpperCase()] = b.sentiment; });
+        var symSent = {}; syms.forEach(function (x) { var v = sent[baseOf(x)]; if (v != null) symSent[x] = v; });
+        var enabled = {};
+        if (s.plan) { STRATS.forEach(function (id) { enabled[id] = false; }); s.plan.symbols.forEach(function (x) { x.enabledStrategies.forEach(function (id) { enabled[id] = true; }); }); }
+        var weights = {};
+        if (learn && learn.arms) learn.arms.forEach(function (a) { var id = String(a.key).split("|")[0]; weights[id] = Math.max(weights[id] || 0, a.weight); });
+        var venue = s.watched.length ? String(s.watched[0].venue).replace(/^ccxt:/, "") : "取引所";
+        var changed = syms.join() !== state.symbols.join() || venue !== state.venue || JSON.stringify(symSent) !== JSON.stringify(state.sentiment) || JSON.stringify(enabled) !== JSON.stringify(state.enabled);
+        state.symbols = syms; state.sentiment = symSent; state.enabled = enabled; state.weights = weights; state.venue = venue; state.riskOn = s.brief ? s.brief.riskOn : 0;
+        if (changed || !W) layout();
+        // 市場データの取り込み (毎回)
+        syms.forEach(function (x, i) { shoot("sym:" + x, "core", C.sym, 2, i * 0.15); });
+        start();
+      },
+      event: function (e) {
+        var d = e.data || {}, st = d.strategyId ? "st:" + d.strategyId : null;
+        if (e.kind === "entry") {
+          toast("▲ エントリー " + (d.symbol || "") + " " + (SLABEL[d.strategyId] || d.strategyId || ""), C.up);
+          if (d.symbol) shoot("sym:" + d.symbol, "core", C.up, 3);
+          shoot("core", st || "st:scalp_obi", C.up, 3, 0.3, function () { shoot(st || "st:scalp_obi", "risk", C.up, 3, 0, function () { pulse("risk", C.up); shoot("risk", "ex", C.up, 3.5, 0, function () { pulse("ex", C.up); }); }); });
+        } else if (e.kind === "exit") {
+          var win = typeof d.netPnl === "number" && d.netPnl > 0, col = win ? C.up : C.down;
+          toast("■ 決済 " + (d.symbol || "") + " " + (typeof d.netPnl === "number" ? (d.netPnl > 0 ? "+" : "") + num(d.netPnl, 0) : ""), col);
+          pulse("ex", col); shoot("ex", "core", col, 3.5, 0, function () { pulse("core", col); });
+        } else if (e.kind === "skip") {
+          shoot("core", "st:scalp_obi", "#94a3b8", 1.8, 0, function () { shoot("st:scalp_obi", "risk", "#94a3b8", 1.8, 0, function () { pulse("risk", C.down); }); });
+        } else if (e.kind === "plan") {
+          toast("◆ 計画を更新 (リスクオン " + signed(Number(d.riskOn) || 0, 2) + ")", C.src);
+          SOURCES.forEach(function (n, i) { shoot("src:" + n, "core", C.src, 2.6, i * 0.12); });
+          STRATS.forEach(function (n, i) { shoot("core", "st:" + n, C.strat, 2, 0.8 + i * 0.06); });
+        } else if (e.kind === "risk" || e.kind === "order") {
+          toast("! " + label(e), C.risk); pulse("risk", C.risk);
+        } else if (e.kind === "learning") {
+          pulse("core", C.strat);
+        }
+        start();
+      },
+    };
+    window.addEventListener("resize", function () { if (visible) { layout(); start(); } });
+    document.addEventListener("visibilitychange", function () { if (!document.hidden && visible) start(); });
+    return api;
+  })();
+  window.__lv = LV;
+
+  var EVT = { entry: ["ENTRY", "#4ade80"], exit: ["EXIT", "#fbbf24"], skip: ["SKIP", "#94a3b8"], plan: ["PLAN", "#38bdf8"], order: ["ORDER", "#f472b6"], risk: ["RISK", "#f87171"], learning: ["LEARN", "#a78bfa"], system: ["SYS", "#64748b"], intel: ["INTEL", "#38bdf8"] };
+  function label(e) {
+    var d = e.data || {};
+    switch (e.type) {
+      case "engine.entry": return (d.symbol || "") + " " + (DIR[d.direction] || "") + "エントリー @" + num(d.price) + " (" + (d.strategyId || "") + ")";
+      case "engine.exit": return (d.symbol || "") + " 決済 @" + num(d.exitPrice) + " " + (EXIT[d.reason] || d.reason || "") + (typeof d.netPnl === "number" ? " 損益 " + signed(d.netPnl, 0) : "") + (typeof d.rMultiple === "number" ? " (" + num(d.rMultiple, 2) + "R)" : "");
+      case "engine.skip_summary": return "見送り: " + (d.reason || "-");
+      case "engine.plan": return "計画を更新 (対象 " + (d.active != null ? d.active : "-") + " 銘柄 / リスクオン " + signed(Number(d.riskOn) || 0, 2) + ")";
+      case "engine.order_rejected": return (d.symbol || "") + " 注文が拒否されました " + (d.reason || "");
+      case "engine.order_error": return (d.symbol || "") + " 発注エラー " + (d.reason || "");
+      case "engine.order_cancel": return (d.symbol || "") + " 注文を取消";
+      case "order.unknown_escalated": return (d.symbol || "") + " 注文の状態が不明 (新規エントリーを停止)";
+      case "engine.entries_paused": return "新規エントリーを停止";
+      case "engine.entries_resumed": return "新規エントリーを再開";
+      case "risk.halt_daily": return "日次損失の上限で当日停止";
+      case "risk.kill_switch": return "キルスイッチ作動";
+      case "risk.resume": return "停止を解除";
+      case "learning.param_adjust": return "パラメータ調整 " + (d.strategyId || "") + " " + (d.param || "") + " " + (d.from != null ? d.from + "→" + d.to : "");
+      case "learning.param_revert": return "パラメータを元に戻す " + (d.strategyId || "") + " " + (d.param || "");
+      case "learning.reflect": return "振り返りを実行";
+      case "engine.start": return "エンジン起動";
+      case "engine.stop": return "エンジン停止";
+      default: return e.type;
+    }
+  }
+  var lvSince = 0, lvBooted = false, lvEquity = null;
+  function countTo(el, to, fmt) {
+    var from = el.__v != null ? el.__v : to, t0 = performance.now();
+    el.__v = to;
+    function step(now) {
+      var k = Math.min(1, (now - t0) / 700), v = from + (to - from) * (1 - Math.pow(1 - k, 3));
+      el.textContent = fmt(v); if (k < 1) requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  }
+  function renderLiveTop(s) {
+    var e = s.equity, ccy = s.baseCurrency, el = document.getElementById("lvEquity");
+    countTo(el, e.current, function (v) { return num(v, 0) + " " + ccy; });
+    el.className = "lv-v" + (lvEquity != null && e.current !== lvEquity ? (e.current > lvEquity ? " up" : " down") : "");
+    lvEquity = e.current;
+    var diff = e.current - e.initial, pe = document.getElementById("lvPnl");
+    countTo(pe, diff, function (v) { return signed(v, 0); });
+    pe.className = "lv-v " + (diff > 0 ? "up" : diff < 0 ? "down" : "");
+    var r = s.brief ? s.brief.riskOn : null, re = document.getElementById("lvRisk");
+    re.textContent = r == null ? "-" : (r >= 0.1 ? "強気 " : r <= -0.1 ? "弱気 " : "中立 ") + signed(r, 2);
+    re.className = "lv-v " + (r > 0.1 ? "up" : r < -0.1 ? "down" : "");
+    document.getElementById("lvTick").textContent = String(s.tickCount);
+  }
+  function loadEvents() {
+    return get("/api/events?limit=30" + (lvSince ? "&since=" + lvSince : "")).then(function (r) {
+      var evs = r.events || [];
+      if (!evs.length) return;
+      lvSince = Math.max(lvSince, evs[0].ts);
+      var ul = document.getElementById("lvTrace"), html = "";
+      evs.forEach(function (e) {
+        var k = EVT[e.kind] || [e.kind, "#94a3b8"], d = new Date(e.ts);
+        html += '<li><span class="t">' + esc(("0" + d.getHours()).slice(-2) + ":" + ("0" + d.getMinutes()).slice(-2)) + '</span><span class="k" style="color:' + k[1] + '">' + esc(k[0]) + '</span><span class="d">' + esc(label(e)) + "</span></li>";
+      });
+      ul.insertAdjacentHTML("afterbegin", html);
+      while (ul.children.length > 60) ul.removeChild(ul.lastChild);
+      // 初回は最新の数件だけ動かす (古い記録を一度に流さない)
+      (lvBooted ? evs : evs.slice(0, 2)).slice().reverse().forEach(function (e, i) { setTimeout(function () { LV.event(e); }, i * 900); });
+      lvBooted = true;
+    });
+  }
+
   function renderStatus(s) {
     lastStatus = s;
+    renderLiveTop(s);
     syncSymbols(s);
     renderSentiment(s);
     var ccy = s.baseCurrency;
@@ -456,10 +768,11 @@ section[hidden] { display: none; }
     var btns = document.querySelectorAll("nav#tabs button");
     var ok = false;
     for (var i = 0; i < btns.length; i++) if (btns[i].getAttribute("data-tab") === name) ok = true;
-    if (!ok) name = "overview";
+    if (!ok) name = "live";
     for (var j = 0; j < btns.length; j++) btns[j].setAttribute("aria-selected", btns[j].getAttribute("data-tab") === name ? "true" : "false");
     var secs = document.querySelectorAll("main section[data-tab]");
     for (var k = 0; k < secs.length; k++) secs[k].hidden = secs[k].getAttribute("data-tab") !== name;
+    if (window.__lv) window.__lv.setVisible(name === "live");
     try { localStorage.setItem(TAB_KEY, name); } catch (e) { /* 保存できなくても表示は続ける */ }
   }
   document.getElementById("tabs").addEventListener("click", function (ev) {
@@ -471,7 +784,7 @@ section[hidden] { display: none; }
   fitHeader();
   var saved = null;
   try { saved = localStorage.getItem(TAB_KEY); } catch (e) { saved = null; }
-  showTab(saved || "overview");
+  showTab(saved || "live");
 
   function get(path) {
     return fetch(path, { cache: "no-store" }).then(function (r) {
@@ -482,6 +795,8 @@ section[hidden] { display: none; }
   function refresh() {
     Promise.all([get("/api/status"), get("/api/trades?limit=50"), get("/api/learning")]).then(function (res) {
       renderStatus(res[0]); renderTrades(res[1]); renderLearning(res[2]);
+      LV.update(res[0], res[2]);
+      loadEvents().catch(function () { /* ライブの記録だけ失敗しても他の表示は続ける */ });
       loadCandles().catch(function () { /* チャートだけ失敗しても他の表示は続ける */ });
       document.getElementById("updated").textContent = new Date().toLocaleTimeString("ja-JP");
       document.getElementById("error").textContent = "";

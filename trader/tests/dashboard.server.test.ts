@@ -49,6 +49,21 @@ async function deps(): Promise<DashboardDeps> {
 }
 
 describe("ダッシュボード (listen せずにハンドラーを呼ぶ)", () => {
+  it("GET /api/events: ライブ用の記録は許可した種類・項目だけを新しい順に返し、文字列は伏せ字にする", async () => {
+    const store = new MemoryStore();
+    store.audit({ ts: 1000, type: "engine.entry", data: { symbol: "BTC/JPY", strategyId: "scalp_obi", price: 100, secretThing: "x", clientId: "c1" } });
+    store.audit({ ts: 2000, type: "engine.order_error", data: { symbol: "BTC/JPY", reason: "HTTP 400 https://api.example.com/v1?apikey=abcdef123456 signature=deadbeef" } });
+    store.audit({ ts: 3000, type: "market", data: { foo: 1 } });
+    const d = { status: () => ({}), store, learning: { snapshot: () => ({}) } } as unknown as DashboardDeps;
+    const r = JSON.parse((await routeDashboard(d, "GET", "/api/events?limit=10")).body);
+    expect(r.events.map((e: { type: string }) => e.type)).toEqual(["engine.order_error", "engine.entry"]);
+    expect(r.events[1].data).toEqual({ symbol: "BTC/JPY", strategyId: "scalp_obi", price: 100 });
+    expect(r.events[0].kind).toBe("order");
+    expect(r.events[0].data.reason).not.toMatch(/abcdef123456|deadbeef/);
+    const later = JSON.parse((await routeDashboard(d, "GET", "/api/events?since=1000")).body);
+    expect(later.events.map((e: { ts: number }) => e.ts)).toEqual([2000]);
+  });
+
   it("GET /api/candles: 監視銘柄のローソク足を時間足ごとに返し、監視外の銘柄・時間足は 404", async () => {
     const d = await deps();
     const r = await routeDashboard(d, "GET", "/api/candles?symbol=" + encodeURIComponent("BTC/USDT") + "&tf=1m&limit=30");
