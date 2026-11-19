@@ -100,7 +100,8 @@ describe("実口座アダプターの挙動 (モック・NODE_ENV を一時変�
 
   it("ccxt: clientOrderId を渡し、同じ clientId は再送しない", async () => {
     await withProd(async () => {
-      const ex = fakeEx();
+      // bitflyer には clientOrderId を送らないので、clientOrderId を扱う取引所として別 id にする
+      const ex = { ...fakeEx(), id: "binance" };
       const b = new CcxtBroker({ mode: "live", exchange: ex, accountCurrency: "JPY", instruments: insts });
       const req = { clientId: "cid-1", symbol: "BTC/JPY", side: "buy" as const, type: "market" as const, qty: "1", strategyId: "s" };
       const r = await b.placeOrder(req);

@@ -1,7 +1,7 @@
 import { D, Decimal } from "../core/decimal";
 import { fetchJson, fetchWithRetry, HttpError, redactSecrets, type FetchOptions } from "../core/http";
 import { assertLive, type LiveGuard } from "./guard";
-import type { Balance, Broker, BrokerPosition, Fill, OrderRequest, OrderResult, OrderStatus } from "../core/types";
+import type { Balance, Broker, BrokerPosition, Fill, OrderLookupHint, OrderRequest, OrderResult, OrderStatus } from "../core/types";
 
 export const ALPACA_LIVE_URL = "https://api.alpaca.markets";
 export const ALPACA_PAPER_URL = "https://paper-api.alpaca.markets";
@@ -143,10 +143,12 @@ export class AlpacaBroker implements Broker {
     try {
       o = await this.req<any>("POST", "/v2/orders", body, 0);
     } catch (e) {
-      // 同じ client_order_id の二重送信は 422。既存注文を返して冪等にする
-      if (e instanceof HttpError && e.status === 422 && /client_order_id/i.test(e.body)) {
+      // 同じ client_order_id の二重送信は 422 ("client_order_id must be unique")。既存注文を返して冪等にする
+      // (照会が 404 / 失敗なら例外 = 状態不明)
+      if (e instanceof HttpError && e.status === 422 && /client_order_id[^"]*(unique|exist|duplicat)|(duplicat|already)[^"]*client_order_id/i.test(e.body)) {
         o = await this.req<any>("GET", `/v2/orders:by_client_order_id?client_order_id=${encodeURIComponent(req.clientId)}`);
-      } else if (e instanceof HttpError && (e.status === 403 || e.status === 422)) {
+      } else if (e instanceof HttpError && e.status >= 400 && e.status < 500 && e.status !== 408) {
+        // 4xx (429 を含む) は受け付けられていない。5xx / タイムアウト / 通信断は状態不明なので投げる
         return this.rejected(req, redactSecrets(e.body.slice(0, 200)));
       } else throw e;
     }
@@ -159,7 +161,7 @@ export class AlpacaBroker implements Broker {
    * 注文の最新状態。client_order_id で照会し、見つからなければ orderId で照会する。
    * 404 のときだけ undefined (それ以外の失敗は例外 = 状態不明)。
    */
-  async getOrder(clientId: string, _symbol: string, orderId?: string): Promise<OrderResult | undefined> {
+  async getOrder(clientId: string, _symbol: string, orderId?: string, _hint?: OrderLookupHint): Promise<OrderResult | undefined> {
     const cached = this.done.get(clientId);
     if (cached && !cached.orderId && cached.status === "rejected") return cached;
     let o: any;

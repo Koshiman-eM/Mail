@@ -5,6 +5,12 @@ import { AlpacaBroker } from "../src/execution/alpacaBroker";
 import { CcxtBroker, type CcxtTradeLike } from "../src/execution/ccxtBroker";
 import { OandaBroker } from "../src/execution/oandaBroker";
 import { createBrokers } from "../src/execution/router";
+import { createRequire } from "node:module";
+import { classifyCcxtError } from "../src/execution/ccxtBroker";
+import * as ccxtEsm from "ccxt";
+
+/** アダプターと同じ (router と同じ createRequire の) ccxt のエラークラス。実クラスのインスタンスを投げて判定を確かめる */
+const E = createRequire(import.meta.url)("ccxt") as Record<string, new (m: string) => Error>;
 
 /**
  * 実口座アダプターの正規化・安全動作 (全てモック。実 API へは送信しない)。
@@ -210,7 +216,8 @@ describe("CcxtBroker", () => {
       if (!symbols) throw new ArgumentsRequired("symbols");
       return [{ product_code: "FX_BTC_JPY", side: "BUY", price: 36000, size: 0.01 }, { product_code: "FX_BTC_JPY", side: "BUY", price: 38000, size: 0.03 }];
     });
-    const b = ccxt(mockEx({ createOrder, fetchPositions }), { instruments: [FXBTC] });
+    // reduceOnly 対応の取引所 (bitflyer 以外) を想定する
+    const b = ccxt(mockEx({ createOrder, fetchPositions }, "mock"), { instruments: [FXBTC] });
     await b.placeOrder(req({ symbol: "BTC/JPY:JPY", side: "sell", qty: "1", reduceOnly: true }));
     expect(fetchPositions).toHaveBeenCalledWith(["BTC/JPY:JPY"]);
     const call = createOrder.mock.calls[0] as unknown as [string, string, string, number, number, Record<string, unknown>];
@@ -222,7 +229,7 @@ describe("CcxtBroker", () => {
 
   it("protectiveStop は ccxt では付けない (取引所側のストップが決済後に残る危険があるため)", async () => {
     const createOrder = vi.fn(async () => ({ id: "s1" }));
-    await ccxt(mockEx({ createOrder })).placeOrder(req({ protectiveStop: 9_000_000 }));
+    await ccxt(mockEx({ createOrder }, "mock")).placeOrder(req({ protectiveStop: 9_000_000 }));
     const params = (createOrder.mock.calls[0] as unknown[])[5] as Record<string, unknown>;
     expect(Object.keys(params).sort()).toEqual(["clientOrderId"]);
   });
@@ -264,16 +271,10 @@ describe("CcxtBroker", () => {
     expect(await b.getBalance()).toEqual({ currency: "JPY", equity: "1015000", available: "700000" });
   });
 
-  it("明確な拒否 (InvalidOrder 等) だけ rejected、通信系は例外", async () => {
-    class InsufficientFunds extends Error {
-      constructor(m: string) {
-        super(m);
-        this.name = "InsufficientFunds";
-      }
-    }
-    const rej = ccxt(mockEx({ createOrder: vi.fn(async () => { throw new InsufficientFunds("no money"); }) }));
+  it("明確な拒否 (ExchangeError 系) だけ rejected、通信系は例外。拒否済みは getOrder でも確定", async () => {
+    const rej = ccxt(mockEx({ createOrder: vi.fn(async () => { throw new E.InsufficientFunds("no money"); }) }));
     expect(await rej.placeOrder(req())).toMatchObject({ status: "rejected", reason: "no money" });
-    const net = ccxt(mockEx({ createOrder: vi.fn(async () => { throw new Error("RequestTimeout"); }) }));
+    const net = ccxt(mockEx({ createOrder: vi.fn(async () => { throw new E.RequestTimeout("timeout"); }) }));
     await expect(net.placeOrder(req())).rejects.toThrow();
     // 拒否済みの注文は getOrder でも確定 (取引所に照会しない)
     expect(await rej.getOrder("c1", "BTC/JPY")).toMatchObject({ status: "rejected" });
@@ -450,5 +451,284 @@ describe("AlpacaBroker", () => {
     expect((await b.placeOrder({ clientId: "s2", symbol: "AAPL", side: "buy", type: "market", qty: "1", reduceOnly: true, strategyId: "s" })).status).toBe("rejected");
     expect((await b.placeOrder({ clientId: "s3", symbol: "MSFT", side: "sell", type: "market", qty: "1", reduceOnly: true, strategyId: "s" })).status).toBe("rejected");
     expect(calls.filter((c) => c.method === "POST")).toHaveLength(1);
+  });
+});
+
+// ───────────────────────── 追加: 安全修正 ─────────────────────────
+
+describe("ccxt のエラー分類 (クラス階層は ccxt/js/src/base/errors.js)", () => {
+  const rejected = [
+    "ExchangeError", "AuthenticationError", "PermissionDenied", "AccountNotEnabled", "AccountSuspended", "ArgumentsRequired", "BadRequest",
+    "BadSymbol", "OperationRejected", "NoChange", "MarketClosed", "ManualInteractionNeeded", "RestrictedLocation", "InsufficientFunds",
+    "InvalidAddress", "InvalidOrder", "OrderNotFound", "OrderNotCached", "OrderImmediatelyFillable", "OrderNotFillable", "DuplicateOrderId",
+    "ContractUnavailable", "NotSupported", "InvalidProxySettings", "ExchangeClosedByUser",
+    "RateLimitExceeded", "DDoSProtection", "OnMaintenance",
+  ];
+  const unknown = ["OperationFailed", "NetworkError", "RequestTimeout", "ExchangeNotAvailable", "InvalidNonce", "ChecksumError", "BadResponse", "NullResponse", "CancelPending"];
+  it.each(rejected)("%s は rejected", (n) => {
+    expect(classifyCcxtError(new E[n]("x"))).toBe("rejected");
+    expect(classifyCcxtError(new (ccxtEsm as any)[n]("x"))).toBe("rejected"); // ESM 版のクラスでも
+  });
+  it.each(unknown)("%s は状態不明 (例外)", (n) => {
+    expect(classifyCcxtError(new E[n]("x"))).toBe("unknown");
+    expect(classifyCcxtError(new (ccxtEsm as any)[n]("x"))).toBe("unknown");
+  });
+  it("ccxt 以外の例外・文字列は状態不明 (名前だけ似せた素の Error も不成立にしない)", () => {
+    expect(classifyCcxtError(new Error("boom"))).toBe("unknown");
+    expect(classifyCcxtError("x")).toBe("unknown");
+    const fake = new Error("x");
+    fake.name = "InsufficientFunds";
+    expect(classifyCcxtError(fake)).toBe("unknown");
+  });
+  it("bitflyer 相当: 汎用 ExchangeError (証拠金不足 -205) は rejected、OnMaintenance も rejected、RequestTimeout は例外", async () => {
+    const mk = (err: Error) => ccxt(mockEx({ createOrder: vi.fn(async () => { throw err; }) }));
+    expect(await mk(new E.ExchangeError('bitflyer {"status":-205,"error_message":"Margin amount is insufficient"}')).placeOrder(req())).toMatchObject({ status: "rejected" });
+    expect(await mk(new E.OnMaintenance("maint")).placeOrder(req())).toMatchObject({ status: "rejected" });
+    expect(await mk(new E.RateLimitExceeded("429")).placeOrder(req())).toMatchObject({ status: "rejected" });
+    await expect(mk(new E.RequestTimeout("t")).placeOrder(req())).rejects.toThrow();
+    await expect(mk(new E.BadResponse("t")).placeOrder(req())).rejects.toThrow();
+    await expect(mk(new E.CancelPending("t")).placeOrder(req())).rejects.toThrow();
+  });
+});
+
+describe("CcxtBroker: 重複 clientId", () => {
+  it("DuplicateOrderId / 'Duplicate order sent' は rejected にせず clientId で既存の注文の状態を返す。照会できなければ例外", async () => {
+    const existing = { id: "B1", clientOrderId: "c1", status: "closed", side: "buy", type: "market", filled: 1, average: 100, fee: { cost: 0, currency: "JPY" } };
+    for (const err of [new E.DuplicateOrderId("dup"), new E.InvalidOrder('binance {"code":-2010,"msg":"Duplicate order sent."}')]) {
+      const fetchOrder = vi.fn(async (_id: string, _s?: string, params?: any) => {
+        expect(params).toEqual({ clientOrderId: "c1" });
+        return existing;
+      });
+      const b = ccxt(mockEx({ has: {}, createOrder: vi.fn(async () => { throw err; }), fetchOrder }, "binance"));
+      expect(await b.placeOrder(req())).toMatchObject({ orderId: "B1", status: "filled" });
+    }
+    const b2 = ccxt(mockEx({ has: {}, createOrder: vi.fn(async () => { throw new E.DuplicateOrderId("dup"); }), fetchOrder: vi.fn(async () => { throw new E.NetworkError("down"); }) }, "mock"));
+    await expect(b2.placeOrder(req())).rejects.toThrow();
+  });
+});
+
+describe("CcxtBroker.getOrder: clientId の照会を広げる", () => {
+  const open = { id: "O1", clientOrderId: "c1", status: "open", side: "buy", type: "limit", filled: 0, amount: 1 };
+  it("fetchOrder('', symbol, { clientOrderId }) を試す。ArgumentsRequired なら一覧へ進む", async () => {
+    const fetchOrder = vi.fn(async (_id: string, _s?: string, params?: any) => ({ ...open, ...(params ? {} : {}) }));
+    const b = ccxt(mockEx({ has: {}, fetchOrder }, "binance"));
+    expect(await b.getOrder("c1", "BTC/JPY")).toMatchObject({ orderId: "O1", status: "open" });
+    expect(fetchOrder).toHaveBeenCalledWith("", "BTC/JPY", { clientOrderId: "c1" });
+    // 次回以降は記録した orderId で照会
+    await b.getOrder("c1", "BTC/JPY");
+    expect(fetchOrder).toHaveBeenLastCalledWith("O1", "BTC/JPY");
+
+    const fetchOpenOrders = vi.fn(async () => [{ ...open, id: "Z", clientOrderId: "other" }, open]);
+    const fetchClosedOrders = vi.fn(async () => []);
+    const b2 = ccxt(mockEx({ has: { fetchOpenOrders: true, fetchClosedOrders: true }, fetchOrder: vi.fn(async () => { throw new E.ArgumentsRequired("id"); }), fetchOpenOrders, fetchClosedOrders }, "mock"));
+    expect(await b2.getOrder("c1", "BTC/JPY", undefined, { createdAt: 1_000_000, side: "buy", qty: "1" })).toMatchObject({ orderId: "O1" });
+    expect(fetchClosedOrders).toHaveBeenCalledWith("BTC/JPY", 1_000_000 - 60_000);
+  });
+  it("一覧に clientOrderId があるのに一致が無ければ undefined。一覧が片方でも失敗すれば例外", async () => {
+    const has = { fetchOpenOrders: true, fetchClosedOrders: true };
+    const ng = vi.fn(async () => { throw new E.ArgumentsRequired("id"); });
+    const b = ccxt(mockEx({ has, fetchOrder: ng, fetchOpenOrders: vi.fn(async () => [{ ...open, clientOrderId: "other" }]), fetchClosedOrders: vi.fn(async () => []) }, "mock"));
+    expect(await b.getOrder("c1", "BTC/JPY")).toBeUndefined();
+    const b2 = ccxt(mockEx({ has, fetchOrder: ng, fetchOpenOrders: vi.fn(async () => []), fetchClosedOrders: vi.fn(async () => { throw new E.RequestTimeout("t"); }) }, "mock"));
+    await expect(b2.getOrder("c1", "BTC/JPY")).rejects.toThrow();
+    // fetchOrders だけでもよい
+    const b3 = ccxt(mockEx({ has: { fetchOrders: true }, fetchOrder: ng, fetchOrders: vi.fn(async () => [open]) }, "mock"));
+    expect(await b3.getOrder("c1", "BTC/JPY")).toMatchObject({ orderId: "O1" });
+  });
+  it("bitflyer 相当 (clientOrderId 無し): hint (side・数量・時刻) で 1 件だけ一致なら採用して orderId を記録、0 件は undefined、2 件は例外", async () => {
+    const T = 1_700_000_000_000;
+    const o = (id: string, ts: number, over: any = {}) => ({ id, status: "open", side: "buy", type: "market", amount: 0.01, filled: 0, timestamp: ts, ...over });
+    const hint = { createdAt: T, side: "buy" as const, qty: "0.01" };
+    const fetchOrder = vi.fn(async (id: string) => {
+      if (id === "") throw new E.OrderNotFound("bitflyer order not found"); // 誤って「無い」と判断しないこと
+      return o(id, T + 1000);
+    });
+    const list = vi.fn(async () => [
+      o("far", T - 11_000), // 範囲外
+      o("sell", T, { side: "sell" }),
+      o("qty", T, { amount: 0.02 }),
+      o("late", T + 121_000),
+      o("hit", T + 5_000),
+    ]);
+    const has = { fetchOpenOrders: true, fetchClosedOrders: true };
+    const b = ccxt(mockEx({ has, fetchOrder, fetchOpenOrders: list, fetchClosedOrders: vi.fn(async () => []) }));
+    expect(await b.getOrder("c1", "BTC/JPY", undefined, hint)).toMatchObject({ orderId: "hit", status: "open" });
+    await b.getOrder("c1", "BTC/JPY");
+    expect(fetchOrder).toHaveBeenLastCalledWith("hit", "BTC/JPY");
+    // 別の clientId は、c1 が採用済みの注文を候補にしない
+    expect(await b.getOrder("c2", "BTC/JPY", undefined, hint)).toBeUndefined();
+
+    const none = ccxt(mockEx({ has, fetchOrder, fetchOpenOrders: vi.fn(async () => []), fetchClosedOrders: vi.fn(async () => []) }));
+    expect(await none.getOrder("c1", "BTC/JPY", undefined, hint)).toBeUndefined();
+    const two = ccxt(mockEx({ has, fetchOrder, fetchOpenOrders: vi.fn(async () => [o("a", T), o("b", T + 1)]), fetchClosedOrders: vi.fn(async () => []) }));
+    await expect(two.getOrder("c1", "BTC/JPY", undefined, hint)).rejects.toThrow(/2 件/);
+    // hint が無ければ特定できない (空の一覧でも「無い」とは言えない)
+    await expect(none.getOrder("c1", "BTC/JPY")).rejects.toThrow();
+  });
+  it("照会手段が無い・一覧の一部しか取れない場合は例外 (未約定とみなさない)", async () => {
+    const ng = vi.fn(async () => { throw new E.NotSupported("x"); });
+    const b = ccxt(mockEx({ has: {}, fetchOrder: ng }, "mock"));
+    await expect(b.getOrder("c1", "BTC/JPY", undefined, { createdAt: 1, side: "buy", qty: "1" })).rejects.toThrow(/照会できません/);
+    const b2 = ccxt(mockEx({ has: { fetchOpenOrders: true }, fetchOrder: ng, fetchOpenOrders: vi.fn(async () => []) }, "mock"));
+    await expect(b2.getOrder("c1", "BTC/JPY", undefined, { createdAt: 1, side: "buy", qty: "1" })).rejects.toThrow();
+  });
+});
+
+describe("CcxtBroker: bitFlyer の発注パラメーター", () => {
+  it("bitflyer には clientOrderId / reduceOnly を送らない。reduceOnly 対応の取引所には送る", async () => {
+    const createOrder = vi.fn(async () => ({ id: "JRF-2", info: {} }));
+    const fx = ccxt(mockEx({ createOrder, fetchPositions: vi.fn(async () => [{ symbol: "BTC/JPY:JPY", contracts: 0.5, side: "long", entryPrice: 1 }]) }), { instruments: [FXBTC] });
+    await fx.placeOrder(req({ symbol: "BTC/JPY:JPY", side: "sell", qty: "2", reduceOnly: true }));
+    const call = createOrder.mock.calls[0] as any[];
+    expect(call[2]).toBe("sell");
+    expect(call[3]).toBe(0.5); // 建玉で上限
+    expect(call[5]).toEqual({});
+    const ok = vi.fn(async () => ({ id: "X", info: {} }));
+    const other = ccxt(mockEx({ createOrder: ok, has: { fetchPositions: true }, fetchPositions: vi.fn(async () => [{ symbol: "BTC/JPY:JPY", contracts: 1, side: "long" }]) }, "mock"), { instruments: [FXBTC] });
+    await other.placeOrder(req({ symbol: "BTC/JPY:JPY", side: "sell", qty: "1", reduceOnly: true }));
+    expect((ok.mock.calls[0] as any[])[5]).toEqual({ clientOrderId: "c1", reduceOnly: true });
+  });
+  it("IOC / FOK は bitflyer では time_in_force、他の取引所では timeInForce で渡す", async () => {
+    const createOrder = vi.fn(async () => ({ id: "JRF-4", info: {} }));
+    const bf = ccxt(mockEx({ createOrder, fetchPositions: vi.fn(async () => []) }), { instruments: [FXBTC] });
+    await bf.placeOrder(req({ symbol: "BTC/JPY:JPY", side: "buy", qty: "0.01", tif: "IOC" }));
+    expect((createOrder.mock.calls[0] as any[])[5]).toEqual({ time_in_force: "IOC" });
+    const ok = vi.fn(async () => ({ id: "Y", info: {} }));
+    const other = ccxt(mockEx({ createOrder: ok, has: { fetchPositions: true }, fetchPositions: vi.fn(async () => []) }, "mock"), { instruments: [FXBTC] });
+    await other.placeOrder(req({ symbol: "BTC/JPY:JPY", side: "buy", qty: "0.01", tif: "FOK" }));
+    expect((ok.mock.calls[0] as any[])[5]).toEqual({ clientOrderId: "c1", timeInForce: "FOK" });
+  });
+  it("bitflyer のデリバティブ決済で建玉を照会できなければ送らずに rejected (記録せず再試行できる)", async () => {
+    const createOrder = vi.fn(async () => ({ id: "JRF-3", info: {} }));
+    let fail = true;
+    const fetchPositions = vi.fn(async () => {
+      if (fail) throw new E.RequestTimeout("t");
+      return [{ symbol: "BTC/JPY:JPY", contracts: 1, side: "long" }];
+    });
+    const b = ccxt(mockEx({ createOrder, fetchPositions }), { instruments: [FXBTC] });
+    const r = req({ symbol: "BTC/JPY:JPY", side: "sell", qty: "1", reduceOnly: true });
+    expect(await b.placeOrder(r)).toMatchObject({ status: "rejected" });
+    expect(createOrder).not.toHaveBeenCalled();
+    fail = false;
+    expect(await b.placeOrder(r)).toMatchObject({ orderId: "JRF-3", status: "open" });
+    expect(createOrder).toHaveBeenCalledTimes(1);
+    // fetchPositions に未対応でも同様
+    const b2 = ccxt(mockEx({ createOrder, has: {}, fetchPositions: undefined }), { instruments: [FXBTC] });
+    expect(await b2.placeOrder({ ...r, clientId: "c9" })).toMatchObject({ status: "rejected" });
+    expect(createOrder).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("CcxtBroker: bitFlyer FX の証拠金", () => {
+  it("デリバティブ銘柄があるときだけ getcollateral の collateral + open_position_pnl を評価額に加える", async () => {
+    const privateGetGetcollateral = vi.fn(async () => ({ collateral: "100000", open_position_pnl: "-2500", require_collateral: "1", keep_rate: "9" }));
+    const fx = ccxt(mockEx({ privateGetGetcollateral }), { instruments: [FXBTC] });
+    expect(await fx.getBalance()).toMatchObject({ currency: "JPY", equity: "897500" });
+    expect(privateGetGetcollateral).toHaveBeenCalledTimes(1);
+    // 現物だけなら呼ばない
+    const spotOnly = ccxt(mockEx({ privateGetGetcollateral }), { instruments: [BTCJPY] });
+    await spotOnly.getBalance();
+    expect(privateGetGetcollateral).toHaveBeenCalledTimes(1);
+    // market が spot でない銘柄 (":" 無しのシンボルでも)
+    const m = ccxt(mockEx({ privateGetGetcollateral, markets: { "FX_BTC": { spot: false, type: "future" } } }), { instruments: [spot("FX_BTC/JPY", {}), ] });
+    await m.getBalance();
+    expect(privateGetGetcollateral).toHaveBeenCalledTimes(1); // FX_BTC/JPY は markets に無く spot 扱い
+    const m2 = ccxt(mockEx({ privateGetGetcollateral, markets: { "BTC/JPY": { spot: false, type: "future" } } }), { instruments: [BTCJPY] });
+    expect(await m2.getBalance()).toMatchObject({ equity: "897500" });
+    // 他の取引所では呼ばない
+    const other = ccxt(mockEx({ privateGetGetcollateral }, "mock"), { instruments: [FXBTC] });
+    await other.getBalance();
+    expect(privateGetGetcollateral).toHaveBeenCalledTimes(2);
+  });
+  it("getcollateral が失敗・不正なら例外 (評価額を欠けたまま返さない)", async () => {
+    const bad = ccxt(mockEx({ privateGetGetcollateral: vi.fn(async () => { throw new E.RequestTimeout("t"); }) }), { instruments: [FXBTC] });
+    await expect(bad.getBalance()).rejects.toThrow();
+    const odd = ccxt(mockEx({ privateGetGetcollateral: vi.fn(async () => ({})) }), { instruments: [FXBTC] });
+    await expect(odd.getBalance()).rejects.toThrow(/不正/);
+    const none = ccxt(mockEx({}), { instruments: [FXBTC] });
+    await expect(none.getBalance()).rejects.toThrow(/getcollateral|privateGetGetcollateral/);
+  });
+});
+
+describe("OandaBroker: 拒否の分類・手数料の通貨", () => {
+  const oreq = { clientId: "k1", symbol: "USD/JPY", side: "buy" as const, type: "market" as const, qty: "1000", strategyId: "s" };
+  it("発注の POST は再試行しない。4xx (429 を含む) は rejected、5xx / 通信断は例外", async () => {
+    for (const status of [400, 401, 429]) {
+      const { calls, fetchImpl } = oandaMock((_u, init) => (init.method === "POST" ? jsonRes({ errorMessage: "x" }, status) : undefined));
+      const b = new OandaBroker({ mode: "live", token: "t", accountId: "A", fetchImpl });
+      expect(await b.placeOrder(oreq)).toMatchObject({ status: "rejected" });
+      expect(calls.filter((c) => c.method === "POST")).toHaveLength(1);
+    }
+    const { calls, fetchImpl } = oandaMock((_u, init) => (init.method === "POST" ? jsonRes({ errorMessage: "x" }, 503) : undefined));
+    const b = new OandaBroker({ mode: "live", token: "t", accountId: "A", fetchImpl });
+    await expect(b.placeOrder(oreq)).rejects.toThrow();
+    expect(calls.filter((c) => c.method === "POST")).toHaveLength(1);
+    const net = vi.fn(async (u: any, init: any) => {
+      if (init.method === "POST") throw new TypeError("fetch failed");
+      return jsonRes({ account: { currency: "JPY", NAV: "1", marginAvailable: "1" } });
+    }) as unknown as typeof fetch;
+    await expect(new OandaBroker({ mode: "live", token: "t", accountId: "A", fetchImpl: net }).placeOrder(oreq)).rejects.toThrow();
+  });
+  it("口座通貨が取れなければ summary を取り直す。それでも不明で commission があれば feeCurrency は UNKNOWN", async () => {
+    let n = 0;
+    const { calls, fetchImpl } = oandaMock((url, init) => {
+      if (url.endsWith("/summary")) return ++n === 1 ? jsonRes({ error: "x" }, 500) : jsonRes({ account: { currency: "JPY", NAV: "1", marginAvailable: "1" } });
+      return init.method === "POST" ? jsonRes({ orderFillTransaction: fillTx }) : undefined;
+    });
+    const b = new OandaBroker({ mode: "live", token: "t", accountId: "A", fetchImpl });
+    expect(await b.placeOrder(oreq)).toMatchObject({ fills: [{ fee: "12.5", feeCurrency: "JPY" }] });
+    expect(calls.filter((c) => c.url.endsWith("/summary")).length).toBeGreaterThanOrEqual(2);
+
+    const { fetchImpl: f2 } = oandaMock((url, init) => {
+      if (url.endsWith("/summary")) return jsonRes({ error: "x" }, 400);
+      return init.method === "POST" ? jsonRes({ orderFillTransaction: fillTx }) : undefined;
+    });
+    const r = await new OandaBroker({ mode: "live", token: "t", accountId: "A", fetchImpl: f2 }).placeOrder({ ...oreq, clientId: "k2" });
+    expect(r.fills[0]).toMatchObject({ fee: "12.5", feeCurrency: "UNKNOWN" });
+    // commission が 0 なら feeCurrency は付けない
+    const { fetchImpl: f3 } = oandaMock((url, init) => {
+      if (url.endsWith("/summary")) return jsonRes({ error: "x" }, 400);
+      return init.method === "POST" ? jsonRes({ orderFillTransaction: { ...fillTx, commission: "0" } }) : undefined;
+    });
+    const r3 = await new OandaBroker({ mode: "live", token: "t", accountId: "A", fetchImpl: f3 }).placeOrder({ ...oreq, clientId: "k3" });
+    expect(r3.fills[0]).not.toHaveProperty("feeCurrency");
+  });
+});
+
+describe("AlpacaBroker: 拒否の分類・重複 client_order_id", () => {
+  const areq = { clientId: "a1", symbol: "AAPL", side: "buy" as const, type: "market" as const, qty: "1", strategyId: "s" };
+  const mk = (routes: (url: string, init: any) => Response | undefined) => {
+    const calls: { url: string; method: string }[] = [];
+    const fetchImpl = vi.fn(async (u: any, init: any) => {
+      calls.push({ url: String(u), method: init.method });
+      return routes(String(u), init) ?? jsonRes({ message: "not found" }, 404);
+    }) as unknown as typeof fetch;
+    return { calls, b: new AlpacaBroker({ mode: "live", keyId: "k", secretKey: "s", paper: true, fetchImpl }) };
+  };
+  it("発注の POST は再試行しない。4xx (429 を含む) は rejected、5xx / 通信断は例外", async () => {
+    for (const status of [403, 422, 429]) {
+      const { calls, b } = mk((_u, init) => (init.method === "POST" ? jsonRes({ message: "insufficient buying power" }, status) : undefined));
+      expect(await b.placeOrder(areq)).toMatchObject({ status: "rejected" });
+      expect(calls.filter((c) => c.method === "POST")).toHaveLength(1);
+    }
+    const { calls, b } = mk((_u, init) => (init.method === "POST" ? jsonRes({ message: "x" }, 500) : undefined));
+    await expect(b.placeOrder(areq)).rejects.toThrow();
+    expect(calls.filter((c) => c.method === "POST")).toHaveLength(1);
+    const net = vi.fn(async () => { throw new TypeError("fetch failed"); }) as unknown as typeof fetch;
+    await expect(new AlpacaBroker({ mode: "live", keyId: "k", secretKey: "s", fetchImpl: net }).placeOrder(areq)).rejects.toThrow();
+  });
+  it("client_order_id の重複 (422 'client_order_id must be unique') は by_client_order_id で既存の注文の状態を返す。照会できなければ例外", async () => {
+    const { calls, b } = mk((url, init) => {
+      if (init.method === "POST") return jsonRes({ code: 40010001, message: "client_order_id must be unique" }, 422);
+      if (url.includes("by_client_order_id")) return jsonRes({ id: "E1", status: "filled", filled_qty: "1", filled_avg_price: "190", type: "market" });
+      return undefined;
+    });
+    expect(await b.placeOrder(areq)).toMatchObject({ orderId: "E1", status: "filled" });
+    expect(calls.some((c) => c.url.includes("by_client_order_id?client_order_id=a1"))).toBe(true);
+    const { b: b2 } = mk((_u, init) => (init.method === "POST" ? jsonRes({ message: "client_order_id must be unique" }, 422) : undefined));
+    await expect(b2.placeOrder(areq)).rejects.toThrow();
+    // 重複以外の 422 (client_order_id に触れていても) は rejected
+    const { b: b3 } = mk((_u, init) => (init.method === "POST" ? jsonRes({ message: "client_order_id must be at most 128 characters" }, 422) : undefined));
+    expect(await b3.placeOrder(areq)).toMatchObject({ status: "rejected" });
   });
 });

@@ -1,7 +1,8 @@
+import { createRequire } from "node:module";
 import { D, Decimal, floorToStep } from "../core/decimal";
 import { createLogger } from "../core/logger";
 import { assertLive, type LiveGuard } from "./guard";
-import type { Balance, Broker, BrokerPosition, Fill, Instrument, OrderRequest, OrderResult, OrderStatus, Quote, Side } from "../core/types";
+import type { Balance, Broker, BrokerPosition, Fill, Instrument, OrderLookupHint, OrderRequest, OrderResult, OrderStatus, Quote, Side } from "../core/types";
 
 const log = createLogger("ccxt-broker");
 
@@ -17,6 +18,11 @@ export interface CcxtTradeLike {
   cancelOrder(id: string, symbol?: string): Promise<any>;
   fetchOrder?(id: string, symbol?: string, params?: Record<string, unknown>): Promise<any>;
   fetchOrderWithClientOrderId?(clientOrderId: string, symbol?: string, params?: Record<string, unknown>): Promise<any>;
+  fetchOpenOrders?(symbol?: string, since?: number, limit?: number, params?: Record<string, unknown>): Promise<any[]>;
+  fetchClosedOrders?(symbol?: string, since?: number, limit?: number, params?: Record<string, unknown>): Promise<any[]>;
+  fetchOrders?(symbol?: string, since?: number, limit?: number, params?: Record<string, unknown>): Promise<any[]>;
+  /** bitFlyer Lightning FX の証拠金 (getcollateral)。bitflyer の ccxt インスタンスだけが持つ */
+  privateGetGetcollateral?(params?: Record<string, unknown>): Promise<any>;
   fetchOrderTrades?(id: string, symbol?: string, since?: number, limit?: number): Promise<any[]>;
   fetchMyTrades?(symbol?: string, since?: number, limit?: number, params?: Record<string, unknown>): Promise<any[]>;
 }
@@ -51,11 +57,62 @@ const midOf = (q: Quote | undefined): number | undefined => {
   if (q.bid > 0 && q.ask > 0) return (q.bid + q.ask) / 2;
   return q.last !== undefined && q.last > 0 ? q.last : undefined;
 };
-/** ccxt のエラー種別名 (クラス名 or name) */
-const errName = (e: unknown): string => (e instanceof Error ? `${e.constructor.name} ${e.name}` : "");
+/**
+ * ccxt のエラークラス (router と同じ createRequire で読む CJS 版)。
+ * ESM 版 (import "ccxt") とはクラスが別物なので、instanceof に加えてプロトタイプ連鎖のクラス名でも判定する
+ * (クラス階層は node_modules/ccxt/js/src/base/errors.js)。
+ */
+let ccxtErrors: Record<string, unknown> | undefined | null;
+function ccxtErrorClasses(): Record<string, unknown> | undefined {
+  if (ccxtErrors === undefined) {
+    try {
+      ccxtErrors = createRequire(import.meta.url)("ccxt") as Record<string, unknown>;
+    } catch {
+      ccxtErrors = null;
+    }
+  }
+  return ccxtErrors ?? undefined;
+}
 
-/** 明確な拒否 (注文が成立していない) とみなす ccxt のエラー */
-const DEFINITE_REJECT = /InvalidOrder|InsufficientFunds|BadSymbol|PermissionDenied|AuthenticationError/;
+/** e が ccxt のエラークラス name (またはその派生) か */
+function isA(e: unknown, name: string): boolean {
+  if (!(e instanceof Error)) return false;
+  const C = ccxtErrorClasses()?.[name];
+  if (typeof C === "function" && e instanceof (C as new (...a: any[]) => Error)) return true;
+  for (let p: any = Object.getPrototypeOf(e); p && p !== Object.prototype; p = Object.getPrototypeOf(p)) {
+    if (p.constructor?.name === name) return true;
+  }
+  return false;
+}
+
+/**
+ * createOrder の例外の分類。
+ * - "rejected": 注文が成立していないと確実に言える (ExchangeError 全般、RateLimitExceeded / DDoSProtection、OnMaintenance)。
+ * - "unknown": 成立したか分からない (NetworkError / RequestTimeout / ExchangeNotAvailable、BadResponse / NullResponse、
+ *   CancelPending、その他の OperationFailed、ccxt 以外の例外)。呼び出し側へ投げる。
+ * OnMaintenance は ExchangeNotAvailable (= NetworkError) の子だが、メンテ中は受け付けられていないので先に rejected とする。
+ */
+export function classifyCcxtError(e: unknown): "rejected" | "unknown" {
+  if (isA(e, "OnMaintenance")) return "rejected";
+  if (isA(e, "RateLimitExceeded") || isA(e, "DDoSProtection")) return "rejected";
+  if (isA(e, "OperationFailed")) return "unknown";
+  if (isA(e, "ExchangeError")) return "rejected";
+  return "unknown";
+}
+
+/** 同じ clientOrderId の再送で取引所が返す「重複」のエラーか (不成立ではなく、既存の注文の状態を返す) */
+function isDuplicateOrder(e: unknown): boolean {
+  if (isA(e, "DuplicateOrderId")) return true;
+  if (!isA(e, "ExchangeError")) return false;
+  return /duplicat\w*\W+(client|order)|(client|order)\W*(id)?\W*(is |was )?(already|duplicat)|already exist|must be unique/i.test(e instanceof Error ? e.message : "");
+}
+
+/** clientOrderId を発注に載せない取引所 (bitflyer の sendchildorder には該当項目が無い) */
+const NO_CLIENT_ORDER_ID = new Set(["bitflyer"]);
+/** reduceOnly を送れない取引所。デリバティブの決済は建玉の照会で数量を上限にし、照会できなければ送らない */
+export const REDUCE_ONLY_UNSUPPORTED = new Set(["bitflyer"]);
+/** fetchOrder("", symbol, { clientOrderId }) を ccxt が変換する取引所 (OrderNotFound を「注文なし」として信用してよい。実 API 未検証) */
+const CLIENT_ID_FETCH_EXCHANGES = new Set(["binance", "binanceusdm", "binancecoinm", "okx", "bybit"]);
 
 /**
  * ccxt の status → OrderStatus。
@@ -111,6 +168,8 @@ export class CcxtBroker implements Broker {
   private readonly done = new Map<string, OrderResult>();
   /** clientId -> 取引所の注文 ID (getOrder の照会用) */
   private readonly orderIds = new Map<string, string>();
+  /** clientId -> 実際に送った数量 (reduceOnly で丸めた後。getOrder の突き合わせ用) */
+  private readonly sentQty = new Map<string, string>();
   private readonly warned = new Set<string>();
   private readonly unknownFee: "base" | "quote";
 
@@ -207,7 +266,27 @@ export class CcxtBroker implements Broker {
       }
       equity = equity.plus(q.mul(px));
     }
+    equity = equity.plus(await this.bitflyerFxEquity());
     return { currency: ccy, equity: equity.toString(), available: free.toString() };
+  }
+
+  /**
+   * bitFlyer Lightning FX の証拠金 + 未実現損益 (口座通貨建て)。ccxt の bitflyer.fetchBalance は現物口座 (getbalance) しか
+   * 見ないので、デリバティブの銘柄を扱うときだけ privateGetGetcollateral で補う。
+   * 注意: 実 API では未検証 (応答の collateral / open_position_pnl は JPY 建てという前提)。
+   * 失敗したら例外 (評価額が欠けたまま返さない。エンジンは失敗時に前回の値を使う)。
+   */
+  private async bitflyerFxEquity(): Promise<Decimal> {
+    if (this.ex.id !== "bitflyer") return D(0);
+    if (!this.o.instruments.some((i) => !this.isSpot(i.symbol))) return D(0);
+    if (typeof this.ex.privateGetGetcollateral !== "function") throw new Error(`${this.venue}: privateGetGetcollateral に未対応のため FX 証拠金を取得できません`);
+    const r = await this.ex.privateGetGetcollateral();
+    const collateral = dec(r?.collateral);
+    const pnl = dec(r?.open_position_pnl);
+    if (!collateral || !pnl) throw new Error(`${this.venue}: getcollateral の応答が不正です`);
+    const rate = this.rate("JPY");
+    if (!rate) throw new Error(`${this.venue}: FX 証拠金 (JPY) を口座通貨 ${this.o.accountCurrency} に換算できません`);
+    return collateral.plus(pnl).mul(rate);
   }
 
   private canFetchPositions(): boolean {
@@ -287,7 +366,10 @@ export class CcxtBroker implements Broker {
       const { base } = this.ccys(req.symbol);
       return dec(b?.free?.[base]) ?? dec(b?.total?.[base]) ?? D(0);
     }
-    if (!this.canFetchPositions()) return undefined;
+    if (!this.canFetchPositions()) {
+      if (REDUCE_ONLY_UNSUPPORTED.has(this.ex.id)) throw new Error(`${this.venue}: reduceOnly 未対応で建玉も照会できません`);
+      return undefined;
+    }
     const p = await this.fetchPosition(req.symbol);
     return req.side === "sell" ? Decimal.max(p.qty, 0) : Decimal.max(p.qty.neg(), 0);
   }
@@ -318,7 +400,7 @@ export class CcxtBroker implements Broker {
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         // 現物は保有を確認できないまま売ると新規の売り (または残高不足) になりうるので送らない。未送信なので記録しない
-        if (spot) return this.rejected(req, `保有数量を照会できないため未送信: ${msg}`, false);
+        if (spot || REDUCE_ONLY_UNSUPPORTED.has(this.ex.id)) return this.rejected(req, `保有数量を照会できないため未送信: ${msg}`, false);
         log.warn("建玉の照会に失敗。取引所側の reduceOnly に任せて送信します", { venue: this.venue, symbol: req.symbol, error: msg });
       }
       if (closable !== undefined) {
@@ -331,18 +413,30 @@ export class CcxtBroker implements Broker {
       }
     }
 
-    const params: Record<string, unknown> = { clientOrderId: req.clientId };
-    // 現物 (market.spot) には reduceOnly を送らない (未対応の取引所で拒否・無視される)。数量は上で保有数量にクランプ済み
-    if (req.reduceOnly && !spot) params.reduceOnly = true;
-    if (req.tif === "IOC" || req.tif === "FOK") params.timeInForce = req.tif;
+    // bitflyer には clientOrderId / reduceOnly の項目が無く、ccxt が params をそのまま本文に入れてしまうので送らない
+    const params: Record<string, unknown> = NO_CLIENT_ORDER_ID.has(this.ex.id) ? {} : { clientOrderId: req.clientId };
+    // 現物 (market.spot) と reduceOnly 未対応の取引所には reduceOnly を送らない。数量は上で建玉・保有数量にクランプ済み
+    if (req.reduceOnly && !spot && !REDUCE_ONLY_UNSUPPORTED.has(this.ex.id)) params.reduceOnly = true;
+    this.sentQty.set(req.clientId, qty.toString());
+    if (req.tif === "IOC" || req.tif === "FOK") {
+      // ccxt の bitflyer は params をそのまま sendchildorder の本文に入れるので、bitFlyer API の項目名 time_in_force で渡す
+      if (this.ex.id === "bitflyer") params.time_in_force = req.tif;
+      else params.timeInForce = req.tif;
+    }
     // protectiveStop は付けない: ccxt の多くの取引所では、エンジンが決済しても取引所側のストップ注文が自動で取り消されず、
     // 後で発動して意図しない新規建てになる危険がある (自動取消を保証できない)
     let order: any;
     try {
       order = await this.ex.createOrder(req.symbol, req.type, req.side, qty.toNumber(), req.type === "limit" ? req.limitPrice : undefined, params);
     } catch (e) {
-      // 明確な拒否のみ rejected に変換。ネットワーク系は状態不明のため呼び出し側へ投げる (getOrder で確認する)
-      if (DEFINITE_REJECT.test(errName(e))) return this.rejected(req, e instanceof Error ? e.message : String(e));
+      // 重複 clientId: 前回の送信が届いていた。不成立ではないので既存の注文の状態を返す (照会できなければ例外)
+      if (isDuplicateOrder(e)) {
+        const existing = await this.getOrder(req.clientId, req.symbol, undefined, { createdAt: Date.now(), side: req.side, qty: req.qty });
+        if (existing) return existing;
+        throw e;
+      }
+      // 不成立と確実に言えるものだけ rejected。ネットワーク系・不明な例外は状態不明のため投げる (getOrder で確認する)
+      if (classifyCcxtError(e) === "rejected") return this.rejected(req, e instanceof Error ? e.message : String(e));
       throw e;
     }
     const orderId = String(order?.id ?? "");
@@ -353,12 +447,11 @@ export class CcxtBroker implements Broker {
   }
 
   /**
-   * 注文の最新状態。orderId (無ければ発注時に記録した ID) で fetchOrder、ID が無ければ
-   * 取引所が対応していれば clientOrderId で照会する。
-   * - 取引所が「注文なし」(OrderNotFound) と答えたときだけ undefined。
-   * - 照会手段が無い・通信失敗は例外 (状態不明。呼び出し側は未約定とみなして再送しないこと)。
+   * 注文の最新状態。orderId (無ければ発注時に記録した ID) で fetchOrder、ID が無ければ clientId で探す (lookupByClientId)。
+   * - 取引所が「注文なし」と答えたときだけ undefined。
+   * - 照会手段が無い・通信失敗・突き合わせが曖昧なときは例外 (状態不明。呼び出し側は未約定とみなして再送しないこと)。
    */
-  async getOrder(clientId: string, symbol: string, orderId?: string): Promise<OrderResult | undefined> {
+  async getOrder(clientId: string, symbol: string, orderId?: string, hint?: OrderLookupHint): Promise<OrderResult | undefined> {
     const cached = this.done.get(clientId);
     // 取引所へ届かずに拒否された注文 (orderId 無し) は確定済み
     if (cached && !cached.orderId && cached.status === "rejected") return cached;
@@ -368,13 +461,11 @@ export class CcxtBroker implements Broker {
       if (id) {
         if (typeof this.ex.fetchOrder !== "function") throw new Error(`${this.venue}: fetchOrder に未対応のため注文を照会できません`);
         order = await this.ex.fetchOrder(id, symbol);
-      } else if (this.ex.has?.fetchOrderWithClientOrderId && typeof this.ex.fetchOrderWithClientOrderId === "function") {
-        order = await this.ex.fetchOrderWithClientOrderId(clientId, symbol);
       } else {
-        throw new Error(`${this.venue}: orderId が無く、clientOrderId での照会にも未対応のため注文を照会できません`);
+        order = await this.lookupByClientId(clientId, symbol, hint);
       }
     } catch (e) {
-      if (/OrderNotFound/.test(errName(e))) return undefined;
+      if (isA(e, "OrderNotFound")) return undefined;
       throw e;
     }
     if (!order) return undefined;
@@ -383,6 +474,91 @@ export class CcxtBroker implements Broker {
     if (res.orderId) this.orderIds.set(clientId, res.orderId);
     this.done.set(clientId, res);
     return res;
+  }
+
+  /** 一覧系の API を呼ぶ。未対応 (has が偽・NotSupported) なら undefined、それ以外の失敗は例外 */
+  private async listOrders(name: "fetchOpenOrders" | "fetchClosedOrders" | "fetchOrders", symbol: string, since?: number): Promise<any[] | undefined> {
+    const fn = this.ex[name];
+    if (!this.ex.has?.[name] || typeof fn !== "function") return undefined;
+    try {
+      const r = name === "fetchOpenOrders" ? await fn.call(this.ex, symbol) : await fn.call(this.ex, symbol, since);
+      if (!Array.isArray(r)) throw new Error(`${this.venue}: ${name} の応答が配列ではありません`);
+      return r;
+    } catch (e) {
+      if (isA(e, "NotSupported")) return undefined;
+      throw e;
+    }
+  }
+
+  /**
+   * orderId が無いときの照会。順に (1) fetchOrderWithClientOrderId (2) fetchOrder("", symbol, { clientOrderId })
+   * (3) 未決済・決済済みの一覧から clientOrderId 一致 (4) 一覧から hint (side・数量・時刻) で突き合わせ。
+   * 見つかれば ccxt の order、取引所が「無い」と確実に言えるときは undefined、それ以外は例外。
+   */
+  private async lookupByClientId(clientId: string, symbol: string, hint?: OrderLookupHint): Promise<any | undefined> {
+    const ex = this.ex;
+    if (ex.has?.fetchOrderWithClientOrderId && typeof ex.fetchOrderWithClientOrderId === "function") {
+      return ex.fetchOrderWithClientOrderId(clientId, symbol); // OrderNotFound は呼び出し側で undefined
+    }
+    let notFoundByParam = false;
+    if (typeof ex.fetchOrder === "function") {
+      try {
+        const o = await ex.fetchOrder("", symbol, { clientOrderId: clientId });
+        if (o && o.clientOrderId === clientId) return o;
+        // params を無視する取引所が別の注文を返すことがあるので、clientOrderId が一致しない応答は採用しない
+      } catch (e) {
+        if (isA(e, "OrderNotFound")) notFoundByParam = true;
+        else if (!(isA(e, "ArgumentsRequired") || isA(e, "NotSupported") || isA(e, "BadRequest"))) throw e;
+      }
+    }
+
+    const since = hint ? hint.createdAt - 60_000 : undefined;
+    const open = await this.listOrders("fetchOpenOrders", symbol);
+    const closed = await this.listOrders("fetchClosedOrders", symbol, since);
+    let all: any[] | undefined;
+    if (!closed) all = await this.listOrders("fetchOrders", symbol, since);
+    const pool = [...(open ?? []), ...(closed ?? []), ...(all ?? [])];
+    // 未決済と決済済みの両方 (または全件) を見られたときだけ「無い」と言える
+    const covered = Boolean((open && closed) || all);
+    if (!open && !closed && !all) {
+      // 一覧が一つも使えない。パラメーター照会が「無い」と答え、その変換が分かっている取引所だけ信用する
+      if (notFoundByParam && CLIENT_ID_FETCH_EXCHANGES.has(ex.id)) return undefined;
+      throw new Error(`${this.venue}: orderId が無く、clientOrderId での照会にも未対応のため注文を照会できません`);
+    }
+
+    const hit = pool.find((o) => o?.clientOrderId === clientId);
+    if (hit) return hit;
+    if (!covered) throw new Error(`${this.venue}: 注文の一覧を全て取得できないため、clientId の注文の有無を確定できません`);
+    // 注文に clientOrderId を持つ取引所なら、一覧に無い = 注文なし
+    if (pool.some((o) => typeof o?.clientOrderId === "string" && o.clientOrderId)) return undefined;
+    if (!hint) throw new Error(`${this.venue}: 注文に clientOrderId が無く、hint も無いため注文を特定できません`);
+    return this.matchByHint(clientId, symbol, pool, hint);
+  }
+
+  /** clientOrderId を持たない取引所向け。side・数量 (lotSize の誤差内)・時刻で突き合わせ、ちょうど 1 件のときだけ採用する */
+  private matchByHint(clientId: string, symbol: string, pool: any[], hint: OrderLookupHint): any | undefined {
+    const lot = this.inst.get(symbol)?.lotSize;
+    const tol = D(lot && lot > 0 ? lot : 1e-8);
+    const wants = [D(hint.qty)];
+    const sent = this.sentQty.get(clientId);
+    if (sent) wants.push(D(sent)); // reduceOnly で丸めた後の数量
+    const claimed = new Set([...this.orderIds].filter(([cid]) => cid !== clientId).map(([, oid]) => oid));
+    const cands: any[] = [];
+    let unknownTime = 0;
+    for (const o of pool) {
+      if (!o || o.side !== hint.side || claimed.has(String(o.id ?? ""))) continue;
+      const amt = dec(o.amount);
+      if (!amt || !wants.some((w) => amt.minus(w).abs().lte(tol))) continue;
+      const ts = num(o.timestamp);
+      if (ts === undefined) {
+        unknownTime++;
+        continue;
+      }
+      if (ts >= hint.createdAt - 10_000 && ts <= hint.createdAt + 120_000) cands.push(o);
+    }
+    if (unknownTime > 0) throw new Error(`${this.venue}: 時刻の無い注文があり、clientId の注文を特定できません`);
+    if (cands.length > 1) throw new Error(`${this.venue}: 条件に合う注文が ${cands.length} 件あり、clientId の注文を特定できません`);
+    return cands[0];
   }
 
   /** 約定価格: average → 約定明細の加重平均 → price (指値など)。分からなければ undefined (0 は不明扱い) */

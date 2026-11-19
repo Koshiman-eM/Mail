@@ -3,7 +3,7 @@ import { fetchJson, HttpError, redactSecrets, type FetchOptions } from "../core/
 import { createLogger } from "../core/logger";
 import { OANDA_HOSTS, toOandaSymbol, fromOandaSymbol, parseOandaTime } from "../market/feeds/oanda";
 import { assertLive, type LiveGuard } from "./guard";
-import type { Balance, Broker, BrokerPosition, Fill, Instrument, OrderRequest, OrderResult } from "../core/types";
+import type { Balance, Broker, BrokerPosition, Fill, Instrument, OrderLookupHint, OrderRequest, OrderResult } from "../core/types";
 
 const log = createLogger("oanda-broker");
 
@@ -158,12 +158,14 @@ export class OandaBroker implements Broker {
         if (existing) return existing;
         throw e; // 状態不明
       }
-      // 4xx は注文が成立していない明確な拒否 (証拠金不足など)。5xx/通信断は状態不明なので投げる
-      if (e instanceof HttpError && e.status >= 400 && e.status < 500 && e.status !== 429) {
+      // 4xx (429 を含む) は受け付けられていない明確な拒否 (証拠金不足など)。5xx/タイムアウト/通信断は状態不明なので投げる
+      if (e instanceof HttpError && e.status >= 400 && e.status < 500 && e.status !== 408) {
         return this.rejected(req, redactSecrets(e.body.slice(0, 200)));
       }
       throw e;
     }
+    // 約定に手数料があるのに口座通貨が未取得なら、summary を取り直してから通貨を付ける
+    if (!this.homeCcy && !(dec(r?.orderFillTransaction?.commission) ?? D(0)).isZero()) await this.homeCurrency().catch(() => undefined);
     const res = this.parse(r, req.clientId, req.type);
     this.done.set(req.clientId, res);
     return res;
@@ -183,7 +185,8 @@ export class OandaBroker implements Broker {
       qty: units.abs().toString(),
       // OANDA はスプレッド型。commission (口座通貨建て・正の値で表される) があれば計上
       fee: commission.abs().toString(),
-      ...(this.homeCcy ? { feeCurrency: this.homeCcy } : {}),
+      // 口座通貨が分からず commission があるときは "UNKNOWN" (クオート通貨建てと誤認させない。エンジンが警告して 0 として記録する)
+      ...(this.homeCcy ? { feeCurrency: this.homeCcy } : !commission.isZero() ? { feeCurrency: "UNKNOWN" } : {}),
       liquidity: type === "limit" ? "maker" : "taker",
     };
   }
@@ -223,7 +226,7 @@ export class OandaBroker implements Broker {
    *   約定済みの注文も通常は照会できる想定だが、見つからない場合にトランザクション履歴を
    *   clientId で検索する手段は無いので undefined を返す (呼び出し側は建玉と突き合わせること)。
    */
-  async getOrder(clientId: string, _symbol: string, orderId?: string): Promise<OrderResult | undefined> {
+  async getOrder(clientId: string, _symbol: string, orderId?: string, _hint?: OrderLookupHint): Promise<OrderResult | undefined> {
     const cached = this.done.get(clientId);
     if (cached && !cached.orderId && cached.status === "rejected") return cached;
     const get = async (spec: string): Promise<any | undefined> => {
