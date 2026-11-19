@@ -1,10 +1,11 @@
 import { request } from "node:http";
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "../src/core/config";
-import type { Signal, Strategy, StrategyContext } from "../src/core/types";
+import type { IntelItem, Signal, Strategy, StrategyContext } from "../src/core/types";
 import {
   createDashboardHandler, dashboardAllowedHosts, isAllowedHost, parseLimit, routeDashboard, startDashboard, type DashboardDeps,
 } from "../src/dashboard/server";
+import { briefHeadlines } from "../src/engine/engine";
 import { buildRuntime } from "../src/engine/setup";
 import { mulberry32 } from "../src/market/feeds/synthetic";
 import { MemoryStore } from "../src/storage/memory";
@@ -24,10 +25,17 @@ const flipper: Strategy = {
   },
 };
 
-async function deps(): Promise<DashboardDeps> {
+/** テスト用の情報 (合成データ) */
+const intel = (i: number, over: Partial<IntelItem> = {}): IntelItem => ({
+  id: `n${i}`, source: "rss:test", kind: "news", title: `Bitcoin rally extends ${i}`, publishedAt: START - (i + 1) * 60_000, fetchedAt: START, assets: ["BTC"], ...over,
+});
+
+async function deps(items: IntelItem[] = []): Promise<DashboardDeps> {
   const clock = { t: START, now() { return this.t; } };
+  const store = new MemoryStore();
+  if (items.length) store.saveIntel(items);
   const rt = await buildRuntime(loadConfig({ NODE_ENV: "test", VENUES: "synthetic", DB_PATH: "memory" }), {
-    clock, store: new MemoryStore(), intelSources: [], ai: null, seed: 2, syntheticHistoryMs: 86_400_000, strategies: [flipper], rng: mulberry32(1),
+    clock, store, intelSources: [], ai: null, seed: 2, syntheticHistoryMs: 86_400_000, strategies: [flipper], rng: mulberry32(1),
   });
   await rt.engine.tick(START);
   await rt.engine.runIntel(START);
@@ -95,7 +103,47 @@ describe("ダッシュボード (listen せずにハンドラーを呼ぶ)", () 
     expect(s.positions.map((p: { symbol: string }) => p.symbol).sort()).toEqual(["BTC/USDT", "ETH/USDT"]);
     expect(s.plan.symbols.length).toBe(5);
     expect(s.brief.stub).toBe(true);
+    expect(s.brief.itemCount).toBe(0);
+    expect(s.brief.items).toEqual([]);
     expect(Array.isArray(s.equityHistory)).toBe(true);
+    // 監視銘柄の現在値 (気配の仲値)
+    for (const w of s.watched) expect(w.lastPrice).toBeGreaterThan(0);
+  });
+
+  it("GET /api/status: ブリーフに直近の情報の件数・強気弱気の内訳・見出し (最大 30 件・伏せ字・100 文字まで)", async () => {
+    const items = [
+      ...Array.from({ length: 40 }, (_, i) => intel(i)),
+      intel(100, { title: "Leaked url https://api.example.com/v1?apikey=abcdef1234567890 crash", publishedAt: START - 1000, sentiment: -0.6 }),
+      intel(101, { title: "x".repeat(300), publishedAt: START - 2000 }),
+      intel(102, { kind: "metric", source: "fng:test", title: "Fear & Greed 70", publishedAt: START - 3000 }),
+      intel(103, { title: "old news", publishedAt: START - 30 * 3_600_000 }), // 集計期間 (24 時間) の外
+    ];
+    const d = await deps(items);
+    const s = JSON.parse((await routeDashboard(d, "GET", "/api/status")).body);
+    expect(s.brief.itemCount).toBe(43);
+    expect(s.brief.itemTone.bull + s.brief.itemTone.bear + s.brief.itemTone.neutral).toBe(43);
+    expect(s.brief.itemTone.bear).toBeGreaterThanOrEqual(1);
+    expect(s.brief.items).toHaveLength(30);
+    // 新しい順
+    expect(s.brief.items[0].title).toMatch(/^Leaked url/);
+    expect(s.brief.items[0].title).not.toContain("abcdef1234567890");
+    expect(s.brief.items[0].sentiment).toBe(-0.6);
+    expect(s.brief.items[1].title.length).toBeLessThanOrEqual(100);
+    expect(s.brief.items[1].title.endsWith("…")).toBe(true);
+    // 指標は本文の感情を持たない
+    expect(s.brief.items[2]).toEqual({ title: "Fear & Greed 70", source: "fng:test" });
+    expect(s.brief.items.some((x: { title: string }) => x.title === "old news")).toBe(false);
+  });
+
+  it("briefHeadlines: 件数・内訳・見出しの切り詰め (純粋関数)", () => {
+    const h = briefHeadlines([intel(1, { sentiment: 0.5 }), intel(2, { sentiment: -0.5 }), intel(3, { sentiment: 0 }), intel(4, { title: "🚀".repeat(150), sentiment: 0.2 })], { limit: 2, maxLen: 10 });
+    expect(h.itemCount).toBe(4);
+    expect(h.itemTone).toEqual({ bull: 2, bear: 1, neutral: 1 });
+    expect(h.items.map((x) => x.sentiment)).toEqual([0.5, -0.5]);
+    const long = briefHeadlines([intel(4, { title: "🚀".repeat(150) })], { maxLen: 10 }).items[0].title;
+    expect(Array.from(long)).toHaveLength(10);
+    expect(long.endsWith("…")).toBe(true);
+    expect(briefHeadlines([]).items).toEqual([]);
   });
 
   it("GET /api/trades: 新しい順のトレードと要因分析・戦略別成績", async () => {
@@ -141,7 +189,7 @@ describe("ダッシュボード (listen せずにハンドラーを呼ぶ)", () 
     expect(Array.isArray(l.adjustments)).toBe(true);
   });
 
-  it("GET /: 単一 HTML (日本語・自動更新・ライト/ダーク・スマホ幅・外部 CDN なし)", async () => {
+  it("GET /: 単一 HTML (日本語・自動更新・暗いテーマ・スマホ幅・外部 CDN なし)", async () => {
     const d = await deps();
     const r = await routeDashboard(d, "GET", "/");
     expect(r.status).toBe(200);
@@ -156,7 +204,18 @@ describe("ダッシュボード (listen せずにハンドラーを呼ぶ)", () 
     expect(html).toContain("情報源の信頼度");
     expect(html).toContain("腕の成績");
     expect(html).toContain("setInterval(refresh, 5000)");
-    expect(html).toContain("prefers-color-scheme: dark");
+    expect(html).toContain('name="color-scheme" content="dark"');
+    // ボードタブ (コックピット風の一覧)
+    expect(html).toContain("TRADER <i>//</i> AUTO");
+    for (const s of ["SIGNAL STACK", "ENGINE LOG", "STRATEGY × REGIME", "ALLOCATION", "THIS RUN", "RISK BUDGET", "TRADES · BY STRATEGY"]) expect(html).toContain(s);
+    expect(html).toContain('data-tab="board"');
+    expect(html).toContain('<canvas id="cloud"');
+    // 負荷への配慮: 隠れているとき・別タブでは止める / 動きを控える設定 / 解像度は 2 倍まで
+    expect(html).toContain("document.hidden");
+    expect(html).toContain("prefers-reduced-motion");
+    expect(html).toContain("Math.min(2, window.devicePixelRatio || 1)");
+    // 文字列は esc() を通す (innerHTML へ生の API 値を入れない)
+    expect(html).toContain("function esc(s)");
     expect(html).toContain('name="viewport"');
     expect(html).toContain("<svg");
     // 外部リソースを読み込まない

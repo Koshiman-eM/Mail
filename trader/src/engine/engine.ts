@@ -5,13 +5,14 @@ import { redactSecrets } from "../core/http";
 import { createLogger, type Logger } from "../core/logger";
 import {
   systemClock, type Balance, type Broker, type BrokerPosition, type Clock, type EntryContext, type Instrument, type IntelBias, type MarketBrief,
-  type MarketView, type OrderRequest, type Params, type Quote, type RegimeFeatures, type Signal, type Store, type Strategy, type StrategyContext,
-  type StrategyPlan, type Timeframe, type TradeRecord,
+  type IntelItem, type MarketView, type OrderRequest, type Params, type Quote, type RegimeFeatures, type Signal, type Store, type Strategy,
+  type StrategyContext, type StrategyPlan, type Timeframe, type TradeRecord,
 } from "../core/types";
 import type { BrokerSet } from "../execution/router";
 import type { PaperSnapshot } from "../execution/paper";
 import type { IntelService } from "../intel/service";
 import { buildBaselinePlan, buildStrategyPlan, MAX_RISK_MULTIPLIER } from "../intel/planner";
+import { estimateSentiment } from "../intel/sentiment";
 import { DEX_SOURCE } from "../intel/sources/dexscreener";
 import { armKey } from "../learning/allocator";
 import { TradeJournal } from "../learning/journal";
@@ -185,7 +186,8 @@ export interface EngineStatus {
   mode: "paper" | "live";
   liveBlockedReason?: string;
   baseCurrency: string;
-  watched: { symbol: string; venue: string; assetClass: string; lastError?: string }[];
+  /** lastPrice: 最新の気配の仲値 (気配が無ければ省略) */
+  watched: { symbol: string; venue: string; assetClass: string; lastPrice?: number; lastError?: string }[];
   equity: { current: number; initial: number; cash?: number; realized?: number; unrealized?: number; available: number };
   risk: {
     halted: boolean;
@@ -219,11 +221,63 @@ export interface EngineStatus {
     watchlist: string[];
     biases: { asset: string; sentiment: number; confidence: number; eventRisk: number; blackoutUntil?: number }[];
     events: { ts: number; title: string; currency?: string; impact: string }[];
-  };
+  } & BriefHeadlines;
   equityHistory: { ts: number; equity: number }[];
   lastTickAt?: number;
   tickCount: number;
 }
+
+/** ダッシュボード用: 直近の情報 (ブリーフの集計対象期間) の件数と見出し */
+export interface BriefHeadlines {
+  /** 情報の件数 */
+  itemCount: number;
+  /** 件数の強気・弱気の内訳 (sentiment が ±0.15 を超えるもの。未分析はキーワード辞書で推定) */
+  itemTone: { bull: number; bear: number; neutral: number };
+  /** 新しい順の見出し (最大 30 件。伏せ字処理済み、各 100 文字まで) */
+  items: { title: string; source: string; sentiment?: number }[];
+}
+
+/** 文字列を伏せ字処理してから max 文字 (コードポイント) に切り詰める */
+const clipText = (s: string, max: number) => {
+  const cps = Array.from(redactSecrets(s).replace(/\s+/g, " ").trim());
+  return cps.length > max ? cps.slice(0, max - 1).join("") + "…" : cps.join("");
+};
+
+/** 見出しの sentiment (指標・カレンダーは本文の感情を持たないので undefined) */
+const headlineSentiment = (it: IntelItem): number | undefined => {
+  if (typeof it.sentiment === "number" && Number.isFinite(it.sentiment)) return it.sentiment;
+  if (it.kind === "metric" || it.kind === "calendar") return undefined;
+  return estimateSentiment(`${it.title} ${it.summary ?? ""}`).sentiment;
+};
+
+/** 情報の一覧 → 件数・強気弱気の内訳・新しい順の見出し (純粋関数) */
+export function briefHeadlines(items: IntelItem[], opts: { limit?: number; maxLen?: number } = {}): BriefHeadlines {
+  const limit = opts.limit ?? 30;
+  const maxLen = opts.maxLen ?? 100;
+  const tone = { bull: 0, bear: 0, neutral: 0 };
+  const scored = items.map((it) => ({ it, s: headlineSentiment(it) }));
+  for (const { s } of scored) {
+    if (s !== undefined && s > 0.15) tone.bull++;
+    else if (s !== undefined && s < -0.15) tone.bear++;
+    else tone.neutral++;
+  }
+  return {
+    itemCount: items.length,
+    itemTone: tone,
+    items: scored
+      .slice()
+      .sort((a, b) => b.it.publishedAt - a.it.publishedAt)
+      .slice(0, Math.max(0, limit))
+      .map(({ it, s }) => ({
+        title: clipText(it.title, maxLen),
+        source: clipText(it.source, 40),
+        ...(s !== undefined ? { sentiment: Math.round(s * 1000) / 1000 } : {}),
+      })),
+  };
+}
+
+/** ブリーフの集計対象期間 (IntelService の既定と同じ 24 時間) */
+const BRIEF_LOOKBACK_MS = 24 * 3_600_000;
 
 /** 等間隔に間引く (先頭と末尾は残す) */
 export function downsample<T>(arr: T[], max: number): T[] {
@@ -289,6 +343,8 @@ export class TradingEngine {
   private entriesPaused?: { since: number; clientIds: string[] };
   private lastTickAt?: number;
   private tickCount = 0;
+  /** ダッシュボード用の見出し (ブリーフが変わるまで再計算しない) */
+  private headlineCache?: { key: number; value: BriefHeadlines };
 
   constructor(deps: EngineDeps) {
     this.config = deps.config;
@@ -1407,6 +1463,15 @@ export class TradingEngine {
 
   // ───────── 状態 (ダッシュボード) ─────────
 
+  /** ブリーフの集計対象期間の情報 → 件数と見出し (ブリーフごとに 1 回だけ計算する) */
+  private briefHeadlinesFor(generatedAt: number): BriefHeadlines {
+    if (this.headlineCache?.key === generatedAt) return this.headlineCache.value;
+    const items = this.store.listIntel({ since: generatedAt - BRIEF_LOOKBACK_MS, limit: 1000 });
+    const value = briefHeadlines(items);
+    this.headlineCache = { key: generatedAt, value };
+    return value;
+  }
+
   async status(): Promise<EngineStatus> {
     const now = this.clock.now();
     const acct = await this.account(now);
@@ -1447,6 +1512,11 @@ export class TradingEngine {
       baseCurrency: this.config.env.BASE_CURRENCY,
       watched: this.hub.watched().map((i) => ({
         symbol: i.symbol, venue: i.venue, assetClass: i.assetClass,
+        ...((() => {
+          const q = this.hub.latestQuote(i.symbol);
+          const px = q ? midOf(q) : NaN;
+          return Number.isFinite(px) && px > 0 ? { lastPrice: px } : {};
+        })()),
         ...(this.hub.lastError(i.symbol) ? { lastError: redactSecrets(this.hub.lastError(i.symbol)!) } : {}),
       })),
       equity: {
@@ -1514,6 +1584,7 @@ export class TradingEngine {
                 .sort((a, b) => a.ts - b.ts)
                 .slice(0, 10)
                 .map((e) => ({ ts: e.ts, title: e.title, ...(e.currency ? { currency: e.currency } : {}), impact: e.impact })),
+              ...this.briefHeadlinesFor(brief.generatedAt),
             },
           }
         : {}),
