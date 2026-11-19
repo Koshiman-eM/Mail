@@ -82,6 +82,8 @@ export interface SimulationReport {
     shadow: LearningSnapshot["shadow"];
     /** ニュースと値動きの答え合わせ (合成データには情報が無いので通常 0 件) */
     news: LearningSnapshot["news"];
+    /** 値動きの予想の答え合わせ */
+    forecast: LearningSnapshot["forecast"];
   };
   plans: number;
 }
@@ -214,6 +216,7 @@ export async function runSimulation(o: SimulationOptions = {}): Promise<{ report
       sources: snapshot.sources,
       shadow: runtime.learning.shadowSummary({ now: end, windowMs: end - start + HOUR }),
       news: snapshot.news,
+      forecast: snapshot.forecast,
     },
     plans,
   };
@@ -248,6 +251,14 @@ export function formatSimulationReport(r: SimulationReport): string {
     `  仮想トレード (見送ったシグナル): 決済 ${sh.closed} 件 / 未決済 ${sh.open} 件 / 平均純R ${sh.avgNetR.toFixed(3)}` +
       `  ニュース判定: ${r.learning.news.sources.reduce((a, x) => a + x.n, 0)} 件`,
   );
+  const fh = r.learning.forecast.byHorizon;
+  const fn = fh.reduce((a, g) => a + g.n, 0);
+  const fhits = fh.reduce((a, g) => a + g.hits, 0);
+  lines.push(
+    `  値動きの予想: ${r.learning.forecast.recorded} 件 / 判定 ${fn} 件 (的中率 ${fn ? fmtPct(fhits / fn, 1) : "-"}) / ` +
+      fh.map((g) => `${g.horizon} ${g.n ? fmtPct(g.hitRate, 1) : "-"} (n=${g.n}, Brier ${g.brierN ? g.brier.toFixed(3) : "-"})`).join(" / ") +
+      ` / 取引に反映中 ${r.learning.forecast.byClass.filter((g) => g.live).length} 件`,
+  );
   lines.push("");
   lines.push(
     renderLearning(
@@ -261,6 +272,7 @@ export function formatSimulationReport(r: SimulationReport): string {
         causes: r.causes,
         shadow: r.learning.shadow,
         news: r.learning.news,
+        forecast: r.learning.forecast,
       },
       { arms: 12, lessons: 8, adjustments: 10 },
     ),

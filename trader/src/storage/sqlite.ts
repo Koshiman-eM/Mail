@@ -4,6 +4,8 @@ import { DatabaseSync, type SQLInputValue, type StatementSync } from "node:sqlit
 import type {
   AuditEvent,
   EquityPoint,
+  ForecastOutcomeFilter,
+  ForecastOutcomeRecord,
   IntelItem,
   IntelKind,
   Lesson,
@@ -30,6 +32,7 @@ import type {
  * - getIntel は引数 ids の順。
  * - 同じ id の save は上書き (upsert)。saveIntel のみ既存 id を無視し、新規件数を返す。
  * - shadow_trades (見送ったシグナルの仮想トレード): exitTs の昇順。
+ * - forecast_outcomes (判定済みの値動きの予想): judgedAt の昇順。
  */
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS trades (
@@ -133,6 +136,16 @@ CREATE TABLE IF NOT EXISTS shadow_trades (
 );
 CREATE INDEX IF NOT EXISTS idx_shadow_exit ON shadow_trades(exitTs);
 CREATE INDEX IF NOT EXISTS idx_shadow_mode ON shadow_trades(mode, exitTs);
+
+CREATE TABLE IF NOT EXISTS forecast_outcomes (
+  id TEXT PRIMARY KEY,
+  judgedAt INTEGER NOT NULL,
+  mode TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  data TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_forecast_judged ON forecast_outcomes(judgedAt);
+CREATE INDEX IF NOT EXISTS idx_forecast_mode ON forecast_outcomes(mode, judgedAt);
 
 CREATE TABLE IF NOT EXISTS kv (
   key TEXT PRIMARY KEY,
@@ -411,6 +424,31 @@ export class SqliteStore implements Store {
 
   pruneShadowTrades(before: number): number {
     return Number(this.stmt("DELETE FROM shadow_trades WHERE exitTs < ?").run(before).changes);
+  }
+
+  // ───────── forecast outcomes ─────────
+
+  saveForecastOutcomes(records: ForecastOutcomeRecord[]): void {
+    if (records.length === 0) return;
+    const st = this.stmt(
+      `INSERT INTO forecast_outcomes (id, judgedAt, mode, symbol, data) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET judgedAt = excluded.judgedAt, mode = excluded.mode, symbol = excluded.symbol, data = excluded.data`,
+    );
+    this.tx(() => {
+      for (const r of records) st.run(r.id, r.judgedAt, r.mode, r.symbol, JSON.stringify(r));
+    });
+  }
+
+  listForecastOutcomes(f: ForecastOutcomeFilter = {}): ForecastOutcomeRecord[] {
+    const w = new Where();
+    if (f.since !== undefined) w.add("judgedAt >= ?", f.since);
+    if (f.mode !== undefined) w.add("mode = ?", f.mode);
+    if (f.symbol !== undefined) w.add("symbol = ?", f.symbol);
+    return this.listLatest<ForecastOutcomeRecord>("forecast_outcomes", "judgedAt", w, f.limit);
+  }
+
+  pruneForecastOutcomes(before: number): number {
+    return Number(this.stmt("DELETE FROM forecast_outcomes WHERE judgedAt < ?").run(before).changes);
   }
 
   // ───────── audit ─────────

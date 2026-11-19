@@ -279,6 +279,7 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
   const learning = new LearningService({
     ...(opts.learning ?? {}),
     store,
+    mode: brokerSet.mode,
     getStrategy: (id) => strategies.find((s) => s.id === id),
     validate: createParamValidator({
       hub, strategies, clock,

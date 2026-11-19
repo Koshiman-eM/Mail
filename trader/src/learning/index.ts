@@ -7,3 +7,4 @@ export * from "./service";
 export * from "./tuner";
 export * from "./newsCheck";
 export * from "./shadow";
+export * from "./forecast";

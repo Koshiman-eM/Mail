@@ -626,6 +626,45 @@ export interface ShadowTradeFilter {
   limit?: number;
 }
 
+// ───────────────────────── 値動きの予想 (判定済みの記録) ─────────────────────────
+
+/** 予想の方向。flat は「ノイズの範囲内」 */
+export type ForecastDirection = "up" | "down" | "flat";
+
+/**
+ * 判定済みの予想 1 件 (銘柄 × 予想時間)。確率・統計なので number。
+ * outcome: 実際の動き (ノイズの範囲内は flat、価格が取れなかったものは expired)
+ */
+export interface ForecastOutcomeRecord {
+  id: string;
+  mode: TradingMode;
+  symbol: string;
+  assetClass: AssetClass;
+  /** 予想時間 (ミリ秒) */
+  horizonMs: number;
+  madeAt: number;
+  dueAt: number;
+  judgedAt: number;
+  pUp: number;
+  direction: ForecastDirection;
+  outcome: ForecastDirection | "expired";
+  /** (判定価格 − 予想時の仲値) / 予想時の仲値 */
+  changePct?: number;
+  /** ノイズの範囲 (比率) */
+  noisePct?: number;
+  /** 方向の予想 (up/down) と方向の結果 (up/down) の両方があるときだけ */
+  hit?: boolean;
+  /** 特徴量 (FORECAST_FEATURES の順) */
+  features: number[];
+}
+
+export interface ForecastOutcomeFilter {
+  since?: number;
+  mode?: TradingMode;
+  symbol?: string;
+  limit?: number;
+}
+
 export interface EquityPoint {
   ts: number;
   equity: number;
@@ -684,6 +723,12 @@ export interface Store {
   listShadowTrades(f?: ShadowTradeFilter): ShadowTradeRecord[];
   /** exitTs < before の仮想トレードを消す。消した件数を返す */
   pruneShadowTrades(before: number): number;
+
+  /** 判定済みの予想 (同じ id は上書き)。list は judgedAt の昇順、limit は最新 N 件 */
+  saveForecastOutcomes(records: ForecastOutcomeRecord[]): void;
+  listForecastOutcomes(f?: ForecastOutcomeFilter): ForecastOutcomeRecord[];
+  /** judgedAt < before の記録を消す。消した件数を返す */
+  pruneForecastOutcomes(before: number): number;
 
   audit(e: AuditEvent): void;
   listAudit(opts?: { since?: number; type?: string; limit?: number }): AuditEvent[];

@@ -81,20 +81,22 @@ export function createParamValidator(o: ValidatorOptions): ParamValidator {
  * 履歴の範囲外 (古すぎる・まだ確定していない) なら undefined (学習側が次回再試行する)。
  */
 export function createPriceAt(hub: HubLike, clock: Clock): PriceAt {
-  return (symbol, ts) => {
-    const c = hub.getView(symbol, clock.now())?.candles["1m"];
-    if (!c || c.length === 0) return undefined;
-    const ms = TIMEFRAME_MS["1m"];
-    if (ts < c[0].ts || ts >= c[c.length - 1].ts + ms) return undefined;
-    // ts 以下で最後の足 (二分探索)
-    let lo = 0;
-    let hi = c.length - 1;
-    while (lo < hi) {
-      const mid = (lo + hi + 1) >> 1;
-      if (c[mid].ts <= ts) lo = mid;
-      else hi = mid - 1;
-    }
-    const px = c[lo].close;
-    return px > 0 ? px : undefined;
-  };
+  return (symbol, ts) => priceFromCandles(hub.getView(symbol, clock.now())?.candles["1m"], ts);
+}
+
+/** 1m 確定足 (昇順) のうち ts を含む足の終値。範囲外なら undefined */
+export function priceFromCandles(c: readonly Candle[] | undefined, ts: number): number | undefined {
+  if (!c || c.length === 0) return undefined;
+  const ms = TIMEFRAME_MS["1m"];
+  if (ts < c[0].ts || ts >= c[c.length - 1].ts + ms) return undefined;
+  // ts 以下で最後の足 (二分探索)
+  let lo = 0;
+  let hi = c.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (c[mid].ts <= ts) lo = mid;
+    else hi = mid - 1;
+  }
+  const px = c[lo].close;
+  return px > 0 ? px : undefined;
 }

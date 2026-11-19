@@ -1,6 +1,8 @@
 import type {
   AuditEvent,
   EquityPoint,
+  ForecastOutcomeFilter,
+  ForecastOutcomeRecord,
   IntelItem,
   IntelKind,
   Lesson,
@@ -42,6 +44,7 @@ export class MemoryStore implements Store {
   private audits: AuditEvent[] = [];
   private kv = new Map<string, string>();
   private shadows = new Map<string, ShadowTradeRecord>();
+  private forecasts = new Map<string, ForecastOutcomeRecord>();
 
   saveTrade(t: TradeRecord): void {
     this.trades.set(t.id, clone(t));
@@ -188,6 +191,35 @@ export class MemoryStore implements Store {
     for (const [id, t] of this.shadows) {
       if (t.exitTs < before) {
         this.shadows.delete(id);
+        n++;
+      }
+    }
+    return n;
+  }
+
+  saveForecastOutcomes(records: ForecastOutcomeRecord[]): void {
+    for (const r of records) {
+      // 上書きでも保存順 (Map の挿入順) を最新にする
+      this.forecasts.delete(r.id);
+      this.forecasts.set(r.id, clone(r));
+    }
+  }
+
+  listForecastOutcomes(f: ForecastOutcomeFilter = {}): ForecastOutcomeRecord[] {
+    const items = [...this.forecasts.values()].filter(
+      (r) =>
+        (f.since === undefined || r.judgedAt >= f.since) &&
+        (f.mode === undefined || r.mode === f.mode) &&
+        (f.symbol === undefined || r.symbol === f.symbol),
+    );
+    return latest(items, (r) => r.judgedAt, f.limit);
+  }
+
+  pruneForecastOutcomes(before: number): number {
+    let n = 0;
+    for (const [id, r] of this.forecasts) {
+      if (r.judgedAt < before) {
+        this.forecasts.delete(id);
         n++;
       }
     }

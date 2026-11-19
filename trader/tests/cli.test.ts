@@ -79,6 +79,12 @@ describe("simulate コマンド", () => {
     expect(text).toContain("■ ニュースと値動きの答え合わせ");
     expect(text).toMatch(/腕\s+件数\s+仮想/);
     expect(text).toContain("ニュース判定");
+    // 値動きの予想の答え合わせ
+    expect(text).toContain("■ 値動きの予想の答え合わせ");
+    expect(text).toMatch(/値動きの予想: \d+ 件 \/ 判定 \d+ 件/);
+    expect(text).toMatch(/時間\|資産クラス\s+トレンド\s+モメンタム\s+平均回帰\s+ニュース\s+戦略の合意\s+バイアス/);
+    expect(text).toContain("取引への反映:");
+    expect(text).toContain("較正 (pUp を 0.1 刻み");
   }, 60_000);
 
   it("runSimulation: レポートの中身 (paper のみ・要因分析済み)", async () => {
@@ -94,6 +100,11 @@ describe("simulate コマンド", () => {
     expect(report.learning.shadow.closed).toBe(store.listShadowTrades().length);
     expect(report.learning.shadow.counters.created).toBeGreaterThanOrEqual(report.learning.shadow.closed);
     expect(report.learning.news.recorded).toBe(0);
+    // 値動きの予想: 5 分ごと × 3 時間 × 銘柄数。判定済みは保存件数と一致
+    expect(report.learning.forecast.recorded).toBeGreaterThan(report.symbols.length * 3 * 30);
+    const judged = report.learning.forecast.byHorizon.reduce((a, g) => a + g.n + g.noise + (g.flatPred - g.flatHits) + g.expired, 0);
+    expect(judged).toBe(store.listForecastOutcomes().length);
+    expect(report.learning.forecast.byClass.every((g) => !g.live)).toBe(true);
     expect(report.plans).toBeGreaterThanOrEqual(12);
     expect(report.finalEquity).toBeGreaterThan(0);
     expect(progress).toHaveBeenCalled();
@@ -133,6 +144,11 @@ describe("report / resume", () => {
     const config = loadConfig({ NODE_ENV: "test", DB_PATH: "memory" });
     const text = buildReportText(config, store, Date.UTC(2026, 0, 6));
     expect(text).toContain("評価額 (paper)");
+    expect(text).toContain("■ 値動きの予想の答え合わせ");
+    expect(text).toMatch(/mode paper \/ 予想 [1-9]\d* 件/);
+    expect(text).toMatch(/15m\s+crypto\s+\d+/);
+    expect(text).toMatch(/15m\|crypto\s+[+-]\d/);
+    expect(text).toContain("取引への反映: なし");
     expect(text).toContain("戦略別の成績");
     expect(text).toContain("腕の成績");
     expect(text).toContain("有効な教訓");

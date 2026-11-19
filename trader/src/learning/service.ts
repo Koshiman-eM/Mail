@@ -14,10 +14,12 @@ import type {
   Strategy,
   TradeAttribution,
   TradeRecord,
+  TradingMode,
 } from "../core/types";
 import { armKey, StrategyAllocator, type AllocatorOptions, type ArmSnapshot, type Rng } from "./allocator";
 import { attributeTrade } from "./attribution";
 import { DEFAULT_POST_EXIT_HORIZON_MS, fillPostExitMoves, type PriceAt } from "./journal";
+import { loadForecastSummary, type ForecastSummary, type ForecastTracker } from "./forecast";
 import { NewsOutcomeTracker, type NewsCheckOptions, type NewsCheckSummary } from "./newsCheck";
 import { reflect, type ReflectionResult } from "./reflection";
 import { SourceReliabilityTracker, type ReliabilityOptions } from "./reliability";
@@ -55,6 +57,8 @@ export interface LearningServiceDeps {
   newsCheck?: Partial<NewsCheckOptions>;
   /** 決済済みの仮想トレードを残す期間 (既定 30 日。periodic で古いものを消す) */
   shadowRetentionMs?: number;
+  /** 値動きの予想の集計を読む mode (エンジンが予想を attachForecast していないとき。省略時は記録の多い方) */
+  mode?: TradingMode;
 }
 
 export interface PeriodicResult {
@@ -89,6 +93,8 @@ export interface LearningSnapshot {
   shadow: ShadowSummary;
   /** ニュースと値動きの答え合わせ */
   news: NewsCheckSummary;
+  /** 値動きの予想の答え合わせ */
+  forecast: ForecastSummary;
 }
 
 const ASSET_CLASSES: AssetClass[] = ["crypto", "meme", "fx", "stock"];
@@ -113,6 +119,8 @@ export class LearningService {
   readonly news: NewsOutcomeTracker;
   private readonly deps: LearningServiceDeps;
   private running = false;
+  /** エンジンが持つ値動きの予想 (無ければ kv から読む) */
+  private forecastTracker?: ForecastTracker;
 
   constructor(deps: LearningServiceDeps) {
     this.deps = deps;
@@ -186,6 +194,16 @@ export class LearningService {
 
   newsSummary(): NewsCheckSummary {
     return this.news.summary();
+  }
+
+  /** エンジンの値動きの予想を集計の対象にする (予想・判定・取引への反映はエンジンが行う) */
+  attachForecast(t: ForecastTracker | undefined): void {
+    this.forecastTracker = t;
+  }
+
+  /** 値動きの予想の答え合わせの集計 (直近 30 日)。ニュースの重みは情報源の信頼度とは別の指標 (重複して更新しない) */
+  forecastSummary(now: number = Date.now()): ForecastSummary {
+    return this.forecastTracker ? this.forecastTracker.summary(now) : loadForecastSummary(this.store, now, this.deps.mode);
   }
 
   /** 定期処理 (学習ループから呼ぶ)。同時実行はスキップ */
@@ -300,6 +318,7 @@ export class LearningService {
       causes: this.causeSummary(now - (opts.causeWindowMs ?? 30 * 86_400_000)),
       shadow: this.shadowSummary({ now, windowMs: opts.shadowWindowMs }),
       news: this.newsSummary(),
+      forecast: this.forecastSummary(now),
     };
   }
 }

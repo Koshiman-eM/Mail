@@ -226,6 +226,34 @@ option { background: #0b1222; color: var(--hi); }
 .sc .sv.pos { color: var(--g); } .sc .sv.neg { color: var(--r); } .sc .sv.no { color: var(--r); font-size: 19px; }
 .sc .sf { font-size: 10.5px; color: var(--mut); letter-spacing: .04em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sc .sf .bull { color: var(--g); } .sc .sf .bear { color: var(--r); }
+/* WATCH カードの右側: 値動きの予想。カード幅が狭いとき・スマホでは価格の下に回り込む */
+.sc.w { container-type: inline-size; }
+.sc.w .sb { display: grid; grid-template-columns: minmax(0, 1fr); gap: 3px 10px; align-items: start; }
+.sc.w .scl { min-width: 0; }
+.sc.w .sf { white-space: normal; }
+.fc { min-width: 0; padding-top: 4px; border-top: 1px dashed var(--line2); font-size: 10.5px; line-height: 1.4; color: var(--mut); }
+.fc .fr { display: grid; grid-template-columns: 26px 12px 30px minmax(28px, 1fr) auto; align-items: center; gap: 0 4px; white-space: nowrap; }
+.fc .fh { color: var(--fg); letter-spacing: .04em; }
+.fc .fh.lv { color: var(--y); }
+.fc .fa { text-align: center; } .fc .f-up { color: var(--g); } .fc .f-dn { color: var(--r); } .fc .f-fl { color: var(--mut); }
+.fc .fp { text-align: right; color: var(--hi); font-variant-numeric: tabular-nums; }
+.fc .fb { position: relative; height: 4px; background: #172036; }
+.fc .fb::after { content: ""; position: absolute; left: 50%; top: -1px; bottom: -1px; width: 1px; background: var(--dim); }
+.fc .fb i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--fbc, #7a89a3); }
+.fc .fg { color: var(--mut); font-variant-numeric: tabular-nums; text-align: right; }
+.fc .fs { display: flex; align-items: center; gap: 6px; margin-top: 2px; font-size: 10px; letter-spacing: .04em; white-space: nowrap; }
+.fc .fs .lrn { color: var(--dim); }
+.lvb { flex: none; display: inline-block; padding: 0 4px; background: var(--y); color: #12141c; font-weight: 800; font-size: 9.5px; letter-spacing: .12em; border-radius: 1px; }
+@container (min-width: 290px) {
+  .sc.w .sb { grid-template-columns: minmax(0, 1fr) auto; }
+  .sc.w .fc { padding: 0 0 0 8px; border-top: 0; border-left: 1px dashed var(--line2); }
+  .sc.w .fc .fr { grid-template-columns: 22px 10px 26px 28px auto; }
+}
+@media (max-width: 760px) {
+  .sc.w .sb { grid-template-columns: minmax(0, 1fr); }
+  .sc.w .fc { padding: 4px 0 0; border-left: 0; border-top: 1px dashed var(--line2); }
+  .sc.w .fc .fr { grid-template-columns: 26px 12px 30px minmax(40px, 1fr) auto; }
+}
 
 /* 下段 */
 .cards3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; }
@@ -454,6 +482,10 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
   <section class="pn wide" data-pane="learning">
     <h2 class="ph"><span class="t">NEWS · PRICE CHECK<span class="jp">ニュースと値動きの答え合わせ</span></span></h2>
     <div class="pb"><div id="newsCheck"></div></div>
+  </section>
+  <section class="pn wide" data-pane="learning">
+    <h2 class="ph"><span class="t">FORECAST · ACCURACY<span class="jp">値動きの予想の答え合わせ</span></span><span class="st" id="fcState"></span></h2>
+    <div class="pb"><div id="forecast"></div></div>
   </section>
 </main>
 <div class="ticker bo" aria-label="ティッカー"><div class="mt" id="tick"></div></div>
@@ -1233,6 +1265,31 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
   }
 
   // ───── SIGNAL STACK ─────
+  var FC_ARROW = { up: "▲", down: "▼", flat: "―" }, FC_CLS = { up: "f-up", down: "f-dn", flat: "f-fl" };
+  var FC_FEAT = { trend: "トレンド", momentum: "モメンタム", meanRevert: "平均回帰", news: "ニュース", consensus: "戦略の合意", bias: "バイアス" };
+  function rangeTxt(r) {
+    if (typeof r !== "number" || !isFinite(r)) return "";
+    var p = r * 100;
+    return "±" + (p >= 1 ? p.toFixed(1) : p >= 0.1 ? p.toFixed(1) : p.toFixed(2)) + "%";
+  }
+  /** WATCH カードの右側: 時間ごとの方向・確率・値幅と、的中率 (件数が少ない間は「学習中」) */
+  function forecastBlock(f) {
+    if (!f || !f.horizons || !f.horizons.length) return "";
+    var rows = f.horizons.map(function (h) {
+      var dir = h.direction === "up" || h.direction === "down" ? h.direction : "flat";
+      var p = typeof h.pUp === "number" ? h.pUp : 0.5, side = Math.max(p, 1 - p);
+      var col = dir === "up" ? C.g : dir === "down" ? C.r : C.mut;
+      var why = Object.keys(h.contributions || {}).map(function (k) { return (FC_FEAT[k] || k) + " " + signed(h.contributions[k], 3); }).join(" / ");
+      var tip = h.horizon + " 後: 上昇確率 " + pct(p, 1) + " · 値幅 " + rangeTxt(h.rangePct) + " · 的中 " + (h.n ? pct(h.hitRate, 1) : "-") + " (n=" + h.n + ")" + (h.live ? " · 取引に反映中" : "") + (why ? " · 根拠: " + why : "");
+      return '<div class="fr" title="' + esc(tip) + '"><span class="fh' + (h.live ? " lv" : "") + '">' + esc(String(h.horizon).toUpperCase()) + '</span><span class="fa ' + FC_CLS[dir] + '">' + FC_ARROW[dir] + '</span><span class="fp">' + esc(Math.round(side * 100) + "%") +
+        '</span><span class="fb"><i style="width:' + (side * 100).toFixed(0) + "%;--fbc:" + col + '"></i></span><span class="fg">' + esc(rangeTxt(h.rangePct)) + "</span></div>";
+    }).join("");
+    var a = f.accuracy || { n: 0, hits: 0, hitRate: 0, minSamples: 100 };
+    var learning = a.n < (a.minSamples || 100);
+    var foot = '<div class="fs">' + (learning ? '<span class="lrn">学習中 · n=' + esc(a.n) + "</span>" : "<span>" + esc("的中 " + Math.round(a.hitRate * 100) + "% · n=" + a.n) + "</span>") +
+      (f.live ? '<span class="lvb" title="実力が統計的に確かめられた予想を新規エントリーのサイズに反映中">LIVE</span>' : "") + "</div>";
+    return '<div class="fc" title="' + esc("予想 " + hms(f.madeAt)) + '">' + rows + foot + "</div>";
+  }
   function renderStack() {
     var s = S, bm = biasMap(), dirOf = {}, posPx = {}, h = "";
     if (s.plan) s.plan.symbols.forEach(function (x) { dirOf[x.symbol] = x.directionBias; });
@@ -1241,9 +1298,10 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
       var x = bm[baseOf(w.symbol)], sv = x ? x.sentiment : null, t = sv == null ? null : toneOf(sv);
       var px = w.lastPrice != null ? w.lastPrice : posPx[w.symbol] != null ? posPx[w.symbol] : lastCandles && lastCandles.symbol === w.symbol && lastCandles.candles.length ? lastCandles.candles[lastCandles.candles.length - 1].close : null;
       var col = t && t[1] === "bull" ? C.g : t && t[1] === "bear" ? C.r : C.c, d = dirOf[w.symbol];
-      h += '<div class="sc" style="--sc:' + col + '"><div class="sq"><span class="tg">WATCH</span><span class="q">' + esc(w.symbol + " · 計画 " + (d ? (d === "both" ? "両方" : DIR[d] || d) : "-") + " · " + String(w.assetClass).toUpperCase()) + "</span>" + (w.lastError ? '<span class="err" title="' + esc(w.lastError) + '">!</span>' : "") + "</div>" +
-        '<div class="sv">' + esc(num(px)) + "</div>" +
-        '<div class="sf">' + (t ? '<span class="' + t[1] + '">' + esc(t[0] + " " + signed(sv, 2)) + "</span>" + esc(" · 信頼度 " + num(x.confidence, 2) + (x.blackoutUntil ? " · " + time(x.blackoutUntil) + " まで停止" : "")) : "情報なし") + "</div></div>";
+      h += '<div class="sc w" style="--sc:' + col + '"><div class="sq"><span class="tg">WATCH</span><span class="q">' + esc(w.symbol + " · 計画 " + (d ? (d === "both" ? "両方" : DIR[d] || d) : "-") + " · " + String(w.assetClass).toUpperCase()) + "</span>" + (w.lastError ? '<span class="err" title="' + esc(w.lastError) + '">!</span>' : "") + "</div>" +
+        '<div class="sb"><div class="scl"><div class="sv">' + esc(num(px)) + "</div>" +
+        '<div class="sf">' + (t ? '<span class="' + t[1] + '">' + esc(t[0] + " " + signed(sv, 2)) + "</span>" + esc(" · 信頼度 " + num(x.confidence, 2) + (x.blackoutUntil ? " · " + time(x.blackoutUntil) + " まで停止" : "")) : "情報なし") + "</div></div>" +
+        forecastBlock(w.forecast) + "</div></div>";
     });
     EV.filter(function (e) { return e.kind === "entry" || e.kind === "exit" || e.kind === "skip"; }).slice(0, 5).forEach(function (e) {
       var d = e.data || {};
@@ -1534,6 +1592,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     }), [false, true, true, true, true, true, true, false]));
     safe("shadow", function () { renderShadow(l.shadow); });
     safe("newsCheck", function () { renderNewsCheck(l.news); });
+    safe("forecast", function () { renderForecast(l.forecast); });
   }
   var SH_EXIT = { stop: "損切り", take_profit: "利確", time: "時間切れ", unwatched: "監視終了" };
   function shadowRows(rows) {
@@ -1569,6 +1628,37 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     }), [false, true, true, true, true, true]) + "</div>";
     h += '<p class="note">ノイズ = |変化率| が max(1 分足 ATR 比 × √分数 × 0.5, 往復コスト比) 未満の動き (判定せず数えません)。1 判定は重み 0.3 で情報源の信頼度に反映。</p>';
     set("newsCheck", h);
+  }
+
+  function renderForecast(f) {
+    if (!f) { set("forecast", '<p class="empty">まだありません</p>'); set("fcState", ""); return; }
+    var o = f.options || {}, minN = o.minSamples || 100;
+    var liveN = (f.byClass || []).filter(function (g) { return g.live; }).length;
+    set("fcState", liveN ? "● LIVE " + liveN : "● 反映なし");
+    var h = '<p class="note">' + esc("予想 " + f.recorded + " 件 (" + Math.round((o.intervalMs || 300000) / 60000) + " 分ごと × " + (f.horizons || []).join("・") + ") / 判定待ち " + f.pending + " 件 / 学習 " + f.learned + " 件 / 直近 " + Math.round(f.windowMs / 86400000) + " 日 / mode " + f.mode) + "</p>";
+    function state(g) {
+      return g.live ? '<span class="lvb">LIVE</span>' : g.n < minN ? '<span class="muted">' + esc("学習中 " + g.n + "/" + minN) + "</span>" : '<span class="muted">有意差なし</span>';
+    }
+    function rate(g) { return g.n ? '<span class="' + (g.hitRate > 0.5 ? "pos" : g.hitRate < 0.5 ? "neg" : "") + '">' + esc(pct(g.hitRate, 1)) + "</span>" : "-"; }
+    h += "<h2>BY HORIZON × CLASS · 時間 × 資産クラス</h2>" + '<div class="scroll">' + table(["時間", "資産クラス", "的中率", "判定", "z", "Brier", "flat予想", "ノイズ", "反映"], (f.byClass || []).map(function (g) {
+      return [esc(g.horizon), esc(g.assetClass || "-"), rate(g), esc(g.n), esc(num(g.z, 2)), esc(g.brierN ? g.brier.toFixed(4) : "-"), esc(g.flatPred), esc(g.noise), state(g)];
+    }), [false, false, true, true, true, true, true, true, false]) + "</div>";
+    var cal = f.calibration || [];
+    var bins = [];
+    for (var i = 0; i < 10; i++) if (cal.some(function (c) { return c.bins[i] && c.bins[i].n > 0; })) bins.push(i);
+    h += "<h2>CALIBRATION · 較正 (pUp 0.1 刻みの実際の上昇率)</h2>" + '<div class="scroll">' + table(["pUp"].concat(cal.map(function (c) { return c.horizon + " 上昇率 (n)"; })), bins.map(function (i) {
+      return [esc((i / 10).toFixed(1) + "–" + ((i + 1) / 10).toFixed(1))].concat(cal.map(function (c) {
+        var b = c.bins[i]; return b && b.n ? esc(pct(b.upRate, 0) + " (" + b.n + ")") : '<span class="muted">-</span>';
+      }));
+    }), [false].concat(cal.map(function () { return true; }))) + "</div>";
+    var feats = ["trend", "momentum", "meanRevert", "news", "consensus"];
+    h += "<h2>WEIGHTS · 特徴量の重み</h2>" + '<div class="scroll">' + table(["時間|資産クラス"].concat(feats.map(function (k) { return FC_FEAT[k]; })).concat(["バイアス", "学習件数"]), (f.models || []).map(function (m) {
+      return [esc(m.key)].concat(feats.map(function (k) { var v = m.weights[k]; return '<span class="' + cls(v) + '">' + esc(signed(v, 3)) + "</span>"; }))
+        .concat(['<span class="' + cls(m.bias) + '">' + esc(signed(m.bias, 3)) + "</span>", esc(m.updates)]);
+    }), [false, true, true, true, true, true, true, true]) + "</div>";
+    h += '<p class="note">' + esc("的中率 = 方向の予想 (▲▼) と方向の結果の組だけ。flat の予想 (|pUp−0.5| < " + (o.flatThreshold || 0.05) + ") とノイズの範囲内の動き (|変化率| < max(1 分足 ATR 比 × √分数 × " + (o.noiseAtrMult || 0.5) + ", 往復コスト比)) は別に数えます。" +
+      "取引への反映は、判定 " + minN + " 件以上かつ的中率が 50% を有意に上回る (片側 95%。z は重なる予想の分を √(予想時間 ÷ 間隔) で割って補正) 時間 × 資産クラスだけ: 一致で最大 " + (1 + (o.maxBoost || 0.2)).toFixed(1) + " 倍、逆で最小 " + (1 - (o.maxCut || 0.3)).toFixed(1) + " 倍 (リスク管理の上限は不変)。ニュースの重みは情報源の信頼度とは別の指標です。") + "</p>";
+    set("forecast", h);
   }
 
   // ───── まとめて描画 (一部が失敗しても他は続ける) ─────

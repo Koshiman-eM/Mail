@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import type { IntelItem, Lesson, ParamAdjustment, ShadowTradeRecord, Store, TradeRecord } from "../src/core/types";
+import type { ForecastOutcomeRecord, IntelItem, Lesson, ParamAdjustment, ShadowTradeRecord, Store, TradeRecord } from "../src/core/types";
 import { MemoryStore } from "../src/storage/memory";
 import { SqliteStore } from "../src/storage/sqlite";
 import { createStore } from "../src/storage";
@@ -245,6 +245,28 @@ describe.each<[string, () => Store]>([
     expect(s.pruneShadowTrades(2_500)).toBe(1);
     expect(s.listShadowTrades().map((t) => t.id)).toEqual(["b", "c"]);
     expect(s.pruneShadowTrades(0)).toBe(0);
+    s.close();
+  });
+
+  it("forecast outcomes: upsert・フィルタ (since/mode/symbol)・judgedAt の昇順・limit は最新 N 件・prune", () => {
+    const s = make();
+    const rec = (id: string, judgedAt: number, over: Partial<ForecastOutcomeRecord> = {}): ForecastOutcomeRecord => ({
+      id, mode: "paper", symbol: "BTC/USDT", assetClass: "crypto", horizonMs: 900_000, madeAt: judgedAt - 900_000, dueAt: judgedAt, judgedAt,
+      pUp: 0.6, direction: "up", outcome: "up", changePct: 0.01, noisePct: 0.002, hit: true, features: [0.1, -0.2, 0, 0.3, 0], ...over,
+    });
+    s.saveForecastOutcomes([rec("b", 2_000), rec("a", 1_000, { mode: "live", symbol: "ETH/USDT" }), rec("c", 3_000, { outcome: "expired", hit: undefined })]);
+    s.saveForecastOutcomes([]);
+    expect(s.listForecastOutcomes().map((r) => r.id)).toEqual(["a", "b", "c"]);
+    expect(s.listForecastOutcomes({ since: 2_000 }).map((r) => r.id)).toEqual(["b", "c"]);
+    expect(s.listForecastOutcomes({ mode: "live" }).map((r) => r.id)).toEqual(["a"]);
+    expect(s.listForecastOutcomes({ symbol: "BTC/USDT" }).map((r) => r.id)).toEqual(["b", "c"]);
+    expect(s.listForecastOutcomes({ limit: 1 }).map((r) => r.id)).toEqual(["c"]);
+    expect(s.listForecastOutcomes({ since: 3_000 })[0]).toEqual(JSON.parse(JSON.stringify(rec("c", 3_000, { outcome: "expired", hit: undefined }))));
+    s.saveForecastOutcomes([rec("b", 2_500, { outcome: "down", hit: false })]);
+    expect(s.listForecastOutcomes()).toHaveLength(3);
+    expect(s.listForecastOutcomes().find((r) => r.id === "b")).toMatchObject({ judgedAt: 2_500, outcome: "down", hit: false });
+    expect(s.pruneForecastOutcomes(2_500)).toBe(1);
+    expect(s.listForecastOutcomes().map((r) => r.id)).toEqual(["b", "c"]);
     s.close();
   });
 
