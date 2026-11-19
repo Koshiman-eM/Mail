@@ -77,6 +77,11 @@ export interface SimulationReport {
     lessons: Lesson[];
     intelInfluence: LearningSnapshot["intelInfluence"];
     learningRuns: number;
+    sources: LearningSnapshot["sources"];
+    /** 見送ったシグナルの答え合わせ (仮想トレード) */
+    shadow: LearningSnapshot["shadow"];
+    /** ニュースと値動きの答え合わせ (合成データには情報が無いので通常 0 件) */
+    news: LearningSnapshot["news"];
   };
   plans: number;
 }
@@ -206,6 +211,9 @@ export async function runSimulation(o: SimulationOptions = {}): Promise<{ report
       lessons: snapshot.lessons,
       intelInfluence: snapshot.intelInfluence,
       learningRuns,
+      sources: snapshot.sources,
+      shadow: runtime.learning.shadowSummary({ now: end, windowMs: end - start + HOUR }),
+      news: snapshot.news,
     },
     plans,
   };
@@ -235,6 +243,11 @@ export function formatSimulationReport(r: SimulationReport): string {
   lines.push("", `■ 学習の動き (学習ループ ${r.learning.learningRuns} 回 / 計画の更新 ${r.plans} 回)`);
   const applied = r.learning.adjustments.filter((a) => a.status === "applied").length;
   lines.push(`  腕 ${r.learning.arms.length} 本を更新 / パラメータ調整 ${r.learning.adjustments.length} 件 (適用 ${applied}) / 有効な教訓 ${r.learning.lessons.length} 件`);
+  const sh = r.learning.shadow;
+  lines.push(
+    `  仮想トレード (見送ったシグナル): 決済 ${sh.closed} 件 / 未決済 ${sh.open} 件 / 平均純R ${sh.avgNetR.toFixed(3)}` +
+      `  ニュース判定: ${r.learning.news.sources.reduce((a, x) => a + x.n, 0)} 件`,
+  );
   lines.push("");
   lines.push(
     renderLearning(
@@ -243,9 +256,11 @@ export function formatSimulationReport(r: SimulationReport): string {
         arms: r.learning.arms,
         lessons: r.learning.lessons,
         adjustments: r.learning.adjustments,
-        sources: {},
+        sources: r.learning.sources,
         intelInfluence: r.learning.intelInfluence,
         causes: r.causes,
+        shadow: r.learning.shadow,
+        news: r.learning.news,
       },
       { arms: 12, lessons: 8, adjustments: 10 },
     ),

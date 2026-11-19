@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import type { IntelItem, Lesson, ParamAdjustment, Store, TradeRecord } from "../src/core/types";
+import type { IntelItem, Lesson, ParamAdjustment, ShadowTradeRecord, Store, TradeRecord } from "../src/core/types";
 import { MemoryStore } from "../src/storage/memory";
 import { SqliteStore } from "../src/storage/sqlite";
 import { createStore } from "../src/storage";
@@ -55,6 +55,15 @@ const tmpDirs: string[] = [];
 afterAll(() => {
   for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
 });
+
+function shadowTrade(id: string, exitTs: number, over: Partial<ShadowTradeRecord> = {}): ShadowTradeRecord {
+  return {
+    id, mode: "paper", symbol: "BTC/USDT", assetClass: "crypto", strategyId: "scalp_a", horizon: "scalp", regime: "range", direction: "long",
+    reason: "risk: 期待値幅 #bps < コスト #bps × #", confidence: 0.6, expectedEdgeBps: 20, entryTs: exitTs - 60_000, entryPrice: 100.05, entryMid: 100,
+    entrySpread: 0.1, stopLoss: 99, takeProfit: 102, maxHoldMs: 600_000, takerFeeRate: 0.001, slippageBps: 2, exitTs, exitPrice: 102,
+    exitReason: "take_profit", grossR: 1.9, costR: 0.6, netR: 1.3, mfeR: 2, maeR: 0.1, ...over,
+  };
+}
 
 describe.each<[string, () => Store]>([
   ["MemoryStore", () => new MemoryStore()],
@@ -213,6 +222,32 @@ describe.each<[string, () => Store]>([
     s.close();
   });
 
+  it("shadow trades: upsert・フィルタ (since/mode/strategyId/reason)・exitTs の昇順・limit は最新 N 件・prune", () => {
+    const s = make();
+    s.saveShadowTrade(shadowTrade("b", 2_000));
+    s.saveShadowTrade(shadowTrade("a", 1_000, { mode: "live", strategyId: "short_b", reason: "direction_bias" }));
+    s.saveShadowTrade(shadowTrade("c", 3_000, { netR: -1.2, exitReason: "stop" }));
+    expect(s.listShadowTrades().map((t) => t.id)).toEqual(["a", "b", "c"]);
+    expect(s.listShadowTrades({ since: 2_000 }).map((t) => t.id)).toEqual(["b", "c"]);
+    expect(s.listShadowTrades({ mode: "live" }).map((t) => t.id)).toEqual(["a"]);
+    expect(s.listShadowTrades({ strategyId: "short_b" }).map((t) => t.id)).toEqual(["a"]);
+    expect(s.listShadowTrades({ reason: "direction_bias" }).map((t) => t.id)).toEqual(["a"]);
+    expect(s.listShadowTrades({ limit: 2 }).map((t) => t.id)).toEqual(["b", "c"]);
+    // 同じ id は上書き
+    s.saveShadowTrade(shadowTrade("b", 2_500, { netR: 0.5 }));
+    const all = s.listShadowTrades();
+    expect(all).toHaveLength(3);
+    expect(all.find((t) => t.id === "b")).toMatchObject({ exitTs: 2_500, netR: 0.5 });
+    expect(all.find((t) => t.id === "c")).toEqual(shadowTrade("c", 3_000, { netR: -1.2, exitReason: "stop" }));
+    // 返した値を書き換えても保存内容は変わらない
+    all[0].netR = 99;
+    expect(s.listShadowTrades()[0].netR).not.toBe(99);
+    expect(s.pruneShadowTrades(2_500)).toBe(1);
+    expect(s.listShadowTrades().map((t) => t.id)).toEqual(["b", "c"]);
+    expect(s.pruneShadowTrades(0)).toBe(0);
+    s.close();
+  });
+
   it("kv", () => {
     const s = make();
     expect(s.kvGet("x")).toBeUndefined();
@@ -235,6 +270,7 @@ describe("SqliteStore (ファイル)", () => {
     s1.saveTrade(trade("t1", 1000));
     s1.kvSet("arm:x", { n: 3 });
     s1.saveIntel([intel("a", 1, ["BTC"])]);
+    s1.saveShadowTrade(shadowTrade("sh1", 1_500));
     s1.close();
     s1.close(); // 二重 close は無害
     expect(existsSync(path)).toBe(true);
@@ -243,6 +279,7 @@ describe("SqliteStore (ファイル)", () => {
     expect(s2.listTrades().map((t) => t.id)).toEqual(["t1"]);
     expect(s2.kvGet("arm:x")).toEqual({ n: 3 });
     expect(s2.saveIntel([intel("a", 1, ["BTC"])])).toBe(0);
+    expect(s2.listShadowTrades().map((t) => t.id)).toEqual(["sh1"]);
     s2.close();
   });
 

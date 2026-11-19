@@ -564,6 +564,66 @@ export interface SourceReliability {
   /** 現在の重み 0〜2 (1 が中立) */
   weight: number;
   updatedAt: number;
+  /** 重み付きの有効件数 (トレード 1 件 = 1、ニュース判定 1 件 = newsWeight)。無ければ n */
+  effN?: number;
+  /** ニュースと値動きの答え合わせの判定件数・的中数 (n / hits はトレード由来のみ) */
+  newsN?: number;
+  newsHits?: number;
+}
+
+// ───────────────────────── 仮想トレード (見送ったシグナルの答え合わせ) ─────────────────────────
+
+/** 仮想トレードの決済理由。unwatched は監視をやめたため捨てたもの (学習には使わない) */
+export type ShadowExitReason = "stop" | "take_profit" | "time" | "unwatched";
+
+/**
+ * 見送ったシグナルの仮想トレード (決済済み)。R は統計値なので number。
+ * - 1R = |エントリー価格 (買い: ask / 売り: bid) − 損切り|
+ * - grossR = 方向 × (決済の基準価格 − エントリー時の仲値) / 1R
+ * - costR = (往復 taker 手数料 + エントリー時のスプレッド (半分 × 2) + 約定ずれ 片道 × 2) / 1R
+ * - netR = grossR − costR
+ */
+export interface ShadowTradeRecord {
+  id: string;
+  mode: TradingMode;
+  symbol: string;
+  assetClass: AssetClass;
+  strategyId: string;
+  horizon: Horizon;
+  regime: RegimeLabel;
+  direction: "long" | "short";
+  /** 見送り理由 (正規化したキー。engine.skip_summary と同じ) */
+  reason: string;
+  confidence: number;
+  expectedEdgeBps: number;
+  entryTs: number;
+  /** 買いなら ask、売りなら bid */
+  entryPrice: number;
+  entryMid: number;
+  entrySpread: number;
+  stopLoss: number;
+  takeProfit?: number;
+  maxHoldMs: number;
+  takerFeeRate: number;
+  slippageBps: number;
+  exitTs: number;
+  /** 決済の基準価格 (損切り・利確は水準、時間切れは仲値。窓開けで損切りを越えた場合は仲値) */
+  exitPrice: number;
+  exitReason: ShadowExitReason;
+  grossR: number;
+  costR: number;
+  netR: number;
+  /** 最大含み益・最大含み損 (R, 正の値) */
+  mfeR: number;
+  maeR: number;
+}
+
+export interface ShadowTradeFilter {
+  since?: number;
+  mode?: TradingMode;
+  strategyId?: string;
+  reason?: string;
+  limit?: number;
 }
 
 export interface EquityPoint {
@@ -618,6 +678,12 @@ export interface Store {
 
   saveEquity(p: EquityPoint): void;
   listEquity(opts?: { since?: number; mode?: TradingMode }): EquityPoint[];
+
+  /** 決済済みの仮想トレード (同じ id は上書き)。list は exitTs の昇順、limit は最新 N 件 */
+  saveShadowTrade(t: ShadowTradeRecord): void;
+  listShadowTrades(f?: ShadowTradeFilter): ShadowTradeRecord[];
+  /** exitTs < before の仮想トレードを消す。消した件数を返す */
+  pruneShadowTrades(before: number): number;
 
   audit(e: AuditEvent): void;
   listAudit(opts?: { since?: number; type?: string; limit?: number }): AuditEvent[];

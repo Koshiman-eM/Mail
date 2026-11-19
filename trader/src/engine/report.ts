@@ -1,7 +1,9 @@
 /** レポート (simulate / report コマンド・ダッシュボード) 用の集計と日本語の表整形 */
 import type { CauseCode, EquityPoint, ExitReason, Store, TradeRecord } from "../core/types";
 import { CAUSE_LABEL } from "../learning/attribution";
+import type { NewsCheckSummary } from "../learning/newsCheck";
 import type { CauseSummary, LearningSnapshot } from "../learning/service";
+import type { ShadowGroup, ShadowSummary } from "../learning/shadow";
 import { quoteCurrencyOfSymbol } from "./fx";
 
 export const EXIT_REASON_LABEL: Record<ExitReason, string> = {
@@ -179,16 +181,86 @@ export function renderCauses(c: CauseSummary): string {
   return `${head}\n${table}`;
 }
 
-/** 学習スナップショットの表示 (腕の成績・教訓・パラメータ調整・情報源信頼度・要因) */
-export function renderLearning(s: LearningSnapshot, opts: { arms?: number; lessons?: number; adjustments?: number } = {}): string {
+const SHADOW_EXIT_LABEL: Record<string, string> = { stop: "損切り", take_profit: "利確", time: "時間切れ", unwatched: "監視終了" };
+
+function shadowGroupTable(title: string, rows: ShadowGroup[], limit: number): string {
+  return formatTable(
+    [title, "件数", "勝率", "平均純R", "純R合計"],
+    rows.slice(0, limit).map((g) => [g.key, g.n, fmtPct(g.winRate, 1), fmtR(g.avgNetR), fmtR(g.sumNetR, 2)]),
+  );
+}
+
+const fmtR = (x: number, d = 3) => (Number.isFinite(x) ? `${x >= 0 ? "+" : ""}${x.toFixed(d)}` : "-");
+
+/** 見送ったシグナルの答え合わせ (仮想トレード) の表示 */
+export function renderShadow(s: ShadowSummary | undefined, opts: { limit?: number } = {}): string {
+  if (!s) return "  (集計なし)";
+  const limit = opts.limit ?? 15;
+  const c = s.counters;
   const out: string[] = [];
-  const arms = [...s.arms].sort((a, b) => b.n - a.n).slice(0, opts.arms ?? 15);
-  out.push("■ 腕の成績 (戦略×レジーム×資産クラス)");
+  const exits = Object.entries(s.exitReasons).map(([k, v]) => `${SHADOW_EXIT_LABEL[k] ?? k} ${v}`).join(" / ");
+  out.push(
+    `  決済 ${s.closed} 件 (勝率 ${fmtPct(s.winRate, 1)}, 平均純R ${fmtR(s.avgNetR)})  未決済 ${s.open} 件` + (exits ? `  決済理由: ${exits}` : ""),
+  );
+  out.push(
+    `  作成 ${c.created} / 重複で見送り ${c.duplicate} / 上限で破棄 ${c.droppedCap} / 毎分上限で破棄 ${c.droppedRate} / 監視終了で破棄 ${c.unwatched} / 不正 ${c.invalid}`,
+  );
+  if (s.closed === 0) {
+    out.push("  (決済済みの仮想トレードはまだありません)");
+    return out.join("\n");
+  }
+  out.push(shadowGroupTable("見送り理由", s.byReason, limit));
+  out.push("", shadowGroupTable("戦略", s.byStrategy, limit));
+  out.push("  ※ 純R = 往復手数料・スプレッド・約定ずれ (片道 2bps 既定) を差し引いた値。平均純R が正の見送り理由は、フィルターが厳しすぎる可能性があります (設定は自動では変えません)。");
+  return out.join("\n");
+}
+
+/** ニュースと値動きの答え合わせの表示 */
+export function renderNewsCheck(n: NewsCheckSummary | undefined): string {
+  if (!n) return "  (集計なし)";
+  const out: string[] = [];
+  out.push(`  記録 ${n.recorded} 件 / 判定待ち ${n.pending} 件 / 上限で破棄 ${n.droppedCap} / 監視終了で破棄 ${n.droppedUnwatched}`);
+  const judged = n.sources.reduce((a, x) => a + x.n, 0);
+  if (n.sources.length === 0 || judged + n.sources.reduce((a, x) => a + x.noise + x.expired, 0) === 0) {
+    out.push("  (判定済みのニュースはまだありません)");
+    return out.join("\n");
+  }
+  out.push(
+    formatTable(
+      ["情報源", "判定", "的中", "的中率", "ノイズ", ...n.horizons.map((h) => `${h} 的中/判定`)],
+      n.sources.map((x) => [
+        x.source, x.n, x.hits, fmtPct(x.n ? x.hitRate : NaN, 1), x.noise,
+        ...n.horizons.map((h) => (x.byHorizon[h] ? `${x.byHorizon[h].hits}/${x.byHorizon[h].n}` : "0/0")),
+      ]),
+    ),
+  );
+  out.push(
+    "",
+    formatTable(
+      ["時間", "判定", "的中", "的中率", "ノイズ", "期限切れ"],
+      n.byHorizon.map((h) => [h.horizon, h.n, h.hits, fmtPct(h.n ? h.hitRate : NaN, 1), h.noise, h.expired]),
+    ),
+  );
+  out.push("  ※ ノイズ = |変化率| < max(1 分足 ATR 比 × √分数 × 0.5, 往復コスト比) の動きは判定せず数えません。");
+  return out.join("\n");
+}
+
+/** 学習スナップショットの表示 (腕の成績・教訓・パラメータ調整・情報源信頼度・要因・仮想トレード・ニュース判定) */
+export function renderLearning(
+  s: Omit<LearningSnapshot, "shadow" | "news"> & Partial<Pick<LearningSnapshot, "shadow" | "news">>,
+  opts: { arms?: number; lessons?: number; adjustments?: number } = {},
+): string {
+  const out: string[] = [];
+  const arms = [...s.arms].sort((a, b) => b.n - a.n || (b.shadowN ?? 0) - (a.shadowN ?? 0)).slice(0, opts.arms ?? 15);
+  out.push("■ 腕の成績 (戦略×レジーム×資産クラス。仮想 = 見送ったシグナルの仮想トレード、重み 0.25 で反映)");
   out.push(
     arms.length
       ? formatTable(
-          ["腕", "件数", "勝率", "期待R", "配分倍率", "状態"],
-          arms.map((a) => [a.key, a.n, fmtPct(a.winRate, 1), a.meanR.toFixed(3), a.weight.toFixed(2), a.disabled ? "停止" : "有効"]),
+          ["腕", "件数", "仮想", "勝率", "期待R", "仮想平均R", "配分倍率", "状態"],
+          arms.map((a) => [
+            a.key, a.n, a.shadowN ?? 0, fmtPct(a.winRate, 1), a.meanR.toFixed(3), (a.shadowN ?? 0) > 0 ? (a.shadowMeanR ?? 0).toFixed(3) : "-",
+            a.weight.toFixed(2), a.disabled ? "停止" : "有効",
+          ]),
         )
       : "  (まだありません)",
   );
@@ -208,15 +280,22 @@ export function renderLearning(s: LearningSnapshot, opts: { arms?: number; lesso
         )
       : "  (まだありません)",
   );
-  out.push("", "■ 情報源の信頼度");
-  const src = Object.values(s.sources).sort((a, b) => b.n - a.n);
+  out.push("", "■ 情報源の信頼度 (件数・的中はトレード由来、ニュース判定は値動きとの答え合わせ)");
+  const src = Object.values(s.sources).sort((a, b) => b.n - a.n || (b.newsN ?? 0) - (a.newsN ?? 0));
   out.push(
     src.length
-      ? formatTable(["情報源", "件数", "的中", "スコア", "重み"], src.map((x) => [x.source, x.n, x.hits, x.ewmaScore.toFixed(2), x.weight.toFixed(2)]))
+      ? formatTable(
+          ["情報源", "件数", "的中", "ニュース判定", "ニュース的中", "スコア", "重み"],
+          src.map((x) => [x.source, x.n, x.hits, x.newsN ?? 0, x.newsHits ?? 0, x.ewmaScore.toFixed(2), x.weight.toFixed(2)]),
+        )
       : "  (まだありません)",
   );
   out.push(`  情報の効き具合: ${Object.entries(s.intelInfluence).map(([k, v]) => `${k} ${v.toFixed(2)}`).join(" / ")}`);
   out.push("", "■ 損益要因の集計");
   out.push(renderCauses(s.causes));
+  out.push("", "■ 見送ったシグナルの答え合わせ (仮想トレード)");
+  out.push(renderShadow(s.shadow));
+  out.push("", "■ ニュースと値動きの答え合わせ");
+  out.push(renderNewsCheck(s.news));
   return out.join("\n");
 }

@@ -447,6 +447,14 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     <h2 class="ph"><span class="t">ARMS<span class="jp">腕の成績 (戦略×レジーム×資産クラス)</span></span></h2>
     <div class="pb"><div id="arms" class="scroll"></div></div>
   </section>
+  <section class="pn wide" data-pane="learning">
+    <h2 class="ph"><span class="t">SHADOW · SKIPPED SIGNALS<span class="jp">見送ったシグナルの答え合わせ</span></span></h2>
+    <div class="pb"><div id="shadow"></div></div>
+  </section>
+  <section class="pn wide" data-pane="learning">
+    <h2 class="ph"><span class="t">NEWS · PRICE CHECK<span class="jp">ニュースと値動きの答え合わせ</span></span></h2>
+    <div class="pb"><div id="newsCheck"></div></div>
+  </section>
 </main>
 <div class="ticker bo" aria-label="ティッカー"><div class="mt" id="tick"></div></div>
 <script>
@@ -1515,13 +1523,52 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
         esc(a.validation ? num(a.validation.baselineScore, 2) + " → " + num(a.validation.candidateScore, 2) + " (" + a.validation.trades + "件)" : "-"), '<span class="muted">' + esc(a.reason) + "</span>"];
     })));
     var src = Object.keys(l.sources).map(function (k) { return l.sources[k]; }).sort(function (a, b) { return b.n - a.n; });
-    set("sources", table(["情報源", "件数", "的中", "重み"], src.map(function (x) {
-      return [esc(x.source), esc(x.n), esc(x.hits), esc(num(x.weight, 2))];
-    }), [false, true, true, true]) + '<p class="note">情報の効き具合: ' + Object.keys(l.intelInfluence).map(function (k) { return esc(k + " " + num(l.intelInfluence[k], 2)); }).join(" / ") + "</p>");
-    set("arms", table(["腕", "件数", "勝率", "期待R", "配分倍率", "状態"], l.arms.slice().sort(function (a, b) { return b.n - a.n; }).map(function (a) {
-      return [esc(a.key), esc(a.n), esc(pct(a.winRate, 1)), '<span class="' + cls(a.meanR) + '">' + esc(num(a.meanR, 3)) + "</span>", esc(num(a.weight, 2)),
+    set("sources", table(["情報源", "件数", "的中", "ニュース", "重み"], src.map(function (x) {
+      return [esc(x.source), esc(x.n), esc(x.hits), esc((x.newsHits || 0) + "/" + (x.newsN || 0)), esc(num(x.weight, 2))];
+    }), [false, true, true, true, true]) + '<p class="note">件数・的中はトレード由来。ニュースは値動きとの答え合わせ (的中/判定、重み 0.3)。</p>' + '<p class="note">情報の効き具合: ' + Object.keys(l.intelInfluence).map(function (k) { return esc(k + " " + num(l.intelInfluence[k], 2)); }).join(" / ") + "</p>");
+    set("arms", table(["腕", "件数", "仮想", "勝率", "期待R", "仮想平均R", "配分倍率", "状態"], l.arms.slice().sort(function (a, b) { return b.n - a.n || (b.shadowN || 0) - (a.shadowN || 0); }).map(function (a) {
+      var sn = a.shadowN || 0;
+      return [esc(a.key), esc(a.n), esc(sn), esc(pct(a.winRate, 1)), '<span class="' + cls(a.meanR) + '">' + esc(num(a.meanR, 3)) + "</span>",
+        sn ? '<span class="' + cls(a.shadowMeanR) + '">' + esc(num(a.shadowMeanR, 3)) + "</span>" : "-", esc(num(a.weight, 2)),
         a.disabled ? '<span class="neg">停止</span>' : "有効"];
-    }), [false, true, true, true, true, false]));
+    }), [false, true, true, true, true, true, true, false]));
+    safe("shadow", function () { renderShadow(l.shadow); });
+    safe("newsCheck", function () { renderNewsCheck(l.news); });
+  }
+  var SH_EXIT = { stop: "損切り", take_profit: "利確", time: "時間切れ", unwatched: "監視終了" };
+  function shadowRows(rows) {
+    return rows.slice(0, 20).map(function (g) {
+      return [esc(g.key), esc(g.n), esc(pct(g.winRate, 1)), '<span class="' + cls(g.avgNetR) + '">' + esc(signed(g.avgNetR, 3)) + "</span>",
+        '<span class="' + cls(g.sumNetR) + '">' + esc(signed(g.sumNetR, 2)) + "</span>"];
+    });
+  }
+  function renderShadow(sh) {
+    if (!sh) { set("shadow", '<p class="empty">まだありません</p>'); return; }
+    var c = sh.counters || {};
+    var ex = Object.keys(sh.exitReasons || {}).map(function (k) { return esc((SH_EXIT[k] || k) + " " + sh.exitReasons[k]); }).join(" / ");
+    var h = '<p class="note">決済 ' + esc(sh.closed) + " 件 (勝率 " + esc(pct(sh.winRate, 1)) + ' / 平均純R <span class="' + cls(sh.avgNetR) + '">' + esc(signed(sh.avgNetR, 3)) + "</span>) / 未決済 " + esc(sh.open) + " 件" +
+      (ex ? " / " + ex : "") + "</p>" +
+      '<p class="note">作成 ' + esc(c.created || 0) + " / 重複 " + esc(c.duplicate || 0) + " / 上限で破棄 " + esc((c.droppedCap || 0) + (c.droppedRate || 0)) + " / 監視終了 " + esc(c.unwatched || 0) + "</p>";
+    var heads = ["件数", "勝率", "平均純R", "純R合計"], numc = [false, true, true, true, true];
+    h += "<h2>BY REASON · 見送り理由ごと</h2>" + '<div class="scroll">' + table(["見送り理由"].concat(heads), shadowRows(sh.byReason || []), numc) + "</div>";
+    h += "<h2>BY STRATEGY · 戦略ごと</h2>" + '<div class="scroll">' + table(["戦略"].concat(heads), shadowRows(sh.byStrategy || []), numc) + "</div>";
+    h += '<p class="note">純R = 往復手数料・スプレッド・約定ずれ (片道 2bps) を差し引いた R。平均純R が正の見送り理由はフィルターが厳しすぎる可能性があります (設定は自動では変えません)。</p>';
+    set("shadow", h);
+  }
+  function renderNewsCheck(n) {
+    if (!n) { set("newsCheck", '<p class="empty">まだありません</p>'); return; }
+    var hz = n.horizons || [];
+    var h = '<p class="note">記録 ' + esc(n.recorded) + " 件 / 判定待ち " + esc(n.pending) + " 件 / 上限で破棄 " + esc(n.droppedCap) + " / 監視終了 " + esc(n.droppedUnwatched) + "</p>";
+    h += "<h2>BY SOURCE · 情報源ごと</h2>" + '<div class="scroll">' + table(["情報源", "判定", "的中", "的中率", "ノイズ"].concat(hz.map(function (x) { return x + " 的中/判定"; })), (n.sources || []).map(function (x) {
+      return [esc(x.source), esc(x.n), esc(x.hits), esc(x.n ? pct(x.hitRate, 1) : "-"), esc(x.noise)].concat(hz.map(function (k) {
+        var b = (x.byHorizon || {})[k]; return esc(b ? b.hits + "/" + b.n : "0/0");
+      }));
+    }), [false, true, true, true, true].concat(hz.map(function () { return true; }))) + "</div>";
+    h += "<h2>BY HORIZON · 時間ごと</h2>" + '<div class="scroll">' + table(["時間", "判定", "的中", "的中率", "ノイズ", "期限切れ"], (n.byHorizon || []).map(function (x) {
+      return [esc(x.horizon), esc(x.n), esc(x.hits), esc(x.n ? pct(x.hitRate, 1) : "-"), esc(x.noise), esc(x.expired)];
+    }), [false, true, true, true, true, true]) + "</div>";
+    h += '<p class="note">ノイズ = |変化率| が max(1 分足 ATR 比 × √分数 × 0.5, 往復コスト比) 未満の動き (判定せず数えません)。1 判定は重み 0.3 で情報源の信頼度に反映。</p>';
+    set("newsCheck", h);
   }
 
   // ───── まとめて描画 (一部が失敗しても他は続ける) ─────

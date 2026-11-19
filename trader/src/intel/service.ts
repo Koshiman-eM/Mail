@@ -33,6 +33,8 @@ export class IntelService {
   private events: EconEvent[];
   /** LLM 分析済み項目のキャッシュ (再分析によるコスト増を避ける) */
   private readonly aiCache = new Map<string, Pick<IntelItem, "sentiment" | "importance" | "assets">>();
+  /** 直近の refresh で分析した項目 (sentiment / assets 反映済み。ニュースと値動きの答え合わせに使う) */
+  private lastAnalyzed: IntelItem[] = [];
 
   constructor(private readonly opts: IntelServiceOptions) {
     this.log = opts.logger ?? createLogger("intel.service");
@@ -76,6 +78,7 @@ export class IntelService {
       events: this.events,
       halfLifeMs: this.opts.halfLifeMs,
     });
+    this.lastAnalyzed = items;
     const analyzed = new Map(items.map((i) => [i.id, i]));
     for (const id of aiAnalyzedIds) {
       const it = analyzed.get(id);
@@ -83,6 +86,11 @@ export class IntelService {
     }
     store.saveBrief(brief);
     return brief;
+  }
+
+  /** 直近の refresh で分析した項目 (複製) */
+  lastItems(): IntelItem[] {
+    return this.lastAnalyzed.map((it) => ({ ...it, assets: [...(it.assets ?? [])] }));
   }
 
   latestBrief(): MarketBrief | undefined {

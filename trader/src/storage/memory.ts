@@ -6,6 +6,8 @@ import type {
   Lesson,
   MarketBrief,
   ParamAdjustment,
+  ShadowTradeFilter,
+  ShadowTradeRecord,
   Store,
   StrategyPlan,
   TradeAttribution,
@@ -39,6 +41,7 @@ export class MemoryStore implements Store {
   private equity: EquityPoint[] = [];
   private audits: AuditEvent[] = [];
   private kv = new Map<string, string>();
+  private shadows = new Map<string, ShadowTradeRecord>();
 
   saveTrade(t: TradeRecord): void {
     this.trades.set(t.id, clone(t));
@@ -163,6 +166,32 @@ export class MemoryStore implements Store {
       (p) => (opts.since === undefined || p.ts >= opts.since) && (opts.mode === undefined || p.mode === opts.mode),
     );
     return latest(items, (p) => p.ts);
+  }
+
+  saveShadowTrade(t: ShadowTradeRecord): void {
+    this.shadows.set(t.id, clone(t));
+  }
+
+  listShadowTrades(f: ShadowTradeFilter = {}): ShadowTradeRecord[] {
+    const items = [...this.shadows.values()].filter(
+      (t) =>
+        (f.since === undefined || t.exitTs >= f.since) &&
+        (f.mode === undefined || t.mode === f.mode) &&
+        (f.strategyId === undefined || t.strategyId === f.strategyId) &&
+        (f.reason === undefined || t.reason === f.reason),
+    );
+    return latest(items, (t) => t.exitTs, f.limit);
+  }
+
+  pruneShadowTrades(before: number): number {
+    let n = 0;
+    for (const [id, t] of this.shadows) {
+      if (t.exitTs < before) {
+        this.shadows.delete(id);
+        n++;
+      }
+    }
+    return n;
   }
 
   audit(e: AuditEvent): void {

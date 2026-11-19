@@ -9,6 +9,8 @@ import type {
   Lesson,
   MarketBrief,
   ParamAdjustment,
+  ShadowTradeFilter,
+  ShadowTradeRecord,
   Store,
   StrategyPlan,
   TradeAttribution,
@@ -27,6 +29,7 @@ import type {
  * - TradeFilter の since/until は exitTs (決済時刻) に対して適用 (両端含む)。
  * - getIntel は引数 ids の順。
  * - 同じ id の save は上書き (upsert)。saveIntel のみ既存 id を無視し、新規件数を返す。
+ * - shadow_trades (見送ったシグナルの仮想トレード): exitTs の昇順。
  */
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS trades (
@@ -119,6 +122,17 @@ CREATE TABLE IF NOT EXISTS audit (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts);
 CREATE INDEX IF NOT EXISTS idx_audit_type ON audit(type, ts);
+
+CREATE TABLE IF NOT EXISTS shadow_trades (
+  id TEXT PRIMARY KEY,
+  exitTs INTEGER NOT NULL,
+  mode TEXT NOT NULL,
+  strategyId TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  data TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_exit ON shadow_trades(exitTs);
+CREATE INDEX IF NOT EXISTS idx_shadow_mode ON shadow_trades(mode, exitTs);
 
 CREATE TABLE IF NOT EXISTS kv (
   key TEXT PRIMARY KEY,
@@ -374,6 +388,29 @@ export class SqliteStore implements Store {
     if (opts.mode !== undefined) w.add("mode = ?", opts.mode);
     const rows = this.stmt(`SELECT ts, mode, equity FROM equity ${w} ORDER BY ts ASC, id ASC`).all(...w.params) as Row[];
     return rows.map((r) => ({ ts: Number(r.ts), mode: String(r.mode) as TradingMode, equity: Number(r.equity) }));
+  }
+
+  // ───────── shadow trades ─────────
+
+  saveShadowTrade(t: ShadowTradeRecord): void {
+    this.stmt(
+      `INSERT INTO shadow_trades (id, exitTs, mode, strategyId, reason, data) VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET exitTs = excluded.exitTs, mode = excluded.mode, strategyId = excluded.strategyId,
+         reason = excluded.reason, data = excluded.data`,
+    ).run(t.id, t.exitTs, t.mode, t.strategyId, t.reason, JSON.stringify(t));
+  }
+
+  listShadowTrades(f: ShadowTradeFilter = {}): ShadowTradeRecord[] {
+    const w = new Where();
+    if (f.since !== undefined) w.add("exitTs >= ?", f.since);
+    if (f.mode !== undefined) w.add("mode = ?", f.mode);
+    if (f.strategyId !== undefined) w.add("strategyId = ?", f.strategyId);
+    if (f.reason !== undefined) w.add("reason = ?", f.reason);
+    return this.listLatest<ShadowTradeRecord>("shadow_trades", "exitTs", w, f.limit);
+  }
+
+  pruneShadowTrades(before: number): number {
+    return Number(this.stmt("DELETE FROM shadow_trades WHERE exitTs < ?").run(before).changes);
   }
 
   // ───────── audit ─────────

@@ -8,6 +8,7 @@ import {
 import { briefHeadlines } from "../src/engine/engine";
 import { buildRuntime } from "../src/engine/setup";
 import { mulberry32 } from "../src/market/feeds/synthetic";
+import type { LearningService } from "../src/learning/service";
 import { MemoryStore } from "../src/storage/memory";
 
 const START = Date.UTC(2026, 0, 5);
@@ -187,6 +188,30 @@ describe("ダッシュボード (listen せずにハンドラーを呼ぶ)", () 
     expect(l.causeLabels.slippage).toBe("約定ずれ");
     expect(Array.isArray(l.lessons)).toBe(true);
     expect(Array.isArray(l.adjustments)).toBe(true);
+    // 見送ったシグナルの答え合わせ・ニュースと値動きの答え合わせ・腕の仮想件数
+    expect(l.shadow).toMatchObject({ closed: expect.any(Number), open: expect.any(Number), byReason: expect.any(Array), byStrategy: expect.any(Array) });
+    expect(l.shadow.counters).toHaveProperty("created");
+    expect(l.news).toMatchObject({ pending: 0, horizons: ["15m", "1h", "4h"], sources: [], byHorizon: expect.any(Array) });
+    expect(l.arms[0]).toHaveProperty("shadowN");
+  });
+
+  it("GET /api/learning: 仮想トレードとニュース判定の集計を返す", async () => {
+    const d = await deps();
+    const svc = d.learning as LearningService;
+    const base = { mode: "paper", symbol: "BTC/USDT", assetClass: "crypto", horizon: "scalp", regime: "range", direction: "long", confidence: 0.5,
+      expectedEdgeBps: 10, entryTs: START, entryPrice: 100.1, entryMid: 100, entrySpread: 0.2, stopLoss: 98, maxHoldMs: 600_000, takerFeeRate: 0.001,
+      slippageBps: 2, exitTs: START + MIN, exitPrice: 104, exitReason: "take_profit", grossR: 2, costR: 0.2, mfeR: 2, maeR: 0 } as const;
+    svc.onShadowClosed({ ...base, id: "s1", strategyId: "a", reason: "direction_bias", netR: 1.8 });
+    svc.onShadowClosed({ ...base, id: "s2", strategyId: "a", reason: "direction_bias", netR: -1.2, exitReason: "stop" });
+    svc.news.ingest([{ id: "n1", source: "rss:x", kind: "news", title: "t", publishedAt: START, fetchedAt: START, assets: ["BTC"], sentiment: 0.5 }],
+      [{ instrument: { symbol: "BTC/USDT", baseCurrency: "BTC" }, mid: 100, costPct: 0.001 }], START);
+    svc.news.evaluate(START + 15 * MIN, { isWatched: () => true, midNow: () => 101 });
+    const l = JSON.parse((await routeDashboard(d, "GET", "/api/learning")).body);
+    expect(l.shadow.byReason[0]).toMatchObject({ key: "direction_bias", n: 2, wins: 1 });
+    expect(l.shadow.byStrategy[0]).toMatchObject({ key: "a", n: 2 });
+    expect(l.news.sources[0]).toMatchObject({ source: "rss:x", n: 1, hits: 1 });
+    expect(l.news.byHorizon[0]).toMatchObject({ horizon: "15m", n: 1, hits: 1 });
+    expect(l.sources["rss:x"]).toMatchObject({ newsN: 1, newsHits: 1 });
   });
 
   it("GET /: 単一 HTML (日本語・自動更新・暗いテーマ・スマホ幅・外部 CDN なし)", async () => {
@@ -203,6 +228,13 @@ describe("ダッシュボード (listen せずにハンドラーを呼ぶ)", () 
     expect(html).toContain("パラメータ調整");
     expect(html).toContain("情報源の信頼度");
     expect(html).toContain("腕の成績");
+    // 学習タブ: 見送ったシグナルの答え合わせ・ニュースと値動きの答え合わせ (表はパネル内でスクロール)
+    expect(html).toContain("SHADOW · SKIPPED SIGNALS");
+    expect(html).toContain("見送ったシグナルの答え合わせ");
+    expect(html).toContain("NEWS · PRICE CHECK");
+    expect(html).toContain("ニュースと値動きの答え合わせ");
+    expect(html).toMatch(/BY REASON[\s\S]*'<div class="scroll">'/);
+    expect(html).toContain("仮想平均R");
     expect(html).toContain("setInterval(refresh, 5000)");
     expect(html).toContain('name="color-scheme" content="dark"');
     // ボードタブ (コックピット風の一覧)

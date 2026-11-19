@@ -1,4 +1,4 @@
-import type { ArmStats, AssetClass, RegimeLabel, Store, TradeRecord } from "../core/types";
+import type { ArmStats, AssetClass, RegimeLabel, ShadowTradeRecord, Store, TradeRecord } from "../core/types";
 import { tradeOutcome } from "./attribution";
 
 /** 腕のキー: 戦略×レジーム×資産クラス */
@@ -32,6 +32,8 @@ export interface AllocatorOptions {
   maxWeight: number;
   /** 勝率 (事後平均 − 0.5) を配分に反映する係数 */
   winTilt: number;
+  /** 仮想トレード (見送ったシグナルの答え合わせ) 1 件の重み (実際の取引は 1) */
+  shadowWeight: number;
 }
 
 export const DEFAULT_ALLOCATOR_OPTIONS: AllocatorOptions = {
@@ -48,19 +50,34 @@ export const DEFAULT_ALLOCATOR_OPTIONS: AllocatorOptions = {
   minWeight: 0.25,
   maxWeight: 1.5,
   winTilt: 0.3,
+  shadowWeight: 0.25,
 };
 
-/** 保存する状態 (ArmStats + R の指数加重分散)。ewmaR / ewmaVarR は序盤は単純平均・分散 */
+/**
+ * 保存する状態 (ArmStats + R の指数加重分散)。ewmaR / ewmaVarR は序盤は (重み付き) 単純平均・分散。
+ * - n / sumR / sumR2: 実際の取引だけ (無効化の判定・表示の平均 R に使う)
+ * - wN: 重み付きの件数 (実際の取引 1 + 仮想トレード shadowWeight)。EWMA の係数と有効件数に使う。無ければ n
+ * - shadowN / shadowWins / shadowSumR: 仮想トレードの件数・勝ち数・R の合計 (表示用)
+ */
 export interface ArmState extends ArmStats {
   ewmaVarR: number;
+  wN?: number;
+  shadowN?: number;
+  shadowWins?: number;
+  shadowSumR?: number;
 }
 
 export interface ArmSnapshot extends ArmState {
   winRate: number;
+  /** 実際の取引の平均 R */
   meanR: number;
   upperR: number;
   weight: number;
   disabled: boolean;
+  shadowN: number;
+  /** 仮想トレードの勝率・平均純 R (件数 0 なら 0) */
+  shadowWinRate: number;
+  shadowMeanR: number;
 }
 
 export type Rng = () => number;
@@ -147,27 +164,48 @@ export class StrategyAllocator {
     };
   }
 
-  /** 決済済みトレードで腕を更新 */
+  /** 決済済みトレードで腕を更新 (重み 1) */
   update(trade: TradeRecord, now: number = trade.exitTs): ArmState {
-    const key = armKeyOf(trade);
+    const outcome = tradeOutcome(trade);
+    const winInc = outcome === "win" ? 1 : outcome === "breakeven" ? 0.5 : 0;
+    return this.observe(armKeyOf(trade), winInc, trade.rMultiple, 1, now, false);
+  }
+
+  /**
+   * 仮想トレード (見送ったシグナル) の結果で同じ腕を更新する。重みは shadowWeight (既定 0.25)。
+   * 無効化の判定に使う件数 (n) には数えない (仮想の結果だけでは腕を止めない)
+   */
+  updateShadow(t: ShadowTradeRecord, now: number = t.exitTs): ArmState {
+    const winInc = t.netR > 0 ? 1 : t.netR < 0 ? 0 : 0.5;
+    return this.observe(armKey(t.strategyId, t.regime, t.assetClass), winInc, t.netR, this.opts.shadowWeight, now, true);
+  }
+
+  /** 重み w の観測で腕を更新する (ベータ分布は w を足し、忘却も w 回分。EWMA の係数も w に比例) */
+  private observe(key: string, winInc: number, rRaw: number, w: number, now: number, shadow: boolean): ArmState {
     const o = this.opts;
     const prev = this.get(key);
     const s = prev ?? this.fresh(key, now);
-    const outcome = tradeOutcome(trade);
-    const winInc = outcome === "win" ? 1 : outcome === "breakeven" ? 0.5 : 0;
+    const decay = Math.pow(o.betaDecay, w);
     // 忘却: 事前分布へ少し戻してから加算
-    s.alpha = o.priorAlpha + (s.alpha - o.priorAlpha) * o.betaDecay + winInc;
-    s.beta = o.priorBeta + (s.beta - o.priorBeta) * o.betaDecay + (1 - winInc);
+    s.alpha = o.priorAlpha + (s.alpha - o.priorAlpha) * decay + w * winInc;
+    s.beta = o.priorBeta + (s.beta - o.priorBeta) * decay + w * (1 - winInc);
 
-    const r = clamp(Number.isFinite(trade.rMultiple) ? trade.rMultiple : 0, -R_CLIP, R_CLIP);
-    s.n += 1;
-    // 序盤は単純平均 (係数 1/n)、件数が増えたら指数加重 (係数 ewmaAlpha) に切り替える
-    const a = Math.max(1 / s.n, o.ewmaAlpha);
+    const r = clamp(Number.isFinite(rRaw) ? rRaw : 0, -R_CLIP, R_CLIP);
+    s.wN = (s.wN ?? s.n) + w;
+    // 序盤は (重み付き) 単純平均 (係数 w/wN)、件数が増えたら指数加重 (係数 ewmaAlpha × w) に切り替える
+    const a = Math.min(1, Math.max(w / s.wN, o.ewmaAlpha * w));
     const diff = r - s.ewmaR;
     s.ewmaR += a * diff;
     s.ewmaVarR = (1 - a) * (s.ewmaVarR + a * diff * diff);
-    s.sumR += r;
-    s.sumR2 += r * r;
+    if (shadow) {
+      s.shadowN = (s.shadowN ?? 0) + 1;
+      s.shadowWins = (s.shadowWins ?? 0) + winInc;
+      s.shadowSumR = (s.shadowSumR ?? 0) + r;
+    } else {
+      s.n += 1;
+      s.sumR += r;
+      s.sumR2 += r * r;
+    }
     s.updatedAt = now;
 
     this.cache.set(key, s);
@@ -179,8 +217,13 @@ export class StrategyAllocator {
     return { ...s };
   }
 
+  /** 重み付きの件数 (旧データは n) */
+  private wN(s: ArmState) {
+    return s.wN ?? s.n;
+  }
+
   private nEff(s: ArmState) {
-    return Math.min(s.n, this.effectiveN);
+    return Math.min(this.wN(s), this.effectiveN);
   }
 
   /** R の分散 (観測の指数加重分散を事前分散と件数で混ぜる。少数サンプルで過小評価しない) */
@@ -192,7 +235,7 @@ export class StrategyAllocator {
   /** 縮小推定した期待 R (新しい腕は 0) */
   meanR(key: string): number {
     const s = this.get(key);
-    if (!s || s.n === 0) return 0;
+    if (!s || !(this.wN(s) > 0)) return 0;
     const n = this.nEff(s);
     return (n * s.ewmaR) / (n + this.opts.shrinkN);
   }
@@ -205,11 +248,11 @@ export class StrategyAllocator {
   /** 期待 R の上側信頼限界 (指数加重平均ベース) */
   upperConfidenceR(key: string): number {
     const s = this.get(key);
-    if (!s || s.n === 0) return Number.POSITIVE_INFINITY;
+    if (!s || !(this.wN(s) > 0)) return Number.POSITIVE_INFINITY;
     return s.ewmaR + this.opts.ucbZ * Math.sqrt(this.varR(s) / this.nEff(s));
   }
 
-  /** n ≥ minSamplesToDisable かつ 期待 R の上側信頼限界 < 0 */
+  /** 実際の取引の件数 n ≥ minSamplesToDisable かつ 期待 R の上側信頼限界 < 0 (仮想トレードの件数は数えない) */
   isDisabled(key: string): boolean {
     const s = this.get(key);
     if (!s || s.n < this.opts.minSamplesToDisable) return false;
@@ -256,6 +299,7 @@ export class StrategyAllocator {
     for (const key of this.keys()) {
       const s = this.get(key);
       if (!s) continue;
+      const shadowN = s.shadowN ?? 0;
       out.push({
         ...s,
         winRate: this.winRate(key),
@@ -263,8 +307,11 @@ export class StrategyAllocator {
         upperR: this.upperConfidenceR(key),
         weight: this.weight(key),
         disabled: this.isDisabled(key),
+        shadowN,
+        shadowWinRate: shadowN > 0 ? (s.shadowWins ?? 0) / shadowN : 0,
+        shadowMeanR: shadowN > 0 ? (s.shadowSumR ?? 0) / shadowN : 0,
       });
     }
-    return out.sort((a, b) => b.n - a.n || a.key.localeCompare(b.key));
+    return out.sort((a, b) => b.n - a.n || b.shadowN - a.shadowN || a.key.localeCompare(b.key));
   }
 }

@@ -27,6 +27,8 @@ export interface ReliabilityOptions {
   maxInfluence: number;
   /** 相関計算で R をクリップする幅 */
   rClip: number;
+  /** ニュースと値動きの答え合わせ 1 判定の重み (トレード由来の更新は 1) */
+  newsWeight: number;
 }
 
 export const DEFAULT_RELIABILITY_OPTIONS: ReliabilityOptions = {
@@ -41,6 +43,7 @@ export const DEFAULT_RELIABILITY_OPTIONS: ReliabilityOptions = {
   influencePriorN: 20,
   maxInfluence: 1.5,
   rClip: 5,
+  newsWeight: 0.3,
 };
 
 /** 資産クラス別の情報の効き具合 (指数加重の相関) */
@@ -107,20 +110,42 @@ export class SourceReliabilityTracker {
     return updated;
   }
 
-  private observe(source: string, hit: boolean, now: number) {
+  /**
+   * ニュースと値動きの答え合わせ 1 判定を反映する (重みは newsWeight、既定 0.3)。
+   * 件数 n / hits はトレード由来のまま、newsN / newsHits を別に数える
+   */
+  observeNews(source: string, hit: boolean, now: number, weight: number = this.opts.newsWeight): SourceReliability {
+    this.observe(source, hit, now, weight, "news");
+    this.store.kvSet(SOURCE_RELIABILITY_KV_KEY, this.sources);
+    return { ...this.sources[source] };
+  }
+
+  /**
+   * 重み w の観測で更新する。指数加重の係数は ewmaAlpha × w (初回は観測値で初期化)。
+   * 縮小推定は重み付きの件数 effN で行う (少数・低重みのうちは weight を 1 に寄せる)
+   */
+  private observe(source: string, hit: boolean, now: number, w = 1, kind: "trade" | "news" = "trade") {
     const s = hit ? 1 : -1;
     const prev = this.sources[source];
-    const n = (prev?.n ?? 0) + 1;
-    // 初回は観測値で初期化し、少数サンプルは縮小推定で 1 に寄せる
-    const ewmaScore = prev ? (1 - this.opts.ewmaAlpha) * prev.ewmaScore + this.opts.ewmaAlpha * s : s;
-    this.sources[source] = {
+    const isTrade = kind === "trade";
+    const effN = (prev ? (prev.effN ?? prev.n) : 0) + w;
+    const a = Math.min(1, this.opts.ewmaAlpha * w);
+    const ewmaScore = prev ? (1 - a) * prev.ewmaScore + a * s : s;
+    const next: SourceReliability = {
       source,
-      n,
-      hits: (prev?.hits ?? 0) + (hit ? 1 : 0),
+      n: (prev?.n ?? 0) + (isTrade ? 1 : 0),
+      hits: (prev?.hits ?? 0) + (isTrade && hit ? 1 : 0),
       ewmaScore,
-      weight: this.weightFrom(ewmaScore, n),
+      weight: this.weightFrom(ewmaScore, effN),
       updatedAt: now,
+      effN,
     };
+    const newsN = (prev?.newsN ?? 0) + (isTrade ? 0 : 1);
+    if (newsN > 0) {
+      next.newsN = newsN;
+      next.newsHits = (prev?.newsHits ?? 0) + (!isTrade && hit ? 1 : 0);
+    }
+    this.sources[source] = next;
   }
 
   private weightFrom(ewmaScore: number, n: number) {

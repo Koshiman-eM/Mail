@@ -75,6 +75,10 @@ describe("simulate コマンド", () => {
     expect(text).toContain("戦略別の成績");
     expect(text).toContain("学習の動き");
     expect(text).toContain("損益要因の集計");
+    expect(text).toContain("■ 見送ったシグナルの答え合わせ (仮想トレード)");
+    expect(text).toContain("■ ニュースと値動きの答え合わせ");
+    expect(text).toMatch(/腕\s+件数\s+仮想/);
+    expect(text).toContain("ニュース判定");
   }, 60_000);
 
   it("runSimulation: レポートの中身 (paper のみ・要因分析済み)", async () => {
@@ -86,6 +90,10 @@ describe("simulate コマンド", () => {
     expect(report.trades).toBe(store.listTrades().length);
     expect(report.attributedTrades).toBe(report.trades);
     expect(report.learning.learningRuns).toBe(3);
+    // 見送ったシグナルの答え合わせ (保存件数と集計が一致)・ニュース判定 (合成データには情報が無いので 0 件)
+    expect(report.learning.shadow.closed).toBe(store.listShadowTrades().length);
+    expect(report.learning.shadow.counters.created).toBeGreaterThanOrEqual(report.learning.shadow.closed);
+    expect(report.learning.news.recorded).toBe(0);
     expect(report.plans).toBeGreaterThanOrEqual(12);
     expect(report.finalEquity).toBeGreaterThan(0);
     expect(progress).toHaveBeenCalled();
@@ -131,6 +139,9 @@ describe("report / resume", () => {
     expect(text).toContain("最近のパラメータ調整");
     expect(text).toContain("情報源の信頼度");
     expect(text).toContain("損益要因の集計");
+    expect(text).toContain("■ 見送ったシグナルの答え合わせ (仮想トレード)");
+    expect(text).toContain("■ ニュースと値動きの答え合わせ");
+    expect(text).toMatch(/腕\s+件数\s+仮想/);
   }, 60_000);
 
   it("resume: キルスイッチを解除して監査ログに残す", () => {

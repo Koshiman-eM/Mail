@@ -6,7 +6,7 @@ import { createLogger, type Logger } from "../core/logger";
 import {
   systemClock, type Balance, type Broker, type BrokerPosition, type Clock, type EntryContext, type Instrument, type IntelBias, type MarketBrief,
   type IntelItem, type MarketView, type OrderRequest, type Params, type Quote, type RegimeFeatures, type Signal, type Store, type Strategy,
-  type StrategyContext, type StrategyPlan, type Timeframe, type TradeRecord,
+  type StrategyContext, type StrategyPlan, type Timeframe, type TradeRecord, TIMEFRAME_MS,
 } from "../core/types";
 import type { BrokerSet } from "../execution/router";
 import type { PaperSnapshot } from "../execution/paper";
@@ -14,7 +14,11 @@ import type { IntelService } from "../intel/service";
 import { buildBaselinePlan, buildStrategyPlan, MAX_RISK_MULTIPLIER } from "../intel/planner";
 import { estimateSentiment } from "../intel/sentiment";
 import { DEX_SOURCE } from "../intel/sources/dexscreener";
+import { atrLast } from "../indicators/series";
 import { armKey } from "../learning/allocator";
+import type { PriceAt } from "../learning/journal";
+import type { NewsMarketInfo } from "../learning/newsCheck";
+import { ShadowTracker, type PriceRange, type ShadowOptions } from "../learning/shadow";
 import { TradeJournal } from "../learning/journal";
 import type { LearningService, PeriodicResult } from "../learning/service";
 import type { DexScreenerFeed } from "../market/feeds/dexscreener";
@@ -28,6 +32,7 @@ import {
 } from "./context";
 import { runGrouped, withDeadline } from "./deadline";
 import { createFxConverter, type FxConverter } from "./fx";
+import { createPriceAt } from "./learningHooks";
 import { peekResolveRequests, removeResolveRequests, type PendingEntry, type PendingOrder, type PendingStatus } from "./orders";
 import { DEFAULT_ORDER_POLICY, PositionManager, type EntryResult, type OrderPolicy } from "./positions";
 
@@ -69,6 +74,13 @@ export interface EngineOptions {
   brokerTimeoutMs?: number;
   /** 保留中の注文の扱い (取消までの時間・状態不明の上限・決済の発注レート上限など) */
   orderPolicy?: Partial<OrderPolicy>;
+  /**
+   * 見送ったシグナルの答え合わせ (仮想トレード)。enabled: false で無効。
+   * 実際の発注・リスク判定・建玉管理には影響しない
+   */
+  shadow?: Partial<ShadowOptions> & { enabled?: boolean };
+  /** ニュースと値動きの答え合わせの判定間隔 (既定 60 秒) */
+  newsEvalEveryMs?: number;
 }
 
 export interface EngineDeps {
@@ -77,7 +89,8 @@ export interface EngineDeps {
   hub: MarketHub;
   brokerSet: BrokerSet;
   risk: RiskManager;
-  intel: Pick<IntelService, "refresh">;
+  /** lastItems があれば、分析済みの情報をニュースと値動きの答え合わせに使う (無ければ store の情報) */
+  intel: Pick<IntelService, "refresh"> & Partial<Pick<IntelService, "lastItems">>;
   learning: LearningService;
   strategies?: readonly Strategy[];
   clock?: Clock;
@@ -306,13 +319,18 @@ export class TradingEngine {
   readonly fx: FxConverter;
   readonly strategies: readonly Strategy[];
   readonly clock: Clock;
-  private readonly intel: Pick<IntelService, "refresh">;
+  private readonly intel: EngineDeps["intel"];
+  /** 見送ったシグナルの仮想トレード (無効なら undefined) */
+  readonly shadow?: ShadowTracker;
+  private readonly priceAt: PriceAt;
+  private readonly newsEvalEveryMs: number;
+  private lastNewsEvalAt?: number;
   private readonly ai?: AiOptions;
   private readonly log: Logger;
   private readonly rng: () => number;
   private readonly dexFeed?: DexScreenerFeed;
   private readonly timeframes?: Timeframe[];
-  private readonly opt: Required<Omit<EngineOptions, "tickMs" | "intelEveryMs" | "learnEveryMs">> & {
+  private readonly opt: Required<Omit<EngineOptions, "tickMs" | "intelEveryMs" | "learnEveryMs" | "shadow" | "newsEvalEveryMs">> & {
     tickMs: number;
     intelEveryMs: number;
     learnEveryMs: number;
@@ -400,6 +418,18 @@ export class TradingEngine {
       onEscalated: (o, now) => this.onOrderEscalated(o, now),
       orderPolicy: { ...this.opt.orderPolicy, brokerTimeoutMs: this.opt.brokerTimeoutMs },
     });
+    const { enabled: shadowEnabled, ...shadowOpts } = o.shadow ?? {};
+    if (shadowEnabled !== false) {
+      this.shadow = new ShadowTracker({
+        store: deps.store,
+        mode: deps.brokerSet.mode,
+        options: shadowOpts,
+        onClosed: (t) => this.learning.onShadowClosed(t),
+        onError: (where, e) => this.warnThrottled(where, this.clock.now(), "仮想トレードの処理に失敗 (取引は継続)", { error: errMsg(e) }),
+      });
+    }
+    this.priceAt = createPriceAt(this.hub, this.clock);
+    this.newsEvalEveryMs = o.newsEvalEveryMs ?? 60_000;
   }
 
   get mode(): "paper" | "live" {
@@ -732,6 +762,8 @@ export class TradingEngine {
 
     // 2. ポジション管理 (損切り・利確・トレーリング・時間切れ)。口座照会より前に、直近の気配で銘柄ごとに分離して判定する
     let exits = await this.manageExits(quotes, now);
+    // 2b. 見送ったシグナルの仮想トレードの判定 (実際の建玉には影響しない。失敗しても続ける)
+    this.shadowUpdate(quotes, now);
 
     // 3. 手動の解消要求 (CLI `orders resolve`) を適用し、保留中の注文を照会して確定したものを journal に反映する
     //    (状態不明が続いた注文は建玉で確定させる。決済の拒否後の建玉確認もここで行う。venue ごとに並列)
@@ -826,6 +858,10 @@ export class TradingEngine {
         this.log.error("銘柄の処理に失敗", { symbol: inst.symbol, error: errMsg(e) });
       }
     }
+
+    // 7b. 仮想トレードの保存・ニュースと値動きの答え合わせ (失敗しても続ける)
+    this.shadowFlush(now);
+    this.newsEvaluate(now, quotes);
 
     // 8. 評価額の記録・スナップショット
     if (this.lastEquitySave === undefined || now - this.lastEquitySave >= this.opt.equityEveryMs) {
@@ -946,6 +982,126 @@ export class TradingEngine {
     this.lastSkipFlush = now;
   }
 
+  // ───────── 見送ったシグナルの答え合わせ (仮想トレード) ─────────
+  // どれも実際の発注・リスク判定・建玉管理には触れず、例外は握りつぶす (ティックを止めない)
+
+  /** 見送ったシグナルを仮想トレードとして記録する */
+  private shadowRecord(key: string, inst: Instrument, view: MarketView, s: Strategy, signal: Signal, regime: RegimeFeatures, now: number): void {
+    if (!this.shadow) return;
+    try {
+      this.shadow.record({ instrument: inst, quote: view.quote, signal: { ...signal, horizon: signal.horizon ?? s.horizon }, regime: regime.label, reason: key, now });
+    } catch (e) {
+      this.warnThrottled("shadow.record", now, "仮想トレードの記録に失敗 (取引は継続)", { error: errMsg(e) });
+    }
+  }
+
+  /** 新規停止中など、戦略を評価しない経路でも仮想トレード用にだけ評価する (腕の乱数・評価回数には触れない) */
+  private shadowEvaluate(s: Strategy, inst: Instrument, view: MarketView, ctx: TickCtx, key: string): void {
+    if (!this.shadow) return;
+    try {
+      const regime = this.regimeFor(view, s.primaryTimeframe, ctx);
+      const intel = this.intelFor(inst, ctx);
+      const signal = s.evaluate({ market: view, regime, ...(intel ? { intel } : {}), params: this.paramsFor(s, inst) });
+      if (signal && signal.direction !== "flat") this.shadowRecord(key, inst, view, s, signal, regime, ctx.now);
+    } catch (e) {
+      this.warnThrottled("shadow.evaluate", ctx.now, "仮想トレード用の戦略評価に失敗 (取引は継続)", { strategyId: s.id, symbol: inst.symbol, error: errMsg(e) });
+    }
+  }
+
+  /** 前回の判定以降の 1m 確定足の高値・安値 */
+  private candleRange(symbol: string, sinceTs: number, now: number, cache: Map<string, MarketView | undefined>): PriceRange | undefined {
+    if (!cache.has(symbol)) cache.set(symbol, this.hub.getView(symbol, now));
+    const c = cache.get(symbol)?.candles["1m"];
+    if (!c || c.length === 0) return undefined;
+    let high = -Infinity;
+    let low = Infinity;
+    let lastTs: number | undefined;
+    for (let i = c.length - 1; i >= 0 && c[i].ts >= sinceTs; i--) {
+      high = Math.max(high, c[i].high);
+      low = Math.min(low, c[i].low);
+      lastTs ??= c[i].ts;
+    }
+    return lastTs === undefined ? undefined : { high, low, lastCandleTs: lastTs };
+  }
+
+  /** 毎ティック: 仮想トレードの損切り・利確・時間切れの判定。監視をやめた銘柄の分は捨てる */
+  private shadowUpdate(quotes: Map<string, Quote>, now: number): void {
+    if (!this.shadow || this.shadow.size === 0) return;
+    try {
+      const watched = new Set(this.hub.watched().map((i) => i.symbol));
+      const views = new Map<string, MarketView | undefined>();
+      this.shadow.update(now, (sym) => quotes.get(sym) ?? this.hub.latestQuote(sym), {
+        isWatched: (sym) => watched.has(sym),
+        rangeOf: (sym, since) => this.candleRange(sym, since, now, views),
+      });
+    } catch (e) {
+      this.warnThrottled("shadow.update", now, "仮想トレードの判定に失敗 (取引は継続)", { error: errMsg(e) });
+    }
+  }
+
+  private shadowFlush(now: number): void {
+    try {
+      this.shadow?.flush();
+    } catch (e) {
+      this.warnThrottled("shadow.flush", now, "仮想トレードの保存に失敗 (取引は継続)", { error: errMsg(e) });
+    }
+  }
+
+  // ───────── ニュースと値動きの答え合わせ ─────────
+
+  /** ニュース判定用の銘柄情報 (仲値・1 分あたりの ATR 比・往復コスト比) */
+  private newsMarketInfo(inst: Instrument, now: number): NewsMarketInfo {
+    const q = this.hub.latestQuote(inst.symbol);
+    if (!q || !(q.bid > 0) || !(q.ask >= q.bid)) return { instrument: inst };
+    const mid = midOf(q);
+    let atrPctPerMin: number | undefined;
+    const view = this.hub.getView(inst.symbol, now);
+    const tfs = (Object.keys(view?.candles ?? {}) as Timeframe[]).sort((a, b) => TIMEFRAME_MS[a] - TIMEFRAME_MS[b]);
+    for (const tf of tfs) {
+      const c = view!.candles[tf];
+      if (!c || c.length < 15) continue;
+      const a = atrLast(c, 14);
+      if (Number.isFinite(a) && a > 0) {
+        // 時間足の ATR を 1 分あたりへ (ランダムウォークの √時間 で換算)
+        atrPctPerMin = a / mid / Math.sqrt(Math.max(1, TIMEFRAME_MS[tf] / 60_000));
+        break;
+      }
+    }
+    return { instrument: inst, mid, ...(atrPctPerMin !== undefined ? { atrPctPerMin } : {}), costPct: costBps(inst, q) / 10_000 };
+  }
+
+  /** 情報ループの後: 分析済みの情報を判定待ちに加える */
+  private newsIngest(now: number): void {
+    try {
+      const items = this.intel.lastItems?.() ?? this.store.listIntel({ since: now - this.learning.news.opts.maxAgeMs, limit: 1000 });
+      if (items.length === 0) return;
+      const markets = this.hub.watched().map((inst) => this.newsMarketInfo(inst, now));
+      const added = this.learning.news.ingest(items, markets, now);
+      if (added > 0) this.log.debug("ニュースの答え合わせ待ちに追加", { added });
+    } catch (e) {
+      this.warnThrottled("news.ingest", now, "ニュースの答え合わせの取り込みに失敗 (取引は継続)", { error: errMsg(e) });
+    }
+  }
+
+  /** newsEvalEveryMs ごと: 判定時刻を過ぎたニュースを値動きと比べる */
+  private newsEvaluate(now: number, quotes: Map<string, Quote>): void {
+    if (this.lastNewsEvalAt !== undefined && now - this.lastNewsEvalAt < this.newsEvalEveryMs) return;
+    this.lastNewsEvalAt = now;
+    try {
+      const watched = new Set(this.hub.watched().map((i) => i.symbol));
+      this.learning.news.evaluate(now, {
+        isWatched: (sym) => watched.has(sym),
+        midNow: (sym) => {
+          const q = quotes.get(sym) ?? this.hub.latestQuote(sym);
+          return q && q.bid > 0 && q.ask >= q.bid ? midOf(q) : undefined;
+        },
+        priceAt: this.priceAt,
+      });
+    } catch (e) {
+      this.warnThrottled("news.evaluate", now, "ニュースの答え合わせの判定に失敗 (取引は継続)", { error: errMsg(e) });
+    }
+  }
+
   private regimeFor(view: MarketView, tf: Timeframe, ctx: TickCtx): RegimeFeatures {
     const key = `${view.instrument.symbol}|${tf}`;
     let r = ctx.regimes.get(key);
@@ -1028,6 +1184,8 @@ export class TradingEngine {
       if (pos && !owner) continue; // 1 銘柄 1 ポジション: 保有中は持ち主の戦略だけ評価 (決済シグナル用)
       if (!pos && ctx.halted) {
         this.skip("halted", ctx.haltReason);
+        // 新規停止中も戦略を評価し、出たシグナルは仮想トレードとしてだけ記録する (発注・腕の乱数には触れない)
+        this.shadowEvaluate(s, inst, view, ctx, "halted");
         continue;
       }
       const regime = this.regimeFor(view, s.primaryTimeframe, ctx);
@@ -1075,10 +1233,12 @@ export class TradingEngine {
       if (signal.direction === "flat") continue;
       if (gate!.directionBias !== "both" && gate!.directionBias !== signal.direction) {
         this.skip("direction_bias");
+        this.shadowRecord("direction_bias", inst, view, s, signal, regime, ctx.now);
         continue;
       }
       if (!(armWeight > 0)) {
         this.skip("arm_disabled");
+        this.shadowRecord("arm_disabled", inst, view, s, signal, regime, ctx.now);
         continue;
       }
       // 計画のリスク倍率 × 腕の重み (上限は計画と同じ MAX_RISK_MULTIPLIER)
@@ -1091,7 +1251,10 @@ export class TradingEngine {
     if (pos || candidates.length === 0) return;
     // 同じ銘柄で複数の戦略がシグナルを出したら confidence × 腕の重み × 期待値幅 が最大のもの
     const best = candidates.reduce((a, b) => (b.score > a.score ? b : a));
-    if (candidates.length > 1) this.skip("lower_score", `${sym}: ${candidates.length} 件中 ${best.strategy.id} を採用`);
+    if (candidates.length > 1) {
+      this.skip("lower_score", `${sym}: ${candidates.length} 件中 ${best.strategy.id} を採用`);
+      for (const c of candidates) if (c !== best) this.shadowRecord("lower_score", inst, view, c.strategy, c.signal, c.regime, ctx.now);
+    }
     await this.enter(inst, view, best, ctx);
   }
 
@@ -1102,10 +1265,14 @@ export class TradingEngine {
     const sig = c.signal;
     if (now - q.ts > this.opt.maxQuoteAgeMs) return this.skip("stale_quote");
     const rate = this.fx.toAccount(inst.quoteCurrency);
-    if (!Number.isFinite(rate) || !(rate > 0)) return this.skip("fx_unknown", `${inst.quoteCurrency} → ${this.fx.baseCurrency}`);
+    if (!Number.isFinite(rate) || !(rate > 0)) {
+      this.shadowRecord("fx_unknown", inst, view, c.strategy, sig, c.regime, now);
+      return this.skip("fx_unknown", `${inst.quoteCurrency} → ${this.fx.baseCurrency}`);
+    }
     try {
       this.brokerFor(sym); // 発注先が無い銘柄はリスク判定の前に見送る
     } catch (e) {
+      this.shadowRecord("no_broker", inst, view, c.strategy, sig, c.regime, now);
       return this.skip("no_broker", errMsg(e));
     }
     const liquidityUsd = inst.assetClass === "meme" ? liquidityUsdFor(inst, view, (ccy) => this.fx.toUsd(ccy)) : undefined;
@@ -1124,7 +1291,11 @@ export class TradingEngine {
       prices: acct.prices,
       toAccount: (ccy) => this.fx.toAccount(ccy),
     });
-    if (!decision.ok) return this.skip(`risk: ${normalizeReason(decision.reason)}`, `${sym} ${c.strategy.id}: ${decision.reason}`);
+    if (!decision.ok) {
+      const key = `risk: ${normalizeReason(decision.reason)}`;
+      this.shadowRecord(key, inst, view, c.strategy, sig, c.regime, now);
+      return this.skip(key, `${sym} ${c.strategy.id}: ${decision.reason}`);
+    }
 
     const side = sig.direction === "long" ? "buy" : "sell";
     const intended = side === "buy" ? q.ask : q.bid;
@@ -1208,6 +1379,8 @@ export class TradingEngine {
       return this.skip("order_pending", `${sym}: ${r.reason ?? "未確定"}`);
     }
     this.acctCache = undefined;
+    // ブローカーが受け付けなかった (発注されていない) ものは仮想トレードとして答え合わせする
+    this.shadowRecord("order_rejected", inst, view, c.strategy, sig, c.regime, now);
     return this.skip("order_rejected", `${sym}: ${r.reason ?? "rejected"}`);
   }
 
@@ -1287,6 +1460,7 @@ export class TradingEngine {
     try {
       const brief = await this.intel.refresh(now);
       if (this.stopped) return undefined; // 停止後は保存しない (store が閉じられている可能性)
+      this.newsIngest(now);
       const plan = await this.buildPlan(brief, now);
       if (this.stopped) return undefined;
       this.store.savePlan(plan);

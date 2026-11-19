@@ -8,6 +8,7 @@ import type {
   ParamAdjustment,
   Params,
   RegimeLabel,
+  ShadowTradeRecord,
   SourceReliability,
   Store,
   Strategy,
@@ -17,8 +18,10 @@ import type {
 import { armKey, StrategyAllocator, type AllocatorOptions, type ArmSnapshot, type Rng } from "./allocator";
 import { attributeTrade } from "./attribution";
 import { DEFAULT_POST_EXIT_HORIZON_MS, fillPostExitMoves, type PriceAt } from "./journal";
+import { NewsOutcomeTracker, type NewsCheckOptions, type NewsCheckSummary } from "./newsCheck";
 import { reflect, type ReflectionResult } from "./reflection";
 import { SourceReliabilityTracker, type ReliabilityOptions } from "./reliability";
+import { shadowCountersKey, shadowOpenKey, summarizeShadowTrades, sumShadowCounters, type ShadowCounters, type ShadowSummary } from "./shadow";
 import { ParamTuner, type ParamValidator, type TunerOptions } from "./tuner";
 
 const log = createLogger("learning");
@@ -48,6 +51,10 @@ export interface LearningServiceDeps {
   allocator?: Partial<AllocatorOptions>;
   reliability?: Partial<ReliabilityOptions>;
   tuner?: Partial<TunerOptions>;
+  /** ニュースと値動きの答え合わせ */
+  newsCheck?: Partial<NewsCheckOptions>;
+  /** 決済済みの仮想トレードを残す期間 (既定 30 日。periodic で古いものを消す) */
+  shadowRetentionMs?: number;
 }
 
 export interface PeriodicResult {
@@ -78,16 +85,23 @@ export interface LearningSnapshot {
   sources: Record<string, SourceReliability>;
   intelInfluence: Record<AssetClass, number>;
   causes: CauseSummary;
+  /** 見送ったシグナルの答え合わせ (仮想トレード) */
+  shadow: ShadowSummary;
+  /** ニュースと値動きの答え合わせ */
+  news: NewsCheckSummary;
 }
 
 const ASSET_CLASSES: AssetClass[] = ["crypto", "meme", "fx", "stock"];
 const LAST_TUNE_KEY = "learning:lastTune";
 const LAST_REFLECT_KEY = "learning:lastReflect";
 const LAST_FILL_KEY = "learning:lastPostExitFill";
+const MODES = ["paper", "live"] as const;
 
 /**
  * 学習の窓口。
  * - onTradeClosed: 要因分析の保存 → アロケーター更新 → 情報源信頼度更新 → 監査ログ
+ * - onShadowClosed: 見送ったシグナルの仮想トレードの保存 → アロケーターの重み付き更新 (既定 0.25)
+ * - news: ニュースと値動きの答え合わせ (情報源の信頼度を重み 0.3 で更新。エンジンが ingest / evaluate を呼ぶ)
  * - periodic: エグジット後の値動きの補完 (と再分析) → 適用済み調整の事後評価 → tuner → 振り返り
  * - snapshot: ダッシュボード/レポート用の要約
  */
@@ -96,6 +110,7 @@ export class LearningService {
   readonly allocator: StrategyAllocator;
   readonly reliability: SourceReliabilityTracker;
   readonly tuner: ParamTuner;
+  readonly news: NewsOutcomeTracker;
   private readonly deps: LearningServiceDeps;
   private running = false;
 
@@ -104,6 +119,7 @@ export class LearningService {
     this.store = deps.store;
     this.allocator = new StrategyAllocator(deps.store, deps.allocator);
     this.reliability = new SourceReliabilityTracker(deps.store, deps.reliability);
+    this.news = new NewsOutcomeTracker(deps.store, this.reliability, deps.newsCheck);
     this.tuner = new ParamTuner({
       store: deps.store,
       getStrategy: (id) => deps.getStrategy?.(id),
@@ -149,6 +165,29 @@ export class LearningService {
     return att;
   }
 
+  /**
+   * 仮想トレード (見送ったシグナル) の決済時に呼ぶ。保存 → 同じ腕を重み shadowWeight で更新。
+   * 監視をやめて捨てたもの (unwatched) は学習に使わない。ParamTuner・要因分析には使わない
+   */
+  onShadowClosed(t: ShadowTradeRecord): void {
+    if (t.exitReason === "unwatched") return;
+    this.store.saveShadowTrade(t);
+    this.allocator.updateShadow(t);
+  }
+
+  /** 見送ったシグナルの答え合わせの集計 (既定は直近 30 日) */
+  shadowSummary(opts: { now?: number; windowMs?: number } = {}): ShadowSummary {
+    const now = opts.now ?? Date.now();
+    const since = now - (opts.windowMs ?? 30 * 86_400_000);
+    const open = MODES.reduce((n, m) => n + (this.store.kvGet<unknown[]>(shadowOpenKey(m))?.length ?? 0), 0);
+    const counters = sumShadowCounters(MODES.map((m) => this.store.kvGet<Partial<ShadowCounters>>(shadowCountersKey(m))));
+    return summarizeShadowTrades(this.store.listShadowTrades({ since }), { open, counters, since });
+  }
+
+  newsSummary(): NewsCheckSummary {
+    return this.news.summary();
+  }
+
   /** 定期処理 (学習ループから呼ぶ)。同時実行はスキップ */
   async periodic(now: number): Promise<PeriodicResult> {
     if (this.running) return { postExitFilled: 0, reattributed: 0, reverted: [], adjustments: [], skipped: true };
@@ -172,6 +211,9 @@ export class LearningService {
         }
         this.store.kvSet(LAST_FILL_KEY, now);
       }
+
+      // 1b. 古い仮想トレードを消す (集計は直近だけを見る)
+      this.store.pruneShadowTrades(now - (this.deps.shadowRetentionMs ?? 30 * 86_400_000));
 
       // 2. 適用済み調整の事後評価 (悪化していれば元に戻す)
       res.reverted = this.tuner.reviewApplied(now);
@@ -246,7 +288,7 @@ export class LearningService {
   }
 
   /** ダッシュボード/レポート用の要約 */
-  snapshot(opts: { now?: number; causeWindowMs?: number; lessonLimit?: number; adjustmentLimit?: number } = {}): LearningSnapshot {
+  snapshot(opts: { now?: number; causeWindowMs?: number; shadowWindowMs?: number; lessonLimit?: number; adjustmentLimit?: number } = {}): LearningSnapshot {
     const now = opts.now ?? Date.now();
     return {
       generatedAt: now,
@@ -256,6 +298,8 @@ export class LearningService {
       sources: this.reliability.all(),
       intelInfluence: Object.fromEntries(ASSET_CLASSES.map((c) => [c, this.reliability.intelInfluence(c)])) as Record<AssetClass, number>,
       causes: this.causeSummary(now - (opts.causeWindowMs ?? 30 * 86_400_000)),
+      shadow: this.shadowSummary({ now, windowMs: opts.shadowWindowMs }),
+      news: this.newsSummary(),
     };
   }
 }
