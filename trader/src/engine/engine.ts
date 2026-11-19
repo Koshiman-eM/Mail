@@ -217,7 +217,7 @@ export interface EngineStatus {
     summary: string;
     stub: boolean;
     watchlist: string[];
-    biases: { asset: string; sentiment: number; confidence: number; eventRisk: number }[];
+    biases: { asset: string; sentiment: number; confidence: number; eventRisk: number; blackoutUntil?: number }[];
     events: { ts: number; title: string; currency?: string; impact: string }[];
   };
   equityHistory: { ts: number; equity: number }[];
@@ -1499,10 +1499,16 @@ export class TradingEngine {
               summary: brief.summary,
               stub: brief.stub,
               watchlist: brief.watchlist,
-              biases: Object.values(brief.biases)
-                .sort((a, b) => b.confidence - a.confidence)
-                .slice(0, 10)
-                .map((b) => ({ asset: b.asset, sentiment: b.sentiment, confidence: b.confidence, eventRisk: b.eventRisk })),
+              biases: (() => {
+                // 監視銘柄の資産は信頼度に関係なく必ず含め、残りは信頼度の高い順に上位を出す (ダッシュボードの強気・弱気の表示用)
+                const watchedAssets = new Set(this.hub.watched().map((i) => i.baseCurrency.toUpperCase()));
+                const all = Object.values(brief.biases).sort((a, b) => b.confidence - a.confidence);
+                const picked = [...all.filter((b) => watchedAssets.has(b.asset.toUpperCase())), ...all.filter((b) => !watchedAssets.has(b.asset.toUpperCase())).slice(0, 20)];
+                return picked.map((b) => ({
+                  asset: b.asset, sentiment: b.sentiment, confidence: b.confidence, eventRisk: b.eventRisk,
+                  ...(b.blackoutUntil !== undefined && b.blackoutUntil > now ? { blackoutUntil: b.blackoutUntil } : {}),
+                }));
+              })(),
               events: brief.events
                 .filter((e) => e.ts >= now - 3_600_000)
                 .sort((a, b) => a.ts - b.ts)

@@ -47,6 +47,13 @@ svg { width: 100%; height: 220px; display: block; }
 .kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; }
 .bar { height: 8px; background: var(--accent); border-radius: 4px; }
 .err { color: var(--neg); }
+.dbar { position: relative; height: 10px; min-width: 120px; background: var(--chip); border-radius: 5px; }
+.dbar::after { content: ""; position: absolute; left: 50%; top: -3px; bottom: -3px; width: 1px; background: var(--muted); }
+.dbar span { position: absolute; top: 0; bottom: 0; border-radius: 5px; }
+.dbar.wide { height: 14px; }
+.tone { display: inline-block; min-width: 64px; text-align: center; padding: 0 6px; border-radius: 6px; font-size: 12px; font-weight: 600; background: var(--chip); }
+.tone.bull { color: var(--pos); } .tone.bear { color: var(--neg); }
+.scale { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); }
 @media (max-width: 600px) { main { padding: 8px; gap: 8px; } .big { font-size: 22px; } th, td { padding: 4px; } }
 </style>
 </head>
@@ -67,6 +74,10 @@ svg { width: 100%; height: 220px; display: block; }
   <section>
     <h2>リスク状態</h2>
     <div id="risk" class="kv"></div>
+  </section>
+  <section class="wide">
+    <h2>相場の強気・弱気</h2>
+    <div id="sentiment"></div>
   </section>
   <section>
     <h2>計画・情報</h2>
@@ -175,7 +186,54 @@ svg { width: 100%; height: 220px; display: block; }
       '<text x="' + (W - R) + '" y="' + (H - 6) + '" text-anchor="end" font-size="11" fill="var(--muted)">' + esc(time(x1)) + "</text></svg>";
   }
 
+  // -1 (弱気) 〜 +1 (強気) を中央から左右に伸びる棒で表す
+  function dbar(x, wide) {
+    var v = typeof x === "number" && isFinite(x) ? Math.max(-1, Math.min(1, x)) : 0;
+    var w = Math.abs(v) * 50, color = v >= 0 ? "var(--pos)" : "var(--neg)";
+    var pos = v >= 0 ? "left:50%" : "left:" + (50 - w) + "%";
+    return '<div class="dbar' + (wide ? " wide" : "") + '"><span style="' + pos + ";width:" + w + "%;background:" + color + '"></span></div>';
+  }
+  function tone(x, conf) {
+    var t = x >= 0.3 ? ["強気", "bull"] : x >= 0.1 ? ["やや強気", "bull"] : x <= -0.3 ? ["弱気", "bear"] : x <= -0.1 ? ["やや弱気", "bear"] : ["中立", ""];
+    var weak = typeof conf === "number" && conf < 0.3 ? '<span class="muted"> (根拠薄)</span>' : "";
+    return '<span class="tone ' + t[1] + '">' + t[0] + "</span>" + weak;
+  }
+  function baseOf(sym) { return String(sym).split(/[\/:|-]/)[0].toUpperCase(); }
+  function renderSentiment(s) {
+    var b = s.brief;
+    if (!b) { set("sentiment", '<p class="muted">情報収集の結果がまだありません (起動後 1 回目の収集を待っています)</p>'); return; }
+    var byAsset = {};
+    b.biases.forEach(function (x) { byAsset[String(x.asset).toUpperCase()] = x; });
+    var dirOf = {};
+    if (s.plan) s.plan.symbols.forEach(function (x) { dirOf[x.symbol] = x.directionBias; });
+    var h = '<div class="kv" style="align-items:center"><span class="muted">市場全体</span><span>' + tone(b.riskOn) + " " + esc(signed(b.riskOn, 2)) + "</span></div>" +
+      dbar(b.riskOn, true) + '<div class="scale"><span>リスクオフ (弱気)</span><span>中立</span><span>リスクオン (強気)</span></div>' +
+      '<p class="muted">' + esc(time(b.generatedAt)) + " 時点 / " + (b.stub ? "キーワード辞書で判定 (AI 未使用)" : "Claude で分析") + "</p>";
+    var seen = {};
+    var watchedRows = s.watched.map(function (w) {
+      var a = baseOf(w.symbol), x = byAsset[a];
+      seen[a] = true;
+      var d = dirOf[w.symbol];
+      return [esc(w.symbol), x ? tone(x.sentiment, x.confidence) : '<span class="muted">情報なし</span>', x ? dbar(x.sentiment) : "", x ? esc(signed(x.sentiment, 2)) : "-",
+        x ? esc(num(x.confidence, 2)) : "-", x ? esc(num(x.eventRisk, 2)) + (x.blackoutUntil ? ' <span class="err">' + esc(time(x.blackoutUntil)) + " まで停止</span>" : "") : "-",
+        esc(d ? (d === "both" ? "両方" : DIR[d] || d) : "-")];
+    });
+    h += '<h2 style="margin-top:12px">監視銘柄</h2>' + table(["銘柄", "判定", "", "スコア", "信頼度", "イベント", "計画の方向"], watchedRows, [false, false, false, true, true, true, false]);
+    var others = b.biases.filter(function (x) { return !seen[String(x.asset).toUpperCase()]; })
+      .sort(function (p, q) { return Math.abs(q.sentiment) * q.confidence - Math.abs(p.sentiment) * p.confidence; }).slice(0, 15);
+    h += '<h2 style="margin-top:12px">ニュースで話題の資産</h2>' + table(["資産", "判定", "", "スコア", "信頼度"], others.map(function (x) {
+      return [esc(x.asset), tone(x.sentiment, x.confidence), dbar(x.sentiment), esc(signed(x.sentiment, 2)), esc(num(x.confidence, 2))];
+    }), [false, false, false, true, true]);
+    if (b.events.length) {
+      h += '<h2 style="margin-top:12px">重要イベント</h2>' + table(["日時", "通貨", "内容"], b.events.map(function (e) {
+        return [esc(time(e.ts)), esc(e.currency || "-"), esc(e.title)];
+      }));
+    }
+    set("sentiment", '<div class="scroll">' + h + "</div>");
+  }
+
   function renderStatus(s) {
+    renderSentiment(s);
     var ccy = s.baseCurrency;
     var m = document.getElementById("mode");
     m.textContent = s.mode === "live" ? "実弾 (LIVE)" : "ペーパー";
