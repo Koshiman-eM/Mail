@@ -365,9 +365,20 @@ export interface Broker {
   cancelOrder(orderId: string, symbol: string): Promise<void>;
   /**
    * 注文の最新状態 (累計の約定を含む)。clientId で照会し、取引所が clientId 照会に未対応なら orderId を使う。
-   * 見つからなければ undefined。
+   * orderId も無い (発注が例外で終わった) 場合、hint (発注時刻・売買方向・数量) で注文一覧と突き合わせてよい
+   * (候補がちょうど 1 件のときだけ採用する)。
+   * undefined は「取引所がその注文は無いと答えた」ときだけ。照会できない・通信に失敗したときは例外を投げる。
    */
-  getOrder(clientId: string, symbol: string, orderId?: string): Promise<OrderResult | undefined>;
+  getOrder(clientId: string, symbol: string, orderId?: string, hint?: OrderLookupHint): Promise<OrderResult | undefined>;
+}
+
+/** clientId で照会できない取引所向けの手がかり (エンジンの保留中の注文から渡す) */
+export interface OrderLookupHint {
+  /** 発注した時刻 (エンジンの時計、ミリ秒) */
+  createdAt: number;
+  side: Side;
+  /** 発注数量 (decimal 文字列) */
+  qty: string;
 }
 
 /** 市場データの取得元 */
