@@ -80,6 +80,12 @@ export interface OrderPolicy {
   positionTolerance: number;
   /** ブローカー呼び出し (発注・照会・取消・建玉) の締め切り。0 で無効 */
   brokerTimeoutMs: number;
+  /** 決済注文の状態不明がこの回数続いたら escalated (損切りを長く止めないため、エントリーより短い) */
+  exitMaxUnknownCount: number;
+  /** 決済注文の状態不明がこの時間続いたら escalated */
+  exitMaxUnknownMs: number;
+  /** escalated の決済注文を建玉で確定させるための getPositions の間隔 */
+  exitPositionCheckMs: number;
 }
 
 export const DEFAULT_ORDER_POLICY: OrderPolicy = {
@@ -93,6 +99,9 @@ export const DEFAULT_ORDER_POLICY: OrderPolicy = {
   positionCheckMs: 30_000,
   positionTolerance: 0.005,
   brokerTimeoutMs: 8_000,
+  exitMaxUnknownCount: 2,
+  exitMaxUnknownMs: 20_000,
+  exitPositionCheckMs: 10_000,
 };
 
 /** 決済が約定しなかった後に建玉を確認し、無い (少ない) と何回確認したら追跡を外すか */
@@ -440,7 +449,7 @@ export class PositionManager {
    * 発注が締め切りを過ぎたら状態不明の保留として扱う (保留は発注前に書き込み済み)。
    * 拒否された場合の建玉の確認は、その場で待たずに次のティック (syncPending) へ回す。
    */
-  async close(symbol: string, reason: ExitReason, intendedPrice: number, now: number): Promise<CloseResult> {
+  async close(symbol: string, reason: ExitReason, intendedPrice: number, now: number, opts: { maxQty?: Decimal } = {}): Promise<CloseResult> {
     const p = this.get(symbol);
     if (!p) return { status: "none", reason: "ポジションがありません" };
     if (this.closing.has(p.id)) return { status: "none", reason: "決済中" };
@@ -464,12 +473,18 @@ export class PositionManager {
         return { status: "error", reason: msg };
       }
       const long = p.direction === "long";
+      // 数量は追跡数量 (と、指定があれば取引所の保有数量) を上限にする (reduceOnly と合わせて過剰決済しない)
+      let qty = D(p.qty);
+      if (opts.maxQty !== undefined) {
+        if (!opts.maxQty.isFinite() || !opts.maxQty.gt(0)) return { status: "none", reason: "決済する数量がありません" };
+        if (opts.maxQty.lt(qty)) qty = opts.maxQty;
+      }
       const req: OrderRequest = {
         clientId: this.newClientId("x", now),
         symbol,
         side: long ? "sell" : "buy",
         type: "market",
-        qty: D(p.qty).toString(),
+        qty: qty.toString(),
         reduceOnly: true,
         strategyId: p.strategyId,
       };
@@ -586,9 +601,18 @@ export class PositionManager {
     return out;
   }
 
+  /** 状態不明 → escalated の上限・建玉照会の間隔 (決済注文は損切りを長く止めないため短い) */
+  private unknownLimits(o: Pick<PendingOrder, "kind">): { count: number; ms: number; checkMs: number } {
+    const P = this.policy;
+    return o.kind === "exit"
+      ? { count: P.exitMaxUnknownCount, ms: P.exitMaxUnknownMs, checkMs: P.exitPositionCheckMs }
+      : { count: P.maxUnknownCount, ms: P.maxUnknownMs, checkMs: P.positionCheckMs };
+  }
+
   private positionCheckDue(o: PendingOrder, now: number): boolean {
-    const stuck = o.escalated || (o.unknownSince !== undefined && now - o.unknownSince >= this.policy.maxUnknownMs);
-    return stuck && (o.positionCheckAt === undefined || now - o.positionCheckAt >= this.policy.positionCheckMs);
+    const lim = this.unknownLimits(o);
+    const stuck = o.escalated || (o.unknownSince !== undefined && now - o.unknownSince >= lim.ms);
+    return stuck && (o.positionCheckAt === undefined || now - o.positionCheckAt >= lim.checkMs);
   }
 
   /** ブローカーの建玉 (同じ syncPending の中では 1 回だけ照会する)。失敗したら undefined */
@@ -925,23 +949,31 @@ export class PositionManager {
     this.auditThrottled(`unk|${o.clientId}`, now, "engine.order_unknown", {
       symbol: o.symbol, clientId: o.clientId, orderId: o.orderId, kind: o.kind, count: o.unknownCount, error: reason,
     });
-    const tooLong = now - o.unknownSince >= this.policy.maxUnknownMs;
-    if (!o.escalated && (o.unknownCount >= this.policy.maxUnknownCount || tooLong)) {
-      o.escalated = true;
-      o.escalatedAt = now;
-      const msg =
-        `注文状態不明: ${o.symbol} ${o.kind === "entry" ? "エントリー" : "決済"} clientId=${o.clientId}` +
-        `${o.orderId ? ` orderId=${o.orderId}` : ""} (${reason})。新規エントリーを止め、建玉の照会で確定させます`;
-      this.log.error(msg, { unknownCount: o.unknownCount, sinceMs: now - o.unknownSince });
-      this.deps.store?.audit({
-        ts: now, type: "order.unknown_escalated",
-        data: { symbol: o.symbol, clientId: o.clientId, orderId: o.orderId, kind: o.kind, count: o.unknownCount, sinceMs: now - o.unknownSince, error: reason },
-      });
-      this.pending.upsert(o);
-      this.deps.onEscalated?.({ ...o }, now);
+    const lim = this.unknownLimits(o);
+    const tooLong = now - o.unknownSince >= lim.ms;
+    if (!o.escalated && (o.unknownCount >= lim.count || tooLong)) {
+      this.escalate(o, now, reason);
       return;
     }
     this.pending.upsert(o);
+  }
+
+  /** escalated にする (新規エントリーを止め、建玉の照会で確定させる)。保存して onEscalated を呼ぶ */
+  private escalate(o: PendingOrder, now: number, reason: string): void {
+    o.escalated = true;
+    o.escalatedAt = now;
+    o.unknownSince ??= now;
+    o.lastError = reason;
+    const msg =
+      `注文状態不明: ${o.symbol} ${o.kind === "entry" ? "エントリー" : "決済"} clientId=${o.clientId}` +
+      `${o.orderId ? ` orderId=${o.orderId}` : ""} (${reason})。新規エントリーを止め、建玉の照会で確定させます`;
+    this.log.error(msg, { unknownCount: o.unknownCount, sinceMs: now - o.unknownSince });
+    this.deps.store?.audit({
+      ts: now, type: "order.unknown_escalated",
+      data: { symbol: o.symbol, clientId: o.clientId, orderId: o.orderId, kind: o.kind, count: o.unknownCount, sinceMs: now - o.unknownSince, error: reason },
+    });
+    this.pending.upsert(o);
+    this.deps.onEscalated?.({ ...o }, now);
   }
 
   // ───────── 建玉・手動の申告による確定 ─────────
@@ -975,20 +1007,67 @@ export class PositionManager {
       });
       return undefined;
     }
-    if (r.verdict !== "filled" && cur.orderId) await this.tryCancel(broker, cur);
+    const canceled = r.verdict !== "filled" && cur.orderId ? await this.tryCancel(broker, cur, "確定は続けます") : true;
     const latest = this.pending.get(cur.clientId);
     if (!latest) return undefined;
     latest.positionCheckAt = now;
-    return this.finalizeResolved(latest, r, now, { source: "position" });
+    const a = this.finalizeResolved(latest, r, now, { source: "position" });
+    // 決済が「約定なし」と確定した: 損切り等を止めたままにしないため、新しい clientId ですぐに決済を再送する
+    // (古い注文の取消に失敗した場合は二重約定を避けて再送しない。次のティックの決済判定に任せる)
+    if (latest.kind === "exit" && r.verdict === "none" && canceled) return (await this.resendExit(latest, r, now)) ?? a;
+    return a;
   }
 
-  private async tryCancel(broker: Broker, o: PendingOrder): Promise<void> {
+  /**
+   * 建玉で「約定なし」と確定した決済を新しい clientId で再送する。数量は追跡数量と取引所の保有数量の小さい方 (reduceOnly)。
+   * 再送しなかったら undefined
+   */
+  private async resendExit(o: PendingOrder, r: Resolution, now: number): Promise<Applied | undefined> {
+    const x = o.exit;
+    const p = x ? this.deps.journal.get(x.tradeId) : undefined;
+    if (!x || !p || r.brokerQty === undefined) return undefined;
+    let brokerQty: Decimal;
+    try {
+      brokerQty = D(r.brokerQty);
+    } catch {
+      return undefined;
+    }
+    const held = Decimal.max(p.direction === "long" ? brokerQty : brokerQty.neg(), 0);
+    const maxQty = Decimal.min(D(p.qty), held);
+    if (!maxQty.isFinite() || !maxQty.gt(0)) return undefined;
+    this.exitBackoff.delete(p.symbol);
+    this.log.warn("決済が約定していないことを建玉で確認したため、新しい clientId で決済を再送します", {
+      symbol: p.symbol, reason: x.reason, previousClientId: o.clientId, qty: maxQty.toString(),
+    });
+    this.deps.store?.audit({
+      ts: now, type: "engine.exit_resend",
+      data: { symbol: p.symbol, tradeId: p.id, reason: x.reason, previousClientId: o.clientId, qty: maxQty.toString(), brokerQty: r.brokerQty, trackedQty: String(p.qty) },
+    });
+    const c = await this.close(p.symbol, x.reason, x.intendedPrice, now, { maxQty });
+    switch (c.status) {
+      case "closed":
+        return c.trade ? { kind: "closed", trade: c.trade } : undefined;
+      case "reduced":
+        return c.position ? { kind: "reduced", position: c.position } : undefined;
+      case "pending":
+        return { kind: "pending", ...(c.reason ? { reason: c.reason } : {}) };
+      case "rejected":
+        return { kind: "rejected", reason: c.reason ?? "rejected" };
+      default:
+        return undefined;
+    }
+  }
+
+  /** 取消を試みる。成功 (または orderId が無く取消できない) なら true、失敗なら false */
+  private async tryCancel(broker: Broker, o: PendingOrder, onFail: string): Promise<boolean> {
     const orderId = o.orderId;
-    if (!orderId) return;
+    if (!orderId) return true;
     try {
       await this.call(() => broker.cancelOrder(orderId, o.symbol), "cancelOrder");
+      return true;
     } catch (e) {
-      this.log.warn("注文の取消に失敗 (確定は続けます)", { symbol: o.symbol, clientId: o.clientId, orderId, error: errMsg(e) });
+      this.log.warn(`注文の取消に失敗 (${onFail})`, { symbol: o.symbol, clientId: o.clientId, orderId, error: errMsg(e) });
+      return false;
     }
   }
 
@@ -1082,7 +1161,10 @@ export class PositionManager {
         this.deps.store?.audit({ ts: now, type: "order.resolved_by_position", data });
       } else {
         this.log.warn("保留中の注文を手動の申告で解消しました", { ...data, by: by.req.by });
-        this.deps.store?.audit({ ts: now, type: "order.manual_resolve", data: { ...data, outcome: by.req.outcome, by: by.req.by, requestedAt: by.req.at } });
+        this.deps.store?.audit({
+          ts: now, type: "order.manual_resolve",
+          data: { ...data, outcome: by.req.outcome, by: by.req.by, requestedAt: by.req.at, ...(by.req.force ? { force: true } : {}) },
+        });
       }
       return a;
     });
@@ -1103,6 +1185,9 @@ export class PositionManager {
       return { applied: false, message };
     };
     if (!o) return reject("保留中の注文が見つかりません (既に確定した可能性があります)");
+    if (!o.escalated && req.force !== true) {
+      return reject("状態不明 (escalated) ではない注文です。照会で確定するのを待つか、取引所で確認したうえで --force を付けてください");
+    }
     let r: Resolution = { verdict: "none", qty: D(0), price: 0 };
     if (req.outcome === "filled") {
       let qty: Decimal;
@@ -1120,10 +1205,28 @@ export class PositionManager {
       r = { verdict: q.gte(base.minus(tol)) ? "filled" : "partial", qty: q, price };
     }
     if (o.orderId) {
+      let canceled: boolean;
       try {
-        await this.tryCancel(this.deps.brokerFor(o.symbol), o);
+        canceled = await this.tryCancel(this.deps.brokerFor(o.symbol), o, req.outcome === "none" ? "確定せず保留のままにします" : "確定は続けます");
       } catch {
-        // 発注先が無い: 取消はできないが解消は続ける
+        canceled = false; // 発注先が無い: 取消できない
+      }
+      if (!canceled && req.outcome === "none") {
+        // 取消できなかった注文を「約定なし」と確定すると、後から約定したときに追跡から漏れる。
+        // 保留のままにし、建玉の照会で確定させる (escalated にして照会の対象にする)
+        const cur = this.pending.get(req.clientId);
+        if (!cur) return reject("取消の間に注文が確定しました");
+        const message = "取消に失敗したため「約定なし」で確定せず、保留のまま建玉の照会で確定させます";
+        if (!cur.escalated) this.escalate(cur, now, `手動の解消 (--none) で取消に失敗`);
+        this.log.warn(`手動の解消要求を保留しました: ${message}`, { clientId: req.clientId });
+        this.deps.store?.audit({
+          ts: now, type: "order.manual_resolve",
+          data: {
+            symbol: o.symbol, clientId: req.clientId, ...(o.orderId ? { orderId: o.orderId } : {}), kind: o.kind, outcome: req.outcome,
+            result: "deferred", reason: message, by: req.by, requestedAt: req.at, ...(req.force ? { force: true } : {}),
+          },
+        });
+        return { applied: false, message };
       }
     }
     const cur = this.pending.get(req.clientId);

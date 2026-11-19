@@ -221,7 +221,7 @@ describe("PositionManager: 保留中の注文・約定の検証 (live の偽ブ�
     return { store, broker, journal, pm, closed, onAnomaly, onEscalated, entry, setPrice: (p: number) => (price = p) };
   }
 
-  it("決済の発注が例外なら保留中として記録し、再送しない (照会で確定)", async () => {
+  it("決済の発注が例外なら保留中として記録し、照会中は再送しない。不明 2 回で escalated、建玉で「約定なし」を 10 秒空けて 2 回確認したら新しい clientId で再送する", async () => {
     const s = liveSetup();
     s.broker.placeMode = "fill";
     const e = s.entry("e1");
@@ -231,8 +231,8 @@ describe("PositionManager: 保留中の注文・約定の検証 (live の偽ブ�
     expect((await s.pm.close("AAA/USD", "stop", 98, T0 + 2_000)).status).toBe("pending");
     expect(s.broker.placed).toHaveLength(2);
     expect(s.pm.pendingOrders()[0]).toMatchObject({ kind: "exit", status: "unknown", unknownCount: 1 });
-    // 照会でも見つからない状態が続くと escalated (kill switch は発動しない = onAnomaly は呼ばない)
-    for (let i = 0; i < 4; i++) await s.pm.syncPending(T0 + 3_000 + i * 1_000);
+    // 照会でも見つからない → 決済は不明 2 回で escalated (kill switch は発動しない = onAnomaly は呼ばない)
+    await s.pm.syncPending(T0 + 3_000);
     expect(s.onEscalated).toHaveBeenCalledTimes(1);
     expect(s.onEscalated.mock.calls[0][0]).toMatchObject({ kind: "exit", escalated: true });
     expect(s.onAnomaly).not.toHaveBeenCalled();
@@ -240,19 +240,43 @@ describe("PositionManager: 保留中の注文・約定の検証 (live の偽ブ�
     expect(s.pm.has("AAA/USD")).toBe(true);
     // 照会の hint (発注時刻・売買方向・数量) を渡している
     expect(s.broker.getOrderHints.at(-1)).toEqual({ createdAt: T0 + 1_000, side: "sell", qty: "2" });
-    // 建玉は減っていない → 30 秒後の 2 回目の判定で「約定なし」として保留を外す
+    // 建玉は減っていない → 1 回目の判定 (escalated と同じ照会)
     expect(s.pm.pendingOrders()[0].positionObs).toMatchObject({ verdict: "none" });
-    await s.pm.syncPending(T0 + 20_000);
-    expect(s.pm.hasPending("AAA/USD")).toBe(true); // 30 秒経っていない
-    await s.pm.syncPending(T0 + 36_000);
-    expect(s.pm.hasPending("AAA/USD")).toBe(false);
-    expect(s.store.listAudit({ type: "order.resolved_by_position" })[0].data).toMatchObject({ kind: "exit", result: "none", qty: "0" });
-    expect(s.store.listAudit({ type: "order.unknown_escalated" })).toHaveLength(1);
-    // 通常の管理に戻り、損切りに当たれば新しい決済が出る
+    await s.pm.syncPending(T0 + 8_000);
+    expect(s.pm.hasPending("AAA/USD")).toBe(true); // 10 秒経っていない
+    expect(s.broker.placed).toHaveLength(2); // 照会中は再送しない
+    // 10 秒後の 2 回目の判定で「約定なし」と確定し、すぐに新しい clientId で決済を再送する
     s.broker.placeMode = "fill";
-    const r = await s.pm.onQuote("AAA/USD", { ts: T0 + 37_000, bid: 97, ask: 97.02 }, T0 + 37_000);
-    expect(r.status).toBe("closed");
+    const sync = await s.pm.syncPending(T0 + 13_000);
+    expect(s.store.listAudit({ type: "order.resolved_by_position" })[0].data).toMatchObject({ kind: "exit", result: "none", qty: "0" });
+    expect(s.broker.placed).toHaveLength(3);
+    const resend = s.broker.placed[2];
+    expect(resend).toMatchObject({ side: "sell", reduceOnly: true, qty: "2" });
+    expect(resend.clientId).not.toBe(s.broker.placed[1].clientId);
+    expect(s.store.listAudit({ type: "engine.exit_resend" })[0].data).toMatchObject({ symbol: "AAA/USD", previousClientId: s.broker.placed[1].clientId, qty: "2" });
+    expect(sync.closed).toHaveLength(1);
+    expect(s.pm.has("AAA/USD")).toBe(false);
+    expect(s.pm.hasPending("AAA/USD")).toBe(false);
+    // 過剰決済しない: 取引所の建玉はちょうど 0
+    expect(s.broker.positions.get("AAA/USD")).toBeCloseTo(0, 12);
     expect(s.closed).toHaveLength(1);
+    expect(s.store.listAudit({ type: "order.unknown_escalated" })).toHaveLength(1);
+  });
+
+  it("決済の再送は取引所の保有数量を上限にする (追跡数量より少なければ保有数量だけ)", async () => {
+    const s = liveSetup();
+    s.broker.placeMode = "fill";
+    const e = s.entry("e1");
+    await s.pm.enter(e.req, e.entry, T0);
+    s.broker.placeMode = "throw";
+    await s.pm.close("AAA/USD", "stop", 98, T0 + 1_000);
+    // 許容差 (0.5%) の範囲で保有数量が少ない (約定なしと判定される)
+    s.broker.positions.set("AAA/USD", 1.995);
+    await s.pm.syncPending(T0 + 2_000);
+    s.broker.placeMode = "fill";
+    await s.pm.syncPending(T0 + 12_000);
+    expect(s.broker.placed.at(-1)).toMatchObject({ reduceOnly: true, qty: "1.995" });
+    expect(s.broker.positions.get("AAA/USD")).toBeCloseTo(0, 12);
   });
 
   it("feeCurrency 付きの手数料はクオート通貨へ換算する (ベース通貨は約定価格、その他は fxRate)", async () => {
@@ -505,7 +529,7 @@ describe("PositionManager: 状態不明の注文の確定 (建玉・手動の申
     const s = setup();
     const e1 = s.entry("e1");
     await s.pm.enter(e1.req, e1.entry, T0); // 受付のみ
-    const res = await s.pm.applyResolveRequest({ id: "r1", clientId: "e1", outcome: "filled", qty: "1.5", price: 100.3, at: T0, by: "cli" }, T0 + 1_000);
+    const res = await s.pm.applyResolveRequest({ id: "r1", clientId: "e1", outcome: "filled", qty: "1.5", price: 100.3, at: T0, by: "cli", force: true }, T0 + 1_000);
     expect(res.applied).toBe(true);
     expect(s.pm.get("AAA/USD")).toMatchObject({ qty: 1.5, entryPrice: 100.3, estimated: true });
     expect(s.broker.canceled).toEqual(["fake-1"]); // 残りが後から約定しないように取消す
@@ -520,9 +544,44 @@ describe("PositionManager: 状態不明の注文の確定 (建玉・手動の申
     const c = await s.pm.close("AAA/USD", "stop", 98, T0 + 3_000);
     expect(c.status).toBe("pending");
     const exitId = s.pm.pendingOrders()[0].clientId;
-    await s.pm.applyResolveRequest({ id: "r3", clientId: exitId, outcome: "none", at: T0, by: "cli" }, T0 + 4_000);
+    await s.pm.applyResolveRequest({ id: "r3", clientId: exitId, outcome: "none", at: T0, by: "cli", force: true }, T0 + 4_000);
     expect(s.pm.hasPending("AAA/USD")).toBe(false);
     expect(s.pm.get("AAA/USD")?.qty).toBe(1.5);
+  });
+
+  it("手動の解消: 状態不明 (escalated) でない注文は force が無ければ適用しない", async () => {
+    const s = setup();
+    const e1 = s.entry("e1");
+    await s.pm.enter(e1.req, e1.entry, T0); // 受付のみ (照会で状態が分かっている)
+    const res = await s.pm.applyResolveRequest({ id: "r1", clientId: "e1", outcome: "none", at: T0, by: "cli" }, T0 + 1_000);
+    expect(res.applied).toBe(false);
+    expect(res.message).toMatch(/--force/);
+    expect(s.pm.hasPending("AAA/USD")).toBe(true);
+    expect(s.broker.canceled).toEqual([]);
+    expect(s.store.listAudit({ type: "order.manual_resolve" })[0].data).toMatchObject({ clientId: "e1", result: "rejected" });
+  });
+
+  it("手動の解消 --none: 取消に失敗したら確定せず保留のまま (escalated にして建玉の照会に任せる)。監査ログに残す", async () => {
+    const s = setup();
+    const e1 = s.entry("e1");
+    await s.pm.enter(e1.req, e1.entry, T0); // 受付のみ (orderId fake-1)
+    s.broker.failCancel = true;
+    const res = await s.pm.applyResolveRequest({ id: "r1", clientId: "e1", outcome: "none", at: T0, by: "cli", force: true }, T0 + 1_000);
+    expect(res.applied).toBe(false);
+    expect(res.message).toMatch(/取消に失敗/);
+    expect(s.pm.hasPending("AAA/USD")).toBe(true);
+    expect(s.pm.pendingOrders()[0]).toMatchObject({ clientId: "e1", escalated: true });
+    expect(s.onEscalated).toHaveBeenCalledTimes(1);
+    expect(s.store.listAudit({ type: "order.manual_resolve" })[0].data).toMatchObject({ clientId: "e1", outcome: "none", result: "deferred", force: true });
+    expect(s.store.listAudit({ type: "order.resolved_by_position" })).toHaveLength(0);
+    // 後から取引所で約定していた → 建玉の照会で約定ありとして確定する (「約定なし」で漏らさない)
+    s.broker.fill("e1");
+    s.broker.getOrderMode = "throw";
+    s.broker.avgPrices.set("AAA/USD", 100.01);
+    await s.pm.syncPending(T0 + 2_000);
+    await s.pm.syncPending(T0 + 40_000);
+    expect(s.pm.get("AAA/USD")).toMatchObject({ qty: 2, estimated: true });
+    expect(s.store.listAudit({ type: "order.resolved_by_position" })[0].data).toMatchObject({ kind: "entry", result: "filled" });
   });
 
   it("約定の反映と保留の削除は 1 つのトランザクション (途中で失敗したら両方とも書かない = 再起動後に 1 回だけ反映)", async () => {

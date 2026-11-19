@@ -14,6 +14,10 @@ export class FakeLiveBroker implements Broker {
   getOrderMode: "normal" | "throw" | "missing" = "normal";
   /** getBalance / getPositions を失敗させる */
   failAccount = false;
+  /** cancelOrder を失敗させる */
+  failCancel = false;
+  /** getPositions の一覧から隠す銘柄 (約定直後に一覧の反映が遅れる取引所の再現) */
+  readonly hidePositions = new Set<string>();
   equity = 1_000_000;
   currency = "USD";
   /** 約定の手数料 (decimal 文字列) と通貨 (省略時はクオート通貨建て) */
@@ -50,7 +54,7 @@ export class FakeLiveBroker implements Broker {
     this.getPositionsCalls++;
     if (this.failAccount) throw new Error("ETIMEDOUT (fake positions)");
     return [...this.positions]
-      .filter(([, q]) => Math.abs(q) > 1e-12)
+      .filter(([s, q]) => Math.abs(q) > 1e-12 && !this.hidePositions.has(s))
       .map(([symbol, q]) => ({ symbol, qty: String(q), avgPrice: this.avgPrices.get(symbol) ?? 0 }));
   }
 
@@ -115,6 +119,7 @@ export class FakeLiveBroker implements Broker {
   }
 
   async cancelOrder(orderId: string, _symbol: string): Promise<void> {
+    if (this.failCancel) throw new Error("ETIMEDOUT (fake cancelOrder)");
     this.canceled.push(orderId);
     for (const { res } of this.orders.values()) {
       if (res.orderId === orderId && (res.status === "open" || res.status === "partially_filled")) res.status = "canceled";

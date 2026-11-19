@@ -32,7 +32,7 @@ import {
   activeBlackout, emptyBrief, intelBiasFor, liquidityUsdFor, normalizeReason, planRegimeTimeframe, selectAutoMemeCandidates,
 } from "./context";
 import { runGrouped, withDeadline } from "./deadline";
-import { createFxConverter, type FxConverter } from "./fx";
+import { createFxConverter, fxApproxReason, normalizeCurrency, type FxConverter } from "./fx";
 import { createPriceAt, priceFromCandles } from "./learningHooks";
 import { peekResolveRequests, removeResolveRequests, type PendingEntry, type PendingOrder, type PendingStatus } from "./orders";
 import { DEFAULT_ORDER_POLICY, PositionManager, type EntryResult, type OrderPolicy } from "./positions";
@@ -143,6 +143,13 @@ export interface AccountState {
   degradedReason?: string;
   /** 保留中のエントリーの件数 (positions に想定代金で加え、available から引いた) */
   pendingEntries?: number;
+  /**
+   * journal で追跡中だが、ブローカーの建玉一覧に無い (または数量が少ない) ポジションの件数
+   * (約定直後で一覧の反映が遅れている分。差分を想定代金で positions に加え、available から引いた)
+   */
+  trackedUnreported?: number;
+  /** live: 口座通貨への換算に概算表・古い気配を使った通貨 (理由付き) */
+  fxApprox?: string[];
 }
 
 /** ブローカーごとの最後に取得できた口座情報 */
@@ -251,6 +258,13 @@ export interface EngineStatus {
   equityHistory: { ts: number; equity: number }[];
   lastTickAt?: number;
   tickCount: number;
+  /** ループ間隔 (ms)。ダッシュボードが更新停止の判定に使う */
+  tickMs: number;
+  /**
+   * 口座取得の劣化。incomplete / missing: 一度も取得できていない (または換算できない) ブローカー /
+   * degradedReason: 取得の失敗が続いている (新規エントリー停止) / fxApprox: live で概算レート・古い為替を使っている通貨
+   */
+  account: { incomplete?: boolean; missing?: string[]; degradedReason?: string; fxApprox?: string[] };
 }
 
 /** ダッシュボード用: 直近の情報 (ブリーフの集計対象期間) の件数と見出し */
@@ -622,7 +636,56 @@ export class TradingEngine {
    * (受付だけで約定が遅れる間に、最大保有数・余力・エクスポージャーの上限を超えて発注しないため)。
    */
   async account(now: number = this.clock.now(), force = false): Promise<AccountState> {
-    return this.withPendingEntries(await this.brokerAccount(now, force));
+    return this.withPendingEntries(this.withTrackedPositions(await this.brokerAccount(now, force)));
+  }
+
+  /**
+   * journal で追跡中のポジションのうち、ブローカーの建玉一覧に無い・数量が少ない分を想定代金で加える (base は変更しない)。
+   * live で約定直後に取引所の一覧の反映が遅れても (口座情報は liveAccountCacheMs キャッシュされる)、
+   * 新しい建玉をリスク計算 (最大保有数・1 銘柄上限・資産クラス上限・余力) から漏らさないため。
+   * ブローカー側に同じ向きの建玉が既にあれば差分だけを足す (二重計上しない)。paper は PaperBroker と journal が一致するので差は出ない
+   */
+  private withTrackedPositions(base: AccountState): AccountState {
+    const tracked = this.positions.list();
+    if (tracked.length === 0) return base;
+    const positions = base.positions.map((p) => ({ ...p }));
+    let available = D(base.available);
+    let added = 0;
+    for (const t of tracked) {
+      let tq: Decimal;
+      try {
+        tq = D(t.qty);
+      } catch {
+        continue;
+      }
+      if (!tq.isFinite() || !tq.gt(0)) continue;
+      const sign = t.direction === "long" ? 1 : -1;
+      const same = positions.filter((p) => p.symbol === t.symbol && Number.isFinite(p.qty) && Math.sign(p.qty) === sign);
+      const reported = same.reduce((a, p) => a.plus(D(Math.abs(p.qty))), D(0));
+      const missing = tq.minus(reported);
+      // 数値誤差程度の差は無視する
+      if (!missing.gt(tq.mul(1e-9))) continue;
+      const inst = this.hub.instrument(t.symbol);
+      const mark = this.priceOf(t.symbol);
+      const px = mark !== undefined && Number.isFinite(mark) && mark > 0 ? mark : t.lastPrice > 0 ? t.lastPrice : t.entryPrice;
+      const cs = t.contractSize ?? inst?.contractSize ?? 1;
+      const ccy = inst?.quoteCurrency;
+      const meta = { assetClass: t.assetClass, contractSize: cs, ...(ccy ? { quoteCurrency: ccy } : {}) };
+      if (same.length > 0) {
+        // 一部だけ一覧に出ている: その行を追跡数量まで増やす (行を増やして最大保有数を二重に数えない)
+        const row = same[0];
+        row.qty = D(Math.abs(row.qty)).plus(missing).mul(sign).toNumber();
+        Object.assign(row, meta);
+        if (row.price === undefined || !Number.isFinite(row.price)) row.price = px;
+      } else {
+        positions.push({ symbol: t.symbol, qty: missing.mul(sign).toNumber(), avgPrice: t.entryPrice, price: px, ...meta });
+      }
+      const rate = ccy ? this.fx.toAccount(ccy) : NaN;
+      if (Number.isFinite(rate) && rate > 0 && px > 0) available = available.minus(missing.mul(px).mul(cs).mul(rate));
+      added++;
+    }
+    if (added === 0) return base;
+    return { ...base, available: available.toNumber(), positions, trackedUnreported: added };
   }
 
   /** 保留中のエントリーを口座情報に加える (base は変更しない) */
@@ -668,6 +731,7 @@ export class TradingEngine {
     const raw: BrokerPosition[] = [];
     const missing: string[] = [];
     const stale: string[] = [];
+    const fxApprox = new Set<string>();
     let degradedReason: string | undefined;
     if (paper) {
       equity = D(paper.markToMarket().equity);
@@ -714,6 +778,8 @@ export class TradingEngine {
         }
         const bal = st.balance!;
         const rate = this.fx.toAccount(bal.currency);
+        const approx = fxApproxReason(this.fx, bal.currency, this.fx.baseCurrency, now);
+        if (approx && Number.isFinite(rate) && rate > 0) fxApprox.add(approx);
         if (!Number.isFinite(rate) || !(rate > 0)) {
           this.warnThrottled(`acctfx|${b.venue}`, now, "口座通貨へ換算できない残高があります (評価額が欠けるため停止判定を保留します)", { venue: b.venue, currency: bal.currency });
           missing.push(b.venue);
@@ -740,6 +806,7 @@ export class TradingEngine {
       ...(missing.length ? { incomplete: true, missing } : {}),
       ...(stale.length ? { stale } : {}),
       ...(degradedReason ? { degradedReason } : {}),
+      ...(fxApprox.size ? { fxApprox: [...fxApprox] } : {}),
     };
     if (degradedReason && !this.accountDegradedAudited) {
       this.accountDegradedAudited = true;
@@ -1376,6 +1443,14 @@ export class TradingEngine {
       this.shadowRecord("fx_unknown", inst, view, c.strategy, sig, c.regime, now);
       return this.skip("fx_unknown", `${inst.quoteCurrency} → ${this.fx.baseCurrency}`);
     }
+    if (this.mode === "live") {
+      // live: 為替が概算表・古い気配・取れない場合は、その通貨に関わる新規エントリーをしない (決済・評価額の計算は続ける)
+      const approx = fxApproxReason(this.fx, inst.quoteCurrency, this.fx.baseCurrency, now);
+      if (approx) {
+        this.shadowRecord("fx_approx", inst, view, c.strategy, sig, c.regime, now);
+        return this.skip("fx_approx", `${sym}: 為替が不確か (${approx}) のため新規エントリーしません`);
+      }
+    }
     try {
       this.brokerFor(sym); // 発注先が無い銘柄はリスク判定の前に見送る
     } catch (e) {
@@ -1894,6 +1969,36 @@ export class TradingEngine {
       equityHistory: downsample(eq.map((p) => ({ ts: p.ts, equity: p.equity })), 300),
       ...(this.lastTickAt !== undefined ? { lastTickAt: this.lastTickAt } : {}),
       tickCount: this.tickCount,
+      tickMs: this.opt.tickMs,
+      account: (() => {
+        const fxApprox = this.fxApproxList(now, acct);
+        return {
+          ...(acct.incomplete ? { incomplete: true } : {}),
+          ...(acct.missing?.length ? { missing: [...acct.missing] } : {}),
+          ...(acct.degradedReason ? { degradedReason: redactSecrets(acct.degradedReason) } : {}),
+          ...(fxApprox.length ? { fxApprox } : {}),
+        };
+      })(),
     };
+  }
+
+  /**
+   * live: 概算表・古い気配で換算している通貨 (口座残高の通貨・監視銘柄と保有銘柄のクオート通貨)。paper は空
+   * (paper は従来どおり概算表で換算し、新規エントリーも止めない)
+   */
+  private fxApproxList(now: number, acct: AccountState): string[] {
+    if (this.mode !== "live") return [];
+    const out = new Set(acct.fxApprox ?? []);
+    const ccys = new Set<string>();
+    for (const i of this.hub.watched()) if (i.quoteCurrency) ccys.add(normalizeCurrency(i.quoteCurrency));
+    for (const p of this.positions.list()) {
+      const c = this.hub.instrument(p.symbol)?.quoteCurrency;
+      if (c) ccys.add(normalizeCurrency(c));
+    }
+    for (const c of ccys) {
+      const r = fxApproxReason(this.fx, c, this.fx.baseCurrency, now);
+      if (r) out.add(r);
+    }
+    return [...out];
   }
 }

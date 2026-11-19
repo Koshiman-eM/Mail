@@ -1,8 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { RESUME_REQUEST_KEY } from "../src/risk/resumeRequest";
 import {
-  buildReportText, CliError, HELP, main, parseArgs, parseBacktestArgs, parseResolveArgs, parseSimulateArgs, pendingOrdersText, requestOrderResolve, resumeTrading,
+  acquireRunLock, buildReportText, CliError, HELP, main, numberFlag, parseArgs, parseBacktestArgs, parseResolveArgs, parseSimulateArgs, pendingOrdersText,
+  requestOrderResolve, resumeTrading,
 } from "../src/cli";
+import { engineLockKey } from "../src/engine/lock";
+import { learningMigrationFlagKey } from "../src/learning/migration";
 import { PendingOrders, peekResolveRequests, type PendingOrder } from "../src/engine/orders";
 import { loadConfig } from "../src/core/config";
 import type { Candle } from "../src/core/types";
@@ -306,5 +309,96 @@ describe("orders (保留中の注文の一覧・手動での解消)", () => {
     const r2 = resumeTrading(config, store, 3_000);
     expect(r2.resumed).toBe(false);
     expect(r2.warnings.length).toBeGreaterThan(0);
+  });
+});
+
+describe("CLI: 誤用防止 (数値・位置引数・--force)", () => {
+  const config = loadConfig({ NODE_ENV: "test", DB_PATH: "memory" }); // paper
+  const p = (argv: string[]) => {
+    const a = parseArgs(["orders", "resolve", ...argv]);
+    return parseResolveArgs(a.positionals.slice(1), a.flags);
+  };
+
+  it("数値は 10 進のみ: --seed= (空) / 16 進 / 指数 / 空白は拒否する", () => {
+    expect(() => parseSimulateArgs(parseArgs(["simulate", "--seed="]).flags)).toThrow(/--seed に値を指定/);
+    expect(() => parseSimulateArgs(parseArgs(["simulate", "--seed=0x10"]).flags)).toThrow(/10 進/);
+    expect(() => parseSimulateArgs(parseArgs(["simulate", "--days", "1e1"]).flags)).toThrow(/10 進/);
+    expect(() => numberFlag({ x: " 1" }, "x", 0)).toThrow(/10 進/);
+    expect(parseSimulateArgs(parseArgs(["simulate", "--seed=-3", "--days", "0.5"]).flags)).toMatchObject({ seed: -3, days: 0.5 });
+  });
+
+  it("orders resolve: --qty / --price は 10 進の正の有限数だけ。0x10 を 16 として受け付けない", () => {
+    expect(() => p(["c1", "--filled", "--qty", "0x10", "--price", "1"])).toThrow(/10 進/);
+    expect(() => p(["c1", "--filled", "--qty", "1e3", "--price", "1"])).toThrow(/10 進/);
+    expect(() => p(["c1", "--filled", "--qty", "Infinity", "--price", "1"])).toThrow(/10 進/);
+    expect(() => p(["c1", "--filled", "--qty", "1", "--price", "0x10"])).toThrow(/10 進/);
+    expect(() => p(["c1", "--filled", "--qty", "0", "--price", "1"])).toThrow(/正の数値/);
+    expect(() => p(["c1", "--filled", "--qty=", "--price", "1"])).toThrow(/--qty/);
+    expect(p(["c1", "--filled", "--qty", ".5", "--price", "101.25"])).toEqual({ clientId: "c1", outcome: "filled", qty: "0.5", price: 101.25 });
+  });
+
+  it("余分な位置引数・矛盾する clientId・未知のオプションはエラー。--force を解析する", async () => {
+    expect(() => p(["c1", "c2", "--none"])).toThrow(/余分な引数/);
+    expect(() => p(["c1", "--none", "c2"])).toThrow(/複数/);
+    expect(() => p(["c1", "--none", "--qtty", "1"])).toThrow(/未知のオプション/);
+    expect(p(["c1", "--none", "--force"])).toEqual({ clientId: "c1", outcome: "none", force: true });
+    expect(p(["--force", "c1", "--none"])).toEqual({ clientId: "c1", outcome: "none", force: true });
+    const a = io();
+    expect(await main(["status", "extra"], a.io)).toBe(2);
+    expect(a.err[0]).toMatch(/余分な引数/);
+    const b = io();
+    expect(await main(["orders", "list", "x"], b.io)).toBe(2);
+    expect(b.err[0]).toMatch(/余分な引数/);
+  });
+
+  it("状態不明 (escalated) でない注文の resolve は --force が必要", () => {
+    const store = new MemoryStore();
+    new PendingOrders({ store, mode: "paper" }).upsert({
+      clientId: "c-open", orderId: "o1", symbol: "BTC/USDT", side: "buy", qty: "1", kind: "entry", createdAt: 1, status: "open", unknownCount: 0,
+    });
+    expect(() => requestOrderResolve(config, store, { clientId: "c-open", outcome: "none" })).toThrow(/--force/);
+    expect(peekResolveRequests(store, "paper")).toEqual([]);
+    const r = requestOrderResolve(config, store, { clientId: "c-open", outcome: "none", force: true }, 1_000, "cli");
+    expect(r.request.force).toBe(true);
+    expect(store.listAudit({ type: "order.manual_resolve_requested" })[0].data).toMatchObject({ escalated: false, force: true });
+  });
+});
+
+describe("CLI: エンジンの二重起動防止ロック", () => {
+  it("同じ mode のロックが新しければ起動しない。古ければ奪取してログに残す。mode が違えば影響しない", () => {
+    const store = new MemoryStore();
+    const now = 1_000_000;
+    const a = io();
+    const owner = acquireRunLock(store, "live", a.io, now);
+    expect(owner).toBeDefined();
+    expect(store.kvGet(engineLockKey("live"))).toMatchObject({ pid: process.pid, startedAt: now, heartbeatAt: now });
+    // 30 秒後に別のプロセスが起動 → 拒否 (保持者を「同じホストで生きている別プロセス」(親プロセス) にする)
+    store.kvSet(engineLockKey("live"), { ...store.kvGet<object>(engineLockKey("live")), pid: process.ppid });
+    const b = io();
+    expect(acquireRunLock(store, "live", b.io, now + 30_000)).toBeUndefined();
+    expect(b.err[0]).toMatch(/同じ mode \(live\) のエンジンが動いています \(pid \d+/);
+    // paper は別のロック
+    expect(acquireRunLock(store, "paper", io().io, now + 30_000)).toBeDefined();
+    // heartbeat が 60 秒より古ければ奪取する
+    const c = io();
+    expect(acquireRunLock(store, "live", c.io, now + 61_000)).toBeDefined();
+    expect(c.err[0]).toMatch(/古いエンジンのロックを引き継ぎました/);
+    expect(store.listAudit({ type: "engine.lock_stolen" })).toHaveLength(1);
+  });
+});
+
+describe("CLI: report は学習状態を取引 mode で読み、DB へ書き込まない", () => {
+  it("移行のフラグ・監査ログを DB に書かない", () => {
+    const store = new MemoryStore();
+    store.kvSet("learning:lastTune", 123); // 旧キー (移行前)
+    const config = loadConfig({ NODE_ENV: "test", DB_PATH: "memory" });
+    const text = buildReportText(config, store, Date.UTC(2026, 0, 6));
+    expect(text).toContain("学習状態: paper");
+    expect(store.kvGet(learningMigrationFlagKey("paper"))).toBeUndefined();
+    expect(store.kvKeys("learning:")).toEqual(["learning:lastTune"]); // 新キーへのコピーも書かない
+    expect(store.listAudit()).toEqual([]);
+    const live = buildReportText({ ...config, mode: "live" }, store, Date.UTC(2026, 0, 6));
+    expect(live).toContain("学習状態: live");
+    expect(store.kvGet(learningMigrationFlagKey("live"))).toBeUndefined();
   });
 });

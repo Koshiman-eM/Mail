@@ -138,6 +138,8 @@ export interface ResolveRequest {
   price?: number;
   at: number;
   by: string;
+  /** 状態不明 (escalated) ではない注文の解消を強制する (CLI `--force`) */
+  force?: boolean;
 }
 
 const isResolveRequest = (v: unknown): v is ResolveRequest => {

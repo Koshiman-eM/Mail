@@ -53,14 +53,33 @@ const nextUtcMidnight = (ts: number) => Math.floor(ts / DAY_MS) * DAY_MS + DAY_M
 const lookup = (m: EntryParams["instruments"], sym: string): Instrument | undefined =>
   !m ? undefined : m instanceof Map ? m.get(sym) : m[sym];
 
-/** 資産クラス別エクスポージャー (口座通貨建ての建玉額) */
-export function exposureByClass(
+/** 有限の数値か (number / Decimal) */
+const finiteNum = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+
+/** 資産クラス別エクスポージャーの詳細 (口座通貨建て、decimal) */
+export interface ClassExposure {
+  /** 資産クラス別の建玉額。換算できない建玉があるクラスは、換算できた分だけの合計 */
+  exposure: Record<AssetClass, Decimal>;
+  /** 換算できない (価格・数量・為替が非有限) 建玉があり、合計が不明な資産クラスと銘柄 */
+  unknown: Partial<Record<AssetClass, string[]>>;
+}
+
+/**
+ * 資産クラス別エクスポージャー (口座通貨建ての建玉額) を decimal で計算する。
+ * 価格・数量・契約サイズ・為替のどれかが非有限 / 不正なら、その建玉の資産クラスを「不明」にする
+ * (NaN を合計に混ぜて上限判定を素通りさせない)。
+ */
+export function classExposure(
   positions: RiskPosition[],
   prices: Record<string, number> = {},
   instruments?: EntryParams["instruments"],
   toAccount: (ccy: string) => number = () => 1,
-): Record<AssetClass, number> {
-  const out: Record<AssetClass, number> = { crypto: 0, meme: 0, fx: 0, stock: 0 };
+): ClassExposure {
+  const exposure: Record<AssetClass, Decimal> = { crypto: D(0), meme: D(0), fx: D(0), stock: D(0) };
+  const unknown: Partial<Record<AssetClass, string[]>> = {};
+  const markUnknown = (cls: AssetClass, sym: string) => {
+    (unknown[cls] ??= []).push(sym);
+  };
   for (const p of positions) {
     if (p.qty === 0) continue;
     const inst = lookup(instruments, p.symbol);
@@ -69,10 +88,38 @@ export function exposureByClass(
     const px = p.price ?? prices[p.symbol] ?? p.avgPrice;
     const cs = p.contractSize ?? inst?.contractSize ?? 1;
     const ccy = p.quoteCurrency ?? inst?.quoteCurrency;
-    out[cls] += Math.abs(p.qty) * px * cs * (ccy ? toAccount(ccy) : 1);
+    let rate = 1;
+    try {
+      rate = ccy ? toAccount(ccy) : 1;
+    } catch {
+      rate = NaN;
+    }
+    if (!finiteNum(p.qty) || !finiteNum(px) || !(px >= 0) || !finiteNum(cs) || !(cs > 0) || !finiteNum(rate) || !(rate > 0)) {
+      markUnknown(cls, p.symbol);
+      continue;
+    }
+    exposure[cls] = exposure[cls].plus(D(p.qty).abs().mul(px).mul(cs).mul(rate));
   }
+  return { exposure, unknown };
+}
+
+/** 資産クラス別エクスポージャー (口座通貨建ての建玉額)。換算できない建玉があるクラスは NaN (不明) */
+export function exposureByClass(
+  positions: RiskPosition[],
+  prices: Record<string, number> = {},
+  instruments?: EntryParams["instruments"],
+  toAccount: (ccy: string) => number = () => 1,
+): Record<AssetClass, number> {
+  const { exposure, unknown } = classExposure(positions, prices, instruments, toAccount);
+  const out = {} as Record<AssetClass, number>;
+  for (const cls of Object.keys(exposure) as AssetClass[]) out[cls] = unknown[cls] ? NaN : exposure[cls].toNumber();
   return out;
 }
+
+/**
+ * サイズ倍率 (計画 × 腕の重み × 予想) の上限。呼び出し側でも同じ値で制限しているが、RiskManager でも二重に制限する
+ */
+export const MAX_SIZE_MULTIPLIER = 1.5;
 
 export class RiskManager {
   private st: InternalState;
@@ -220,7 +267,10 @@ export class RiskManager {
     if (h.halted) return { ok: false, reason: h.reason! };
     if (signal.direction === "flat") return { ok: false, reason: "flat シグナルは新規エントリーではありません" };
     if (!(p.riskMultiplier > 0)) return { ok: false, reason: "リスク倍率が 0 以下" };
+    if (!Number.isFinite(p.riskMultiplier)) return { ok: false, reason: `リスク倍率が数値ではありません (${p.riskMultiplier})` };
+    if (!finiteNum(equity)) return { ok: false, reason: `評価額が数値ではありません (${equity}) のため拒否` };
     if (!(equity > 0)) return { ok: false, reason: "評価額が 0 以下" };
+    if (!finiteNum(available)) return { ok: false, reason: `余力が数値ではありません (${available}) のため拒否` };
     const isLong = signal.direction === "long";
     if (!isLong && !inst.allowShort) return { ok: false, reason: `${inst.symbol} は空売り不可` };
 
@@ -253,13 +303,34 @@ export class RiskManager {
       return { ok: false, reason: `損切りが決済側の価格に近すぎます (距離 ${room} < スプレッド ${spread} × ${MIN_STOP_DISTANCE_SPREADS})` };
     }
     const toAcct = p.toAccount ?? (() => 1);
-    const fx = D(inst.quoteCurrency ? toAcct(inst.quoteCurrency) : 1);
-    const cs = D(inst.contractSize ?? 1);
-    const confidence = Math.min(1, Math.max(0, signal.confidence));
-    const riskAmount = D(equity).mul(L.riskPerTrade).mul(p.riskMultiplier).mul(0.5 + 0.5 * confidence);
+    let fxRate: number;
+    try {
+      fxRate = inst.quoteCurrency ? toAcct(inst.quoteCurrency) : 1;
+    } catch {
+      fxRate = NaN;
+    }
+    if (!finiteNum(fxRate) || !(fxRate > 0)) {
+      return { ok: false, reason: `${inst.quoteCurrency} を口座通貨へ換算できないため拒否 (為替 ${fxRate})` };
+    }
+    const fx = D(fxRate);
+    const csNum = inst.contractSize ?? 1;
+    if (!finiteNum(csNum) || !(csNum > 0)) return { ok: false, reason: `契約サイズが不正 (${csNum})` };
+    const cs = D(csNum);
+    const confidence = Number.isFinite(signal.confidence) ? Math.min(1, Math.max(0, signal.confidence)) : 0;
+    // サイズ倍率 (計画 × 腕の重み × 予想) は呼び出し側でも MAX_SIZE_MULTIPLIER で制限しているが、ここでも二重に制限する
+    let sizeMult = p.riskMultiplier;
+    if (sizeMult > MAX_SIZE_MULTIPLIER) {
+      notes.push(`サイズ倍率 ${sizeMult.toFixed(3)} を上限 ${MAX_SIZE_MULTIPLIER} に制限`);
+      sizeMult = MAX_SIZE_MULTIPLIER;
+    }
+    const riskAmount = D(equity).mul(L.riskPerTrade).mul(sizeMult).mul(0.5 + 0.5 * confidence);
     const perUnitRisk = D(dist).mul(cs).mul(fx);
     const perUnitNotional = D(entry).mul(cs).mul(fx);
+    if (!perUnitNotional.isFinite() || !perUnitNotional.gt(0) || !perUnitRisk.isFinite() || !perUnitRisk.gt(0)) {
+      return { ok: false, reason: `1 単位あたりの代金・リスクが計算できないため拒否 (代金 ${perUnitNotional}, リスク ${perUnitRisk})` };
+    }
     let qty = riskAmount.div(perUnitRisk);
+    if (!qty.isFinite()) return { ok: false, reason: `数量が計算できないため拒否 (${qty})` };
     notes.push(`risk-based qty ${qty.toSignificantDigits(6)}`);
 
     const cap = (name: string, limitQty: Decimal) => {
@@ -269,20 +340,35 @@ export class RiskManager {
       }
     };
 
-    const exNotional = existing ? D(Math.abs(existing.qty)).mul(existing.price ?? p.prices?.[existing.symbol] ?? existing.avgPrice).mul(cs).mul(fx) : D(0);
+    let exNotional = D(0);
+    if (existing) {
+      const exPx = existing.price ?? p.prices?.[existing.symbol] ?? existing.avgPrice;
+      exNotional = finiteNum(existing.qty) && finiteNum(exPx) ? D(Math.abs(existing.qty)).mul(exPx).mul(cs).mul(fx) : D(NaN);
+    }
     const posRoom = D(equity).mul(L.maxPositionPct).minus(exNotional);
+    if (!posRoom.isFinite()) return { ok: false, reason: `${inst.symbol} の既存の建玉額が計算できないため拒否 (1銘柄上限を確認できません)` };
     if (posRoom.lte(0)) return { ok: false, reason: `1銘柄上限 ${(L.maxPositionPct * 100).toFixed(0)}% に到達` };
     cap("1銘柄上限", posRoom.div(perUnitNotional));
 
-    const exp = exposureByClass(open, p.prices, p.instruments, toAcct);
-    const classRoom = D(equity).mul(L.maxExposureByClass[inst.assetClass]).minus(exp[inst.assetClass]);
+    const { exposure, unknown } = classExposure(open, p.prices, p.instruments, toAcct);
+    const unknownSyms = unknown[inst.assetClass];
+    if (unknownSyms?.length) {
+      return {
+        ok: false,
+        reason: `${inst.assetClass} のエクスポージャーが不明のため拒否 (口座通貨へ換算できない建玉: ${unknownSyms.join(", ")})`,
+      };
+    }
+    const classRoom = D(equity).mul(L.maxExposureByClass[inst.assetClass]).minus(exposure[inst.assetClass]);
+    if (!classRoom.isFinite()) return { ok: false, reason: `${inst.assetClass} のエクスポージャー上限の余地が計算できないため拒否` };
     if (classRoom.lte(0)) return { ok: false, reason: `${inst.assetClass} のエクスポージャー上限に到達` };
     cap(`${inst.assetClass} エクスポージャー上限`, classRoom.div(perUnitNotional));
 
     if (!(available > 0)) return { ok: false, reason: "余力がありません" };
     cap("余力", D(available).div(perUnitNotional));
 
+    if (!qty.isFinite()) return { ok: false, reason: `数量が計算できないため拒否 (${qty})` };
     qty = floorToStep(qty, inst.lotSize);
+    if (!qty.isFinite()) return { ok: false, reason: `数量が計算できないため拒否 (${qty})` };
     if (qty.lte(0) || qty.lt(inst.minQty)) return { ok: false, reason: `数量 ${qty} が最小数量 ${inst.minQty} 未満` };
     if (inst.minNotional !== undefined && D(entry).mul(qty).mul(cs).lt(inst.minNotional)) {
       return { ok: false, reason: `約定代金 ${D(entry).mul(qty).mul(cs)} が最小 ${inst.minNotional} 未満` };

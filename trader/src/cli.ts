@@ -16,6 +16,7 @@ import {
 } from "./engine/report";
 import { D } from "./core/decimal";
 import { peekResolveRequests, PendingOrders, requestResolve, type PendingOrder, type ResolveRequest } from "./engine/orders";
+import { acquireEngineLock, releaseEngineLock, startEngineLockHeartbeat, type LockOwner } from "./engine/lock";
 import { buildRuntime, resolveDbPath } from "./engine/setup";
 import { formatSimulationReport, runSimulation } from "./engine/simulate";
 import { createDefaultSources, IntelService } from "./intel/service";
@@ -25,6 +26,7 @@ import { CcxtFeed } from "./market/feeds/ccxt";
 import { RiskManager } from "./risk/manager";
 import { requestResume } from "./risk/resumeRequest";
 import { createStore } from "./storage";
+import { ReadOnlyOverlayStore } from "./storage/readonly";
 import { getStrategy } from "./strategies/registry";
 import type { ExitReason, Timeframe } from "./core/types";
 
@@ -72,6 +74,11 @@ export function parseArgs(argv: string[]): ParsedArgs {
 
 export class CliError extends Error {}
 
+/** 10 進の数値表記 (符号・小数点のみ。16 進・指数・空白・空文字は受け付けない) */
+const DECIMAL_RE = /^-?(\d+(\.\d+)?|\.\d+)$/;
+/** 10 進の正の数の表記 (数量・価格用) */
+const POSITIVE_DECIMAL_RE = /^(\d+(\.\d+)?|\.\d+)$/;
+
 export function numberFlag(
   flags: ParsedArgs["flags"],
   name: string,
@@ -80,7 +87,9 @@ export function numberFlag(
 ): number {
   const v = flags[name];
   if (v === undefined) return def;
-  const n = typeof v === "string" ? Number(v) : NaN;
+  if (typeof v !== "string" || v.trim() === "") throw new CliError(`--${name} に値を指定してください`);
+  if (!DECIMAL_RE.test(v)) throw new CliError(`--${name} には 10 進の数値を指定してください (指定値: ${v})`);
+  const n = Number(v);
   if (!Number.isFinite(n)) throw new CliError(`--${name} には数値を指定してください (指定値: ${String(v)})`);
   if (o.integer && !Number.isInteger(n)) throw new CliError(`--${name} には整数を指定してください`);
   if (o.min !== undefined && n < o.min) throw new CliError(`--${name} は ${o.min} 以上にしてください`);
@@ -167,6 +176,8 @@ export const HELP = `自己学習型マルチアセット自動売買ツール
   orders resolve <clientId> --filled --qty <数量> --price <価格>
                               状態不明の注文を「約定した」として解消 (推定扱いで記録し、学習には使いません)
                               動作中のエンジンは次のティックで、停止中なら次回の起動時に適用します (監査ログに記録)
+                              状態不明 (escalated) でない注文には --force が必要です。
+                              --none で取消に失敗した場合は確定せず、建玉の照会で確定させます
 
 実弾 (live) は TRADING_MODE=live と LIVE_TRADING_CONFIRM=I_UNDERSTAND_REAL_MONEY_RISK の両方が必要です。`;
 
@@ -203,6 +214,25 @@ function openExistingStore(dbPath: string): Store {
 
 // ───────── コマンド ─────────
 
+/**
+ * run 用: 同じ mode のエンジンの二重起動防止ロックを取得する (kv `engine:lock:<mode>`)。
+ * 動いているエンジンがあれば (heartbeat が 60 秒以内) メッセージを出して undefined。古いロックは奪取してログに残す
+ */
+export function acquireRunLock(store: Store, mode: "paper" | "live", io: Io, now: number = Date.now()): LockOwner | undefined {
+  const r = acquireEngineLock(store, mode, { now });
+  if (!r.ok) {
+    io.err(`エラー: ${r.message}。二重に起動しないため終了します`);
+    return undefined;
+  }
+  if (r.stolen) {
+    io.err(
+      `警告: 古いエンジンのロックを引き継ぎました (pid ${r.stolen.pid}, host ${r.stolen.hostname}, ` +
+        `最終 heartbeat ${Math.round((now - r.stolen.heartbeatAt) / 1000)} 秒前)。前回のエンジンが異常終了した可能性があります`,
+    );
+  }
+  return { pid: r.lock.pid, hostname: r.lock.hostname, startedAt: r.lock.startedAt };
+}
+
 async function cmdRun(io: Io): Promise<number> {
   const config = loadConfig();
   const m = modeLines(config);
@@ -214,6 +244,36 @@ async function cmdRun(io: Io): Promise<number> {
   io.out(`時間足: ${rt.timeframes.join(", ")} / 口座通貨: ${config.env.BASE_CURRENCY} / DB: ${resolveDbPath(config)}`);
   riskLines(config).forEach((l) => io.out(l));
   io.out(`AI: ${rt.ai ? `有効 (${rt.ai.model})` : "無効 (ルールベース)"}`);
+
+  // 同じ mode のエンジンの二重起動防止 (同じ DB の kv にロックを書き、15 秒ごとに heartbeat を更新する)
+  const mode = rt.engine.mode;
+  const owner = acquireRunLock(rt.store, mode, io);
+  if (!owner) {
+    try {
+      rt.close();
+    } catch {
+      /* 既に閉じている */
+    }
+    return 1;
+  }
+  const releaseLock = () => {
+    try {
+      releaseEngineLock(rt.store, mode, owner);
+    } catch (e) {
+      io.err(`警告: エンジンのロックの削除に失敗しました (${e instanceof Error ? e.message : String(e)})`);
+    }
+  };
+  // 起動中 (シグナル待ちに入る前) にロックを失った場合も、待ちに入った時点で停止する
+  let lockLostReason: string | undefined;
+  let onLockLost: (reason: string) => void = () => undefined;
+  const heartbeat = startEngineLockHeartbeat(rt.store, mode, owner, {
+    now: () => Date.now(),
+    onLost: (reason) => {
+      lockLostReason = reason;
+      onLockLost(reason);
+    },
+    onError: (msg, failures) => io.err(`警告: エンジンのロックの heartbeat の更新に失敗しました (${failures} 回目): ${msg}`),
+  });
 
   let dash: DashboardServer | undefined;
   try {
@@ -244,6 +304,8 @@ async function cmdRun(io: Io): Promise<number> {
     io.err(`エラー: エンジンの起動に失敗しました: ${e instanceof Error ? e.message : String(e)}`);
     await rt.engine.stop().catch(() => undefined);
     await dash?.close().catch(() => undefined);
+    heartbeat.stop();
+    releaseLock();
     try {
       rt.close();
     } catch {
@@ -252,25 +314,32 @@ async function cmdRun(io: Io): Promise<number> {
     throw e;
   }
   io.out("起動しました。Ctrl+C で停止します (保有ポジションは自動決済しません)。");
-  await new Promise<void>((done) => {
+  return await new Promise<number>((done) => {
     let stopping = false;
-    const onSignal = async (sig: string) => {
+    const onSignal = async (sig: string, code = 0) => {
       if (stopping) return;
       stopping = true;
       io.out(`${sig} を受信: 停止します...`);
       try {
+        heartbeat.stop();
         await rt.engine.stop();
         await dash?.close();
       } finally {
+        // ロックを失った (別のエンジンが奪取した) 場合は相手のロックを消さない (releaseEngineLock は自分のものだけ消す)
+        releaseLock();
         rt.close();
         io.out(`停止しました。保有ポジション ${rt.engine.journal.list().length} 件はそのままです。`);
-        done();
+        done(code);
       }
     };
+    onLockLost = (reason) => {
+      io.err(`エラー: エンジンのロックを失いました (${reason})。二重に動作しないよう停止します`);
+      void onSignal("LOCK_LOST", 1);
+    };
+    if (lockLostReason !== undefined) onLockLost(lockLostReason);
     process.once("SIGINT", () => void onSignal("SIGINT"));
     process.once("SIGTERM", () => void onSignal("SIGTERM"));
   });
-  return 0;
 }
 
 async function cmdSimulate(flags: ParsedArgs["flags"], io: Io): Promise<number> {
@@ -372,8 +441,10 @@ export function buildReportText(config: AppConfig, store: Store, now: number = D
   if (reasons.length) lines.push(`決済理由: ${reasons.join(" / ")}`);
   lines.push("", "■ 戦略別の成績 (口座通貨換算は決済時点のレート。記録が無いものは概算レート)");
   lines.push(renderStrategyTable(summarizeByStrategy(trades, (c) => fx.toAccount(c), (t) => quoteCurrencyOfSymbol(t.symbol), exitFxRates(store)), ccy));
-  const learning = new LearningService({ store, getStrategy: (id) => getStrategy(id) });
-  lines.push("", renderLearning(learning.snapshot({ now, adjustmentLimit: 20 })));
+  // 学習状態は取引 mode (paper / live) 別。report は読み取り専用なので、起動時の移行などの書き込みは DB に反映しない
+  const learning = new LearningService({ store: new ReadOnlyOverlayStore(store), mode: config.mode, getStrategy: (id) => getStrategy(id) });
+  lines.push("", `学習状態: ${config.mode}`);
+  lines.push(renderLearning(learning.snapshot({ now, adjustmentLimit: 20 })));
   return lines.join("\n");
 }
 
@@ -478,34 +549,45 @@ export interface ResolveArgs {
   outcome: "none" | "filled";
   qty?: string;
   price?: number;
+  /** 状態不明 (escalated) ではない注文も解消する */
+  force?: boolean;
 }
 
-/** `orders resolve` の引数解析。--none と --filled のどちらか一方 (--filled は --qty と --price が必要) */
+/**
+ * `orders resolve` の引数解析。--none と --filled のどちらか一方 (--filled は --qty と --price が必要)。
+ * 数量・価格は 10 進の正の有限数だけを受け付ける。余分な位置引数はエラー
+ */
 export function parseResolveArgs(positionals: string[], flags: ParsedArgs["flags"]): ResolveArgs {
-  // `--none <clientId>` の書き方も受け付ける (値付きフラグとして解析されるため)
-  const flagId = [flags.none, flags.filled].find((v): v is string => typeof v === "string");
-  const clientId = positionals[0] ?? flagId;
+  if (positionals.length > 1) throw new CliError(`余分な引数があります: ${positionals.slice(1).join(" ")} (clientId は 1 つだけ指定してください)`);
+  // `--none <clientId>` / `--force <clientId>` の書き方も受け付ける (値付きフラグとして解析されるため)
+  const ids = [positionals[0], ...[flags.none, flags.filled, flags.force].map((v) => (typeof v === "string" ? v : undefined))].filter(
+    (v): v is string => v !== undefined,
+  );
+  if (new Set(ids).size > 1) throw new CliError(`clientId が複数指定されています: ${[...new Set(ids)].join(", ")}`);
+  const clientId = ids[0];
   if (!clientId) throw new CliError("解消する注文の clientId を指定してください (npm run trader -- orders で一覧)");
+  const known = new Set(["none", "filled", "qty", "price", "force"]);
+  const unknown = Object.keys(flags).filter((k) => !known.has(k));
+  if (unknown.length) throw new CliError(`orders resolve に未知のオプションがあります: ${unknown.map((k) => `--${k}`).join(" ")}`);
+  const force = flags.force !== undefined;
   const none = flags.none !== undefined;
   const filled = flags.filled !== undefined;
   if (none === filled) throw new CliError("--none (約定なし) か --filled --qty <数量> --price <価格> (約定した) のどちらか一方を指定してください");
   if (none) {
     if (flags.qty !== undefined || flags.price !== undefined) throw new CliError("--none には --qty / --price を指定できません");
-    return { clientId, outcome: "none" };
+    return { clientId, outcome: "none", ...(force ? { force: true } : {}) };
   }
   const qtyStr = stringFlag(flags, "qty", "");
   if (!qtyStr) throw new CliError("--filled には --qty <約定数量> が必要です");
-  let qty;
-  try {
-    qty = D(qtyStr);
-  } catch {
-    throw new CliError(`--qty には正の数値を指定してください (指定値: ${qtyStr})`);
-  }
+  if (!POSITIVE_DECIMAL_RE.test(qtyStr)) throw new CliError(`--qty には 10 進の正の数値を指定してください (指定値: ${qtyStr})`);
+  const qty = D(qtyStr);
   if (!qty.isFinite() || !qty.gt(0)) throw new CliError(`--qty には正の数値を指定してください (指定値: ${qtyStr})`);
   if (flags.price === undefined) throw new CliError("--filled には --price <約定価格> が必要です");
-  const price = numberFlag(flags, "price", NaN);
-  if (!(price > 0)) throw new CliError("--price には正の数値を指定してください");
-  return { clientId, outcome: "filled", qty: qty.toString(), price };
+  const priceStr = stringFlag(flags, "price", "");
+  if (!POSITIVE_DECIMAL_RE.test(priceStr)) throw new CliError(`--price には 10 進の正の数値を指定してください (指定値: ${priceStr})`);
+  const price = Number(priceStr);
+  if (!Number.isFinite(price) || !(price > 0)) throw new CliError("--price には正の数値を指定してください");
+  return { clientId, outcome: "filled", qty: qty.toString(), price, ...(force ? { force: true } : {}) };
 }
 
 /**
@@ -516,6 +598,12 @@ export function requestOrderResolve(config: AppConfig, store: Store, a: ResolveA
   const mode = config.mode;
   const o = new PendingOrders({ store, mode }).get(a.clientId);
   if (!o) throw new CliError(`保留中の注文が見つかりません (${mode}, clientId=${a.clientId})。npm run trader -- orders で一覧を確認してください`);
+  if (!o.escalated && !a.force) {
+    throw new CliError(
+      `この注文は状態不明 (escalated) ではありません (状態 ${o.status})。エンジンの照会で確定するのを待ってください。` +
+        "取引所で注文と建玉を確認したうえで強制的に解消する場合は --force を付けてください",
+    );
+  }
   if (a.outcome === "filled" && D(a.qty!).gt(D(o.qty))) {
     throw new CliError(`--qty (${a.qty}) が注文数量 (${o.qty}) を超えています`);
   }
@@ -524,6 +612,7 @@ export function requestOrderResolve(config: AppConfig, store: Store, a: ResolveA
     clientId: a.clientId,
     outcome: a.outcome,
     ...(a.outcome === "filled" ? { qty: a.qty, price: a.price } : {}),
+    ...(a.force ? { force: true } : {}),
     at: now,
     by,
   };
@@ -531,7 +620,10 @@ export function requestOrderResolve(config: AppConfig, store: Store, a: ResolveA
   store.audit({
     ts: now,
     type: "order.manual_resolve_requested",
-    data: { mode, clientId: a.clientId, symbol: o.symbol, kind: o.kind, outcome: a.outcome, ...(a.outcome === "filled" ? { qty: a.qty, price: a.price } : {}), by },
+    data: {
+      mode, clientId: a.clientId, symbol: o.symbol, kind: o.kind, outcome: a.outcome, ...(a.outcome === "filled" ? { qty: a.qty, price: a.price } : {}),
+      escalated: Boolean(o.escalated), ...(a.force ? { force: true } : {}), by,
+    },
   });
   const what = a.outcome === "none" ? "約定なし" : `約定 (数量 ${a.qty} / 価格 ${a.price}、推定扱い・学習には使いません)`;
   return {
@@ -545,6 +637,7 @@ export function requestOrderResolve(config: AppConfig, store: Store, a: ResolveA
 function cmdOrders(positionals: string[], flags: ParsedArgs["flags"], io: Io): number {
   const sub = positionals[0];
   if (sub !== undefined && sub !== "list" && sub !== "resolve") throw new CliError(`未知のサブコマンド: orders ${sub} (orders / orders resolve)`);
+  if (sub !== "resolve" && positionals.length > 1) throw new CliError(`余分な引数があります: ${positionals.slice(1).join(" ")}`);
   const args = sub === "resolve" ? parseResolveArgs(positionals.slice(1), flags) : undefined;
   const config = loadConfig();
   const store = openExistingStore(resolveDbPath(config));
@@ -605,6 +698,9 @@ export async function main(argv: string[] = process.argv.slice(2), io: Io = cons
     if (args.flags.help || args.command === "help") {
       io.out(HELP);
       return 0;
+    }
+    if (args.command !== "orders" && args.positionals.length > 0) {
+      throw new CliError(`余分な引数があります: ${args.positionals.join(" ")} (${args.command} は位置引数を取りません)`);
     }
     switch (args.command) {
       case "run":

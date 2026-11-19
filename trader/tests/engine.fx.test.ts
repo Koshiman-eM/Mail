@@ -47,3 +47,32 @@ describe("fx 換算", () => {
     expect(quoteCurrencyOfSymbol("AAPL")).toBe("USD");
   });
 });
+
+describe("fx: 換算の内訳と live の信頼性判定", async () => {
+  const { fxApproxReason, LIVE_FX_MAX_QUOTE_AGE_MS } = await import("../src/engine/fx");
+  const qt = (bid: number, ask: number, ts: number): Quote => ({ ts, bid, ask });
+
+  it("rateInfo: 気配 / 概算表 / 換算不能 を区別し、使った気配の時刻を返す", () => {
+    const quotes: Record<string, Quote> = { "USD/JPY": qt(150, 150, 1_000), "BTC/USDT": qt(60_000, 60_000, 2_000) };
+    const fx = createFxConverter({ baseCurrency: "JPY", getQuote: (s) => quotes[s] });
+    expect(fx.rateInfo!("USD", "JPY")).toMatchObject({ rate: 150, source: "quote", oldestQuoteTs: 1_000 });
+    expect(fx.rateInfo!("BTC", "JPY")).toMatchObject({ source: "quote", oldestQuoteTs: 1_000 });
+    expect(fx.rateInfo!("EUR", "JPY")).toMatchObject({ source: "fallback", fallbackCurrencies: ["EUR"] });
+    expect(fx.rateInfo!("SOL", "JPY")).toMatchObject({ source: "none" });
+    expect(fx.rateInfo!("JPY", "JPY")).toMatchObject({ rate: 1, source: "identity" });
+    expect(fx.rate("EUR", "JPY")).toBe(fx.rateInfo!("EUR", "JPY").rate);
+  });
+
+  it("fxApproxReason: 概算表・5 分超の古い気配・換算不能・時刻不明は理由を返し、新しい気配と同じ通貨は undefined", () => {
+    const quotes: Record<string, Quote> = { "USD/JPY": qt(150, 150, 0) };
+    const fx = createFxConverter({ baseCurrency: "JPY", getQuote: (s) => quotes[s] });
+    expect(fxApproxReason(fx, "USD", "JPY", LIVE_FX_MAX_QUOTE_AGE_MS)).toBeUndefined();
+    expect(fxApproxReason(fx, "USD", "JPY", LIVE_FX_MAX_QUOTE_AGE_MS + 1)).toMatch(/古い/);
+    expect(fxApproxReason(fx, "USDT", "USD", 0)).toBeUndefined();
+    expect(fxApproxReason(fx, "EUR", "JPY", 0)).toMatch(/概算表/);
+    expect(fxApproxReason(fx, "SOL", "JPY", 0)).toMatch(/換算できません/);
+    const noTs = createFxConverter({ baseCurrency: "JPY", getQuote: (s) => (s === "USD/JPY" ? ({ bid: 150, ask: 150 } as Quote) : undefined) });
+    expect(fxApproxReason(noTs, "USD", "JPY", 0)).toMatch(/時刻が不明/);
+    expect(fxApproxReason({ baseCurrency: "JPY", toAccount: () => 150, toUsd: () => 1, rate: () => 150 }, "USD", "JPY", 0)).toMatch(/内訳/);
+  });
+});

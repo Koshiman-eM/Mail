@@ -636,10 +636,27 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     var paused = s.risk.entriesPaused, ids = esc2.map(function (o) { return o.clientId; });
     if (paused && paused.orders) paused.orders.forEach(function (id) { if (ids.indexOf(id) < 0) ids.push(id); });
     var html = "", kind = "";
+    // 口座取得の劣化・概算レート (黄): 外部由来の文字列は esc() を通す
+    var ac = s.account || {}, acctWarn = '', acctHtml = '';
+    if (ac.incomplete || (ac.missing && ac.missing.length)) {
+      acctWarn = '● DEGRADED 口座情報が欠けています';
+      acctHtml += '<b>口座情報を取得できません</b> (新規エントリーを停止中): ' + esc((ac.missing || []).join(', ')) + '<br>';
+    }
+    if (ac.degradedReason) {
+      acctWarn = acctWarn || '● DEGRADED 口座取得の失敗が継続';
+      acctHtml += '<b>口座情報の取得失敗が続いています</b> (新規エントリーを停止中): ' + esc(ac.degradedReason) + '<br>';
+    }
+    if (ac.fxApprox && ac.fxApprox.length) {
+      acctWarn = acctWarn || '● FX≈ 概算レート使用中';
+      acctHtml += '<b>概算レート使用中</b> (該当通貨の新規エントリーを停止中。決済・評価額は概算で継続): ' +
+        ac.fxApprox.map(function (x) { return esc(x); }).join(' / ') + '<br>';
+    }
     if (s.risk.killSwitch) { rb.textContent = "● KILL SWITCH キルスイッチ作動中"; rb.className = "rk ng"; kind = "ng"; html += "<b>キルスイッチ作動中</b>: " + esc(s.risk.killSwitch.reason || "") + " (手動の resume まで新規停止)<br>"; }
     else if (s.risk.halted) { rb.textContent = "● HALTED 停止中"; rb.className = "rk ng"; kind = "ng"; html += "<b>停止中</b>: " + esc(s.risk.reason || "") + "<br>"; }
     else if (paused || ids.length) { rb.textContent = "● PAUSED 新規停止中 (状態不明の注文)"; rb.className = "rk warn"; kind = "warn"; }
+    else if (acctWarn) { rb.textContent = acctWarn; rb.className = 'rk warn'; kind = 'warn'; }
     else { rb.textContent = "● ACTIVE 稼働中"; rb.className = "rk ok"; }
+    if (acctHtml) { if (!kind) kind = 'warn'; html += acctHtml; }
     if (ids.length) {
       if (!kind || kind === "warn") kind = "warn";
       html += "<b>状態不明の注文があります (新規エントリーを停止中)</b>。取引所で約定の有無を確認し、次のコマンドで解消してください:<br>";

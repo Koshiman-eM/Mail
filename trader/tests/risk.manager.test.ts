@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_RISK } from "../src/core/config";
-import { costBps, exposureByClass, MIN_STOP_DISTANCE_SPREADS, RiskManager, type EntryParams } from "../src/risk/manager";
+import { classExposure, costBps, exposureByClass, MAX_SIZE_MULTIPLIER, MIN_STOP_DISTANCE_SPREADS, RiskManager, type EntryParams } from "../src/risk/manager";
 import type { AuditEvent, Instrument, RiskLimits, Signal, Store } from "../src/core/types";
 
 const NOW = Date.parse("2025-03-01T12:00:00Z");
@@ -229,5 +229,65 @@ describe("exposureByClass", () => {
     );
     expect(e.crypto).toBeCloseTo(2 * 110 * 2 + 100 * 10 * 0.01 * 2, 6);
     expect(e.meme).toBe(1);
+  });
+});
+
+describe("為替・非有限値で上限判定を素通りさせない", () => {
+  const eth: Instrument = { ...btc, symbol: "ETH/BTC", baseCurrency: "ETH", quoteCurrency: "BTC" };
+  const insts = new Map<string, Instrument>([["BTC/USDT", btc], ["ETH/BTC", eth]]);
+  // USDT は 1、BTC は換算できない (NaN)
+  const toAccount = (c: string) => (c === "USDT" ? 1 : NaN);
+
+  it("換算できない建玉があるクラスは「不明」(NaN を合計に混ぜない)", () => {
+    const pos = [{ symbol: "BTC/USDT", qty: 1, avgPrice: 100 }, { symbol: "ETH/BTC", qty: 10, avgPrice: 0.05 }];
+    const d = classExposure(pos, {}, insts, toAccount);
+    expect(d.exposure.crypto.toNumber()).toBe(100);
+    expect(d.unknown.crypto).toEqual(["ETH/BTC"]);
+    expect(Number.isNaN(exposureByClass(pos, {}, insts, toAccount).crypto)).toBe(true);
+    expect(exposureByClass(pos, {}, insts, toAccount).meme).toBe(0);
+    // 価格が NaN の建玉も不明
+    expect(classExposure([{ symbol: "BTC/USDT", qty: 1, avgPrice: NaN }], {}, insts).unknown.crypto).toEqual(["BTC/USDT"]);
+  });
+
+  it("再現: 換算できない ETH/BTC 建玉 1 件 + 上限超過のエントリーは拒否する (以前は ok:true)", () => {
+    const rm = new RiskManager(limits);
+    // crypto 上限 60% = 6000 を既に超える建玉 (ETH/BTC) があるが、為替が NaN
+    const d = rm.evaluateEntry(params({ positions: [{ symbol: "ETH/BTC", qty: 1000, avgPrice: 0.05 }], instruments: insts, toAccount }));
+    expect(d).toMatchObject({ ok: false, reason: expect.stringContaining("エクスポージャーが不明") });
+    if (!d.ok) expect(d.reason).toContain("ETH/BTC");
+    // 別クラス (meme) へのエントリーは影響しない
+    const m = rm.evaluateEntry(params({ instrument: pepe, signal: sig({ symbol: "PEPE/USDT" }), liquidityUsd: 1e6, positions: [{ symbol: "ETH/BTC", qty: 1000, avgPrice: 0.05 }], instruments: insts, toAccount }));
+    expect(m.ok).toBe(true);
+  });
+
+  it("エントリー銘柄の為替・評価額・余力・倍率が非有限なら拒否", () => {
+    const rm = new RiskManager(limits);
+    expect(rm.evaluateEntry(params({ toAccount: () => NaN }))).toMatchObject({ ok: false, reason: expect.stringContaining("換算できない") });
+    expect(rm.evaluateEntry(params({ toAccount: () => Infinity })).ok).toBe(false);
+    expect(rm.evaluateEntry(params({ equity: NaN })).ok).toBe(false);
+    expect(rm.evaluateEntry(params({ equity: Infinity })).ok).toBe(false);
+    expect(rm.evaluateEntry(params({ available: NaN })).ok).toBe(false);
+    expect(rm.evaluateEntry(params({ available: Infinity })).ok).toBe(false);
+    expect(rm.evaluateEntry(params({ riskMultiplier: Infinity })).ok).toBe(false);
+    expect(rm.evaluateEntry(params({ riskMultiplier: NaN })).ok).toBe(false);
+    // 既存の同じ銘柄の建玉の価格が NaN → 1 銘柄上限を確認できない
+    expect(rm.evaluateEntry(params({ positions: [{ symbol: "BTC/USDT", qty: 1, avgPrice: NaN, assetClass: "crypto" }] }))).toMatchObject({
+      ok: false, reason: expect.stringContaining("1銘柄上限を確認できません"),
+    });
+    expect(rm.evaluateEntry(params({ instrument: { ...btc, contractSize: NaN } })).ok).toBe(false);
+  });
+
+  it("サイズ倍率は RiskManager でも上限 1.5 に制限する", () => {
+    const rm = new RiskManager({ ...limits, maxPositionPct: 1, maxExposureByClass: { ...limits.maxExposureByClass, crypto: 1 } });
+    // 損切りが遠いのでリスク基準の数量が効く: 10000*0.01*m / 10.01
+    const at = (m: number) => {
+      const d = rm.evaluateEntry(params({ signal: sig({ stopLoss: 90 }), riskMultiplier: m }));
+      return d.ok ? Number(d.qty) : NaN;
+    };
+    expect(MAX_SIZE_MULTIPLIER).toBe(1.5);
+    expect(at(1.5)).toBeCloseTo(14.985, 3);
+    expect(at(5)).toBeCloseTo(at(1.5), 9);
+    const d = rm.evaluateEntry(params({ signal: sig({ stopLoss: 90 }), riskMultiplier: 3 }));
+    expect(d.ok && d.notes.join(" ")).toMatch(/上限 1.5 に制限/);
   });
 });
