@@ -1,5 +1,6 @@
 import { createRequire } from "node:module";
 import type { AssetClass, Candle, Instrument, MarketDataFeed, OrderBook, Quote, Timeframe, TradePrint } from "../../core/types";
+import { bitbankRefreshIntervalMs, fetchBitbankCandles, type BitbankBoundary } from "./bitbankCandles";
 
 /** ccxt の exchange のうち使う部分だけの型 (テストでモック可能) */
 export interface CcxtLike {
@@ -7,8 +8,10 @@ export interface CcxtLike {
   precisionMode?: number;
   rateLimit?: number;
   markets?: Record<string, unknown>;
+  /** ccxt の機能表。fetchOHLCV が falsy (undefined / false) なら足を取得できない (例: bitflyer) */
+  has?: Record<string, unknown>;
   loadMarkets(): Promise<Record<string, any>>;
-  fetchOHLCV(symbol: string, timeframe: string, since?: number, limit?: number): Promise<number[][]>;
+  fetchOHLCV(symbol: string, timeframe: string, since?: number, limit?: number, params?: Record<string, unknown>): Promise<number[][]>;
   fetchTicker(symbol: string): Promise<any>;
   fetchOrderBook(symbol: string, limit?: number): Promise<any>;
   fetchTrades(symbol: string, since?: number, limit?: number): Promise<any[]>;
@@ -31,6 +34,8 @@ export interface CcxtFeedOptions {
   defaultMakerFee?: number;
   /** 対象のクオート通貨 (空なら全て) */
   quoteFilter?: string[];
+  /** 現在時刻 (テスト用。既定 Date.now) */
+  now?: () => number;
 }
 
 const toNumber = (v: unknown): number | undefined => {
@@ -90,6 +95,8 @@ export class CcxtFeed implements MarketDataFeed {
   readonly minIntervalMs: number;
   private instruments?: Instrument[];
   private readonly memeBases: Set<string>;
+  /** bitbank のローソク足ファイルの日付境界 (取得データから判定できたら保持) */
+  private readonly bitbankBoundary: Partial<Record<"day" | "year", BitbankBoundary>> = {};
 
   constructor(
     private readonly exchange: CcxtLike,
@@ -126,11 +133,32 @@ export class CcxtFeed implements MarketDataFeed {
   async fetchCandles(symbol: string, tf: Timeframe, limit: number, since?: number): Promise<Candle[]> {
     const t = TF_MAP[tf];
     if (!t) throw new Error(`未対応の時間足: ${tf}`);
+    if (this.exchange.has && !this.exchange.has.fetchOHLCV) {
+      throw new Error(
+        `取引所 ${this.exchange.id} は ccxt でローソク足 (fetchOHLCV) を提供していません。` +
+          "ローソク足が必要な処理 (バックテスト等) には別の取引所を CCXT_EXCHANGE に指定してください",
+      );
+    }
+    if (this.exchange.id === "bitbank") {
+      return fetchBitbankCandles(
+        { exchange: this.exchange, now: (this.opts.now ?? Date.now)(), boundary: this.bitbankBoundary },
+        symbol, tf, limit, since,
+      );
+    }
     const rows = await this.exchange.fetchOHLCV(symbol, t, since, limit);
     return rows
       .map((r) => ({ ts: Number(r[0]), open: Number(r[1]), high: Number(r[2]), low: Number(r[3]), close: Number(r[4]), volume: Number(r[5] ?? 0) }))
       .filter((c) => Number.isFinite(c.close))
       .sort((a, b) => a.ts - b.ts);
+  }
+
+  /**
+   * MarketHub の毎回更新で、同じ (銘柄, 時間足) の足を取り直す最短間隔 (ms)。0 なら毎回取る (従来どおり)。
+   * bitbank は 1 回の更新でファイル (1 日 / 1 年分) を丸ごと返すため間引く。
+   * 正の値を返す feed には、hub は since (最後に持っている足の ts) を付けて差分を要求する。
+   */
+  candleRefreshIntervalMs(tf: Timeframe): number {
+    return this.exchange.id === "bitbank" ? bitbankRefreshIntervalMs(tf) : 0;
   }
 
   async fetchQuote(symbol: string): Promise<Quote> {

@@ -36,6 +36,20 @@ interface SymbolState {
   lastError?: string;
 }
 
+/**
+ * feed が任意で実装する: 毎回更新で同じ (銘柄, 時間足) の足を取り直す最短間隔 (ms)。
+ * 正の値を返す feed (例: ccxt の bitbank) だけ、hub は
+ * - since (最後に持っている足の ts) を付けて差分だけ要求し、
+ * - 間隔内は取得を見送って現在足を気配で更新する (足の境界をまたいだ直後は間隔に関係なく取り直す)。
+ * 未実装 / 0 の feed は従来どおり毎回直近 5 本を取る。
+ */
+interface RefreshThrottledFeed {
+  candleRefreshIntervalMs?(tf: Timeframe): number;
+}
+
+/** 足の境界をまたいだ後、この時間内に取得した足は確定値でない可能性があるので取り直す */
+const BOUNDARY_GRACE_MS = 10_000;
+
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export class MarketHub {
@@ -118,6 +132,8 @@ export class MarketHub {
         const c = await s.feed.fetchCandles(sym, tf, this.historyLimit);
         if (c.length === 0) throw new Error("empty");
         s.candles[tf] = mergeCandles([], c);
+        // 間引き対象の feed は、履歴取得を最初の「更新取得」とみなす (直後の poll で同じファイルを取り直さない)
+        if (((s.feed as RefreshThrottledFeed).candleRefreshIntervalMs?.(tf) ?? 0) > 0) this.lastCandleFetch.set(`${sym}|${tf}`, this.clock.now());
       } catch {
         // feed が持たない足は 1m からの集約 (なければ quote から組み立て)
         const m1 = s.candles["1m"];
@@ -168,6 +184,11 @@ export class MarketHub {
           s.candles[tf] = aggregateCandles(m1, TIMEFRAME_MS[tf]);
           continue;
         }
+        const interval = (s.feed as RefreshThrottledFeed).candleRefreshIntervalMs?.(tf) ?? 0;
+        if (interval > 0) {
+          await this.refreshThrottled(s, tf, interval, q.ts, q.last ?? mid);
+          continue;
+        }
         await this.gate(s.feed);
         const recent = await s.feed.fetchCandles(symbol, tf, 5);
         s.candles[tf] = mergeCandles(s.candles[tf] ?? [], recent);
@@ -178,6 +199,41 @@ export class MarketHub {
       log.warn("poll 失敗", { symbol, error: s.lastError });
     }
   }
+
+  /**
+   * 間引き対象の feed の足更新。
+   * 次をすべて満たすときは取得を見送り、現在足だけ気配で更新する:
+   * - 前回取得から interval 未満
+   * - 持っている最後の足がまだ形成中 (開始 + 足の長さ > now)。確定したら新しい足が始まっているので必ず取る
+   * - 前回取得がその足の開始 + 猶予より後 (足が切り替わった直後の取得は前の足の確定値を含まないことがあるため)
+   * 境界は取得した足の ts から求める (取引所の足が UTC 以外 (JST 等) にそろっていても正しく判定する)。
+   * 取得するときは since = 最後に持っている足の ts で、そこから現在までの本数だけ要求する。
+   */
+  private async refreshThrottled(s: SymbolState, tf: Timeframe, interval: number, quoteTs: number, price: number): Promise<void> {
+    const symbol = s.instrument.symbol;
+    const ms = TIMEFRAME_MS[tf];
+    const now = this.clock.now();
+    const key = `${symbol}|${tf}`;
+    const last = this.lastCandleFetch.get(key);
+    const arr = s.candles[tf] ?? [];
+    const cur = arr[arr.length - 1];
+    if (last !== undefined && cur && now - last < interval && cur.ts + ms > now && last >= cur.ts + BOUNDARY_GRACE_MS) {
+      // 現在足の区間内の気配なら高値・安値・終値を更新する。次回の取得で取引所の値に置き換わる
+      if (Number.isFinite(price) && price > 0 && quoteTs >= cur.ts && quoteTs < cur.ts + ms) {
+        const next = { ...cur, high: Math.max(cur.high, price), low: Math.min(cur.low, price), close: price };
+        s.candles[tf] = [...arr.slice(0, -1), next];
+      }
+      return;
+    }
+    const since = arr.length ? arr[arr.length - 1].ts : undefined;
+    const limit = since === undefined ? 5 : Math.max(5, Math.ceil((now - since) / ms) + 2);
+    await this.gate(s.feed);
+    const recent = await s.feed.fetchCandles(symbol, tf, limit, since);
+    this.lastCandleFetch.set(key, now);
+    s.candles[tf] = mergeCandles(arr, recent);
+  }
+  /** 間引き対象の (銘柄|時間足) ごとの最後の足取得時刻 (clock) */
+  private readonly lastCandleFetch = new Map<string, number>();
 
   /** 履歴取得時に feed が直接返した時間足か (集約で作った足でないか) */
   private feedSupports(s: SymbolState, tf: Timeframe): boolean {
