@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import type { EntryContext, Instrument, Quote, TradeRecord } from "../src/core/types";
 import { PaperBroker } from "../src/execution/paper";
-import { PositionManager, type ExitPlan } from "../src/engine/positions";
+import { PositionManager, type ExitPlan, type OrderPolicy } from "../src/engine/positions";
 import { TradeJournal } from "../src/learning/journal";
 import { MemoryStore } from "../src/storage/memory";
+import { SqliteStore } from "../src/storage/sqlite";
 import { FakeLiveBroker } from "./helpers/fakeLiveBroker";
 
 const T0 = Date.UTC(2026, 0, 5);
@@ -186,18 +187,23 @@ describe("PositionManager", () => {
 });
 
 describe("PositionManager: 保留中の注文・約定の検証 (live の偽ブローカー)", () => {
-  function liveSetup(o: { fxRate?: (from: string, to: string) => number; maxExitOrdersPerMinute?: number } = {}) {
-    const store = new MemoryStore();
+  function liveSetup(
+    o: { fxRate?: (from: string, to: string) => number; maxExitOrdersPerMinute?: number; store?: MemoryStore | SqliteStore; policy?: Partial<OrderPolicy> } = {},
+  ) {
+    const store = o.store ?? new MemoryStore();
     const broker = new FakeLiveBroker("x");
     const journal = new TradeJournal({ store, mode: "live" });
     const closed: TradeRecord[] = [];
-    const onUnknown = vi.fn();
+    const onAnomaly = vi.fn();
+    const onEscalated = vi.fn();
+    let price = 100;
     const pm = new PositionManager({
-      journal, brokerFor: () => broker, onTradeClosed: (t) => closed.push(t), store, onUnknown,
+      journal, brokerFor: () => broker, onTradeClosed: (t) => closed.push(t), store, onAnomaly, onEscalated,
       instrumentOf: () => ({ baseCurrency: "AAA", quoteCurrency: "USD", minQty: 0.001 }),
       quoteCurrencyOf: () => "USD",
+      priceOf: () => price,
       ...(o.fxRate ? { fxRate: o.fxRate } : {}),
-      ...(o.maxExitOrdersPerMinute ? { orderPolicy: { maxExitOrdersPerMinute: o.maxExitOrdersPerMinute } } : {}),
+      orderPolicy: { ...(o.maxExitOrdersPerMinute ? { maxExitOrdersPerMinute: o.maxExitOrdersPerMinute } : {}), ...(o.policy ?? {}) },
     });
     const quote = { ts: T0, bid: 99.99, ask: 100.01 };
     broker.quoteOf = () => quote;
@@ -212,7 +218,7 @@ describe("PositionManager: 保留中の注文・約定の検証 (live の偽ブ�
         audit: {},
       },
     });
-    return { store, broker, journal, pm, closed, onUnknown, entry };
+    return { store, broker, journal, pm, closed, onAnomaly, onEscalated, entry, setPrice: (p: number) => (price = p) };
   }
 
   it("決済の発注が例外なら保留中として記録し、再送しない (照会で確定)", async () => {
@@ -225,11 +231,28 @@ describe("PositionManager: 保留中の注文・約定の検証 (live の偽ブ�
     expect((await s.pm.close("AAA/USD", "stop", 98, T0 + 2_000)).status).toBe("pending");
     expect(s.broker.placed).toHaveLength(2);
     expect(s.pm.pendingOrders()[0]).toMatchObject({ kind: "exit", status: "unknown", unknownCount: 1 });
-    // 照会でも見つからない状態が続くと onUnknown (kill switch)
+    // 照会でも見つからない状態が続くと escalated (kill switch は発動しない = onAnomaly は呼ばない)
     for (let i = 0; i < 4; i++) await s.pm.syncPending(T0 + 3_000 + i * 1_000);
-    expect(s.onUnknown).toHaveBeenCalledTimes(1);
-    expect(s.onUnknown.mock.calls[0][0]).toMatch(/注文状態不明/);
+    expect(s.onEscalated).toHaveBeenCalledTimes(1);
+    expect(s.onEscalated.mock.calls[0][0]).toMatchObject({ kind: "exit", escalated: true });
+    expect(s.onAnomaly).not.toHaveBeenCalled();
+    expect(s.store.listAudit({ type: "order.unknown_escalated" })).toHaveLength(1);
     expect(s.pm.has("AAA/USD")).toBe(true);
+    // 照会の hint (発注時刻・売買方向・数量) を渡している
+    expect(s.broker.getOrderHints.at(-1)).toEqual({ createdAt: T0 + 1_000, side: "sell", qty: "2" });
+    // 建玉は減っていない → 30 秒後の 2 回目の判定で「約定なし」として保留を外す
+    expect(s.pm.pendingOrders()[0].positionObs).toMatchObject({ verdict: "none" });
+    await s.pm.syncPending(T0 + 20_000);
+    expect(s.pm.hasPending("AAA/USD")).toBe(true); // 30 秒経っていない
+    await s.pm.syncPending(T0 + 36_000);
+    expect(s.pm.hasPending("AAA/USD")).toBe(false);
+    expect(s.store.listAudit({ type: "order.resolved_by_position" })[0].data).toMatchObject({ kind: "exit", result: "none", qty: "0" });
+    expect(s.store.listAudit({ type: "order.unknown_escalated" })).toHaveLength(1);
+    // 通常の管理に戻り、損切りに当たれば新しい決済が出る
+    s.broker.placeMode = "fill";
+    const r = await s.pm.onQuote("AAA/USD", { ts: T0 + 37_000, bid: 97, ask: 97.02 }, T0 + 37_000);
+    expect(r.status).toBe("closed");
+    expect(s.closed).toHaveLength(1);
   });
 
   it("feeCurrency 付きの手数料はクオート通貨へ換算する (ベース通貨は約定価格、その他は fxRate)", async () => {
@@ -289,12 +312,250 @@ describe("PositionManager: 保留中の注文・約定の検証 (live の偽ブ�
     const r2 = s.pm.reconcile(bp, T0 + 2_000, { confirmations: 2, priceOf: () => 101 });
     expect(r2.reduced).toEqual(["AAA/USD"]);
     expect(s.pm.get("AAA/USD")!.qty).toBeCloseTo(0.5, 9);
-    expect(r2.trades[0]).toMatchObject({ qty: 1.5, exitReason: "manual", exitPrice: 101 });
+    // 一部決済はポジションに累計する (TradeRecord は全量を決済したときに 1 件)
+    expect(r2.trades).toEqual([]);
+    expect(s.pm.get("AAA/USD")).toMatchObject({ exitedQty: "1.5", exitNotional: "151.5" });
+    expect(s.store.listTrades()).toHaveLength(0);
     expect(s.closed).toHaveLength(0); // 学習には渡さない
     expect(s.store.listAudit({ type: "reconcile.external_reduce" })).toHaveLength(1);
     // 保留中の注文がある銘柄は対象外
     s.broker.placeMode = "accept";
     await s.pm.close("AAA/USD", "stop", 98, T0 + 3_000);
     expect(s.pm.reconcile([], T0 + 4_000).orphaned).toEqual([]);
+  });
+});
+
+describe("PositionManager: 状態不明の注文の確定 (建玉・手動の申告)", () => {
+  const ctx2 = ctx;
+  function setup(o: { store?: MemoryStore | SqliteStore; policy?: Partial<OrderPolicy> } = {}) {
+    const store = o.store ?? new MemoryStore();
+    const broker = new FakeLiveBroker("x");
+    const journal = new TradeJournal({ store, mode: "live" });
+    const closed: TradeRecord[] = [];
+    const onEscalated = vi.fn();
+    const onAnomaly = vi.fn();
+    let price = 100;
+    const pm = new PositionManager({
+      journal, brokerFor: () => broker, onTradeClosed: (t) => closed.push(t), store, onEscalated, onAnomaly,
+      instrumentOf: () => ({ baseCurrency: "AAA", quoteCurrency: "USD", minQty: 0.001 }),
+      quoteCurrencyOf: () => "USD",
+      priceOf: () => price,
+      orderPolicy: o.policy ?? {},
+    });
+    const quote = { ts: T0, bid: 99.99, ask: 100.01 };
+    broker.quoteOf = () => quote;
+    const entry = (clientId: string, qty = "2") => ({
+      req: { clientId, symbol: "AAA/USD", side: "buy" as const, type: "market" as const, qty, strategyId: "s1" },
+      entry: {
+        input: {
+          mode: "live" as const, symbol: "AAA/USD", venue: "x", assetClass: "crypto" as const, strategyId: "s1", horizon: "scalp" as const,
+          direction: "long" as const, entryTs: T0, intendedEntryPrice: 100.01, initialStop: 98, entryContext: ctx2,
+        },
+        plan: { trailingStopPct: 0.01, maxHoldMs: 600_000 },
+        audit: {},
+      },
+    });
+    return { store, broker, journal, pm, closed, onEscalated, onAnomaly, entry, setPrice: (p: number) => (price = p) };
+  }
+
+  /** 例外で状態不明にしてから、不明が 5 回続くまで照会する (escalated) */
+  async function escalate(s: ReturnType<typeof setup>, t0: number) {
+    for (let i = 1; i <= 4; i++) await s.pm.syncPending(t0 + i * 1_000);
+  }
+
+  it("エントリー: 建玉が増えていれば (2 回確認して) 推定で建玉を登録し、決済ルールで管理する。学習には渡さない", async () => {
+    const s = setup();
+    s.broker.placeMode = "throw";
+    const e = s.entry("e1");
+    expect((await s.pm.enter(e.req, e.entry, T0)).status).toBe("pending");
+    s.broker.positions.set("AAA/USD", 2); // 実は取引所で約定していた
+    s.broker.avgPrices.set("AAA/USD", 100.2);
+    await escalate(s, T0);
+    expect(s.onEscalated).toHaveBeenCalledTimes(1);
+    expect(s.pm.has("AAA/USD")).toBe(false); // 1 回目の判定では確定しない
+    expect(s.pm.pendingOrders()[0].positionObs).toMatchObject({ verdict: "filled", qty: "2" });
+    await s.pm.syncPending(T0 + 4_000 + 30_000);
+    const p = s.pm.get("AAA/USD")!;
+    expect(p).toMatchObject({ qty: 2, entryPrice: 100.2, estimated: true, initialStop: 98 });
+    expect(s.pm.planOf(p.id)).toEqual({ trailingStopPct: 0.01, maxHoldMs: 600_000 });
+    expect(s.pm.hasPending("AAA/USD")).toBe(false);
+    expect(s.broker.canceled).toEqual([]); // 約定ありは取消しない
+    expect(s.store.listAudit({ type: "order.resolved_by_position" })[0].data).toMatchObject({ kind: "entry", result: "filled", qty: "2", price: 100.2, estimated: true });
+    expect(s.store.listAudit({ type: "engine.entry" })[0].data).toMatchObject({ estimated: true, source: "position" });
+    // 損切りは管理下に戻る。推定を含むトレードは学習に渡さない
+    s.broker.placeMode = "fill";
+    const r = await s.pm.onQuote("AAA/USD", { ts: T0 + 40_000, bid: 97.5, ask: 97.52 }, T0 + 40_000);
+    expect(r.status).toBe("closed");
+    // 保留の entry.plan のトレーリング (1%) が引き上げたストップで記録される
+    expect(r.trade).toMatchObject({ exitReason: "trailing", estimated: true });
+    expect(s.closed).toHaveLength(0);
+  });
+
+  it("エントリー: 建玉が増えていなければ、orderId があれば取消してから「約定なし」で外す。判定が変われば数え直す", async () => {
+    const s = setup();
+    const e = s.entry("e1");
+    await s.pm.enter(e.req, e.entry, T0); // 受付のみ (orderId fake-1)
+    s.broker.getOrderMode = "throw";
+    await escalate(s, T0);
+    await s.pm.syncPending(T0 + 5_000);
+    expect(s.pm.pendingOrders()[0]).toMatchObject({ escalated: true, positionObs: { verdict: "none" } });
+    // 一覧の反映遅れで一時的に建玉が見えた → 判定が変わったので確定しない
+    s.broker.positions.set("AAA/USD", 2);
+    await s.pm.syncPending(T0 + 40_000);
+    expect(s.pm.pendingOrders()[0].positionObs).toMatchObject({ verdict: "filled" });
+    s.broker.positions.delete("AAA/USD");
+    await s.pm.syncPending(T0 + 75_000);
+    expect(s.pm.hasPending("AAA/USD")).toBe(true);
+    await s.pm.syncPending(T0 + 110_000);
+    expect(s.pm.hasPending("AAA/USD")).toBe(false);
+    expect(s.pm.has("AAA/USD")).toBe(false);
+    expect(s.broker.canceled).toEqual(["fake-1"]);
+    expect(s.store.listAudit({ type: "order.resolved_by_position" })[0].data).toMatchObject({ result: "none", orderId: "fake-1" });
+  });
+
+  it("決済: 建玉が一部だけ減っていれば差分を推定の一部決済として記録し、残りは同じ理由で決済を続ける", async () => {
+    const s = setup();
+    s.broker.placeMode = "fill";
+    const e = s.entry("e1");
+    await s.pm.enter(e.req, e.entry, T0);
+    s.broker.placeMode = "throw";
+    s.broker.getOrderMode = "throw";
+    expect((await s.pm.close("AAA/USD", "stop", 98, T0 + 1_000)).status).toBe("pending");
+    s.broker.positions.set("AAA/USD", 0.5); // 1.5 だけ約定していた
+    s.setPrice(97.9);
+    await escalate(s, T0 + 1_000);
+    await s.pm.syncPending(T0 + 40_000);
+    const p = s.pm.get("AAA/USD")!;
+    expect(p.qty).toBeCloseTo(0.5, 9);
+    expect(p).toMatchObject({ exitedQty: "1.5", estimated: true });
+    expect(s.pm.planOf(p.id).retryExit).toEqual({ reason: "stop", intendedPrice: 98 });
+    expect(s.store.listAudit({ type: "order.resolved_by_position" })[0].data).toMatchObject({ kind: "exit", result: "partial", qty: "1.5", price: 97.9 });
+    // 残りは次の判定で同じ理由で決済 → 1 件の TradeRecord (元の数量・推定・学習には渡さない)
+    s.broker.placeMode = "fill";
+    s.broker.getOrderMode = "normal";
+    const r = await s.pm.onQuote("AAA/USD", { ts: T0 + 41_000, bid: 99.5, ask: 99.52 }, T0 + 41_000);
+    expect(r.status).toBe("closed");
+    expect(r.trade).toMatchObject({ qty: 2, exitReason: "stop", estimated: true });
+    expect(s.closed).toHaveLength(0);
+    expect(s.store.listTrades()).toHaveLength(1);
+  });
+
+  it("決済: 建玉が無くなっていれば現在値で決済済みとして記録する (exitReason は保留の理由・推定)", async () => {
+    const s = setup();
+    s.broker.placeMode = "fill";
+    const e = s.entry("e1");
+    await s.pm.enter(e.req, e.entry, T0);
+    s.broker.placeMode = "throw";
+    s.broker.getOrderMode = "throw";
+    await s.pm.close("AAA/USD", "take_profit", 104, T0 + 1_000);
+    s.broker.positions.delete("AAA/USD");
+    s.setPrice(104.1);
+    await escalate(s, T0 + 1_000);
+    s.broker.failAccount = true; // 照会が例外なら何もしない
+    await s.pm.syncPending(T0 + 40_000);
+    expect(s.pm.has("AAA/USD")).toBe(true);
+    s.broker.failAccount = false;
+    await s.pm.syncPending(T0 + 41_000);
+    expect(s.pm.has("AAA/USD")).toBe(false);
+    const t = s.store.listTrades()[0];
+    expect(t).toMatchObject({ qty: 2, exitReason: "take_profit", exitPrice: 104.1, intendedExitPrice: 104, estimated: true });
+    expect(s.closed).toHaveLength(0);
+  });
+
+  it("orderId が分かっている注文の「見つからない」は作成から 60 秒は不明として数えない (例外は数える)", async () => {
+    const s = setup();
+    const e = s.entry("e1");
+    await s.pm.enter(e.req, e.entry, T0); // orderId fake-1
+    s.broker.getOrderMode = "missing";
+    for (let t = 5_000; t < 60_000; t += 5_000) await s.pm.syncPending(T0 + t);
+    expect(s.pm.pendingOrders()[0]).toMatchObject({ unknownCount: 0 });
+    expect(s.onEscalated).not.toHaveBeenCalled();
+    await s.pm.syncPending(T0 + 60_000);
+    expect(s.pm.pendingOrders()[0]).toMatchObject({ unknownCount: 1 });
+    s.broker.getOrderMode = "throw";
+    await s.pm.syncPending(T0 + 61_000);
+    expect(s.pm.pendingOrders()[0]).toMatchObject({ unknownCount: 2 });
+  });
+
+  it("同じ時刻 (同じティック) に作った注文はその時刻には照会しない", async () => {
+    const s = setup();
+    const e = s.entry("e1");
+    await s.pm.enter(e.req, e.entry, T0);
+    await s.pm.syncPending(T0);
+    expect(s.broker.getOrderCalls).toEqual([]);
+    await s.pm.syncPending(T0 + 1);
+    expect(s.broker.getOrderCalls).toEqual(["e1"]);
+  });
+
+  it("ブローカー呼び出しの締め切り: 決済の発注が返らなければ状態不明の保留として扱う", async () => {
+    const s = setup({ policy: { brokerTimeoutMs: 30 } });
+    s.broker.placeMode = "fill";
+    const e = s.entry("e1");
+    await s.pm.enter(e.req, e.entry, T0);
+    let release!: () => void;
+    s.broker.placeGate = () => new Promise<void>((r) => (release = r));
+    const r = await s.pm.close("AAA/USD", "stop", 98, T0 + 1_000);
+    expect(r.status).toBe("pending");
+    expect(s.pm.pendingOrders()[0]).toMatchObject({ kind: "exit", status: "unknown", unknownCount: 1 });
+    expect(s.pm.pendingOrders()[0].lastError).toMatch(/締め切り/);
+    release();
+  });
+
+  it("手動の解消: --filled は申告の数量・価格で推定の約定として記録し、--none は取消してから外す", async () => {
+    const s = setup();
+    const e1 = s.entry("e1");
+    await s.pm.enter(e1.req, e1.entry, T0); // 受付のみ
+    const res = await s.pm.applyResolveRequest({ id: "r1", clientId: "e1", outcome: "filled", qty: "1.5", price: 100.3, at: T0, by: "cli" }, T0 + 1_000);
+    expect(res.applied).toBe(true);
+    expect(s.pm.get("AAA/USD")).toMatchObject({ qty: 1.5, entryPrice: 100.3, estimated: true });
+    expect(s.broker.canceled).toEqual(["fake-1"]); // 残りが後から約定しないように取消す
+    expect(s.store.listAudit({ type: "order.manual_resolve" })[0].data).toMatchObject({ clientId: "e1", outcome: "filled", result: "partial", qty: "1.5", price: 100.3, by: "cli" });
+    // 対象が無い要求は監査ログに残して捨てる
+    const miss = await s.pm.applyResolveRequest({ id: "r2", clientId: "nope", outcome: "none", at: T0, by: "cli" }, T0 + 2_000);
+    expect(miss.applied).toBe(false);
+    expect(s.store.listAudit({ type: "order.manual_resolve" })[1].data).toMatchObject({ clientId: "nope", result: "rejected" });
+    // 決済の保留を「約定なし」で外す
+    s.broker.placeMode = "accept";
+    s.broker.positions.set("AAA/USD", 1.5);
+    const c = await s.pm.close("AAA/USD", "stop", 98, T0 + 3_000);
+    expect(c.status).toBe("pending");
+    const exitId = s.pm.pendingOrders()[0].clientId;
+    await s.pm.applyResolveRequest({ id: "r3", clientId: exitId, outcome: "none", at: T0, by: "cli" }, T0 + 4_000);
+    expect(s.pm.hasPending("AAA/USD")).toBe(false);
+    expect(s.pm.get("AAA/USD")?.qty).toBe(1.5);
+  });
+
+  it("約定の反映と保留の削除は 1 つのトランザクション (途中で失敗したら両方とも書かない = 再起動後に 1 回だけ反映)", async () => {
+    class FlakyStore extends SqliteStore {
+      failPendingWrite = false;
+      kvSet<T>(key: string, value: T): void {
+        if (this.failPendingWrite && key === "orders:pending:live") {
+          this.failPendingWrite = false;
+          throw new Error("disk I/O error (fake)");
+        }
+        super.kvSet(key, value);
+      }
+    }
+    const store = new FlakyStore(":memory:");
+    const s = setup({ store });
+    s.broker.placeMode = "fill";
+    const e = s.entry("e1");
+    await s.pm.enter(e.req, e.entry, T0);
+    s.broker.placeMode = "accept";
+    await s.pm.close("AAA/USD", "stop", 98, T0 + 1_000);
+    s.broker.fill(s.broker.last().clientId);
+    store.failPendingWrite = true; // 決済の約定を反映した後、保留の削除の書き込みで停止したのと同じ
+    await s.pm.syncPending(T0 + 2_000);
+    expect(store.listTrades()).toHaveLength(0); // trades も journal も巻き戻っている
+    expect(store.kvGet<unknown[]>("journal:open:live")).toHaveLength(1);
+    expect(store.kvGet<unknown[]>("orders:pending:live")).toHaveLength(1);
+    // 再起動 (同じ DB から作り直す) → 照会で 1 回だけ反映
+    const journal2 = new TradeJournal({ store, mode: "live" });
+    const pm2 = new PositionManager({ journal: journal2, brokerFor: () => s.broker, store, instrumentOf: () => ({ baseCurrency: "AAA", quoteCurrency: "USD", minQty: 0.001 }) });
+    await pm2.syncPending(T0 + 3_000);
+    expect(store.listTrades()).toHaveLength(1);
+    expect(pm2.list()).toHaveLength(0);
+    expect(pm2.pendingOrders()).toHaveLength(0);
+    store.close();
   });
 });

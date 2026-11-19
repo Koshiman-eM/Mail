@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { RESUME_REQUEST_KEY } from "../src/risk/resumeRequest";
-import { buildReportText, CliError, HELP, main, parseArgs, parseBacktestArgs, parseSimulateArgs, resumeTrading } from "../src/cli";
+import {
+  buildReportText, CliError, HELP, main, parseArgs, parseBacktestArgs, parseResolveArgs, parseSimulateArgs, pendingOrdersText, requestOrderResolve, resumeTrading,
+} from "../src/cli";
+import { PendingOrders, peekResolveRequests, type PendingOrder } from "../src/engine/orders";
 import { loadConfig } from "../src/core/config";
 import type { Candle } from "../src/core/types";
 import { fetchCandlesPaged, formatBacktestRows, runBacktestCommand } from "../src/engine/backtestCommand";
@@ -174,5 +177,87 @@ describe("report / resume", () => {
     expect(lines[0]).toBe("戦略  件数");
     expect(lines[2]).toBe("abc      1");
     expect(lines[3]).toBe("日本    20");
+  });
+});
+
+describe("orders (保留中の注文の一覧・手動での解消)", () => {
+  const config = loadConfig({ NODE_ENV: "test", DB_PATH: "memory" }); // mode は paper
+  const order = (o: Partial<PendingOrder> = {}): PendingOrder => ({
+    clientId: "eng-x-1-1-abcd", orderId: "ord-9", symbol: "BTC/USDT", side: "sell", qty: "0.5", kind: "exit", createdAt: Date.UTC(2026, 0, 5),
+    status: "unknown", unknownCount: 5, lastError: "照会に失敗: ETIMEDOUT", escalated: true,
+    exit: { tradeId: "t1", reason: "stop", intendedPrice: 100 },
+    ...o,
+  });
+
+  it("HELP に orders / orders resolve の使い方がある", () => {
+    expect(HELP).toContain("orders resolve <clientId> --none");
+    expect(HELP).toContain("orders resolve <clientId> --filled --qty <数量> --price <価格>");
+  });
+
+  it("引数の解析: --none か --filled (--qty・--price 必須) のどちらか一方", () => {
+    const p = (argv: string[]) => {
+      const a = parseArgs(["orders", "resolve", ...argv]);
+      return parseResolveArgs(a.positionals.slice(1), a.flags);
+    };
+    expect(p(["c1", "--none"])).toEqual({ clientId: "c1", outcome: "none" });
+    expect(p(["--none", "c1"])).toEqual({ clientId: "c1", outcome: "none" });
+    expect(p(["c1", "--filled", "--qty", "0.25", "--price", "101.5"])).toEqual({ clientId: "c1", outcome: "filled", qty: "0.25", price: 101.5 });
+    expect(() => p(["--none"])).toThrow(/clientId/);
+    expect(() => p(["c1"])).toThrow(/--none/);
+    expect(() => p(["c1", "--none", "--filled"])).toThrow(/どちらか一方/);
+    expect(() => p(["c1", "--filled", "--price", "1"])).toThrow(/--qty/);
+    expect(() => p(["c1", "--filled", "--qty", "1"])).toThrow(/--price/);
+    expect(() => p(["c1", "--filled", "--qty", "-1", "--price", "1"])).toThrow(/正の数値/);
+    expect(() => p(["c1", "--filled", "--qty", "1", "--price", "0"])).toThrow(/正の数値/);
+    expect(() => p(["c1", "--none", "--qty", "1"])).toThrow(/--none には/);
+  });
+
+  it("main: 引数の誤りは終了コード 2 (DB を開く前に検証する)", async () => {
+    const a = io();
+    expect(await main(["orders", "resolve", "c1"], a.io)).toBe(2);
+    expect(a.err[0]).toMatch(/^エラー: --none/);
+    const b = io();
+    expect(await main(["orders", "cancel"], b.io)).toBe(2);
+    expect(b.err[0]).toMatch(/未知のサブコマンド/);
+  });
+
+  it("一覧は状態不明の注文に印を付け、解消の方法を案内する", () => {
+    const store = new MemoryStore();
+    expect(pendingOrdersText(config, store)).toMatch(/保留中の注文はありません \(paper\)/);
+    new PendingOrders({ store, mode: "paper" }).upsert(order());
+    const text = pendingOrdersText(config, store);
+    expect(text).toContain("[状態不明] BTC/USDT 決済 sell 0.5 clientId=eng-x-1-1-abcd orderId=ord-9");
+    expect(text).toContain("orders resolve <clientId> --none");
+    expect(text).toContain("--filled --qty <数量> --price <価格>");
+  });
+
+  it("resolve: 要求を kv の要求キュー (mode 別) に積み、監査ログを残す。存在しない clientId・注文数量を超える --qty は拒否する", () => {
+    const store = new MemoryStore();
+    new PendingOrders({ store, mode: "paper" }).upsert(order());
+    expect(() => requestOrderResolve(config, store, { clientId: "nope", outcome: "none" })).toThrow(CliError);
+    expect(() => requestOrderResolve(config, store, { clientId: "eng-x-1-1-abcd", outcome: "filled", qty: "0.6", price: 100 })).toThrow(/超えています/);
+    const r1 = requestOrderResolve(config, store, { clientId: "eng-x-1-1-abcd", outcome: "filled", qty: "0.5", price: 99.5 }, 1_000, "cli");
+    expect(r1.message).toMatch(/次のティック/);
+    const r2 = requestOrderResolve(config, store, { clientId: "eng-x-1-1-abcd", outcome: "none" }, 2_000, "cli");
+    expect(r2.request.id).not.toBe(r1.request.id);
+    expect(peekResolveRequests(store, "paper").map((r) => [r.outcome, r.qty, r.price])).toEqual([["filled", "0.5", 99.5], ["none", undefined, undefined]]);
+    expect(peekResolveRequests(store, "live")).toEqual([]);
+    expect(store.listAudit({ type: "order.manual_resolve_requested" })).toHaveLength(2);
+    expect(pendingOrdersText(config, store)).toContain("適用待ちの解消要求: 2 件");
+  });
+
+  it("resume: 状態不明の保留注文が残っていれば、一覧と orders resolve の案内を警告として返す (解除自体は行う)", () => {
+    const store = new MemoryStore();
+    new RiskManager(config.risk, store).trip("テスト", 1_000);
+    new PendingOrders({ store, mode: "paper" }).upsert(order());
+    const r = resumeTrading(config, store, 2_000);
+    expect(r.resumed).toBe(true);
+    expect(r.warnings.join("\n")).toMatch(/状態不明の注文が 1 件/);
+    expect(r.warnings.join("\n")).toContain("clientId=eng-x-1-1-abcd");
+    expect(r.warnings.join("\n")).toContain("orders resolve <clientId> --none");
+    // 停止していなくても警告は返す
+    const r2 = resumeTrading(config, store, 3_000);
+    expect(r2.resumed).toBe(false);
+    expect(r2.warnings.length).toBeGreaterThan(0);
   });
 });

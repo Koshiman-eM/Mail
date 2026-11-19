@@ -173,6 +173,11 @@ export class SqliteStore implements Store {
     return s;
   }
 
+  /** 複数の書き込み (trades・kv など) をまとめて確定する。fn は同期関数。入れ子は外側に参加する */
+  transaction<T>(fn: () => T): T {
+    return this.tx(fn);
+  }
+
   /** トランザクション (入れ子はそのまま外側に参加) */
   private tx<T>(fn: () => T): T {
     if (this.db.isTransaction) return fn();

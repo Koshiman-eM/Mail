@@ -189,9 +189,10 @@ export class MarketHub {
    * 全監視銘柄を更新する。feed (venue) ごとに並列で、同じ feed の銘柄は順に取得する (レート制限のため)。
    * timeoutMs を指定すると、その時間で待つのをやめて戻る。終わらなかった venue の取得は裏で続け、
    * 次回の poll はその完了を待つ (同じ venue を二重に取得しない = 次回へ持ち越し)。
-   * 戻り値の timedOut は時間内に終わらなかった venue。
+   * 戻り値の timedOut は時間内に終わらなかった venue、timedOutSymbols はその venue の銘柄
+   * (エンジンはそのティックの新規エントリーの対象から外す)。
    */
-  async poll(opts: { timeoutMs?: number } = {}): Promise<{ timedOut: string[] }> {
+  async poll(opts: { timeoutMs?: number } = {}): Promise<{ timedOut: string[]; timedOutSymbols: string[] }> {
     const byFeed = new Map<MarketDataFeed, string[]>();
     for (const [symbol, s] of this.symbols) {
       const list = byFeed.get(s.feed) ?? [];
@@ -217,14 +218,16 @@ export class MarketHub {
     const timeoutMs = opts.timeoutMs;
     if (timeoutMs === undefined || !(timeoutMs > 0)) {
       await all;
-      return { timedOut: [] };
+      return { timedOut: [], timedOutSymbols: [] };
     }
     let timer: ReturnType<typeof setTimeout> | undefined;
     await Promise.race([all, new Promise<void>((r) => (timer = setTimeout(r, timeoutMs)))]);
     if (timer) clearTimeout(timer);
-    const timedOut = [...byFeed.keys()].filter((f) => !done.has(f)).map((f) => f.venue);
+    const late = [...byFeed.keys()].filter((f) => !done.has(f));
+    const timedOut = late.map((f) => f.venue);
+    const timedOutSymbols = late.flatMap((f) => byFeed.get(f) ?? []);
     if (timedOut.length) log.warn("poll が時間内に終わらない venue を次回へ持ち越します", { venues: timedOut, timeoutMs });
-    return { timedOut };
+    return { timedOut, timedOutSymbols };
   }
   /** 取得中の venue (feed) ごとの poll */
   private readonly inflight = new Map<MarketDataFeed, Promise<void>>();

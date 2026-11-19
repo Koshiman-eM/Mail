@@ -121,28 +121,48 @@ describe("TradeJournal", () => {
 });
 
 describe("TradeJournal.reduce (一部決済)", () => {
-  it("約定分の TradeRecord を返し、残りは追跡を続ける (エントリー手数料は按分)", () => {
+  it("一部決済は TradeRecord を作らずに累計し、最後の全量決済で元の数量・加重平均の決済価格・合計損益の 1 件にする", () => {
     const store = new MemoryStore();
     const j = new TradeJournal({ store });
     const p = j.open(openInput({ id: "r1", qty: 3, entryFees: 0.3 }));
     j.mark("BTC/USDT", 103, 2_000);
-    const t1 = j.reduce(p.id, { qty: 1, exitPrice: 102, exitTs: 3_000, exitReason: "stop", fees: 0.1 });
-    expect(t1.id).toBe("r1#1");
-    expect(t1.qty).toBe(1);
-    expect(t1.grossPnl).toBe(2);
-    expect(t1.fees).toBe(0.2); // 0.3 × 1/3 + 0.1
-    expect(t1.netPnl).toBe(1.8);
-    const rest = j.get("r1")!;
-    expect(rest.qty).toBe(2);
-    expect(rest.entryFees).toBe(0.2);
-    expect(rest.highWater).toBe(103);
-    // 残りの全量を決済すると元の id で記録
-    const t2 = j.reduce(p.id, { qty: 2, exitPrice: 104, exitTs: 4_000, exitReason: "stop" });
-    expect(t2.id).toBe("r1");
-    expect(t2.qty).toBe(2);
-    expect(t2.fees).toBe(0.2);
-    expect(j.list()).toHaveLength(0);
-    expect(store.listTrades().map((t) => t.id).sort()).toEqual(["r1", "r1#1"]);
+    const r1 = j.reduce(p.id, { qty: 1, exitPrice: 102, intendedExitPrice: 101, exitTs: 3_000, exitReason: "stop", fees: 0.1 });
+    expect(r1.kind).toBe("reduced");
+    if (r1.kind !== "reduced") throw new Error("unreachable");
+    expect(r1.position).toMatchObject({ qty: 2, entryFees: 0.3, partials: 1, exitedQty: "1", realizedGross: "2", exitFees: "0.1" });
+    expect(store.listTrades()).toEqual([]); // 一部決済では保存しない
+    // 再起動しても累計は残る
+    const j2 = new TradeJournal({ store });
+    expect(j2.get("r1")).toMatchObject({ qty: 2, exitedQty: "1", exitNotional: "102" });
+    // 残りの全量を決済すると元の id・元の数量で 1 件
+    const r2 = j2.reduce(p.id, { qty: 2, exitPrice: 104, exitTs: 4_000, exitReason: "stop" });
+    expect(r2.kind).toBe("closed");
+    if (r2.kind !== "closed") throw new Error("unreachable");
+    const t = r2.trade;
+    expect(t.id).toBe("r1");
+    expect(t.qty).toBe(3);
+    expect(t.exitPrice).toBeCloseTo(310 / 3, 12); // (1 × 102 + 2 × 104) / 3
+    expect(t.intendedExitPrice).toBeCloseTo((101 + 2 * 104) / 3, 12);
+    expect(t.grossPnl).toBe(10); // 1 × 2 + 2 × 4
+    expect(t.fees).toBe(0.4); // エントリー 0.3 + 一部決済 0.1
+    expect(t.netPnl).toBe(9.6);
+    expect(t.rMultiple).toBeCloseTo(9.6 / (2 * 3), 12); // 当初リスク = (100 - 98) × 元の数量 3
+    expect(t.returnPct).toBeCloseTo(9.6 / 300, 12);
+    expect(t.mfePct).toBeCloseTo(0.04, 12);
+    expect(t.estimated).toBeUndefined();
+    expect(j2.list()).toHaveLength(0);
+    expect(store.listTrades().map((x) => x.id)).toEqual(["r1"]);
+  });
+
+  it("一部決済の後の close も合算し、推定 (estimated) の印は最後の TradeRecord に残る", () => {
+    const j = new TradeJournal();
+    const p = j.open(openInput({ id: "r2", qty: 2, direction: "short", entryPrice: 100, initialStop: 102 }));
+    j.reduce(p.id, { qty: 0.5, exitPrice: 99, exitTs: 2_000, exitReason: "stop", estimated: true });
+    const t = j.close({ id: p.id, exitPrice: 98, exitTs: 3_000, exitReason: "stop" });
+    expect(t.qty).toBe(2);
+    expect(t.grossPnl).toBe(0.5 + 1.5 * 2); // ショート: (100 - 99) × 0.5 + (100 - 98) × 1.5
+    expect(t.exitPrice).toBeCloseTo((0.5 * 99 + 1.5 * 98) / 2, 12);
+    expect(t.estimated).toBe(true);
   });
 
   it("異常な数量・価格は例外", () => {

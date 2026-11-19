@@ -34,11 +34,14 @@ export interface OpenTradeInput {
   entryFees?: number;
   /** 1 単位あたりの契約サイズ (FX/先物)。既定 1 */
   contractSize?: number;
+  /** 約定を確認できず、建玉の照会・手動の申告から数量・価格を推定したエントリー */
+  estimated?: boolean;
 }
 
 /** 追跡中のポジション */
 export interface OpenTrade extends OpenTradeInput {
   id: string;
+  /** エントリー手数料の全額 (一部決済では按分せず、最後の決済の TradeRecord にまとめる) */
   entryFees: number;
   contractSize: number;
   /** 保有中の最高値・最安値 (エントリー価格を含む) */
@@ -46,8 +49,21 @@ export interface OpenTrade extends OpenTradeInput {
   lowWater: number;
   lastPrice: number;
   lastTs: number;
-  /** 一部決済 (reduce) の回数。一部決済の TradeRecord.id は `${id}#${n}` */
+  /** 一部決済 (reduce) の回数 */
   partials?: number;
+  /**
+   * 一部決済の累計 (decimal 文字列)。qty は残りの数量で、元の数量は qty + exitedQty。
+   * 最後に全量を決済したとき、元の数量・加重平均の決済価格・合計損益で 1 件の TradeRecord にする
+   */
+  exitedQty?: string;
+  /** Σ 決済数量 × 決済価格 (加重平均の決済価格用) */
+  exitNotional?: string;
+  /** Σ 決済数量 × 想定決済価格 */
+  intendedExitNotional?: string;
+  /** 一部決済の実現損益 (手数料控除前、クオート通貨建て) */
+  realizedGross?: string;
+  /** 一部決済の手数料 (クオート通貨建て) */
+  exitFees?: string;
 }
 
 export interface CloseTradeInput {
@@ -60,10 +76,15 @@ export interface CloseTradeInput {
   exitReason: ExitReason;
   /** 決済時の手数料 (クオート通貨建て)。open.entryFees と合算して TradeRecord.fees になる */
   fees?: number;
+  /** 約定を確認できず推定した決済 (TradeRecord.estimated を付ける) */
+  estimated?: boolean;
 }
 
 /** 一部決済の入力。qty は決済した数量 (正の値) */
 export type ReduceTradeInput = Omit<CloseTradeInput, "id"> & { qty: number };
+
+/** reduce の結果: 全量の決済になった (closed) か、残りを追跡中 (reduced) か */
+export type ReduceResult = { kind: "closed"; trade: TradeRecord } | { kind: "reduced"; position: OpenTrade };
 
 /** 旧キー (mode なし)。paper 用として扱い、live では読まない */
 export const LEGACY_OPEN_KV_KEY = "journal:open";
@@ -166,27 +187,35 @@ export class TradeJournal {
   }
 
   /**
-   * 一部決済。決済した数量分の TradeRecord (id は `${id}#${n}`) を返し、残りは追跡を続ける。
-   * エントリー手数料は数量比で按分する。qty が保有数量以上なら close と同じ。
+   * 一部決済。TradeRecord は作らず、決済した数量・損益・手数料・決済価格をポジションに累計して残りの追跡を続ける
+   * (学習が 1 回のトレードを複数回として数えないように)。最後に全量を決済したときに、元の数量・加重平均の
+   * 決済価格・合計損益で 1 件の TradeRecord を保存する。qty が保有数量以上なら close と同じ。
    */
-  reduce(id: string, input: ReduceTradeInput): TradeRecord {
+  reduce(id: string, input: ReduceTradeInput): ReduceResult {
     const p = this.open_.get(id);
     if (!p) throw new Error(`ポジション ${id} は追跡されていません`);
     const qty = D(input.qty);
     if (!qty.isFinite() || !qty.gt(0)) throw new Error(`qty は正の値が必要です: ${input.qty}`);
     const { qty: _q, ...rest } = input;
-    if (qty.gte(p.qty)) return this.close({ ...rest, id });
+    if (qty.gte(p.qty)) return { kind: "closed", trade: this.close({ ...rest, id }) };
     if (!(input.exitPrice > 0)) throw new Error(`exitPrice が不正です: ${input.exitPrice}`);
-    const n = (p.partials ?? 0) + 1;
-    const feePart = D(p.entryFees).mul(qty).div(p.qty);
-    const part: OpenTrade = { ...p, id: `${p.id}#${n}`, qty: qty.toNumber(), entryFees: feePart.toNumber() };
-    const trade = buildTradeRecord(part, { ...rest, id: part.id });
+    const dir = p.direction === "long" ? 1 : -1;
+    const intended = input.intendedExitPrice ?? input.exitPrice;
+    p.exitedQty = D(p.exitedQty ?? 0).plus(qty).toString();
+    p.exitNotional = D(p.exitNotional ?? 0).plus(qty.mul(input.exitPrice)).toString();
+    p.intendedExitNotional = D(p.intendedExitNotional ?? 0).plus(qty.mul(intended)).toString();
+    p.realizedGross = D(p.realizedGross ?? 0)
+      .plus(D(input.exitPrice).minus(p.entryPrice).mul(qty).mul(p.contractSize).mul(dir))
+      .toString();
+    p.exitFees = D(p.exitFees ?? 0).plus(input.fees ?? 0).toString();
     p.qty = D(p.qty).minus(qty).toNumber();
-    p.entryFees = D(p.entryFees).minus(feePart).toNumber();
-    p.partials = n;
+    p.partials = (p.partials ?? 0) + 1;
+    // 一部決済の価格も MFE/MAE に含める
+    if (input.exitPrice > p.highWater) p.highWater = input.exitPrice;
+    if (input.exitPrice < p.lowWater) p.lowWater = input.exitPrice;
+    if (input.estimated) p.estimated = true;
     this.persist();
-    this.store?.saveTrade(trade);
-    return trade;
+    return { kind: "reduced", position: { ...p } };
   }
 
   private persist() {
@@ -194,21 +223,32 @@ export class TradeJournal {
   }
 }
 
-/** 損益・R・MFE/MAE の計算 (会計値は decimal) */
+/**
+ * 損益・R・MFE/MAE の計算 (会計値は decimal)。
+ * 一部決済の累計があれば、元の数量 (残り + 決済済み)・加重平均の決済価格・合計損益で 1 件にまとめる。
+ */
 export function buildTradeRecord(p: OpenTrade, c: CloseTradeInput): TradeRecord {
   const dir = p.direction === "long" ? 1 : -1;
   const high = Math.max(p.highWater, c.exitPrice);
   const low = Math.min(p.lowWater, c.exitPrice);
-  const units = D(p.qty).abs().mul(p.contractSize);
+  const remain = D(p.qty).abs();
+  const exited = D(p.exitedQty ?? 0);
+  const totalQty = remain.plus(exited);
+  const units = totalQty.mul(p.contractSize);
   const entry = D(p.entryPrice);
+  const intendedExit = c.intendedExitPrice ?? c.exitPrice;
 
-  const gross = D(c.exitPrice).minus(entry).mul(units).mul(dir);
-  const fees = D(p.entryFees).plus(c.fees ?? 0);
+  const gross = D(p.realizedGross ?? 0).plus(D(c.exitPrice).minus(entry).mul(remain).mul(p.contractSize).mul(dir));
+  const fees = D(p.entryFees).plus(p.exitFees ?? 0).plus(c.fees ?? 0);
   const net = gross.minus(fees);
   const notional = entry.mul(units).abs();
   const returnPct = notional.gt(0) ? net.div(notional) : D(0);
   const risk = entry.minus(p.initialStop).abs().mul(units);
   const rMultiple = risk.gt(0) ? net.div(risk) : D(0);
+  // 一部決済があれば数量で加重平均した決済価格 (無ければ今回の価格そのもの)
+  const partial = exited.gt(0) && totalQty.gt(0);
+  const exitPrice = partial ? D(p.exitNotional ?? 0).plus(remain.mul(c.exitPrice)).div(totalQty).toNumber() : c.exitPrice;
+  const intendedExitPrice = partial ? D(p.intendedExitNotional ?? 0).plus(remain.mul(intendedExit)).div(totalQty).toNumber() : intendedExit;
 
   const favorable = dir === 1 ? D(high).minus(entry) : entry.minus(low);
   const adverse = dir === 1 ? entry.minus(low) : D(high).minus(entry);
@@ -224,13 +264,13 @@ export function buildTradeRecord(p: OpenTrade, c: CloseTradeInput): TradeRecord 
     strategyId: p.strategyId,
     horizon: p.horizon,
     direction: p.direction,
-    qty: p.qty,
+    qty: partial ? totalQty.toNumber() : p.qty,
     entryTs: p.entryTs,
     entryPrice: p.entryPrice,
     intendedEntryPrice: p.intendedEntryPrice,
     exitTs: c.exitTs,
-    exitPrice: c.exitPrice,
-    intendedExitPrice: c.intendedExitPrice ?? c.exitPrice,
+    exitPrice,
+    intendedExitPrice,
     initialStop: p.initialStop,
     ...(p.takeProfit !== undefined ? { takeProfit: p.takeProfit } : {}),
     grossPnl: gross.toNumber(),
@@ -242,6 +282,7 @@ export function buildTradeRecord(p: OpenTrade, c: CloseTradeInput): TradeRecord 
     maePct,
     exitReason: c.exitReason,
     entryContext: p.entryContext,
+    ...(p.estimated || c.estimated ? { estimated: true } : {}),
   };
 }
 

@@ -5,11 +5,14 @@
 import { describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/core/config";
 import type { Candle, Clock, Instrument, MarketDataFeed, Quote, Signal, Strategy, StrategyContext, Timeframe } from "../src/core/types";
+import { requestOrderResolve } from "../src/cli";
 import { buildRuntime, type RuntimeOptions } from "../src/engine/setup";
+import { requestResolve } from "../src/engine/orders";
 import type { BrokerSet } from "../src/execution/router";
 import { TradeJournal } from "../src/learning/journal";
 import { mulberry32, SyntheticFeed } from "../src/market/feeds/synthetic";
 import { RiskManager } from "../src/risk/manager";
+import { peekResumeRequest, requestResume } from "../src/risk/resumeRequest";
 import { MemoryStore } from "../src/storage/memory";
 import { FakeLiveBroker } from "./helpers/fakeLiveBroker";
 
@@ -42,11 +45,15 @@ function alwaysLong(): Strategy {
   };
 }
 
-/** 合成フィードの気配を銘柄ごとに上書き・失敗させられる feed */
+/** 合成フィードの気配を銘柄ごとに上書き・失敗・遅延させられる feed */
 class ControlledFeed implements MarketDataFeed {
   readonly venue = "paper";
   readonly override = new Map<string, { bid: number; ask: number }>();
   readonly failQuote = new Set<string>();
+  /** 気配の時刻をこの分だけ古くする */
+  readonly quoteAgeMs = new Map<string, number>();
+  /** 気配の取得を遅らせる (ms, 実時間) */
+  quoteDelayMs = 0;
   constructor(private readonly inner: SyntheticFeed, private readonly clock: Clock) {}
   listInstruments(): Promise<Instrument[]> {
     return this.inner.listInstruments();
@@ -55,41 +62,58 @@ class ControlledFeed implements MarketDataFeed {
     return this.inner.fetchCandles(symbol, tf, limit, since);
   }
   async fetchQuote(symbol: string): Promise<Quote> {
+    if (this.quoteDelayMs > 0) await new Promise((r) => setTimeout(r, this.quoteDelayMs));
     if (this.failQuote.has(symbol)) throw new Error("quote unavailable (fake)");
     const o = this.override.get(symbol);
-    return o ? { ts: this.clock.now(), ...o } : this.inner.fetchQuote(symbol);
+    const q = o ? { ts: this.clock.now(), ...o } : await this.inner.fetchQuote(symbol);
+    return { ...q, ts: q.ts - (this.quoteAgeMs.get(symbol) ?? 0) };
   }
 }
 
-async function liveRuntime(o: { store?: MemoryStore; broker?: FakeLiveBroker; engine?: RuntimeOptions["engine"] } = {}) {
+async function liveRuntime(
+  o: {
+    store?: MemoryStore;
+    broker?: FakeLiveBroker;
+    /** 銘柄ごとの発注先 (省略した銘柄は broker) */
+    brokers?: Record<string, FakeLiveBroker>;
+    symbols?: string[];
+    env?: Record<string, string>;
+    engine?: RuntimeOptions["engine"];
+  } = {},
+) {
   const clock = mkClock();
   const store = o.store ?? new MemoryStore();
   const feed = new ControlledFeed(new SyntheticFeed({ clock, seed: 3, historyMs: 2 * 86_400_000 }), clock);
-  const instruments = (await feed.listInstruments()).filter((i) => i.symbol === SYM);
+  const symbols = o.symbols ?? [SYM];
+  const all = await feed.listInstruments();
+  const instruments = symbols.map((s) => all.find((i) => i.symbol === s)!);
   const broker = o.broker ?? new FakeLiveBroker("paper");
+  const brokerOf = (s: string) => o.brokers?.[s] ?? broker;
+  const unique = [...new Set(symbols.map(brokerOf))];
   const brokerSet: BrokerSet = {
     mode: "live",
-    brokers: new Map([[broker.venue, broker]]),
+    brokers: new Map(unique.map((b) => [b.venue, b])),
     brokerFor(symbol) {
-      if (symbol !== SYM) throw new Error(`未知の銘柄: ${symbol}`);
-      return broker;
+      if (!symbols.includes(symbol)) throw new Error(`未知の銘柄: ${symbol}`);
+      return brokerOf(symbol);
     },
   };
-  const rt = await buildRuntime(loadConfig({ NODE_ENV: "test", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "USD" }), {
+  const config = loadConfig({ NODE_ENV: "test", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "USD", ...(o.env ?? {}) });
+  const rt = await buildRuntime(config, {
     clock, store, intelSources: [], ai: null, rng: mulberry32(7), strategies: [alwaysLong()], markets: [{ feed, instruments }], brokerSet,
     engine: { liveAccountCacheMs: 0, ...(o.engine ?? {}) },
   });
-  broker.quoteOf = (s) => rt.hub.latestQuote(s);
+  for (const b of unique) b.quoteOf = (s) => rt.hub.latestQuote(s);
   const tick = async (dt = 5_000) => {
     clock.t += dt;
     return rt.engine.tick(clock.t);
   };
-  return { rt, clock, store, feed, broker, tick };
+  return { rt, clock, store, feed, broker, tick, config };
 }
 
 /** 現在値の下で損切りに当たる気配に固定する */
-function hitStop(feed: ControlledFeed, stop: number) {
-  feed.override.set(SYM, { bid: stop * 0.97, ask: stop * 0.97 + 1 });
+function hitStop(feed: ControlledFeed, stop: number, symbol = SYM) {
+  feed.override.set(symbol, { bid: stop * 0.97, ask: stop * 0.97 + 1 });
 }
 
 function skipCounts(store: MemoryStore): Record<string, number> {
@@ -147,29 +171,39 @@ describe("live: 受付済み・未約定の注文 (保留中)", () => {
     expect(broker.positions.get(SYM)).toBeCloseTo(0, 9);
   });
 
-  it("発注が例外 (状態不明) なら再送せず照会を続け、不明が続いたら kill switch を発動する", async () => {
+  it("発注が例外 (状態不明) なら再送せず照会を続け、不明が続いても kill switch は発動せず、新規エントリーだけを止めて建玉で確定させる", async () => {
     const { rt, clock, store, broker, tick } = await liveRuntime();
     broker.placeMode = "throw";
     broker.getOrderMode = "missing";
     await rt.engine.tick(clock.t);
     expect(broker.placed).toHaveLength(1);
     expect(rt.engine.positions.hasPending(SYM)).toBe(true);
-    expect(rt.risk.state().killSwitch).toBeUndefined();
     for (let i = 0; i < 3; i++) await tick();
-    expect(rt.risk.state().killSwitch).toBeUndefined();
+    expect(store.listAudit({ type: "order.unknown_escalated" })).toHaveLength(0);
     await tick(); // 照会の不明が 4 回 + 発注時の 1 回 = 5 回
     expect(broker.placed).toHaveLength(1);
-    expect(rt.risk.state().killSwitch?.reason).toMatch(/注文状態不明/);
-    expect(store.listAudit({ type: "engine.order_unknown_escalated" })).toHaveLength(1);
-    // kill switch 中も保留中の注文は残り、照会を続ける (新規は出さない)
-    const calls = broker.getOrderCalls.length;
-    await tick(MIN);
-    expect(broker.placed).toHaveLength(1);
-    expect(broker.getOrderCalls.length).toBeGreaterThan(calls);
+    expect(rt.risk.state().killSwitch).toBeUndefined();
+    expect(store.listAudit({ type: "order.unknown_escalated" })).toHaveLength(1);
+    expect(store.listAudit({ type: "engine.entries_paused" })).toHaveLength(1);
     expect(rt.engine.positions.pendingOrders()[0]).toMatchObject({ symbol: SYM, kind: "entry", escalated: true });
+    expect((await rt.engine.status()).risk.entriesPaused?.orders).toEqual([broker.placed[0].clientId]);
+    expect((await rt.engine.status()).pendingOrders[0]).toMatchObject({ escalated: true });
+    // orderId が無いので hint (発注時刻・売買方向・数量) を渡して照会している
+    expect(broker.getOrderHints.at(-1)).toEqual({ createdAt: START, side: "buy", qty: broker.placed[0].qty });
     // 再起動しても保留中の注文は残る (mode 別のキー)
     expect(store.kvGet<unknown[]>("orders:pending:live")).toHaveLength(1);
     expect(store.kvGet("orders:pending:paper")).toBeUndefined();
+    // 建玉が増えていないことを 30 秒空けて 2 回確認したら「約定なし」で外し、新規エントリーを自動で再開する
+    await tick(30_000);
+    expect(rt.engine.positions.hasPending(SYM)).toBe(false);
+    expect(rt.engine.positions.list()).toHaveLength(0);
+    expect(store.listAudit({ type: "order.resolved_by_position" })[0].data).toMatchObject({ kind: "entry", result: "none" });
+    expect(store.listAudit({ type: "engine.entries_resumed" })).toHaveLength(1);
+    expect(store.listAudit({ type: "order.unknown_escalated" })).toHaveLength(1);
+    broker.placeMode = "reject";
+    await tick(MIN); // 新しい 1 分足で新規エントリー
+    expect(broker.placed).toHaveLength(2);
+    expect(rt.risk.state().killSwitch).toBeUndefined();
   });
 
   it("成行が 30 秒を過ぎても約定しなければ取消してから再照会する (約定なしなら追跡しない)", async () => {
@@ -185,11 +219,12 @@ describe("live: 受付済み・未約定の注文 (保留中)", () => {
     expect(store.listAudit({ type: "engine.order_rejected" })[0].data).toMatchObject({ symbol: SYM, status: "canceled" });
   });
 
-  it("決済の一部約定: 約定分だけ記録して残りを追跡し、次のティックで残りを決済する", async () => {
+  it("決済の一部約定: 約定分を累計して残りを追跡し、次のティックで残りを決済する (TradeRecord と学習は 1 回だけ)", async () => {
     const { rt, store, feed, broker, tick } = await liveRuntime();
     broker.placeMode = "fill";
     await rt.engine.tick(START);
     const pos = rt.engine.positions.get(SYM)!;
+    const onClosed = vi.spyOn(rt.learning, "onTradeClosed");
     expect(pos).toBeDefined();
     broker.placeMode = "accept";
     hitStop(feed, pos.initialStop);
@@ -201,22 +236,23 @@ describe("live: 受付済み・未約定の注文 (保留中)", () => {
     broker.fill(exitReq.clientId, { qty: half, status: "partially_filled" });
     await tick();
     expect(rt.engine.positions.get(SYM)?.qty).toBeCloseTo(pos.qty, 9); // 確定まで反映しない
-    // 30 秒経過 → 取消 → 一部約定で確定
-    for (let i = 0; i < 8 && store.listTrades().length === 0; i++) await tick();
+    // 30 秒経過 → 取消 → 一部約定で確定 (ポジションに累計し、TradeRecord はまだ作らない)
+    for (let i = 0; i < 8 && rt.engine.positions.get(SYM)!.qty > pos.qty - 1e-12; i++) await tick();
     expect(broker.canceled.length).toBeGreaterThanOrEqual(1);
-    const trades = store.listTrades();
-    expect(trades.length).toBeGreaterThanOrEqual(1);
-    expect(trades[0].id).toBe(`${pos.id}#1`);
-    expect(trades[0].qty).toBeCloseTo(Number(half), 9);
-    expect(trades[0].exitReason).toBe("stop");
-    // 残りは次のティックで決済 (同じ理由)
+    expect(rt.engine.positions.get(SYM)!.qty).toBeCloseTo(pos.qty - Number(half), 9);
+    expect(rt.engine.positions.get(SYM)!.exitedQty).toBe(half);
+    expect(store.listTrades()).toHaveLength(0);
+    expect(onClosed).not.toHaveBeenCalled();
+    expect(store.listAudit({ type: "engine.exit" })[0].data).toMatchObject({ partial: true, tradeId: pos.id });
+    // 残りは次のティックで決済 (同じ理由) → 元の数量・加重平均の決済価格で 1 件
     broker.placeMode = "fill";
     await tick();
     expect(rt.engine.positions.list()).toHaveLength(0);
     const all = store.listTrades();
-    expect(all).toHaveLength(2);
-    expect(all.map((t) => t.exitReason)).toEqual(["stop", "stop"]);
-    expect(all.reduce((s, t) => s + t.qty, 0)).toBeCloseTo(pos.qty, 9);
+    expect(all).toHaveLength(1);
+    expect(all[0]).toMatchObject({ id: pos.id, exitReason: "stop" });
+    expect(all[0].qty).toBeCloseTo(pos.qty, 9);
+    expect(onClosed).toHaveBeenCalledTimes(1);
     expect(broker.positions.get(SYM)).toBeCloseTo(0, 9);
   });
 
@@ -345,9 +381,14 @@ describe("live: kill switch・口座照会の失敗・外部での決済", () =>
     hitStop(feed, pos.initialStop);
     await tick();
     expect(broker.placed).toHaveLength(2);
+    expect(rt.engine.positions.list()).toHaveLength(1); // 建玉の確認はその場で待たずに次のティックへ
+    const calls = broker.getPositionsCalls;
+    await tick();
+    expect(broker.getPositionsCalls).toBeGreaterThan(calls);
+    expect(broker.placed).toHaveLength(3);
     expect(rt.engine.positions.list()).toHaveLength(1); // 1 回目は確認中
     await tick();
-    expect(broker.placed).toHaveLength(3);
+    expect(broker.placed).toHaveLength(3); // 再試行待ち
     expect(rt.engine.positions.list()).toHaveLength(0);
     expect(store.listTrades()[0]).toMatchObject({ id: pos.id, exitReason: "manual" });
     expect(store.listAudit({ type: "reconcile.external_close" })[0].data).toMatchObject({ phase: "exit_rejected" });
@@ -360,18 +401,20 @@ describe("live: kill switch・口座照会の失敗・外部での決済", () =>
     broker.placeMode = "fill";
     await rt.engine.tick(START);
     const pos = rt.engine.positions.get(SYM)!;
+    const onClosed = vi.spyOn(rt.learning, "onTradeClosed");
     broker.positions.set(SYM, pos.qty * 0.6); // 外部で 4 割を決済済み
     hitStop(feed, pos.initialStop);
-    await tick(); // 保有分 (6 割) だけ約定 → 一部決済
-    let trades = store.listTrades();
-    expect(trades).toHaveLength(1);
-    expect(trades[0].qty).toBeCloseTo(pos.qty * 0.6, 9);
+    await tick(); // 保有分 (6 割) だけ約定 → 一部決済 (累計)
+    expect(store.listTrades()).toHaveLength(0);
     expect(rt.engine.positions.get(SYM)!.qty).toBeCloseTo(pos.qty * 0.4, 9);
     // 残りの決済は拒否される → 2 回の確認で manual として整理し、以後は発注しない
     for (let i = 0; i < 4; i++) await tick(10_000);
     expect(rt.engine.positions.list()).toHaveLength(0);
-    trades = store.listTrades();
-    expect(trades.map((t) => t.exitReason)).toEqual(["stop", "manual"]);
+    const trades = store.listTrades();
+    expect(trades).toHaveLength(1);
+    expect(trades[0]).toMatchObject({ id: pos.id, exitReason: "manual" });
+    expect(trades[0].qty).toBeCloseTo(pos.qty, 9); // 元の数量で 1 件
+    expect(onClosed).not.toHaveBeenCalled(); // 最後の決済が manual なので学習には渡さない
     const exitsPlaced = () => broker.placed.filter((r) => r.reduceOnly).length;
     const n = exitsPlaced();
     for (let i = 0; i < 3; i++) await tick();
@@ -426,5 +469,258 @@ describe("paper と live の分離", () => {
     // paper 側の状態はそのまま
     expect(new TradeJournal({ store, mode: "paper" }).list()).toHaveLength(2);
     expect(new RiskManager(paper.config.risk, store, { mode: "paper" }).state().peakEquity).toBe(paperPeak);
+  });
+});
+
+const ETH = "ETH/USDT";
+/** 実時間で少し待つ (並列処理・締め切りの試験用) */
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+describe("live: 状態不明の注文 (kill switch を発動せず、建玉・手動で確定させる)", () => {
+  it("決済の発注が例外で不明が続き escalated になっても kill switch は発動しない。他の銘柄の損切りは動き、新規エントリーは止まり、建玉で確定した後にその銘柄の損切りが再び動く", async () => {
+    const { rt, store, feed, broker, tick } = await liveRuntime({ symbols: [SYM, ETH], engine: { orderPolicy: { positionCheckMs: 60_000 } } });
+    broker.placeMode = "fill";
+    await rt.engine.tick(START);
+    const btc = rt.engine.positions.get(SYM)!;
+    const eth = rt.engine.positions.get(ETH)!;
+    expect(btc).toBeDefined();
+    expect(eth).toBeDefined();
+    const onClosed = vi.spyOn(rt.learning, "onTradeClosed");
+    // BTC の決済だけが例外 (タイムアウト等) で状態不明。照会も失敗し続ける
+    broker.throwPlaceFor.add(SYM);
+    broker.throwGetOrderFor.add(SYM);
+    hitStop(feed, btc.initialStop);
+    await tick(); // 5 秒: 発注の例外 (不明 1 回目)
+    expect(broker.last()).toMatchObject({ symbol: SYM, reduceOnly: true });
+    expect(rt.engine.positions.hasPending(SYM)).toBe(true);
+    for (let i = 0; i < 4; i++) await tick(); // 25 秒: 不明 5 回 → escalated (建玉の 1 回目の判定)
+    expect(store.listAudit({ type: "order.unknown_escalated" })).toHaveLength(1);
+    expect(rt.risk.state().killSwitch).toBeUndefined();
+    expect(store.listAudit({ type: "risk.kill_switch" })).toHaveLength(0);
+    expect(store.listAudit({ type: "engine.kill_switch_close" })).toHaveLength(0);
+    expect(rt.engine.positions.get(SYM)).toBeDefined(); // 状態が分かるまで追跡を続ける
+
+    // 他の銘柄 (ETH) の損切りは通常どおり動く
+    hitStop(feed, eth.initialStop, ETH);
+    await tick(); // 30 秒
+    expect(rt.engine.positions.get(ETH)).toBeUndefined();
+    expect(store.listTrades().map((t) => [t.symbol, t.exitReason])).toEqual([[ETH, "stop"]]);
+    expect(onClosed).toHaveBeenCalledTimes(1);
+
+    // 新規エントリーは止まる (ETH は空いたが、新しい 1 分足でも入らない)
+    feed.override.delete(ETH);
+    const entries = () => broker.placed.filter((r) => !r.reduceOnly).length;
+    const before = entries();
+    await tick(35_000); // 65 秒 (BTC の建玉の判定はまだ 60 秒経っていない)
+    expect(entries()).toBe(before);
+    expect(rt.engine.positions.hasPending(SYM)).toBe(true);
+
+    // 取引所の BTC の建玉は減っていない → 2 回目の判定で「約定なし」として保留を外す
+    await tick(25_000); // 90 秒
+    expect(rt.engine.positions.hasPending(SYM)).toBe(false);
+    expect(store.listAudit({ type: "order.resolved_by_position" })[0].data).toMatchObject({ symbol: SYM, kind: "exit", result: "none" });
+    expect(store.listAudit({ type: "engine.entries_resumed" })).toHaveLength(1);
+    // その銘柄の損切りが再び動く
+    broker.throwPlaceFor.delete(SYM);
+    await tick();
+    expect(rt.engine.positions.get(SYM)).toBeUndefined();
+    expect(store.listTrades().filter((t) => t.symbol === SYM).map((t) => t.exitReason)).toEqual(["stop"]);
+    expect(onClosed).toHaveBeenCalledTimes(2);
+    expect(rt.risk.state().killSwitch).toBeUndefined();
+    await rt.engine.stop();
+    expect(skipCounts(store).order_unknown).toBeGreaterThan(0);
+  });
+
+  it("CLI の resolve 要求は動作中のエンジンの次のティックで反映される (--filled は推定扱いで学習に渡さない、--none は取消してから外す)", async () => {
+    const { rt, store, feed, broker, tick, config } = await liveRuntime();
+    const liveConfig = { ...config, mode: "live" as const };
+    broker.getOrderMode = "throw"; // 照会できない (受付のみの注文が状態不明)
+    await rt.engine.tick(START);
+    const entryReq = broker.placed[0];
+    expect(rt.engine.positions.hasPending(SYM)).toBe(true);
+    const px = rt.hub.latestQuote(SYM)!.ask;
+    const r = requestOrderResolve(liveConfig, store, { clientId: entryReq.clientId, outcome: "filled", qty: entryReq.qty, price: px }, START + 1, "cli");
+    expect(r.message).toMatch(/次のティック/);
+    expect(store.kvGet<unknown[]>("orders:resolveRequests:live")).toHaveLength(1);
+    await tick();
+    expect(store.kvGet("orders:resolveRequests:live")).toBeUndefined();
+    const pos = rt.engine.positions.get(SYM)!;
+    expect(pos).toMatchObject({ qty: Number(entryReq.qty), entryPrice: px, estimated: true });
+    expect(rt.engine.positions.hasPending(SYM)).toBe(false);
+    expect(broker.canceled).toEqual(["fake-1"]);
+    expect(store.listAudit({ type: "order.manual_resolve" })[0].data).toMatchObject({ clientId: entryReq.clientId, outcome: "filled", result: "filled", by: "cli" });
+    // 決済の保留を --none で外す → 損切りが再び出る。推定を含むトレードは学習に渡さない
+    const onClosed = vi.spyOn(rt.learning, "onTradeClosed");
+    broker.positions.set(SYM, pos.qty);
+    hitStop(feed, pos.initialStop);
+    await tick();
+    const exitReq = broker.last();
+    expect(exitReq.reduceOnly).toBe(true);
+    requestOrderResolve(liveConfig, store, { clientId: exitReq.clientId, outcome: "none" }, START + 2, "cli");
+    broker.placeMode = "fill";
+    await tick(); // 要求を適用 (保留を外す)
+    expect(store.listAudit({ type: "order.manual_resolve" })[1].data).toMatchObject({ clientId: exitReq.clientId, outcome: "none", result: "none" });
+    await tick(); // 通常の管理に戻って損切り
+    expect(rt.engine.positions.list()).toHaveLength(0);
+    expect(store.listTrades()[0]).toMatchObject({ exitReason: "stop", estimated: true });
+    expect(onClosed).not.toHaveBeenCalled();
+  });
+
+  it("エンジンが停止中に書かれた resolve 要求は、次回の起動時に適用する", async () => {
+    const store = new MemoryStore();
+    const broker = new FakeLiveBroker("paper");
+    broker.getOrderMode = "throw";
+    const first = await liveRuntime({ store, broker });
+    await first.rt.engine.tick(START);
+    await first.rt.engine.stop();
+    const clientId = broker.placed[0].clientId;
+    requestResolve(store, "live", { id: "req-1", clientId, outcome: "none", at: START + 1, by: "cli" });
+    const second = await liveRuntime({ store, broker });
+    expect(second.rt.engine.positions.hasPending(SYM)).toBe(true);
+    await second.rt.engine.init();
+    expect(second.rt.engine.positions.hasPending(SYM)).toBe(false);
+    expect(store.listAudit({ type: "order.manual_resolve" })[0].data).toMatchObject({ clientId, result: "none" });
+    expect(store.kvGet("orders:resolveRequests:live")).toBeUndefined();
+  });
+});
+
+describe("live: 保留中のエントリーのリスク判定・venue ごとの並列処理・締め切り", () => {
+  it("保留中のエントリーを建玉 (想定代金) として扱う: maxOpenPositions=1 なら 1 ティックで 1 件しか発注しない", async () => {
+    const { rt, store, broker } = await liveRuntime({ symbols: [SYM, ETH], env: { MAX_OPEN_POSITIONS: "1" } });
+    await rt.engine.tick(START); // 受付のみ
+    expect(broker.placed).toHaveLength(1);
+    const o = rt.engine.positions.pendingOrders()[0];
+    const acct = await rt.engine.account(START);
+    expect(acct.pendingEntries).toBe(1);
+    expect(acct.positions.find((p) => p.symbol === o.symbol)).toMatchObject({ assetClass: "crypto", qty: Number(o.qty) });
+    const rate = rt.fx.toAccount(rt.hub.instrument(o.symbol)!.quoteCurrency);
+    expect(acct.available).toBeCloseTo(broker.equity - Number(o.qty) * o.entry!.input.intendedEntryPrice * rate, 6);
+    await rt.engine.stop();
+    expect(Object.keys(skipCounts(store)).some((k) => k.includes("最大保有数"))).toBe(true);
+  });
+
+  it("1 つの venue の発注が返らなくても、他の venue の損切りは同じティックで動く (venue ごとに並列)", async () => {
+    const slow = new FakeLiveBroker("slow");
+    const fast = new FakeLiveBroker("fast");
+    slow.placeMode = "fill";
+    fast.placeMode = "fill";
+    const { rt, feed, clock } = await liveRuntime({ symbols: [SYM, ETH], brokers: { [SYM]: slow, [ETH]: fast } });
+    await rt.engine.tick(START);
+    const btc = rt.engine.positions.get(SYM)!;
+    const eth = rt.engine.positions.get(ETH)!;
+    let release!: () => void;
+    slow.placeGate = (req) => (req.reduceOnly ? new Promise<void>((r) => (release = r)) : undefined);
+    hitStop(feed, btc.initialStop);
+    hitStop(feed, eth.initialStop, ETH);
+    clock.t += 5_000;
+    const p = rt.engine.tick(clock.t);
+    for (let i = 0; i < 100 && rt.engine.positions.get(ETH); i++) await sleep(2);
+    expect(rt.engine.positions.get(ETH)).toBeUndefined(); // 遅い venue (BTC) を待たずに決済
+    expect(slow.placed.at(-1)).toMatchObject({ symbol: SYM, reduceOnly: true });
+    expect(rt.engine.positions.get(SYM)).toBeDefined();
+    expect(eth.id).toBeDefined();
+    release();
+    await p;
+    expect(rt.engine.positions.get(SYM)).toBeUndefined();
+  });
+
+  it("決済の発注が締め切り (brokerTimeoutMs) を過ぎたら状態不明の保留として扱い、ティックを終える", async () => {
+    const slow = new FakeLiveBroker("slow");
+    const fast = new FakeLiveBroker("fast");
+    slow.placeMode = "fill";
+    fast.placeMode = "fill";
+    const { rt, feed, store, tick } = await liveRuntime({ symbols: [SYM, ETH], brokers: { [SYM]: slow, [ETH]: fast }, engine: { brokerTimeoutMs: 30 } });
+    await rt.engine.tick(START);
+    const btc = rt.engine.positions.get(SYM)!;
+    let release!: () => void;
+    slow.placeGate = (req) => (req.reduceOnly ? new Promise<void>((r) => (release = r)) : undefined);
+    hitStop(feed, btc.initialStop);
+    await tick();
+    expect(rt.engine.positions.pendingOrders()[0]).toMatchObject({ symbol: SYM, kind: "exit", status: "unknown", unknownCount: 1 });
+    expect(rt.engine.positions.pendingOrders()[0].lastError).toMatch(/締め切り/);
+    expect(store.listAudit({ type: "engine.exit_error" })[0].data).toMatchObject({ symbol: SYM, pending: true });
+    release();
+  });
+});
+
+describe("live: 再開要求・古い気配・エラー文", () => {
+  it("start は自分の mode 宛ての古い再開要求だけを消す (mode の無い要求は paper 宛て)", async () => {
+    const { rt, store } = await liveRuntime();
+    requestResume(store, { at: 1, by: "cli", mode: "paper" });
+    await rt.engine.start();
+    await rt.engine.stop();
+    expect(peekResumeRequest(store)).toMatchObject({ at: 1, mode: "paper" }); // 動作中の paper エンジン宛てを消さない
+    requestResume(store, { at: 2, by: "cli" });
+    await rt.engine.start();
+    await rt.engine.stop();
+    expect(peekResumeRequest(store)).toMatchObject({ at: 2 }); // mode 無し = paper 宛て
+    requestResume(store, { at: 3, by: "cli", mode: "live" });
+    await rt.engine.start();
+    await rt.engine.stop();
+    expect(peekResumeRequest(store)).toBeUndefined();
+
+    // paper のエンジンは mode の無い古い要求を消す
+    const paperStore = new MemoryStore();
+    const paper = await buildRuntime(loadConfig({ NODE_ENV: "test", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "USD" }), {
+      clock: mkClock(), store: paperStore, intelSources: [], ai: null, seed: 3, syntheticHistoryMs: 2 * 86_400_000, rng: mulberry32(7), strategies: [alwaysLong()],
+    });
+    requestResume(paperStore, { at: 4, by: "cli", mode: "live" });
+    await paper.engine.start();
+    await paper.engine.stop();
+    expect(peekResumeRequest(paperStore)).toMatchObject({ mode: "live" });
+    requestResume(paperStore, { at: 5, by: "cli" });
+    await paper.engine.start();
+    await paper.engine.stop();
+    expect(peekResumeRequest(paperStore)).toBeUndefined();
+  });
+
+  it("新規エントリーは 30 秒より古い気配では行わない (オプションで変更可)", async () => {
+    const a = await liveRuntime();
+    a.feed.quoteAgeMs.set(SYM, 40_000);
+    await a.rt.engine.tick(START);
+    expect(a.broker.placed).toHaveLength(0);
+    await a.rt.engine.stop();
+    expect(skipCounts(a.store).stale_quote).toBeGreaterThan(0);
+    const b = await liveRuntime({ engine: { maxQuoteAgeMs: 60_000 } });
+    b.feed.quoteAgeMs.set(SYM, 40_000);
+    await b.rt.engine.tick(START);
+    expect(b.broker.placed).toHaveLength(1);
+  });
+
+  it("市場データの取得が時間切れになった venue の銘柄は、そのティックの新規エントリーの対象から外す", async () => {
+    const { rt, store, feed, broker, clock } = await liveRuntime({ engine: { pollTimeoutMs: 20 } });
+    broker.placeMode = "reject";
+    await rt.engine.tick(START);
+    expect(broker.placed).toHaveLength(1);
+    clock.t = START + 45_000;
+    await rt.engine.tick(clock.t); // 気配を更新 (新しい 1 分足はまだ無い)
+    feed.quoteDelayMs = 200;
+    clock.t = START + 65_000;
+    await rt.engine.tick(clock.t); // 新しい 1 分足だが、取得が時間切れ
+    expect(broker.placed).toHaveLength(1);
+    await sleep(300); // 裏で続いている取得を終わらせる
+    feed.quoteDelayMs = 0;
+    clock.t = START + 70_000;
+    await rt.engine.tick(clock.t);
+    expect(broker.placed).toHaveLength(2);
+    await rt.engine.stop();
+    expect(skipCounts(store).poll_timeout).toBeGreaterThan(0);
+  });
+
+  it("エラー文の URL・署名・キーは伏せて記録する (保留の lastError・監査ログ・ダッシュボードの pendingOrders)", async () => {
+    const { rt, store, broker } = await liveRuntime();
+    broker.placeMode = "throw";
+    broker.placeError = "POST https://api.example.com/v1/order?apiKey=AKIA1234567890abcdefXYZ&signature=deadbeefcafe0123456789abcdef0123456789 failed";
+    await rt.engine.tick(START);
+    const o = rt.engine.positions.pendingOrders()[0];
+    expect(o.lastError).toMatch(/signature=\*\*\*/);
+    expect(o.lastError).not.toMatch(/deadbeef|AKIA1234/);
+    expect(JSON.stringify(store.listAudit())).not.toMatch(/deadbeef|AKIA1234/);
+    expect(JSON.stringify(store.kvGet("orders:pending:live"))).not.toMatch(/deadbeef|AKIA1234/);
+    // 以前の版で伏せずに保存された lastError もダッシュボードには伏せて出す
+    rt.engine.positions.pending.upsert({ ...o, lastError: "GET /order?signature=deadbeefcafe0123456789abcdef0123456789" });
+    const st = await rt.engine.status();
+    expect(st.pendingOrders[0].lastError).toMatch(/signature=\*\*\*/);
+    expect(JSON.stringify(st.pendingOrders)).not.toMatch(/deadbeef/);
   });
 });

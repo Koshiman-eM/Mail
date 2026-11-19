@@ -91,6 +91,8 @@ export function tradesPayload(deps: DashboardDeps, limit: number) {
         regime: t.entryContext.regime.label,
         reason: t.entryContext.reason,
         ...(t.postExitMovePct !== undefined ? { postExitMovePct: t.postExitMovePct } : {}),
+        // 約定を確認できず建玉・手動の申告から推定した部分を含む (学習には使っていない)
+        ...(t.estimated ? { estimated: true } : {}),
         attribution: att
           ? {
               outcome: att.outcome,

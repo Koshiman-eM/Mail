@@ -189,6 +189,11 @@ export class MemoryStore implements Store {
     this.kv.set(key, JSON.stringify(value));
   }
 
+  /** メモリ実装は途中で失敗しても巻き戻さない (そのまま実行する) */
+  transaction<T>(fn: () => T): T {
+    return fn();
+  }
+
   close(): void {
     // メモリ実装では何もしない
   }

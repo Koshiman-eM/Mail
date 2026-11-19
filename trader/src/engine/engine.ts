@@ -1,6 +1,7 @@
 import type { AiOptions } from "../core/ai";
 import type { AppConfig } from "../core/config";
-import { D } from "../core/decimal";
+import { D, Decimal } from "../core/decimal";
+import { redactSecrets } from "../core/http";
 import { createLogger, type Logger } from "../core/logger";
 import {
   systemClock, type Balance, type Broker, type BrokerPosition, type Clock, type EntryContext, type Instrument, type IntelBias, type MarketBrief,
@@ -24,19 +25,22 @@ import { ALL_STRATEGIES, resolveParams } from "../strategies/registry";
 import {
   activeBlackout, emptyBrief, intelBiasFor, liquidityUsdFor, normalizeReason, planRegimeTimeframe, selectAutoMemeCandidates,
 } from "./context";
+import { runGrouped, withDeadline } from "./deadline";
 import { createFxConverter, type FxConverter } from "./fx";
-import type { PendingEntry, PendingStatus } from "./orders";
-import { PositionManager, type EntryResult, type OrderPolicy } from "./positions";
+import { peekResolveRequests, removeResolveRequests, type PendingEntry, type PendingOrder, type PendingStatus } from "./orders";
+import { DEFAULT_ORDER_POLICY, PositionManager, type EntryResult, type OrderPolicy } from "./positions";
 
 export const PAPER_SNAPSHOT_KEY = "paper:snapshot";
 export const AUTO_MEME_KEY = "engine:autoMemeWatch";
 /** レジーム判定に必要な最低本数 (未満なら「レジーム不明」) */
 const MIN_REGIME_BARS = 30;
+/** エラー文 (ccxt は URL・署名を含みうる) は伏せてから記録する */
+const errMsg = (e: unknown) => redactSecrets(e instanceof Error ? e.message : String(e));
 
 export interface EngineOptions {
   /** 評価額の保存間隔 (既定 60 秒) */
   equityEveryMs?: number;
-  /** これより古い気配では新規エントリーしない (既定 120 秒) */
+  /** これより古い気配では新規エントリーしない (既定 30 秒) */
   maxQuoteAgeMs?: number;
   /** start() のティック間隔 (既定 SCALP_LOOP_MS) */
   tickMs?: number;
@@ -60,7 +64,9 @@ export interface EngineOptions {
   killSwitchRetryMs?: number;
   /** 口座照会がこの回数続けて失敗したら新規エントリーを止める (既定 3) */
   accountFailLimit?: number;
-  /** 保留中の注文の扱い (取消までの時間・状態不明の上限・決済の発注レート上限) */
+  /** ブローカー呼び出し (発注・照会・取消・口座) の締め切り (既定 8 秒)。超えた発注は状態不明の保留として扱う */
+  brokerTimeoutMs?: number;
+  /** 保留中の注文の扱い (取消までの時間・状態不明の上限・決済の発注レート上限など) */
   orderPolicy?: Partial<OrderPolicy>;
 }
 
@@ -108,6 +114,8 @@ export interface AccountState {
   stale?: string[];
   /** 取得の失敗が続いている (新規エントリーを止める) */
   degradedReason?: string;
+  /** 保留中のエントリーの件数 (positions に想定代金で加え、available から引いた) */
+  pendingEntries?: number;
 }
 
 /** ブローカーごとの最後に取得できた口座情報 */
@@ -146,6 +154,8 @@ interface TickCtx {
   account: AccountState;
   /** 口座情報の欠落・取得失敗の継続による新規エントリーの停止 */
   entryBlock?: { key: string; sample: string };
+  /** このティックで市場データの取得が時間内に終わらなかった銘柄 (新規エントリーの対象外) */
+  timedOut: Set<string>;
   regimes: Map<string, RegimeFeatures>;
   intel: Map<string, IntelBias | undefined>;
   entries: number;
@@ -182,6 +192,8 @@ export interface EngineStatus {
     reason?: string;
     killSwitch?: { at: number; reason: string };
     haltedUntil?: number;
+    /** 状態不明の注文による新規エントリーの停止 (確定すれば自動で再開) */
+    entriesPaused?: { since: number; orders: string[] };
     peakEquity: number;
     dayStartEquity: number;
     limits: AppConfig["risk"];
@@ -189,7 +201,8 @@ export interface EngineStatus {
   positions: PositionStatus[];
   /** 保留中の注文 (受付済み・未約定、または状態不明) */
   pendingOrders: {
-    symbol: string; kind: "entry" | "exit"; clientId: string; orderId?: string; status: PendingStatus; createdAt: number; unknownCount: number; lastError?: string;
+    symbol: string; kind: "entry" | "exit"; clientId: string; orderId?: string; status: PendingStatus; createdAt: number; unknownCount: number;
+    lastError?: string; escalated?: boolean;
   }[];
   plan?: {
     generatedAt: number;
@@ -272,6 +285,8 @@ export class TradingEngine {
   private lastReconcileAt?: number;
   private lastKillCloseAt?: number;
   private readonly warnedAt = new Map<string, number>();
+  /** 状態不明の注文による新規エントリーの停止 (ソフト停止) */
+  private entriesPaused?: { since: number; clientIds: string[] };
   private lastTickAt?: number;
   private tickCount = 0;
 
@@ -294,7 +309,7 @@ export class TradingEngine {
     const o = deps.options ?? {};
     this.opt = {
       equityEveryMs: o.equityEveryMs ?? 60_000,
-      maxQuoteAgeMs: o.maxQuoteAgeMs ?? 120_000,
+      maxQuoteAgeMs: o.maxQuoteAgeMs ?? 30_000,
       tickMs: o.tickMs ?? env.SCALP_LOOP_MS,
       intelEveryMs: o.intelEveryMs ?? env.INTEL_LOOP_MS,
       learnEveryMs: o.learnEveryMs ?? env.LEARN_LOOP_MS,
@@ -306,6 +321,7 @@ export class TradingEngine {
       reconcileMinAgeMs: o.reconcileMinAgeMs ?? 60_000,
       killSwitchRetryMs: o.killSwitchRetryMs ?? 30_000,
       accountFailLimit: o.accountFailLimit ?? 3,
+      brokerTimeoutMs: o.brokerTimeoutMs ?? o.orderPolicy?.brokerTimeoutMs ?? DEFAULT_ORDER_POLICY.brokerTimeoutMs,
       orderPolicy: o.orderPolicy ?? {},
     };
     this.fx = deps.fx ?? createFxConverter({ baseCurrency: env.BASE_CURRENCY, getQuote: (s) => this.hub.latestQuote(s) });
@@ -323,8 +339,10 @@ export class TradingEngine {
       quoteCurrencyOf: (s) => this.hub.instrument(s)?.quoteCurrency,
       instrumentOf: (s) => this.hub.instrument(s),
       fxRate: (from, to) => this.fx.rate(from, to),
-      onUnknown: (reason, now) => this.onOrderUnknown(reason, now),
-      orderPolicy: this.opt.orderPolicy,
+      priceOf: (s) => this.priceOf(s),
+      onAnomaly: (reason, now) => this.onAnomaly(reason, now),
+      onEscalated: (o, now) => this.onOrderEscalated(o, now),
+      orderPolicy: { ...this.opt.orderPolicy, brokerTimeoutMs: this.opt.brokerTimeoutMs },
     });
   }
 
@@ -337,11 +355,75 @@ export class TradingEngine {
     return this.brokerSet.paper ?? this.brokerSet.brokerFor(symbol);
   }
 
-  /** 注文状態の不明が続いた: kill switch で新規を止め、手動確認を促す */
-  private onOrderUnknown(reason: string, now: number): void {
-    this.log.error("注文状態が確認できないためキルスイッチを作動させます。取引所で注文と建玉を確認し、問題が無ければ resume してください", { reason });
+  /** 建玉の不整合が確実な異常 (追跡中の銘柄でエントリーが約定・決済の約定超過): kill switch で止め、手動確認を促す */
+  private onAnomaly(reason: string, now: number): void {
+    this.log.error("建玉の不整合を検知したためキルスイッチを作動させます。取引所で建玉を確認し、問題が無ければ resume してください", { reason });
     this.risk.trip(reason, now);
     this.acctCache = undefined;
+  }
+
+  /**
+   * 注文状態の不明が続いた (escalated): kill switch は発動せず、エンジン全体の新規エントリーだけを止める
+   * (他の銘柄の損切り・利確・決済は続ける)。建玉の照会で確定すれば自動で再開する
+   */
+  private onOrderEscalated(o: PendingOrder, now: number): void {
+    this.log.error(
+      "注文状態が確認できません。新規エントリーを止めます (損切り・利確・決済は続けます)。" +
+        "建玉の照会で自動的に確定させ、確定すれば再開します。急ぐ場合は取引所で注文と建玉を確認し、" +
+        "`npm run trader -- orders resolve <clientId> --none` または `--filled --qty <数量> --price <価格>` で解消してください",
+      { symbol: o.symbol, kind: o.kind, clientId: o.clientId, ...(o.orderId ? { orderId: o.orderId } : {}), error: o.lastError },
+    );
+    this.acctCache = undefined;
+    this.entryPause(now);
+  }
+
+  /**
+   * 状態不明 (escalated) の保留注文があれば新規エントリーを止める理由を返す (ソフト停止)。
+   * 1 件も無くなれば自動で再開する。開始・再開は監査ログに残す
+   */
+  private entryPause(now: number): { key: string; sample: string } | undefined {
+    const esc = this.positions.escalatedOrders();
+    if (esc.length > 0) {
+      const clientIds = esc.map((o) => o.clientId);
+      if (!this.entriesPaused) {
+        this.entriesPaused = { since: now, clientIds };
+        this.store.audit({ ts: now, type: "engine.entries_paused", data: { orders: esc.map((o) => ({ symbol: o.symbol, kind: o.kind, clientId: o.clientId })) } });
+      } else this.entriesPaused.clientIds = clientIds;
+      return { key: "order_unknown", sample: `状態不明の注文 ${esc.length} 件の確定待ち (${[...new Set(esc.map((o) => o.symbol))].join(", ")})` };
+    }
+    if (this.entriesPaused) {
+      this.log.warn("状態不明の注文が解消したため新規エントリーを再開します", { pausedMs: now - this.entriesPaused.since });
+      this.store.audit({ ts: now, type: "engine.entries_resumed", data: { since: this.entriesPaused.since, pausedMs: now - this.entriesPaused.since } });
+      this.entriesPaused = undefined;
+    }
+    return undefined;
+  }
+
+  /** ブローカー呼び出しの締め切り */
+  private brokerCall<T>(fn: () => Promise<T>, label: string): Promise<T> {
+    return withDeadline((async () => fn())(), this.opt.brokerTimeoutMs, label);
+  }
+
+  /** 解消の要求 (CLI `orders resolve`) を適用して消す。適用した件数 */
+  private async applyResolveRequests(now: number): Promise<number> {
+    const reqs = peekResolveRequests(this.store, this.mode);
+    if (reqs.length === 0) return 0;
+    let applied = 0;
+    for (const r of reqs) {
+      try {
+        const res = await this.positions.applyResolveRequest(r, now);
+        if (res.applied) applied++;
+        this.log.warn(`手動の解消要求: ${res.message}`, { clientId: r.clientId, outcome: r.outcome, by: r.by });
+      } catch (e) {
+        this.log.error("手動の解消要求の適用に失敗", { clientId: r.clientId, error: errMsg(e) });
+      }
+    }
+    removeResolveRequests(this.store, this.mode, reqs.map((r) => r.id));
+    if (applied > 0) {
+      this.saveSnapshot();
+      this.acctCache = undefined;
+    }
+    return applied;
   }
 
   /** 同じ警告を間引く */
@@ -361,7 +443,7 @@ export class TradingEngine {
     try {
       this.learning.onTradeClosed(t);
     } catch (e) {
-      this.log.error("学習への反映に失敗", { tradeId: t.id, error: e instanceof Error ? e.message : String(e) });
+      this.log.error("学習への反映に失敗", { tradeId: t.id, error: errMsg(e) });
     }
     this.saveSnapshot();
     this.acctCache = undefined;
@@ -381,10 +463,12 @@ export class TradingEngine {
         paper.restore(snap);
         this.log.info("ペーパー口座を復元しました", { positions: snap.positions.length });
       } catch (e) {
-        this.log.warn("ペーパー口座の復元に失敗", { error: e instanceof Error ? e.message : String(e) });
+        this.log.warn("ペーパー口座の復元に失敗", { error: errMsg(e) });
       }
     }
     if (this.config.env.AUTO_MEME_WATCH && this.dexFeed) await this.restoreAutoMeme();
+    // エンジン停止中に書かれた解消の要求 (CLI `orders resolve`) を適用する
+    await this.applyResolveRequests(now);
     try {
       const brokerPositions = await this.brokerPositions();
       const r = this.positions.reconcile(brokerPositions, now, { priceOf: (s) => this.priceOf(s), phase: "startup", confirmations: this.reconcileConfirmations() });
@@ -396,11 +480,12 @@ export class TradingEngine {
         );
       }
     } catch (e) {
-      this.log.warn("建玉の突き合わせに失敗", { error: e instanceof Error ? e.message : String(e) });
+      this.log.warn("建玉の突き合わせに失敗", { error: errMsg(e) });
     }
     this.lastReconcileAt = now;
     const pending = this.positions.pendingOrders();
     if (pending.length) this.log.warn("保留中の注文があります。照会して確定させます", { orders: pending.map((o) => `${o.symbol} ${o.kind} ${o.clientId}`) });
+    this.entryPause(now);
     this.store.audit({
       ts: now,
       type: "engine.start",
@@ -412,10 +497,10 @@ export class TradingEngine {
     return this.brokerSet.paper ? [this.brokerSet.paper] : [...new Set(this.brokerSet.brokers.values())];
   }
 
+  /** 全ブローカーの建玉 (venue ごとに並列・締め切りあり)。1 つでも失敗したら例外 */
   private async brokerPositions(): Promise<BrokerPosition[]> {
-    const out: BrokerPosition[] = [];
-    for (const b of this.uniqueBrokers()) out.push(...(await b.getPositions()));
-    return out;
+    const lists = await Promise.all(this.uniqueBrokers().map((b) => this.brokerCall(() => b.getPositions(), `${b.venue} getPositions`)));
+    return lists.flat();
   }
 
   // ───────── 口座 ─────────
@@ -424,8 +509,49 @@ export class TradingEngine {
    * 評価額 (口座通貨)・余力・建玉。会計値は decimal で合算する。
    * live はブローカー単位で失敗を許容し、前回の値を使う (取得できたことが無い・換算できないブローカーがあれば incomplete)。
    * 失敗が accountFailLimit 回続いたら degradedReason を付ける (エンジンは新規エントリーを止める)。
+   * 保留中のエントリーは、想定代金 (数量 × 想定価格を口座通貨に換算) の建玉として positions に加え、available から引く
+   * (受付だけで約定が遅れる間に、最大保有数・余力・エクスポージャーの上限を超えて発注しないため)。
    */
   async account(now: number = this.clock.now(), force = false): Promise<AccountState> {
+    return this.withPendingEntries(await this.brokerAccount(now, force));
+  }
+
+  /** 保留中のエントリーを口座情報に加える (base は変更しない) */
+  private withPendingEntries(base: AccountState): AccountState {
+    const entries = this.positions.pendingOrders().filter((o) => o.kind === "entry" && o.entry);
+    if (entries.length === 0) return base;
+    let available = D(base.available);
+    const positions = [...base.positions];
+    for (const o of entries) {
+      const e = o.entry!.input;
+      const inst = this.hub.instrument(o.symbol);
+      const px = e.intendedEntryPrice;
+      let qty: Decimal;
+      try {
+        qty = D(o.qty);
+      } catch {
+        continue;
+      }
+      if (!qty.isFinite() || !qty.gt(0) || !(px > 0)) continue;
+      const cs = e.contractSize ?? inst?.contractSize ?? 1;
+      const ccy = inst?.quoteCurrency;
+      positions.push({
+        symbol: o.symbol,
+        qty: qty.mul(o.side === "buy" ? 1 : -1).toNumber(),
+        avgPrice: px,
+        price: px,
+        assetClass: e.assetClass,
+        contractSize: cs,
+        ...(ccy ? { quoteCurrency: ccy } : {}),
+      });
+      const rate = ccy ? this.fx.toAccount(ccy) : NaN;
+      if (Number.isFinite(rate) && rate > 0) available = available.minus(qty.mul(px).mul(cs).mul(rate));
+    }
+    return { ...base, available: available.toNumber(), positions, pendingEntries: entries.length };
+  }
+
+  /** ブローカーの口座情報 (保留中のエントリーを含まない)。live は venue ごとに並列・締め切りあり */
+  private async brokerAccount(now: number, force: boolean): Promise<AccountState> {
     const paper = this.brokerSet.paper;
     if (!paper && !force && this.acctCache && now - this.acctCache.at < this.opt.liveAccountCacheMs) return this.acctCache.value;
     let equity = D(0);
@@ -439,12 +565,26 @@ export class TradingEngine {
       available = D((await paper.getBalance()).available);
       raw.push(...(await paper.getPositions()));
     } else {
-      for (const b of this.uniqueBrokers()) {
+      const brokers = this.uniqueBrokers();
+      // venue ごとに並列で取得する (1 つの venue の遅延が他を止めない。同じ venue の中は順番どおり)
+      const fetched = await Promise.all(
+        brokers.map(async (b) => {
+          try {
+            const bal = await this.brokerCall(() => b.getBalance(), `${b.venue} getBalance`);
+            const pos = await this.brokerCall(() => b.getPositions(), `${b.venue} getPositions`);
+            return { bal, pos };
+          } catch (e) {
+            return { error: e };
+          }
+        }),
+      );
+      for (const [i, b] of brokers.entries()) {
         const st = this.brokerAcct.get(b) ?? { failures: 0 };
         this.brokerAcct.set(b, st);
         try {
-          const bal = await b.getBalance();
-          const pos = await b.getPositions();
+          const f = fetched[i];
+          if ("error" in f) throw f.error;
+          const { bal, pos } = f;
           if (!D(bal.equity).isFinite() || !D(bal.available).isFinite()) throw new Error(`残高が数値ではありません (equity=${bal.equity})`);
           if (st.failures > 0) this.log.info("口座情報の取得が回復しました", { venue: b.venue, failures: st.failures });
           st.balance = bal;
@@ -454,7 +594,7 @@ export class TradingEngine {
           delete st.lastError;
         } catch (e) {
           st.failures++;
-          st.lastError = e instanceof Error ? e.message : String(e);
+          st.lastError = errMsg(e);
           this.warnThrottled(`acct|${b.venue}`, now, "口座情報の取得に失敗 (前回の値を使います)", { venue: b.venue, failures: st.failures, error: st.lastError });
           if (st.failures >= this.opt.accountFailLimit) degradedReason = `${b.venue}: 口座情報の取得に ${st.failures} 回連続で失敗 (${st.lastError})`;
           if (!st.balance) {
@@ -516,11 +656,13 @@ export class TradingEngine {
 
   private async tickInner(now: number): Promise<TickResult> {
     let killedBefore = Boolean(this.risk.state().killSwitch);
-    // 1. 市場データ (venue ごとに並列。時間上限を超えた venue は次回へ持ち越し)
+    // 1. 市場データ (venue ごとに並列。時間上限を超えた venue は次回へ持ち越し、その銘柄はこのティックで新規エントリーしない)
+    let timedOut = new Set<string>();
     try {
-      await this.hub.poll({ timeoutMs: this.opt.pollTimeoutMs });
+      const r = await this.hub.poll({ timeoutMs: this.opt.pollTimeoutMs });
+      timedOut = new Set(r?.timedOutSymbols ?? []);
     } catch (e) {
-      this.log.error("市場データの取得に失敗", { error: e instanceof Error ? e.message : String(e) });
+      this.log.error("市場データの取得に失敗", { error: errMsg(e) });
     }
     const insts = this.hub.watched();
     const quotes = new Map<string, Quote>();
@@ -535,13 +677,15 @@ export class TradingEngine {
     // 2. ポジション管理 (損切り・利確・トレーリング・時間切れ)。口座照会より前に、直近の気配で銘柄ごとに分離して判定する
     let exits = await this.manageExits(quotes, now);
 
-    // 3. 保留中の注文を照会し、確定したものを journal に反映する
+    // 3. 手動の解消要求 (CLI `orders resolve`) を適用し、保留中の注文を照会して確定したものを journal に反映する
+    //    (状態不明が続いた注文は建玉で確定させる。決済の拒否後の建玉確認もここで行う。venue ごとに並列)
     let entries = 0;
-    if (this.positions.pending.size > 0) {
+    await this.applyResolveRequests(now);
+    if (this.positions.pending.size > 0 || this.positions.hasDeferredChecks()) {
       const sync = await this.positions.syncPending(now);
       entries += sync.opened.length;
-      exits += sync.closed.length;
-      if (sync.opened.length || sync.closed.length) {
+      exits += sync.closed.length + sync.reduced;
+      if (sync.opened.length || sync.closed.length || sync.reduced || sync.resolved || sync.reconciled) {
         this.saveSnapshot();
         this.acctCache = undefined;
       }
@@ -562,6 +706,14 @@ export class TradingEngine {
         clearResumeRequest(this.store);
         killedBefore = false;
         this.log.warn("再開要求を適用しました", { by: resumeReq.by, requestedAt: resumeReq.at });
+        const esc = this.positions.escalatedOrders();
+        if (esc.length) {
+          this.log.warn(
+            "状態不明の注文が残っているため、新規エントリーは止めたままです。建玉の照会で確定するのを待つか、" +
+              "`npm run trader -- orders resolve <clientId> --none|--filled --qty <数量> --price <価格>` で解消してください",
+            { orders: esc.map((o) => `${o.symbol} ${o.kind} clientId=${o.clientId}`) },
+          );
+        }
         this.store.audit({
           ts: now,
           type: "engine.resume_request_applied",
@@ -593,6 +745,7 @@ export class TradingEngine {
       : account.degradedReason
         ? { key: "account_unavailable", sample: account.degradedReason }
         : undefined;
+    this.entryPause(now);
     const ctx: TickCtx = {
       now,
       brief: this.store.latestBrief(),
@@ -601,6 +754,7 @@ export class TradingEngine {
       haltReason: halted.reason,
       account,
       ...(accountBlock ? { entryBlock: accountBlock } : {}),
+      timedOut,
       regimes: new Map(),
       intel: new Map(),
       entries,
@@ -613,7 +767,7 @@ export class TradingEngine {
       try {
         await this.processSymbol(inst, view, ctx);
       } catch (e) {
-        this.log.error("銘柄の処理に失敗", { symbol: inst.symbol, error: e instanceof Error ? e.message : String(e) });
+        this.log.error("銘柄の処理に失敗", { symbol: inst.symbol, error: errMsg(e) });
       }
     }
 
@@ -631,19 +785,22 @@ export class TradingEngine {
     return { now, equity: ctx.account.equity, entries: ctx.entries, exits: ctx.exits, evaluations: ctx.evaluations, killSwitchTripped };
   }
 
-  /** 損切り・利確などの決済判定。銘柄ごとに失敗を分離し、直近の気配で判定する (poll に失敗した銘柄も含む) */
+  /**
+   * 損切り・利確などの決済判定。銘柄ごとに失敗を分離し、直近の気配で判定する (poll に失敗した銘柄も含む)。
+   * venue (ブローカー) ごとに並列で、同じ venue の中は順番どおり (1 つの venue の遅延が他の venue の損切りを止めない)
+   */
   private async manageExits(quotes: Map<string, Quote>, now: number): Promise<number> {
     let exits = 0;
-    for (const pos of this.positions.list()) {
+    await runGrouped(this.positions.list(), (p) => this.positions.brokerKey(p.symbol), async (pos) => {
       try {
         const q = quotes.get(pos.symbol) ?? this.hub.latestQuote(pos.symbol);
-        if (!q) continue;
+        if (!q) return;
         const res = await this.positions.onQuote(pos.symbol, q, now);
         if (res.status === "closed" || res.status === "reduced") exits++;
       } catch (e) {
-        this.log.error("ポジション管理に失敗", { symbol: pos.symbol, error: e instanceof Error ? e.message : String(e) });
+        this.log.error("ポジション管理に失敗", { symbol: pos.symbol, error: errMsg(e) });
       }
-    }
+    });
     return exits;
   }
 
@@ -684,7 +841,7 @@ export class TradingEngine {
     try {
       bp = await this.brokerPositions();
     } catch (e) {
-      this.log.warn("建玉の突き合わせに失敗 (次回に再試行)", { error: e instanceof Error ? e.message : String(e) });
+      this.log.warn("建玉の突き合わせに失敗 (次回に再試行)", { error: errMsg(e) });
       return false;
     }
     const r = this.positions.reconcile(bp, now, {
@@ -700,9 +857,13 @@ export class TradingEngine {
   private entryBlock(inst: Instrument, ctx: TickCtx): { key: string; sample: string } | undefined {
     const sym = inst.symbol;
     if (this.positions.hasPending(sym)) return { key: "pending_order", sample: `${sym}: 保留中の注文の確定待ち` };
+    // 状態不明の注文がある間はエンジン全体の新規エントリーを止める (確定すれば自動で再開)
+    const paused = this.entryPause(ctx.now);
+    if (paused) return paused;
     if (ctx.entryBlock) return ctx.entryBlock;
     const err = this.hub.lastError(sym);
-    if (err) return { key: "poll_failed", sample: `${sym}: ${err}` };
+    if (err) return { key: "poll_failed", sample: `${sym}: ${redactSecrets(err)}` };
+    if (ctx.timedOut.has(sym)) return { key: "poll_timeout", sample: `${sym}: 市場データの取得が時間内に終わりませんでした` };
     if (this.mode === "live") {
       // ブローカーに journal で追跡していない建玉がある銘柄には入らない (外部の建玉との不整合を避ける)
       const bp = ctx.account.positions.find((p) => p.symbol === sym && p.qty !== 0);
@@ -838,7 +999,7 @@ export class TradingEngine {
       try {
         signal = s.evaluate(sctx);
       } catch (e) {
-        this.log.error("戦略の評価に失敗", { strategyId: s.id, symbol: sym, error: e instanceof Error ? e.message : String(e) });
+        this.log.error("戦略の評価に失敗", { strategyId: s.id, symbol: sym, error: errMsg(e) });
         continue;
       }
       if (!signal) continue;
@@ -889,7 +1050,7 @@ export class TradingEngine {
     try {
       this.brokerFor(sym); // 発注先が無い銘柄はリスク判定の前に見送る
     } catch (e) {
-      return this.skip("no_broker", e instanceof Error ? e.message : String(e));
+      return this.skip("no_broker", errMsg(e));
     }
     const liquidityUsd = inst.assetClass === "meme" ? liquidityUsdFor(inst, view, (ccy) => this.fx.toUsd(ccy)) : undefined;
     const acct = ctx.account;
@@ -974,7 +1135,7 @@ export class TradingEngine {
     try {
       r = await this.positions.enter(req, entry, now);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = errMsg(e);
       this.log.error("エントリーの処理に失敗", { symbol: sym, error: msg });
       this.store.audit({ ts: now, type: "engine.order_error", data: { symbol: sym, strategyId: c.strategy.id, error: msg } });
       return this.skip("order_error", msg);
@@ -985,8 +1146,12 @@ export class TradingEngine {
       ctx.account = await this.account(now, true);
       return;
     }
+    if (r.status === "pending") {
+      // 保留中のエントリーを想定代金で口座情報に加え、同じティックの後続の銘柄のリスク判定に反映する
+      ctx.account = await this.account(now);
+      return this.skip("order_pending", `${sym}: ${r.reason ?? "未確定"}`);
+    }
     this.acctCache = undefined;
-    if (r.status === "pending") return this.skip("order_pending", `${sym}: ${r.reason ?? "未確定"}`);
     return this.skip("order_rejected", `${sym}: ${r.reason ?? "rejected"}`);
   }
 
@@ -1074,7 +1239,7 @@ export class TradingEngine {
       if (this.config.env.AUTO_MEME_WATCH) await this.autoMemeWatch(brief, now);
       return plan;
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = errMsg(e);
       this.log.warn("情報ループに失敗 (取引は継続)", { error: msg });
       if (!this.stopped) this.store.audit({ ts: now, type: "engine.intel_error", data: { error: msg } });
       return undefined;
@@ -1114,7 +1279,7 @@ export class TradingEngine {
       }
       return r;
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = errMsg(e);
       this.log.warn("学習ループに失敗 (取引は継続)", { error: msg });
       if (!this.stopped) this.store.audit({ ts: now, type: "engine.learning_error", data: { error: msg } });
       return undefined;
@@ -1136,7 +1301,7 @@ export class TradingEngine {
       try {
         this.watchInstrument(await this.dexFeed!.trackPair(chainId, pairAddress));
       } catch (e) {
-        this.log.warn("自動監視ミームの復元に失敗", { key, error: e instanceof Error ? e.message : String(e) });
+        this.log.warn("自動監視ミームの復元に失敗", { key, error: errMsg(e) });
       }
     }
   }
@@ -1163,7 +1328,7 @@ export class TradingEngine {
         symbols.push(inst.symbol);
         this.store.audit({ ts: now, type: "engine.auto_meme_watch", data: { ...c, symbol: inst.symbol, trendingSymbol: c.symbol } });
       } catch (e) {
-        this.log.warn("ミームの自動監視に失敗", { key: c.key, error: e instanceof Error ? e.message : String(e) });
+        this.log.warn("ミームの自動監視に失敗", { key: c.key, error: errMsg(e) });
       }
     }
     this.store.kvSet(AUTO_MEME_KEY, added);
@@ -1186,7 +1351,7 @@ export class TradingEngine {
     try {
       await this.tick(this.clock.now());
     } catch (e) {
-      this.log.error("ティックの処理に失敗", { error: e instanceof Error ? e.message : String(e) });
+      this.log.error("ティックの処理に失敗", { error: errMsg(e) });
     }
   }
 
@@ -1198,8 +1363,10 @@ export class TradingEngine {
   async start(): Promise<void> {
     if (this.running) return;
     this.stopped = false;
-    // エンジン停止中に書かれた古い再開要求は捨てる (起動後に作動した停止を意図せず解除しない)
-    clearResumeRequest(this.store);
+    // エンジン停止中に書かれた古い再開要求は捨てる (起動後に作動した停止を意図せず解除しない)。
+    // 消すのは自分の mode 宛ての要求だけ (mode の無い古い要求は paper 宛て)。別の mode で動作中のエンジン宛ての要求は残す
+    const staleResume = peekResumeRequest(this.store);
+    if (staleResume && (staleResume.mode ?? "paper") === this.mode) clearResumeRequest(this.store);
     await this.init();
     await this.safeTick();
     void this.runIntel(this.clock.now());
@@ -1231,7 +1398,7 @@ export class TradingEngine {
       const acct = await this.account(now, true);
       if (!acct.incomplete) this.store.saveEquity({ ts: now, equity: acct.equity, mode: this.mode });
     } catch (e) {
-      this.log.warn("停止時の評価額の保存に失敗", { error: e instanceof Error ? e.message : String(e) });
+      this.log.warn("停止時の評価額の保存に失敗", { error: errMsg(e) });
     }
     this.saveSnapshot();
     this.flushSkips(now);
@@ -1280,7 +1447,7 @@ export class TradingEngine {
       baseCurrency: this.config.env.BASE_CURRENCY,
       watched: this.hub.watched().map((i) => ({
         symbol: i.symbol, venue: i.venue, assetClass: i.assetClass,
-        ...(this.hub.lastError(i.symbol) ? { lastError: this.hub.lastError(i.symbol) } : {}),
+        ...(this.hub.lastError(i.symbol) ? { lastError: redactSecrets(this.hub.lastError(i.symbol)!) } : {}),
       })),
       equity: {
         current: acct.equity,
@@ -1293,6 +1460,7 @@ export class TradingEngine {
         ...(halted.reason ? { reason: halted.reason } : {}),
         ...(rs.killSwitch ? { killSwitch: rs.killSwitch } : {}),
         ...(rs.haltedUntil !== undefined ? { haltedUntil: rs.haltedUntil } : {}),
+        ...(this.entriesPaused ? { entriesPaused: { since: this.entriesPaused.since, orders: [...this.entriesPaused.clientIds] } } : {}),
         peakEquity: rs.peakEquity,
         dayStartEquity: rs.dayStartEquity,
         limits: this.config.risk,
@@ -1306,7 +1474,8 @@ export class TradingEngine {
         status: o.status,
         createdAt: o.createdAt,
         unknownCount: o.unknownCount,
-        ...(o.lastError ? { lastError: o.lastError } : {}),
+        ...(o.lastError ? { lastError: redactSecrets(o.lastError) } : {}),
+        ...(o.escalated ? { escalated: true } : {}),
       })),
       ...(plan
         ? {

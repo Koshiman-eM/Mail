@@ -1,7 +1,8 @@
 /**
- * CLI: run / simulate / backtest / intel / report / resume / status
+ * CLI: run / simulate / backtest / intel / report / resume / status / orders
  * 依存なしの簡易引数解析。表示はすべて日本語。
  */
+import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { loadConfig, type AppConfig } from "./core/config";
@@ -12,7 +13,8 @@ import { createFxConverter, quoteCurrencyOfSymbol } from "./engine/fx";
 import {
   equityStats, EXIT_REASON_LABEL, exitFxRates, exitReasonCounts, fmtNum, fmtPct, fmtSigned, fmtTime, renderLearning, renderStrategyTable, summarizeByStrategy,
 } from "./engine/report";
-import { PendingOrders } from "./engine/orders";
+import { D } from "./core/decimal";
+import { peekResolveRequests, PendingOrders, requestResolve, type PendingOrder, type ResolveRequest } from "./engine/orders";
 import { buildRuntime, resolveDbPath } from "./engine/setup";
 import { formatSimulationReport, runSimulation } from "./engine/simulate";
 import { createDefaultSources, IntelService } from "./intel/service";
@@ -158,6 +160,12 @@ export const HELP = `自己学習型マルチアセット自動売買ツール
   report                      評価額・戦略別成績・学習の状態を表示 (DB_PATH)
   resume                      キルスイッチ・日次停止を解除 (監査ログに記録)
   status                      設定と現在の状態を表示
+  orders                      保留中の注文 (受付済み・未約定、状態不明) を一覧
+  orders resolve <clientId> --none
+                              状態不明の注文を「約定なし」として解消 (取引所で約定していないことを確認してから)
+  orders resolve <clientId> --filled --qty <数量> --price <価格>
+                              状態不明の注文を「約定した」として解消 (推定扱いで記録し、学習には使いません)
+                              動作中のエンジンは次のティックで、停止中なら次回の起動時に適用します (監査ログに記録)
 
 実弾 (live) は TRADING_MODE=live と LIVE_TRADING_CONFIRM=I_UNDERSTAND_REAL_MONEY_RISK の両方が必要です。`;
 
@@ -353,18 +361,53 @@ function cmdReport(io: Io): number {
   }
 }
 
-/** キルスイッチ・日次停止の解除 (config.mode のリスク状態だけ)。解除した場合 true */
-export function resumeTrading(config: AppConfig, store: Store, now: number = Date.now(), by = "cli"): { resumed: boolean; message: string } {
+const RESOLVE_HINT = [
+  "  約定していない: npm run trader -- orders resolve <clientId> --none",
+  "  約定した:       npm run trader -- orders resolve <clientId> --filled --qty <数量> --price <価格>",
+];
+
+/** 保留中の注文 1 件の表示 */
+function pendingOrderLine(o: PendingOrder): string {
+  return (
+    `  ${o.escalated ? "[状態不明] " : ""}${o.symbol} ${o.kind === "entry" ? "エントリー" : "決済"} ${o.side} ${o.qty} clientId=${o.clientId}` +
+    `${o.orderId ? ` orderId=${o.orderId}` : ""} 状態 ${o.status}${o.unknownCount ? ` (不明 ${o.unknownCount} 回)` : ""} 発注 ${fmtTime(o.createdAt)}` +
+    `${o.lastError ? ` ${cleanText(o.lastError)}` : ""}`
+  );
+}
+
+/** 状態不明 (escalated) の保留注文の警告 (resume のときに表示する) */
+function escalatedWarnings(store: Store, mode: "paper" | "live"): string[] {
+  const esc = new PendingOrders({ store, mode }).escalated();
+  if (esc.length === 0) return [];
+  return [
+    `警告: 状態不明の注文が ${esc.length} 件残っています (${mode})。解消するまで新規エントリーは止まったままです (決済は続けます)。`,
+    ...esc.map(pendingOrderLine),
+    "取引所で注文と建玉を確認し、次のどちらかで解消してください (エンジンは建玉の照会でも自動的に確定させます):",
+    ...RESOLVE_HINT,
+  ];
+}
+
+/**
+ * キルスイッチ・日次停止の解除 (config.mode のリスク状態だけ)。解除した場合 resumed: true。
+ * 状態不明の保留注文が残っていれば warnings に一覧と `orders resolve` の案内を入れる (解除自体は行う)
+ */
+export function resumeTrading(
+  config: AppConfig,
+  store: Store,
+  now: number = Date.now(),
+  by = "cli",
+): { resumed: boolean; message: string; warnings: string[] } {
   const mode = config.mode;
   const risk = new RiskManager(config.risk, store, { mode });
   const st = risk.state();
-  if (!st.killSwitch && st.haltedUntil === undefined) return { resumed: false, message: `停止状態ではありません (${mode}、変更なし)` };
+  const warnings = escalatedWarnings(store, mode);
+  if (!st.killSwitch && st.haltedUntil === undefined) return { resumed: false, message: `停止状態ではありません (${mode}、変更なし)`, warnings };
   const last = store.listEquity({ mode }).at(-1);
   risk.resume({ ...(last ? { equity: last.equity } : {}), now, by });
   // 別プロセスで動作中のエンジンはメモリ上の状態を持つので、kv の再開要求でも依頼する (同じ mode のエンジンが次のティックで適用)
   requestResume(store, { at: now, by, mode });
   const what = st.killSwitch ? `キルスイッチ (${st.killSwitch.reason})` : `日次停止 (${fmtTime(st.haltedUntil)} まで)`;
-  return { resumed: true, message: `${what} を解除しました。監査ログに記録しました。` };
+  return { resumed: true, message: `${what} を解除しました。監査ログに記録しました。`, warnings };
 }
 
 function cmdResume(io: Io): number {
@@ -374,6 +417,116 @@ function cmdResume(io: Io): number {
     const r = resumeTrading(config, store);
     io.out(r.message);
     if (r.resumed) io.out("※ 実行中のエンジンへは再開要求として伝えました。次のティックで自動的に反映されます (再起動は不要)。エンジンが停止中なら次回起動時の状態から再開します。");
+    r.warnings.forEach((l) => io.err(l));
+    return 0;
+  } finally {
+    store.close();
+  }
+}
+
+/** `orders`: 保留中の注文と、まだ適用されていない解消の要求 (config.mode) */
+export function pendingOrdersText(config: AppConfig, store: Store): string {
+  const mode = config.mode;
+  const pending = new PendingOrders({ store, mode }).list();
+  const lines: string[] = [];
+  if (pending.length === 0) lines.push(`保留中の注文はありません (${mode})`);
+  else {
+    lines.push(`保留中の注文 (${mode}): ${pending.length} 件`);
+    lines.push(...pending.map(pendingOrderLine));
+    if (pending.some((o) => o.escalated)) {
+      lines.push("", "状態不明の注文がある間は新規エントリーを止めています (決済は続けます。建玉の照会で確定すれば自動で再開します)。");
+      lines.push("取引所で注文と建玉を確認してから、次のどちらかで解消できます:", ...RESOLVE_HINT);
+    }
+  }
+  const reqs = peekResolveRequests(store, mode);
+  if (reqs.length) {
+    lines.push("", `適用待ちの解消要求: ${reqs.length} 件 (動作中のエンジンは次のティック、停止中なら次回の起動時に適用)`);
+    for (const r of reqs) lines.push(`  clientId=${r.clientId} ${r.outcome === "none" ? "約定なし" : `約定 ${r.qty} @ ${r.price}`} (${fmtTime(r.at)})`);
+  }
+  return lines.join("\n");
+}
+
+export interface ResolveArgs {
+  clientId: string;
+  outcome: "none" | "filled";
+  qty?: string;
+  price?: number;
+}
+
+/** `orders resolve` の引数解析。--none と --filled のどちらか一方 (--filled は --qty と --price が必要) */
+export function parseResolveArgs(positionals: string[], flags: ParsedArgs["flags"]): ResolveArgs {
+  // `--none <clientId>` の書き方も受け付ける (値付きフラグとして解析されるため)
+  const flagId = [flags.none, flags.filled].find((v): v is string => typeof v === "string");
+  const clientId = positionals[0] ?? flagId;
+  if (!clientId) throw new CliError("解消する注文の clientId を指定してください (npm run trader -- orders で一覧)");
+  const none = flags.none !== undefined;
+  const filled = flags.filled !== undefined;
+  if (none === filled) throw new CliError("--none (約定なし) か --filled --qty <数量> --price <価格> (約定した) のどちらか一方を指定してください");
+  if (none) {
+    if (flags.qty !== undefined || flags.price !== undefined) throw new CliError("--none には --qty / --price を指定できません");
+    return { clientId, outcome: "none" };
+  }
+  const qtyStr = stringFlag(flags, "qty", "");
+  if (!qtyStr) throw new CliError("--filled には --qty <約定数量> が必要です");
+  let qty;
+  try {
+    qty = D(qtyStr);
+  } catch {
+    throw new CliError(`--qty には正の数値を指定してください (指定値: ${qtyStr})`);
+  }
+  if (!qty.isFinite() || !qty.gt(0)) throw new CliError(`--qty には正の数値を指定してください (指定値: ${qtyStr})`);
+  if (flags.price === undefined) throw new CliError("--filled には --price <約定価格> が必要です");
+  const price = numberFlag(flags, "price", NaN);
+  if (!(price > 0)) throw new CliError("--price には正の数値を指定してください");
+  return { clientId, outcome: "filled", qty: qty.toString(), price };
+}
+
+/**
+ * 保留中の注文の解消を要求する (kv `orders:resolveRequests:<mode>`)。
+ * 動作中のエンジンは次のティックで、停止中なら次回の起動時に適用し、監査ログ order.manual_resolve を残す
+ */
+export function requestOrderResolve(config: AppConfig, store: Store, a: ResolveArgs, now: number = Date.now(), by = "cli"): { request: ResolveRequest; message: string } {
+  const mode = config.mode;
+  const o = new PendingOrders({ store, mode }).get(a.clientId);
+  if (!o) throw new CliError(`保留中の注文が見つかりません (${mode}, clientId=${a.clientId})。npm run trader -- orders で一覧を確認してください`);
+  if (a.outcome === "filled" && D(a.qty!).gt(D(o.qty))) {
+    throw new CliError(`--qty (${a.qty}) が注文数量 (${o.qty}) を超えています`);
+  }
+  const request: ResolveRequest = {
+    id: randomUUID(),
+    clientId: a.clientId,
+    outcome: a.outcome,
+    ...(a.outcome === "filled" ? { qty: a.qty, price: a.price } : {}),
+    at: now,
+    by,
+  };
+  requestResolve(store, mode, request);
+  store.audit({
+    ts: now,
+    type: "order.manual_resolve_requested",
+    data: { mode, clientId: a.clientId, symbol: o.symbol, kind: o.kind, outcome: a.outcome, ...(a.outcome === "filled" ? { qty: a.qty, price: a.price } : {}), by },
+  });
+  const what = a.outcome === "none" ? "約定なし" : `約定 (数量 ${a.qty} / 価格 ${a.price}、推定扱い・学習には使いません)`;
+  return {
+    request,
+    message:
+      `${o.symbol} ${o.kind === "entry" ? "エントリー" : "決済"} (clientId=${a.clientId}) を「${what}」として解消する要求を登録しました。` +
+      "動作中のエンジンは次のティックで、停止中なら次回の起動時に適用します (監査ログに記録)。",
+  };
+}
+
+function cmdOrders(positionals: string[], flags: ParsedArgs["flags"], io: Io): number {
+  const sub = positionals[0];
+  if (sub !== undefined && sub !== "list" && sub !== "resolve") throw new CliError(`未知のサブコマンド: orders ${sub} (orders / orders resolve)`);
+  const args = sub === "resolve" ? parseResolveArgs(positionals.slice(1), flags) : undefined;
+  const config = loadConfig();
+  const store = createStore(resolveDbPath(config));
+  try {
+    if (!args) {
+      io.out(pendingOrdersText(config, store));
+      return 0;
+    }
+    io.out(requestOrderResolve(config, store, args).message);
     return 0;
   } finally {
     store.close();
@@ -404,10 +557,8 @@ function cmdStatus(io: Io): number {
     for (const p of open) io.out(`  ${p.symbol} ${p.direction === "long" ? "買い" : "売り"} ${p.qty} @ ${p.entryPrice} (${p.strategyId}, ${fmtTime(p.entryTs)})`);
     const pending = new PendingOrders({ store, mode }).list();
     if (pending.length) {
-      io.out(`保留中の注文 (${mode}): ${pending.length} 件 (取引所で状態を確認してください)`);
-      for (const o of pending) {
-        io.out(`  ${o.symbol} ${o.kind === "entry" ? "エントリー" : "決済"} ${o.side} ${o.qty} clientId=${o.clientId}${o.orderId ? ` orderId=${o.orderId}` : ""} 状態 ${o.status} (${fmtTime(o.createdAt)})${o.lastError ? ` ${o.lastError}` : ""}`);
-      }
+      io.out(`保留中の注文 (${mode}): ${pending.length} 件 (取引所で状態を確認してください。解消は npm run trader -- orders)`);
+      for (const o of pending) io.out(pendingOrderLine(o));
     }
     const plan = store.latestPlan();
     io.out(`最新の計画: ${plan ? `${fmtTime(plan.generatedAt)} (有効期限 ${fmtTime(plan.validUntil)})` : "(なし)"}`);
@@ -443,6 +594,8 @@ export async function main(argv: string[] = process.argv.slice(2), io: Io = cons
         return cmdResume(io);
       case "status":
         return cmdStatus(io);
+      case "orders":
+        return cmdOrders(args.positionals, args.flags, io);
       default:
         io.err(`未知のコマンド: ${args.command}\n`);
         io.out(HELP);

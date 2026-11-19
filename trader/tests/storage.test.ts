@@ -252,4 +252,25 @@ describe("SqliteStore (ファイル)", () => {
     expect(s).toBeInstanceOf(SqliteStore);
     s.close();
   });
+
+  it("transaction: trades と kv の書き込みをまとめて確定し、途中で例外なら両方とも巻き戻す (入れ子は外側に参加)", () => {
+    const s = new SqliteStore(":memory:");
+    expect(s.transaction(() => {
+      s.saveTrade(trade("ok", 1_000));
+      s.kvSet("k", 1);
+      return s.transaction(() => 42);
+    })).toBe(42);
+    expect(() =>
+      s.transaction(() => {
+        s.saveTrade(trade("ng", 2_000));
+        s.kvSet("k", 2);
+        throw new Error("crash");
+      }),
+    ).toThrow("crash");
+    expect(s.listTrades().map((t) => t.id)).toEqual(["ok"]);
+    expect(s.kvGet("k")).toBe(1);
+    s.close();
+    // メモリ実装はそのまま実行する
+    expect(new MemoryStore().transaction(() => "done")).toBe("done");
+  });
 });

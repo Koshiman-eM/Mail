@@ -479,6 +479,11 @@ export interface TradeRecord {
   entryContext: EntryContext;
   /** エグジット後一定時間の値動き (方向付き, エントリー方向に有利なら正)。後から埋める */
   postExitMovePct?: number;
+  /**
+   * 約定を確認できず、建玉の照会や手動の申告から数量・価格を推定した部分を含む (学習には渡さない)。
+   * 推定の価格は照会時点の現在値など
+   */
+  estimated?: boolean;
 }
 
 export type CauseCode =
@@ -620,6 +625,12 @@ export interface Store {
   /** 学習状態 (ArmStats, SourceReliability, 現行パラメータ, RiskState 等) の汎用 KV */
   kvGet<T>(key: string): T | undefined;
   kvSet<T>(key: string, value: T): void;
+
+  /**
+   * fn の中の書き込み (trades・kv など) をまとめて確定する (途中で例外なら何も書かない)。
+   * fn は同期関数 (中で await しない)。入れ子は外側に参加する。未対応の実装では fn をそのまま実行する
+   */
+  transaction?<T>(fn: () => T): T;
 
   close(): void;
 }

@@ -84,6 +84,15 @@ describe("ダッシュボード (listen せずにハンドラーを呼ぶ)", () 
     }
     expect(all.byStrategy[0]).toMatchObject({ strategyId: "flipper", trades: 2 });
     expect(all.exitReasons).toEqual({ signal: 2 });
+    expect(all.trades.some((x: { estimated?: boolean }) => x.estimated)).toBe(false);
+  });
+
+  it("GET /api/trades: 推定 (建玉・手動の申告で確定) を含むトレードには estimated を付ける", async () => {
+    const d = await deps();
+    const [t] = d.store.listTrades();
+    d.store.saveTrade({ ...t, id: "est-1", exitTs: t.exitTs + 1, estimated: true });
+    const all = JSON.parse((await routeDashboard(d, "GET", "/api/trades")).body);
+    expect(all.trades.filter((x: { estimated?: boolean }) => x.estimated).map((x: { id: string }) => x.id)).toEqual(["est-1"]);
   });
 
   it("GET /api/learning: 学習スナップショット", async () => {

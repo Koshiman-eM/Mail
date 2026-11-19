@@ -42,6 +42,7 @@ describe("MarketHub.poll", () => {
     const r1 = await hub.poll({ timeoutMs: 50 });
     expect(Date.now() - t0).toBeLessThan(1_000);
     expect(r1.timedOut).toEqual(["slow"]);
+    expect(r1.timedOutSymbols).toEqual(["S/USD"]); // エンジンはこの銘柄の新規エントリーをこのティックで見送る
     expect(hub.latestQuote("F/USD")?.bid).toBe(20);
     expect(hub.latestQuote("S/USD")).toBeUndefined();
     // 取得中の venue は再度呼ばない
@@ -52,6 +53,7 @@ describe("MarketHub.poll", () => {
     slow.open();
     const r3 = await hub.poll({ timeoutMs: 1_000 });
     expect(r3.timedOut).toEqual([]);
+    expect(r3.timedOutSymbols).toEqual([]);
     expect(hub.latestQuote("S/USD")?.bid).toBe(10);
   });
 

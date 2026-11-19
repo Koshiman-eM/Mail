@@ -45,11 +45,22 @@ export interface PendingOrder {
   lastError?: string;
   lastCheckedAt?: number;
   cancelRequestedAt?: number;
-  /** kill switch を発動済み (二重に発動しない) */
+  /**
+   * 状態不明が続いた (不明 maxUnknownCount 回、または maxUnknownMs)。kill switch は発動せず、
+   * エンジン全体の新規エントリーだけを止め (解消すれば自動で再開)、ブローカーの建玉で確定させる
+   */
   escalated?: boolean;
+  escalatedAt?: number;
+  /** 建玉による確定のために最後に getPositions を呼んだ時刻 */
+  positionCheckAt?: number;
+  /** 建玉による直前の判定 (同じ判定が 2 回続いたら確定する) */
+  positionObs?: { verdict: PositionVerdict; qty: string; at: number; count?: number };
   entry?: PendingEntry;
   exit?: PendingExit;
 }
+
+/** 建玉による判定: none = 約定なし / filled = 全量約定 / partial = 一部約定 */
+export type PositionVerdict = "none" | "filled" | "partial";
 
 export const isFinalStatus = (s: PendingStatus): s is "filled" | "canceled" | "rejected" =>
   s === "filled" || s === "canceled" || s === "rejected";
@@ -87,6 +98,11 @@ export class PendingOrders {
     return this.orders.size;
   }
 
+  /** 状態不明が続いている (escalated) 注文 */
+  escalated(): PendingOrder[] {
+    return this.list().filter((o) => o.escalated);
+  }
+
   /** 銘柄に保留中の注文があるか */
   hasSymbol(symbol: string): boolean {
     for (const o of this.orders.values()) if (o.symbol === symbol) return true;
@@ -102,4 +118,49 @@ export class PendingOrders {
   remove(clientId: string): void {
     if (this.orders.delete(clientId)) this.persist();
   }
+}
+
+// ───────── 手動での解消 (CLI `orders resolve`) ─────────
+
+/** 別プロセスの CLI からエンジンへ保留中の注文の解消を依頼する kv キー (mode 別) */
+export const RESOLVE_REQUESTS_KEY = "orders:resolveRequests";
+export const resolveRequestsKey = (mode: TradingMode) => `${RESOLVE_REQUESTS_KEY}:${mode}`;
+
+export interface ResolveRequest {
+  /** 要求の ID (処理済みの要求だけを消すため) */
+  id: string;
+  clientId: string;
+  /** none: 約定なし / filled: 数量 qty・価格 price で約定した */
+  outcome: "none" | "filled";
+  /** 約定数量 (decimal 文字列, outcome = filled のとき) */
+  qty?: string;
+  /** 約定価格 (outcome = filled のとき) */
+  price?: number;
+  at: number;
+  by: string;
+}
+
+const isResolveRequest = (v: unknown): v is ResolveRequest => {
+  const r = v as ResolveRequest;
+  return Boolean(r) && typeof r.id === "string" && typeof r.clientId === "string" && (r.outcome === "none" || r.outcome === "filled");
+};
+
+/** 解消の要求を追加する (動作中のエンジンは次のティック、停止中なら次回の起動時に適用する) */
+export function requestResolve(store: Store, mode: TradingMode, req: ResolveRequest): void {
+  const cur = peekResolveRequests(store, mode).filter((r) => r.id !== req.id);
+  store.kvSet<ResolveRequest[]>(resolveRequestsKey(mode), [...cur, req]);
+}
+
+/** 解消の要求を読む (消さない) */
+export function peekResolveRequests(store: Store, mode: TradingMode): ResolveRequest[] {
+  const v = store.kvGet<unknown>(resolveRequestsKey(mode));
+  return Array.isArray(v) ? v.filter(isResolveRequest) : [];
+}
+
+/** 処理した要求だけを消す (読んだ後に追加された要求は残す) */
+export function removeResolveRequests(store: Store, mode: TradingMode, ids: string[]): void {
+  if (ids.length === 0) return;
+  const done = new Set(ids);
+  const rest = peekResolveRequests(store, mode).filter((r) => !done.has(r.id));
+  store.kvSet<ResolveRequest[] | undefined>(resolveRequestsKey(mode), rest.length ? rest : undefined);
 }

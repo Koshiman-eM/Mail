@@ -1,10 +1,12 @@
-import type { Balance, Broker, BrokerPosition, OrderRequest, OrderResult, OrderStatus, Quote } from "../../src/core/types";
+import type { Balance, Broker, BrokerPosition, OrderLookupHint, OrderRequest, OrderResult, OrderStatus, Quote } from "../../src/core/types";
 
 /**
  * テスト用の「受付のみ」を返す live ブローカー (実在の取引所へは何も送らない)。
  * - placeMode: accept = status "open" / fills [] で受付だけ返す (bitFlyer・Alpaca の成行で多い応答)
  *              fill = 即時に全量約定 / reject = 拒否 / throw = 例外 (タイムアウト等で状態不明)
  * - fill() で取引所側の約定を進め、getOrder は累計の約定を返す。
+ * - throwPlaceFor / throwGetOrderFor: 銘柄ごとに発注・照会を例外にする (placeError でエラー文を変えられる)。
+ * - placeGate: 発注の応答を止める (返した Promise が解決するまで待つ。遅延・締め切りの試験用)。
  */
 export class FakeLiveBroker implements Broker {
   readonly mode = "live" as const;
@@ -20,6 +22,17 @@ export class FakeLiveBroker implements Broker {
   readonly placed: OrderRequest[] = [];
   readonly canceled: string[] = [];
   readonly getOrderCalls: string[] = [];
+  /** getOrder に渡された hint (getOrderCalls と同じ順) */
+  readonly getOrderHints: (OrderLookupHint | undefined)[] = [];
+  getPositionsCalls = 0;
+  /** この銘柄の発注・照会は例外 */
+  readonly throwPlaceFor = new Set<string>();
+  readonly throwGetOrderFor = new Set<string>();
+  placeError = "ETIMEDOUT (fake placeOrder)";
+  /** 発注の応答を遅らせる (undefined を返せば即時) */
+  placeGate?: (req: OrderRequest) => Promise<void> | undefined;
+  /** getPositions の平均取得単価 (無ければ 0) */
+  readonly avgPrices = new Map<string, number>();
   /** 取引所側の建玉 (符号付き) */
   readonly positions = new Map<string, number>();
   quoteOf: (symbol: string) => Quote | undefined = () => undefined;
@@ -34,13 +47,18 @@ export class FakeLiveBroker implements Broker {
   }
 
   async getPositions(): Promise<BrokerPosition[]> {
+    this.getPositionsCalls++;
     if (this.failAccount) throw new Error("ETIMEDOUT (fake positions)");
-    return [...this.positions].filter(([, q]) => Math.abs(q) > 1e-12).map(([symbol, q]) => ({ symbol, qty: String(q), avgPrice: 0 }));
+    return [...this.positions]
+      .filter(([, q]) => Math.abs(q) > 1e-12)
+      .map(([symbol, q]) => ({ symbol, qty: String(q), avgPrice: this.avgPrices.get(symbol) ?? 0 }));
   }
 
   async placeOrder(req: OrderRequest): Promise<OrderResult> {
     this.placed.push({ ...req });
-    if (this.placeMode === "throw") throw new Error("ETIMEDOUT (fake placeOrder)");
+    const gate = this.placeGate?.(req);
+    if (gate) await gate;
+    if (this.placeMode === "throw" || this.throwPlaceFor.has(req.symbol)) throw new Error(this.placeError);
     if (req.reduceOnly) {
       // 実アダプターと同じく、決済は保有数量を上限にする (無ければ拒否)
       const held = this.positions.get(req.symbol) ?? 0;
@@ -87,9 +105,10 @@ export class FakeLiveBroker implements Broker {
     return this.placed[this.placed.length - 1];
   }
 
-  async getOrder(clientId: string, _symbol: string, _orderId?: string): Promise<OrderResult | undefined> {
+  async getOrder(clientId: string, symbol: string, _orderId?: string, hint?: OrderLookupHint): Promise<OrderResult | undefined> {
     this.getOrderCalls.push(clientId);
-    if (this.getOrderMode === "throw") throw new Error("ETIMEDOUT (fake getOrder)");
+    this.getOrderHints.push(hint ? { ...hint } : undefined);
+    if (this.getOrderMode === "throw" || this.throwGetOrderFor.has(symbol)) throw new Error("ETIMEDOUT (fake getOrder)");
     if (this.getOrderMode === "missing") return undefined;
     const rec = this.orders.get(clientId);
     return rec ? structuredClone(rec.res) : undefined;
