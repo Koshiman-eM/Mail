@@ -3,6 +3,7 @@ import { basename, dirname, extname, join } from "node:path";
 import type { AiOptions } from "../core/ai";
 import type { AppConfig } from "../core/config";
 import { createLogger, type Logger } from "../core/logger";
+import { withSimulatedShort } from "../core/short";
 import {
   systemClock, TIMEFRAME_MS, type AssetClass, type Clock, type Instrument, type MarketDataFeed, type Store, type Strategy, type Timeframe,
 } from "../core/types";
@@ -250,6 +251,10 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
     const feed = getDex();
     if (!feeds.includes(feed)) feeds.push(feed);
   }
+  // paper の空売りの再現: 発注先の mode が paper で PAPER_SIMULATE_SHORT=true のときだけ、空売り不可の現物暗号資産に
+  // simulatedShort を付ける (allowShort は書き換えない。live では付けず、付いていても canShort が live では無視する)
+  const tradeMode = opts.brokerSet?.mode ?? config.mode;
+  for (const p of pairs) p.inst = withSimulatedShort(p.inst, { mode: tradeMode, enabled: env.PAPER_SIMULATE_SHORT });
   const instruments = pairs.map((p) => p.inst);
   if (instruments.length === 0) throw new Error("監視銘柄がありません (VENUES / WATCHLIST を確認してください)");
 

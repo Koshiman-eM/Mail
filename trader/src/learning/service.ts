@@ -173,7 +173,9 @@ export class LearningService {
     this.store.saveAttribution(att);
     const arm = this.allocator.update(trade);
     this.auditArmTransition(arm, trade.exitTs, { tradeId: trade.id, source: "trade" });
-    const sources = this.reliability.update(trade);
+    // paper で再現した空売り (simulatedShort) は情報源の信頼度・情報の効き具合を更新しない
+    // (live で実行できない取引の結果を、買いの判断に使う情報の重みに混ぜない。腕は方向別のキーで学習済み)
+    const sources = trade.simulatedShort ? [] : this.reliability.update(trade);
     this.store.audit({
       ts: trade.exitTs,
       type: "learning.trade_closed",
@@ -186,6 +188,7 @@ export class LearningService {
         causes: att.causes.map((c) => ({ code: c.code, weight: Number(c.weight.toFixed(3)) })),
         arm: arm.key,
         armWeight: this.allocator.weight(arm.key),
+        ...(trade.simulatedShort ? { simulatedShort: true } : {}),
         sources,
       },
     });
@@ -210,7 +213,8 @@ export class LearningService {
     const arm = this.allocator.updateShadow(t);
     this.auditArmTransition(arm, t.exitTs, { shadowId: t.id, source: "shadow", reason: t.reason });
     const w = this.deps.influenceShadowWeight ?? DEFAULT_INFLUENCE_SHADOW_WEIGHT;
-    if (t.reason === "direction_bias" && w > 0 && typeof opts.intelSentiment === "number" && Number.isFinite(opts.intelSentiment)) {
+    // paper で再現した空売りの仮想トレードは情報の効き具合に入れない (腕は方向別のキーで学習済み。onTradeClosed と同じ理由)
+    if (t.reason === "direction_bias" && !t.simulatedShort && w > 0 && typeof opts.intelSentiment === "number" && Number.isFinite(opts.intelSentiment)) {
       // 決済済みトレードの更新 (reliability.updateInfluence) と同じ尺度: x = 情報バイアス × 取引方向、y = R (仮想は純 R)
       const dir = t.direction === "long" ? 1 : -1;
       observeInfluenceWeighted(this.store, this.mode, this.reliability.opts, t.assetClass, opts.intelSentiment * dir, t.netR, w, t.exitTs);
@@ -303,7 +307,7 @@ export class LearningService {
           this.store.saveAttribution(this.attribute(t, prev?.createdAt));
           res.reattributed++;
           // 情報源の信頼度: 決済時の更新をエグジット後の値動きで差分だけ直す (決済時の記録が無ければ何もしない = 二重に数えない)
-          if (!t.estimated && (t.mode === undefined || t.mode === this.mode)) {
+          if (!t.estimated && !t.simulatedShort && (t.mode === undefined || t.mode === this.mode)) {
             try {
               if (this.reliability.reviseWithPostExit(t, now).length > 0) res.reliabilityRevised = (res.reliabilityRevised ?? 0) + 1;
             } catch (e) {
@@ -358,19 +362,22 @@ export class LearningService {
     }
   }
 
-  /** 腕の配分倍率 (探索込み)。エンジンがエントリー時にリスク予算に掛ける (無効化中の腕は exploreProb で探索) */
-  armWeight(strategyId: string, regime: RegimeLabel, assetClass: AssetClass, rng?: Rng): number {
-    return this.allocator.explorationWeight(armKey(strategyId, regime, assetClass), rng);
+  /**
+   * 腕の配分倍率 (探索込み)。エンジンがエントリー時にリスク予算に掛ける (無効化中の腕は exploreProb で探索)。
+   * simulatedShort: paper で再現した空売りの腕 (…|short)
+   */
+  armWeight(strategyId: string, regime: RegimeLabel, assetClass: AssetClass, rng?: Rng, simulatedShort = false): number {
+    return this.allocator.explorationWeight(armKey(strategyId, regime, assetClass, simulatedShort), rng);
   }
 
   /** 計画用の腕の配分倍率 (乱数なし・決定的。無効化中は 0) */
-  armPlanWeight(strategyId: string, regime: RegimeLabel, assetClass: AssetClass): number {
-    return this.allocator.weight(armKey(strategyId, regime, assetClass));
+  armPlanWeight(strategyId: string, regime: RegimeLabel, assetClass: AssetClass, simulatedShort = false): number {
+    return this.allocator.weight(armKey(strategyId, regime, assetClass, simulatedShort));
   }
 
   /** 腕が無効化中か (保存した状態) */
-  isArmDisabled(strategyId: string, regime: RegimeLabel, assetClass: AssetClass): boolean {
-    return this.allocator.isDisabled(armKey(strategyId, regime, assetClass));
+  isArmDisabled(strategyId: string, regime: RegimeLabel, assetClass: AssetClass, simulatedShort = false): boolean {
+    return this.allocator.isDisabled(armKey(strategyId, regime, assetClass, simulatedShort));
   }
 
   /** 学習済みの現行パラメータ (未知の戦略は undefined) */

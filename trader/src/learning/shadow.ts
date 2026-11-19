@@ -71,6 +71,12 @@ export interface ShadowRecordInput {
   /** 見送り理由 (正規化したキー) */
   reason: string;
   now: number;
+  /**
+   * paper で再現した空売り (取引所では空売りできない現物の売り)。腕は方向別のキー (…|short) で学習し、
+   * 借入コスト (エントリーの仲値 × borrowRateDaily × 保有日数) を costR / netR に含める
+   */
+  simulatedShort?: boolean;
+  borrowRateDaily?: number;
 }
 
 /** 前回の判定以降の値幅 (1m 確定足の高値・安値。仲値ベース) */
@@ -271,6 +277,9 @@ export class ShadowTracker {
       risk,
       mfeR: 0,
       maeR: 0,
+      ...(input.simulatedShort && !long
+        ? { simulatedShort: true, borrowRateDaily: finite(input.borrowRateDaily) ? Math.max(0, input.borrowRateDaily) : 0 }
+        : {}),
     };
     this.open.push(o);
     this.keys.add(key);
@@ -400,6 +409,14 @@ export class ShadowTracker {
     }
     if (!reason || !exit) return undefined;
     const r = shadowR(o, exit);
+    // 再現した空売りの借入コスト (PaperBroker と同じ: 建玉代金 × 日率 × 保有日数。ここでは 1 単位あたりを R に換算)
+    const borrow = o.simulatedShort && finite(o.borrowRateDaily) && o.borrowRateDaily > 0
+      ? (o.entryMid * o.borrowRateDaily * Math.max(0, now - o.entryTs)) / 86_400_000 / o.risk
+      : 0;
+    if (borrow > 0) {
+      r.netR -= borrow;
+      r.costR += borrow;
+    }
     const { risk: _risk, lastCandleTs: _l, mfeR, maeR, ...base } = o;
     return { ...base, exitTs: now, exitPrice: exit.fill, exitReason: reason, ...r, mfeR, maeR };
   }
@@ -450,8 +467,17 @@ export interface ShadowSummary {
   byStrategy: ShadowGroup[];
   /** 見送り理由 × 戦略 ("理由 / 戦略") */
   byReasonStrategy: ShadowGroup[];
+  /** 方向別 ("買い" / "売り" / "空売り (paper 再現)")。paper で再現した空売りを買いと分けて見る */
+  bySide?: ShadowGroup[];
   exitReasons: Partial<Record<ShadowExitReason, number>>;
   counters: ShadowCounters;
+}
+
+/** 方向の表示名。paper で再現した空売りは「空売り (paper 再現)」として買い・取引所で可能な売りと分ける */
+export const SIMULATED_SHORT_LABEL = "空売り (paper 再現)";
+export function sideLabel(direction: "long" | "short", simulatedShort?: boolean): string {
+  if (direction === "long") return "買い";
+  return simulatedShort ? SIMULATED_SHORT_LABEL : "売り";
 }
 
 const emptyCounters = (): ShadowCounters => ({ created: 0, closed: 0, duplicate: 0, droppedCap: 0, droppedRate: 0, invalid: 0, unwatched: 0 });
@@ -490,6 +516,7 @@ export function summarizeShadowTrades(
     byReason: group((t) => t.reason),
     byStrategy: group((t) => t.strategyId),
     byReasonStrategy: group((t) => `${t.reason} / ${t.strategyId}`),
+    bySide: group((t) => sideLabel(t.direction, t.simulatedShort)),
     exitReasons,
     counters: extra.counters ?? emptyCounters(),
   };

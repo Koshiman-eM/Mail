@@ -1,6 +1,7 @@
 import type { Candle, IntelBias, Signal, Strategy, StrategyContext, Timeframe } from "../core/types";
 import { TIMEFRAME_MS } from "../core/types";
 import { roundToStep, toNum } from "../core/decimal";
+import { canShort } from "../core/short";
 
 /** 戦略共通ヘルパー */
 
@@ -66,7 +67,8 @@ export function buildEntrySignal(a: EntryArgs): Signal | null {
   const { ctx, strategy, direction } = a;
   const p = ctx.params;
   const inst = ctx.market.instrument;
-  if (direction === "short" && !inst.allowShort) return null;
+  // 実効の空売り可否 (取引所で可能か、paper で再現する銘柄で ctx.mode が paper のとき。live では allowShort だけ)
+  if (direction === "short" && !canShort(inst, ctx.mode)) return null;
   if (!(a.atr > 0) || !Number.isFinite(a.atr)) return null;
   const price = refPrice(ctx, direction, a.lastPrice);
   if (!(price > 0)) return null;

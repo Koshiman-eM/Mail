@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { DEFAULT_SHORT_BORROW_RATE_DAILY, MAX_SHORT_BORROW_RATE_DAILY } from "./short";
 import type { AssetClass, RiskLimits } from "./types";
 
 /**
@@ -91,6 +92,23 @@ const riskEnv = (k: RiskSettingKey) => {
   return s.kind === "ratio" ? ratio(s.env, s.def, s.max) : count(s.env, s.def, s.max);
 };
 
+/**
+ * 真偽値の環境変数 (1/true/yes/on と 0/false/no/off。大文字小文字は問わない)。未設定・空は def。
+ * それ以外は書き間違いとして起動を止める (既定 true の項目を誤って無効にしたつもりで有効のまま動かさない)
+ */
+const bool = (key: string, def: boolean) =>
+  z
+    .string()
+    .optional()
+    .transform((v, ctx) => {
+      const x = (v ?? "").trim().toLowerCase();
+      if (x === "") return def;
+      if (["1", "true", "yes", "on"].includes(x)) return true;
+      if (["0", "false", "no", "off"].includes(x)) return false;
+      ctx.addIssue({ code: "custom", message: `${key}=${v} は true / false で指定してください` });
+      return z.NEVER;
+    });
+
 const str = (def = "") =>
   z
     .string()
@@ -107,6 +125,18 @@ const EnvSchema = z.object({
   WATCHLIST: str(),
   BASE_CURRENCY: str("JPY"),
   PAPER_INITIAL_EQUITY: num(1_000_000),
+  /**
+   * paper で、取引所では空売りできない現物の暗号資産 (allowShort=false。meme・DEX は対象外) の空売りを再現して学習する (既定 true)。
+   * live では常に無効 (src/core/short.ts の canShort)
+   */
+  PAPER_SIMULATE_SHORT: bool("PAPER_SIMULATE_SHORT", true),
+  /**
+   * paper で再現する空売りの借入コスト (建玉代金に対する日率。0〜0.01)。既定 0.0004 (0.04%/日) は
+   * bitbank の信用取引の手数料・金利を想定した仮の値。実際の料率は取引所で確認すること
+   */
+  PAPER_SHORT_BORROW_RATE_DAILY: num(DEFAULT_SHORT_BORROW_RATE_DAILY).refine((x) => x >= 0 && x <= MAX_SHORT_BORROW_RATE_DAILY, {
+    message: `PAPER_SHORT_BORROW_RATE_DAILY は 0 以上 ${MAX_SHORT_BORROW_RATE_DAILY} 以下の日率で指定してください (0.04%/日なら 0.0004)`,
+  }),
   DB_PATH: str("./data/trader.db"),
 
   ANTHROPIC_API_KEY: str(),

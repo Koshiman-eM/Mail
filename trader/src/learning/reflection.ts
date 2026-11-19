@@ -184,13 +184,16 @@ class Acc {
   }
 }
 
-/** 期間内のトレードを集計 (opts.mode の取引のうち、推定約定 estimated を除く) */
+/**
+ * 期間内のトレードを集計 (opts.mode の取引のうち、推定約定 estimated と paper で再現した空売り simulatedShort を除く)。
+ * 振り返りの提案はパラメータ (買い・売り共通) の調整と教訓になるので、live で実行できない取引は混ぜない (tuner と同じ基準)
+ */
 export function computeReflectionStats(opts: ReflectOptions): ReflectionStats {
   const { store, now, windowMs } = opts;
   const from = now - windowMs;
   const trades = store
     .listTrades({ since: from, until: now, ...(opts.mode ? { mode: opts.mode } : {}) })
-    .filter((t) => !t.estimated);
+    .filter((t) => !t.estimated && !t.simulatedShort);
   const atts = new Map<string, TradeAttribution>();
   for (const t of trades) {
     atts.set(t.id, store.getAttribution(t.id) ?? attributeTrade(t, { strategyRegimes: opts.strategyRegimes }));

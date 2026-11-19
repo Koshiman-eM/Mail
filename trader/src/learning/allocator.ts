@@ -1,11 +1,22 @@
 import type { ArmStats, AssetClass, RegimeLabel, ShadowTradeRecord, Store, TradeRecord, TradingMode } from "../core/types";
 import { tradeOutcome } from "./attribution";
 
-/** 腕のキー: 戦略×レジーム×資産クラス */
-export const armKey = (strategyId: string, regime: RegimeLabel, assetClass: AssetClass) =>
-  `${strategyId}|${regime}|${assetClass}`;
+/** paper で再現した空売りの腕のキーの接尾辞 */
+export const SIMULATED_SHORT_ARM_SUFFIX = "|short";
 
-export const armKeyOf = (t: TradeRecord) => armKey(t.strategyId, t.entryContext.regime.label, t.assetClass);
+/**
+ * 腕のキー: 戦略×レジーム×資産クラス。
+ * paper で再現した空売り (simulatedShort) は別の腕 `<戦略>|<レジーム>|<資産クラス>|short` で学習する
+ * (live で実行できない取引の結果を買いの配分・停止の判断に混ぜない)。買いと、取引所で空売りできる銘柄 (FX・株) の売りは
+ * 従来どおり接尾辞なしのキー (保存済みの腕と互換)。live では simulatedShort が無いので short の腕は使われない
+ */
+export const armKey = (strategyId: string, regime: RegimeLabel, assetClass: AssetClass, simulatedShort = false) =>
+  `${strategyId}|${regime}|${assetClass}${simulatedShort ? SIMULATED_SHORT_ARM_SUFFIX : ""}`;
+
+/** paper で再現した空売りの腕か */
+export const isSimulatedShortArm = (key: string) => key.endsWith(SIMULATED_SHORT_ARM_SUFFIX);
+
+export const armKeyOf = (t: TradeRecord) => armKey(t.strategyId, t.entryContext.regime.label, t.assetClass, t.simulatedShort === true);
 
 export interface AllocatorOptions {
   /** 勝率のベータ事前分布 */
@@ -268,7 +279,7 @@ export class StrategyAllocator {
    */
   updateShadow(t: ShadowTradeRecord, now: number = t.exitTs): ArmUpdate {
     const winInc = t.netR > 0 ? 1 : t.netR < 0 ? 0 : 0.5;
-    return this.observe(armKey(t.strategyId, t.regime, t.assetClass), winInc, t.netR, this.opts.shadowWeight, now, true);
+    return this.observe(armKey(t.strategyId, t.regime, t.assetClass, t.simulatedShort === true), winInc, t.netR, this.opts.shadowWeight, now, true);
   }
 
   /** 重み w の観測で腕を更新する (ベータ分布は w を足し、忘却も w 回分。EWMA の係数も w に比例) */

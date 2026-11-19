@@ -46,6 +46,8 @@ export function createBrokers(config: AppConfig, instruments: Instrument[], deps
       instruments,
       baseCurrency: config.env.BASE_CURRENCY,
       initialEquity: config.env.PAPER_INITIAL_EQUITY,
+      // paper で再現する空売りの借入コスト (日率)。live の経路 (下) には渡さない
+      shortBorrowRateDaily: config.env.PAPER_SHORT_BORROW_RATE_DAILY,
       clock: deps.clock,
       ...(deps.quoteProvider ? { quoteProvider: deps.quoteProvider } : {}),
       ...(deps.toAccount ? { toAccount: deps.toAccount } : {}),

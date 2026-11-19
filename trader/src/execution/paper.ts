@@ -1,6 +1,7 @@
 import { D, floorToStep, roundToStep, Decimal } from "../core/decimal";
 import { TerminalMap, isTerminalOrder } from "../core/sweep";
 import { createLogger } from "../core/logger";
+import { canShort, DEFAULT_SHORT_BORROW_RATE_DAILY } from "../core/short";
 import {
   systemClock, type Balance, type Broker, type BrokerPosition, type Clock, type Fill, type Instrument, type OrderRequest, type OrderResult, type Quote,
 } from "../core/types";
@@ -22,13 +23,27 @@ export interface PaperBrokerOptions {
   clock?: Clock;
   /** quote が未受信のときの取得元 */
   quoteProvider?: (symbol: string) => Quote | undefined;
+  /**
+   * 空売りを再現する銘柄 (simulatedShort。allowShort=false の現物) の借入コストの日率 (既定 0.0004 = 0.04%/日)。
+   * 建玉代金 (平均建値 × 数量) × 日率 × 経過日数 (日割り) を、買い戻しの約定の手数料に加えて計上する
+   */
+  shortBorrowRateDaily?: number;
 }
 
 interface Pos {
   qty: Decimal;
   avg: Decimal;
   openedAt: number;
+  /**
+   * 再現した空売り (allowShort=false の銘柄の負の建玉) の借入コストの計算の起点 (この時刻までの分は borrowAccrued に積んだ)。
+   * 取引所で空売りできる銘柄 (FX・株) と買いの建玉には付けない (従来の会計のまま)
+   */
+  borrowFrom?: number;
+  /** borrowFrom までに積んだ未払いの借入コスト (クオート通貨建て) */
+  borrowAccrued?: Decimal;
 }
+
+const DAY_MS = 86_400_000;
 
 interface RestingOrder {
   orderId: string;
@@ -43,7 +58,7 @@ export interface PaperSnapshot {
   cash: string;
   realizedPnl: string;
   seq: number;
-  positions: { symbol: string; qty: string; avg: string; openedAt: number }[];
+  positions: { symbol: string; qty: string; avg: string; openedAt: number; borrowFrom?: number; borrowAccrued?: string }[];
   resting: { orderId: string; req: OrderRequest; qty: string; limitPrice: string; createdAt: number }[];
   results: Record<string, OrderResult>;
   quotes: Record<string, Quote>;
@@ -77,6 +92,7 @@ export class PaperBroker implements Broker {
   private lastRates = new Map<string, Decimal>();
   private readonly warned = new Set<string>();
   private listeners: ((f: Fill, symbol: string, side: "buy" | "sell") => void)[] = [];
+  private readonly borrowRate: Decimal;
 
   constructor(private readonly o: PaperBrokerOptions) {
     for (const i of o.instruments) this.inst.set(i.symbol, i);
@@ -86,6 +102,20 @@ export class PaperBroker implements Broker {
     this.toAcct = o.toAccount ?? (() => 1);
     this.clock = o.clock ?? systemClock;
     this.lev = { ...DEFAULT_LEVERAGE, ...(o.leverage ?? {}) };
+    const br = o.shortBorrowRateDaily;
+    this.borrowRate = D(br !== undefined && Number.isFinite(br) && br >= 0 ? br : DEFAULT_SHORT_BORROW_RATE_DAILY);
+  }
+
+  /** 空売りできるか (取引所で可能、または paper で再現する銘柄)。PaperBroker は paper 専用なので mode は paper */
+  private shortable(inst: Instrument): boolean {
+    return canShort(inst, this.mode);
+  }
+
+  /** 再現した空売りの、now までの未払いの借入コスト (クオート通貨建て)。対象外の建玉は 0 */
+  private borrowOwed(p: Pos, inst: Instrument, now: number): Decimal {
+    if (p.borrowFrom === undefined) return D(0);
+    const days = D(Math.max(0, now - p.borrowFrom)).div(DAY_MS);
+    return (p.borrowAccrued ?? D(0)).plus(p.avg.mul(p.qty.abs()).mul(this.cs(inst)).mul(this.borrowRate).mul(days));
   }
 
   addInstrument(i: Instrument): void {
@@ -148,7 +178,8 @@ export class PaperBroker implements Broker {
       const fx = this.fx(inst);
       if (!fx) continue;
       const m = marks?.[sym] !== undefined ? D(marks[sym]) : this.mark(sym, p.avg);
-      u = u.plus(m.minus(p.avg).mul(p.qty).mul(this.cs(inst)).mul(fx));
+      // 再現した空売りの未払いの借入コストは負債として評価額から引く (決済時に手数料として現金から引く)
+      u = u.plus(m.minus(p.avg).mul(p.qty).mul(this.cs(inst)).mul(fx)).minus(this.borrowOwed(p, inst, this.clock.now()).mul(fx));
     }
     return u;
   }
@@ -246,7 +277,7 @@ export class PaperBroker implements Broker {
     }
     if (qty.lte(0)) return this.reject(req, "数量が 0 以下 (lotSize 未満)");
     if (qty.lt(inst.minQty) && !req.reduceOnly) return this.reject(req, `数量が最小未満: ${qty} < ${inst.minQty}`);
-    if (!inst.allowShort && req.side === "sell" && qty.gt(Decimal.max(cur, 0))) {
+    if (!this.shortable(inst) && req.side === "sell" && qty.gt(Decimal.max(cur, 0))) {
       return this.reject(req, `${req.symbol} は空売り不可 (保有 ${cur} を超える売り)`);
     }
     const q = this.quoteOf(req.symbol);
@@ -298,24 +329,48 @@ export class PaperBroker implements Broker {
     const now = this.clock.now();
     const cs = this.cs(inst);
     let realizedQuote = D(0);
+    /** 再現した空売りの借入コスト (買い戻した分。クオート通貨建て) */
+    let borrowFee = D(0);
+    // 取引所で空売りできない銘柄の負の建玉 (= paper で再現した空売り) だけ借入コストを積む
+    const simulated = (q: Decimal) => q.isNegative() && !inst.allowShort;
 
     if (!pos || cur.isZero() || cur.isPositive() === signed.isPositive()) {
       const newQty = cur.plus(signed);
       const avg = pos && !cur.isZero() ? cur.abs().mul(pos.avg).plus(qty.mul(price)).div(newQty.abs()) : price;
-      this.positions.set(inst.symbol, { qty: newQty, avg, openedAt: pos && !cur.isZero() ? pos.openedAt : now });
+      const next: Pos = { qty: newQty, avg, openedAt: pos && !cur.isZero() ? pos.openedAt : now };
+      if (simulated(newQty)) {
+        // 増し玉: それまでの建玉の分を積んでから、平均建値 × 新しい数量で起点を取り直す
+        next.borrowAccrued = pos && !cur.isZero() ? this.borrowOwed(pos, inst, now) : D(0);
+        next.borrowFrom = now;
+      }
+      this.positions.set(inst.symbol, next);
     } else {
       const closeQty = Decimal.min(cur.abs(), qty);
       const dir = cur.isPositive() ? 1 : -1;
       realizedQuote = price.minus(pos.avg).mul(closeQty).mul(dir).mul(cs);
       const remaining = qty.minus(closeQty);
       const newQty = cur.plus(signed);
+      // 再現した空売りの買い戻し: 未払いの借入コストのうち買い戻した数量の分を手数料として払う (残りは持ち越す)
+      let owedLeft = D(0);
+      if (pos.borrowFrom !== undefined) {
+        const owed = this.borrowOwed(pos, inst, now);
+        borrowFee = owed.mul(closeQty).div(cur.abs());
+        owedLeft = owed.minus(borrowFee);
+      }
       if (newQty.isZero()) this.positions.delete(inst.symbol);
-      else if (remaining.gt(0)) this.positions.set(inst.symbol, { qty: newQty, avg: price, openedAt: now }); // ドテン
-      else this.positions.set(inst.symbol, { qty: newQty, avg: pos.avg, openedAt: pos.openedAt }); // 部分決済
+      else if (remaining.gt(0)) this.positions.set(inst.symbol, { qty: newQty, avg: price, openedAt: now, ...(simulated(newQty) ? { borrowFrom: now, borrowAccrued: D(0) } : {}) }); // ドテン
+      else {
+        const next: Pos = { qty: newQty, avg: pos.avg, openedAt: pos.openedAt }; // 部分決済
+        if (pos.borrowFrom !== undefined) {
+          next.borrowFrom = now;
+          next.borrowAccrued = owedLeft;
+        }
+        this.positions.set(inst.symbol, next);
+      }
     }
 
     const rate = liq === "maker" ? inst.makerFeeRate : inst.takerFeeRate;
-    const feeQuote = price.mul(qty).mul(cs).mul(rate);
+    const feeQuote = price.mul(qty).mul(cs).mul(rate).plus(borrowFee);
     this.cash = this.cash.plus(realizedQuote.mul(fx)).minus(feeQuote.mul(fx));
     this.realized = this.realized.plus(realizedQuote.mul(fx));
 
@@ -338,7 +393,7 @@ export class PaperBroker implements Broker {
       // 売りでドテン防止: 空売り不可銘柄で保有が減っていたら取消
       const cur = this.positions.get(symbol)?.qty ?? D(0);
       const fx = this.fx(inst);
-      if (!fx || (!inst.allowShort && !isBuy && r.qty.gt(Decimal.max(cur, 0))) || !this.canAfford(inst, r.req.side, r.qty, r.limitPrice)) {
+      if (!fx || (!this.shortable(inst) && !isBuy && r.qty.gt(Decimal.max(cur, 0))) || !this.canAfford(inst, r.req.side, r.qty, r.limitPrice)) {
         this.results.set(r.req.clientId, { orderId: r.orderId, clientId: r.req.clientId, status: "canceled", fills: [], reason: "約定時に条件を満たさず取消" });
         continue;
       }
@@ -367,7 +422,10 @@ export class PaperBroker implements Broker {
       cash: this.cash.toString(),
       realizedPnl: this.realized.toString(),
       seq: this.seq,
-      positions: [...this.positions].map(([symbol, p]) => ({ symbol, qty: p.qty.toString(), avg: p.avg.toString(), openedAt: p.openedAt })),
+      positions: [...this.positions].map(([symbol, p]) => ({
+        symbol, qty: p.qty.toString(), avg: p.avg.toString(), openedAt: p.openedAt,
+        ...(p.borrowFrom !== undefined ? { borrowFrom: p.borrowFrom, borrowAccrued: (p.borrowAccrued ?? D(0)).toString() } : {}),
+      })),
       resting: [...this.resting.values()].map((r) => ({ orderId: r.orderId, req: r.req, qty: r.qty.toString(), limitPrice: r.limitPrice.toString(), createdAt: r.createdAt })),
       results: Object.fromEntries(this.results),
       quotes: Object.fromEntries(this.quotes),
@@ -385,7 +443,16 @@ export class PaperBroker implements Broker {
     this.cash = D(s.cash);
     this.realized = D(s.realizedPnl);
     this.seq = s.seq;
-    this.positions = new Map(s.positions.map((p) => [p.symbol, { qty: D(p.qty), avg: D(p.avg), openedAt: p.openedAt }]));
+    this.positions = new Map(
+      s.positions.map((p) => [
+        p.symbol,
+        {
+          qty: D(p.qty), avg: D(p.avg), openedAt: p.openedAt,
+          // 再現した空売りの借入コストの起点・未払い分 (古いスナップショットには無い)
+          ...(typeof p.borrowFrom === "number" && Number.isFinite(p.borrowFrom) ? { borrowFrom: p.borrowFrom, borrowAccrued: D(p.borrowAccrued ?? 0) } : {}),
+        },
+      ]),
+    );
     this.resting = new Map(s.resting.map((r) => [r.orderId, { orderId: r.orderId, req: r.req, qty: D(r.qty), limitPrice: D(r.limitPrice), createdAt: r.createdAt }]));
     this.results = new TerminalMap<OrderResult>({ isTerminal: isTerminalOrder });
     for (const [k, v] of Object.entries(s.results)) this.results.set(k, v);

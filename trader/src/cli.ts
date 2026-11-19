@@ -7,12 +7,13 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { loadConfig, type AppConfig } from "./core/config";
-import type { Store } from "./core/types";
+import type { Store, TradeRecord } from "./core/types";
 import { isLoopbackHost, startDashboard, type DashboardServer } from "./dashboard/server";
 import { formatBacktestRows, runBacktestCommand } from "./engine/backtestCommand";
 import { createFxConverter, quoteCurrencyOfSymbol } from "./engine/fx";
 import {
-  equityStats, EXIT_REASON_LABEL, exitFxRates, exitReasonCounts, fmtNum, fmtPct, fmtSigned, fmtTime, renderLearning, renderStrategyTable, summarizeByStrategy,
+  equityStats, EXIT_REASON_LABEL, exitFxRates, exitReasonCounts, fmtNum, fmtPct, fmtSigned, fmtTime, isSimulatedShortTrade, liveExecutableTrades,
+  renderLearning, renderSideTable, renderStrategyTable, summarizeBySide, summarizeByStrategy,
 } from "./engine/report";
 import { D } from "./core/decimal";
 import { peekResolveRequests, PendingOrders, requestResolve, type PendingOrder, type ResolveRequest } from "./engine/orders";
@@ -450,8 +451,19 @@ export function buildReportText(config: AppConfig, store: Store, now: number = D
   lines.push(`取引数: ${trades.length} (勝率 ${fmtPct(trades.length ? wins / trades.length : 0, 1)})`);
   const reasons = Object.entries(exitReasonCounts(trades)).map(([k, v]) => `${EXIT_REASON_LABEL[k as ExitReason] ?? k} ${v}`);
   if (reasons.length) lines.push(`決済理由: ${reasons.join(" / ")}`);
-  lines.push("", "■ 戦略別の成績 (口座通貨換算は決済時点のレート。記録が無いものは概算レート)");
-  lines.push(renderStrategyTable(summarizeByStrategy(trades, (c) => fx.toAccount(c), (t) => quoteCurrencyOfSymbol(t.symbol), exitFxRates(store)), ccy));
+  const toAcct = (c: string) => fx.toAccount(c);
+  const quoteOf = (t: TradeRecord) => quoteCurrencyOfSymbol(t.symbol);
+  const rates = exitFxRates(store);
+  // 買い・取引所で可能な売りと、paper で再現した空売り (live では実行できない) を分けて表示する
+  lines.push("", "■ 方向別の成績");
+  lines.push(renderSideTable(summarizeBySide(trades, toAcct, quoteOf, rates), ccy));
+  const simShorts = trades.filter(isSimulatedShortTrade);
+  lines.push("", `■ 戦略別の成績${simShorts.length ? " (live で実行できる取引。空売り (paper 再現) を除く)" : ""} (口座通貨換算は決済時点のレート。記録が無いものは概算レート)`);
+  lines.push(renderStrategyTable(summarizeByStrategy(liveExecutableTrades(trades), toAcct, quoteOf, rates), ccy));
+  if (simShorts.length) {
+    lines.push("", "■ 戦略別の成績 (空売り (paper 再現)。live では空売りしません)");
+    lines.push(renderStrategyTable(summarizeByStrategy(simShorts, toAcct, quoteOf, rates), ccy));
+  }
   // 学習状態は取引 mode (paper / live) 別。report は読み取り専用なので、起動時の移行などの書き込みは DB に反映しない
   const learning = new LearningService({ store: new ReadOnlyOverlayStore(store), mode: config.mode, getStrategy: (id) => getStrategy(id) });
   lines.push("", `学習状態: ${config.mode}`);

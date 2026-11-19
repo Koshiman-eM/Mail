@@ -1,5 +1,6 @@
 import { D, floorToStep, Decimal } from "../core/decimal";
 import { createLogger } from "../core/logger";
+import { canShort } from "../core/short";
 import { sweepOld } from "../core/sweep";
 import { normalizeReason } from "../engine/context";
 import type { AssetClass, Instrument, PositionView, Quote, RiskDecision, RiskLimits, RiskState, Signal, Store, TradingMode } from "../core/types";
@@ -137,6 +138,11 @@ export class RiskManager {
   /** 上書き値を読む mode (文字列キー指定・store なしのときは読まない = 渡された limits をそのまま使う) */
   private readonly overrideMode?: TradingMode;
   private readonly overrideCacheMs: number;
+  /**
+   * 取引 mode (空売りの可否の判定に使う。paper の空売りの再現は mode が paper のときだけ)。
+   * 文字列キー指定のときは不明 (= 取引所の allowShort だけで判定する)
+   */
+  readonly tradeMode?: TradingMode;
   private limitsCache?: { at: number; limits: RiskLimits; updatedAt: number };
 
   /**
@@ -159,6 +165,7 @@ export class RiskManager {
       saved = store?.kvGet<InternalState>(this.key);
     } else {
       const mode = keyOrOpts.mode ?? "paper";
+      this.tradeMode = mode;
       if (store) this.overrideMode = mode;
       if (keyOrOpts.overrideCacheMs !== undefined) this.overrideCacheMs = keyOrOpts.overrideCacheMs;
       this.key = riskStateKey(mode);
@@ -328,7 +335,9 @@ export class RiskManager {
     if (!(equity > 0)) return { ok: false, reason: "評価額が 0 以下" };
     if (!finiteNum(available)) return { ok: false, reason: `余力が数値ではありません (${available}) のため拒否` };
     const isLong = signal.direction === "long";
-    if (!isLong && !inst.allowShort) return { ok: false, reason: `${inst.symbol} は空売り不可` };
+    // 実効の空売り可否 (live では取引所の allowShort だけ。paper では再現する銘柄 simulatedShort も可)。
+    // 再現した空売りも以降の判定 (最大保有数・コスト比・損切り (上側)・1 銘柄上限・資産クラス別上限・余力) をすべて通す
+    if (!isLong && !canShort(inst, this.tradeMode)) return { ok: false, reason: `${inst.symbol} は空売り不可` };
 
     const open = p.positions.filter((x) => x.qty !== 0);
     const existing = open.find((x) => x.symbol === inst.symbol);

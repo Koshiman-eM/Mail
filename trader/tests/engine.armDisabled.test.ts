@@ -12,7 +12,7 @@ const START = Date.UTC(2026, 0, 5);
 const LABELS: RegimeLabel[] = ["trend_up", "trend_down", "range", "high_vol", "low_liquidity"];
 
 const mkClock = (t = START): Clock & { t: number } => ({ t, now() { return this.t; } });
-const testConfig = () => loadConfig({ NODE_ENV: "test", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "JPY" });
+const testConfig = (extra: Record<string, string> = {}) => loadConfig({ NODE_ENV: "test", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "JPY", ...extra });
 
 function fixedStrategy(id: string, o: { classes?: AssetClass[]; direction?: "long" | "short" } = {}): Strategy {
   return {
@@ -42,11 +42,11 @@ function seedDisabled(store: MemoryStore, id: string) {
   }
 }
 
-async function runtime(opts: RuntimeOptions & { rng: () => number }) {
+async function runtime(opts: RuntimeOptions & { rng: () => number }, env: Record<string, string> = {}) {
   const clock = mkClock();
   const store = new MemoryStore();
   seedDisabled(store, "off");
-  const rt = await buildRuntime(testConfig(), { clock, store, intelSources: [], ai: null, seed: 3, syntheticHistoryMs: 2 * 86_400_000, ...opts });
+  const rt = await buildRuntime(testConfig(env), { clock, store, intelSources: [], ai: null, seed: 3, syntheticHistoryMs: 2 * 86_400_000, ...opts });
   return { rt, clock, store };
 }
 
@@ -98,7 +98,8 @@ describe("無効化された腕 (エンジン統合)", () => {
   }, 60_000);
 
   it("direction_bias で止めた仮想トレードは、記録時の情報バイアスを添えて情報の効き具合を更新する (再起動をまたいでも)", async () => {
-    const { rt, clock, store } = await runtime({ strategies: [fixedStrategy("a", { direction: "short" })], rng: () => 0.99 });
+    // 合成の crypto は現物 (allowShort=false)。空売りの再現を切って、従来の (再現ではない) 売りの仮想トレードとして確かめる
+    const { rt, clock, store } = await runtime({ strategies: [fixedStrategy("a", { direction: "short" })], rng: () => 0.99 }, { PAPER_SIMULATE_SHORT: "false" });
     await run(rt, clock, START, START + MIN);
     const sym = rt.hub.watched().find((i) => i.assetClass === "crypto")!.symbol;
     const view = rt.hub.getView(sym, clock.t)!;
@@ -116,5 +117,28 @@ describe("無効化された腕 (エンジン統合)", () => {
     const st = store.kvGet<{ shadowN?: number; n: number }>("intelInfluence:paper:crypto");
     expect(st).toMatchObject({ shadowN: 1, n: 0.25 });
     expect(store.kvGet<Record<string, unknown>>("shadowIntel:paper")).toEqual({});
+  }, 60_000);
+
+  it("paper で再現した空売りの direction_bias の仮想トレードは、空売りの腕 (…|short) だけを更新し、情報の効き具合には入れない", async () => {
+    const { rt, clock, store } = await runtime({ strategies: [fixedStrategy("a", { direction: "long" })], rng: () => 0.99 });
+    await run(rt, clock, START, START + MIN);
+    const inst = rt.hub.watched().find((i) => i.assetClass === "crypto")!;
+    expect(inst.allowShort).toBe(false);
+    expect(inst.simulatedShort).toBe(true);
+    const view = rt.hub.getView(inst.symbol, clock.t)!;
+    const engine = rt.engine as unknown as {
+      shadowRecord: (k: string, i: unknown, v: unknown, s: Strategy, sig: Signal, r: unknown, now: number, sent?: number) => void;
+    };
+    const strat = fixedStrategy("b2", { direction: "short" });
+    const sig = strat.evaluate({ market: view, regime: { label: "range", trend: 0, trendStrength: 10, volatility: 0.01, volatilityPercentile: 0.5, spreadBps: 1 }, params: {} })!;
+    engine.shadowRecord("direction_bias", view.instrument, view, strat, sig, { label: "range" }, clock.t, 0.7);
+    await run(rt, clock, clock.t + 15_000, clock.t + 15 * MIN);
+    const closed = store.listShadowTrades().filter((t) => t.strategyId === "b2");
+    expect(closed).toHaveLength(1);
+    expect(closed[0]).toMatchObject({ simulatedShort: true, direction: "short" });
+    expect(closed[0].borrowRateDaily).toBeCloseTo(0.0004, 10);
+    expect(store.kvGet(armStateKey("paper", armKey("b2", "range", "crypto", true)))).toMatchObject({ shadowN: 1 });
+    expect(store.kvGet(armStateKey("paper", armKey("b2", "range", "crypto")))).toBeUndefined();
+    expect(store.kvGet("intelInfluence:paper:crypto")).toBeUndefined();
   }, 60_000);
 });

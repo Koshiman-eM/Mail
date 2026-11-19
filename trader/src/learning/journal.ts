@@ -36,6 +36,8 @@ export interface OpenTradeInput {
   contractSize?: number;
   /** 約定を確認できず、建玉の照会・手動の申告から数量・価格を推定したエントリー */
   estimated?: boolean;
+  /** paper で再現した空売り (TradeRecord.simulatedShort へ引き継ぐ) */
+  simulatedShort?: boolean;
 }
 
 /** 追跡中のポジション */
@@ -283,6 +285,7 @@ export function buildTradeRecord(p: OpenTrade, c: CloseTradeInput): TradeRecord 
     exitReason: c.exitReason,
     entryContext: p.entryContext,
     ...(p.estimated || c.estimated ? { estimated: true } : {}),
+    ...(p.simulatedShort ? { simulatedShort: true } : {}),
   };
 }
 

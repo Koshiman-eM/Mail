@@ -20,7 +20,7 @@ import { systemClock, type Clock, type Store, type TradingMode } from "../core/t
 import { riskStateKey } from "../risk/manager";
 import { applyRiskSettingsChange, riskSettingsView, type RiskMetrics } from "../risk/settings";
 import { quoteCurrencyOfSymbol } from "../engine/fx";
-import { exitFxRates, exitReasonCounts, summarizeByStrategy, tradePnlAccount } from "../engine/report";
+import { exitFxRates, exitReasonCounts, summarizeBySide, summarizeByStrategy, tradePnlAccount } from "../engine/report";
 import { CAUSE_LABEL } from "../learning/attribution";
 import type { LearningService } from "../learning/service";
 import { DASHBOARD_HTML } from "./page";
@@ -141,6 +141,8 @@ export function tradesPayload(deps: DashboardDeps, limit: number, mode?: Trading
         ...(t.postExitMovePct !== undefined ? { postExitMovePct: t.postExitMovePct } : {}),
         // 約定を確認できず建玉・手動の申告から推定した部分を含む (学習には使っていない)
         ...(t.estimated ? { estimated: true } : {}),
+        // paper で再現した空売り (live では実行できない取引)
+        ...(t.simulatedShort ? { simulatedShort: true } : {}),
         attribution: att
           ? {
               outcome: att.outcome,
@@ -150,6 +152,8 @@ export function tradesPayload(deps: DashboardDeps, limit: number, mode?: Trading
       };
     }),
     byStrategy: summarizeByStrategy(allInMode, toAccount ?? (() => 1), (t) => quoteOf(t.symbol), rates),
+    /** 方向別 (買い / 売り / 空売り (paper 再現))。live で実際にできる成績は空売り (paper 再現) を除いたもの */
+    bySide: summarizeBySide(allInMode, toAccount ?? (() => 1), (t) => quoteOf(t.symbol), rates),
     exitReasons: exitReasonCounts(trades),
   };
 }

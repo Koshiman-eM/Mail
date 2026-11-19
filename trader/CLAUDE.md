@@ -40,6 +40,12 @@
 9. **仮想トレードの重みと停止中の扱い**: 見送ったシグナルの結果は腕の配分に重み 0.25 (腕を止める判定には使わず、止まった腕の回復判定にだけ使う)。ニュースの答え合わせは 1 記事あたり合計 0.3 (時間 × 資産の数で割る)。取引による信頼度の更新は (情報源, 記事) ごとに 1 回。停止中 (`HALT_SHADOW_REASONS`) に記録した仮想トレードは学習に使わない。
 10. **腕の停止と回復**: 止めるのは実取引だけの統計で、件数 ≥ 30 かつ「縮小推定の平均 + 2.5·SE < 0」のとき。止まった腕も戦略は評価し、仮想トレード (`arm_disabled`) を記録して、回復の推定が 0 を越えたら戻す (`allocator.ts`)。
 11. **ダッシュボードの書き込みはリスク設定だけ**: `/api/risk-settings` (kv `risk:limits:<mode>`)。CSRF トークン・Origin 確認・ループバック待ち受け (それ以外は `DASHBOARD_WRITE_TOKEN`) が必須。live でリスクを上げる変更は確認語が必要。範囲は `config.ts` の `RISK_SETTING_SPECS` が唯一の定義。
+12. **空売りの再現は paper だけ** (`PAPER_SIMULATE_SHORT`、既定 true。`src/core/short.ts`): live では空売りしない。
+   - `allowShort` (取引所の仕様) は書き換えない。paper かつ有効のとき、`allowShort=false` の `crypto` (meme・DEX は対象外) に `simulatedShort: true` を付ける (`setup.ts`)。
+   - 実効の空売り可否は必ず `canShort(inst, mode)` で判定する (戦略 `common.ts` は `ctx.mode`、RiskManager、PaperBroker、planner)。live・バックテスト・mode 不明では `allowShort` だけ。
+   - PaperBroker は負の建玉で約定し、建玉代金を余力から拘束、買い戻し時に借入コスト (建玉代金 × `PAPER_SHORT_BORROW_RATE_DAILY` × 日数) を手数料に計上 (decimal)。
+   - 取引・仮想トレードは `simulatedShort: true` を付け、腕は `<戦略>|<レジーム>|<資産クラス>|short` で学習する (買いと取引所で可能な売りは従来のキー)。ParamTuner・振り返り・情報源の信頼度・情報の効き具合・予想の applied からは除外。
+   - report / simulate / ダッシュボードは「買い」「売り」「空売り (paper 再現)」に分け、live で実際にできる成績 (再現の空売りを除く) を明示する。
 
 ## 4. 構成
 - `src/core/`: 型の契約 (`types.ts`)、設定、decimal、HTTP リトライ、Claude 呼び出し (`ai.ts`。構造化出力、拒否時はサーバー側フォールバック、キー未設定時はルールベース)

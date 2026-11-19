@@ -50,8 +50,13 @@ export interface Instrument {
   /** 手数料率 (0.001 = 0.1%) */
   takerFeeRate: number;
   makerFeeRate: number;
-  /** 空売り (ショート) 可能か */
+  /** 空売り (ショート) 可能か (取引所の仕様。paper の空売り再現でも書き換えない) */
   allowShort: boolean;
+  /**
+   * paper で空売りを再現する銘柄 (allowShort=false の現物暗号資産だけ。src/core/short.ts の markSimulatedShort が付ける)。
+   * 実効の空売り可否は必ず canShort(inst, mode) で判定する (live では常に無視される)
+   */
+  simulatedShort?: boolean;
   /** 1 単位あたりの契約サイズ (FX/先物用。現物は 1) */
   contractSize?: number;
   /** 取引先固有の情報 (DEX のペアアドレス、流動性 USD など) */
@@ -241,6 +246,11 @@ export interface StrategyContext {
   /** この戦略が持っているポジション (なければ undefined) */
   position?: PositionView;
   params: Params;
+  /**
+   * 取引 mode (エンジンが渡す)。空売りの再現 (simulatedShort) は mode === "paper" のときだけ効く。
+   * 省略時 (バックテスト・パラメータ検証) は取引所の allowShort だけで判定する
+   */
+  mode?: TradingMode;
 }
 
 export interface Signal {
@@ -489,6 +499,11 @@ export interface TradeRecord {
    * 推定の価格は照会時点の現在値など
    */
   estimated?: boolean;
+  /**
+   * paper で再現した空売り (取引所では空売りできない現物の売り建て)。live では実行できない取引なので、
+   * 腕は方向別のキー (…|short) で学習し、パラメータ調整・振り返り・情報源の信頼度には使わない。表示も買いと分ける
+   */
+  simulatedShort?: boolean;
 }
 
 export type CauseCode =
@@ -628,6 +643,10 @@ export interface ShadowTradeRecord {
   /** 最大含み益・最大含み損 (R, 正の値) */
   mfeR: number;
   maeR: number;
+  /** paper で再現した空売りの仮想トレード (腕は方向別のキー …|short で学習する)。借入コストは costR / netR に含める */
+  simulatedShort?: boolean;
+  /** 空売りの借入コストの日率 (simulatedShort のときだけ。記録時の PAPER_SHORT_BORROW_RATE_DAILY) */
+  borrowRateDaily?: number;
 }
 
 export interface ShadowTradeFilter {

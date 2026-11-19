@@ -11,8 +11,8 @@ import { mulberry32 } from "../market/feeds/synthetic";
 import { createStore, MemoryStore } from "../storage";
 import { buildRuntime, syntheticDbPath, type Runtime } from "./setup";
 import {
-  equityStats, EXIT_REASON_LABEL, exitFxRates, exitReasonCounts, fmtNum, fmtPct, fmtSigned, fmtTime, renderLearning, renderStrategyTable, summarizeByStrategy,
-  type StrategySummary,
+  equityStats, EXIT_REASON_LABEL, exitFxRates, exitReasonCounts, fmtNum, fmtPct, fmtSigned, fmtTime, renderLearning, renderSideTable, renderStrategyTable,
+  summarizeBySide, summarizeByStrategy, type SideSummary, type StrategySummary,
 } from "./report";
 
 const HOUR = 3_600_000;
@@ -66,6 +66,8 @@ export interface SimulationReport {
   trades: number;
   winRate: number;
   byStrategy: StrategySummary[];
+  /** 方向別 (買い / 売り / 空売り (paper 再現)) */
+  bySide: SideSummary[];
   exitReasons: Partial<Record<ExitReason, number>>;
   causes: CauseSummary;
   attributedTrades: number;
@@ -202,6 +204,7 @@ export async function runSimulation(o: SimulationOptions = {}): Promise<{ report
     trades: trades.length,
     winRate: trades.length ? wins / trades.length : 0,
     byStrategy: summarizeByStrategy(trades, (c) => runtime.fx.toAccount(c), quoteOf, exitFxRates(store, start)),
+    bySide: summarizeBySide(trades, (c) => runtime.fx.toAccount(c), quoteOf, exitFxRates(store, start)),
     exitReasons: exitReasonCounts(trades),
     causes: snapshot.causes,
     attributedTrades: trades.filter((t) => store.getAttribution(t.id) !== undefined).length,
@@ -242,7 +245,8 @@ export function formatSimulationReport(r: SimulationReport): string {
   const reasons = Object.entries(r.exitReasons).map(([k, v]) => `${EXIT_REASON_LABEL[k as ExitReason] ?? k} ${v}`);
   if (reasons.length) lines.push(`決済理由: ${reasons.join(" / ")}`);
   if (r.killSwitch) lines.push(`キルスイッチ: ${r.killSwitch.reason} (${fmtTime(r.killSwitch.at)})`);
-  lines.push("", "■ 戦略別の成績", renderStrategyTable(r.byStrategy, ccy));
+  lines.push("", "■ 方向別の成績", renderSideTable(r.bySide ?? [], ccy));
+  lines.push("", "■ 戦略別の成績 (全方向)", renderStrategyTable(r.byStrategy, ccy));
   lines.push("", `■ 学習の動き (学習ループ ${r.learning.learningRuns} 回 / 計画の更新 ${r.plans} 回)`);
   const applied = r.learning.adjustments.filter((a) => a.status === "applied").length;
   lines.push(`  腕 ${r.learning.arms.length} 本を更新 / パラメータ調整 ${r.learning.adjustments.length} 件 (適用 ${applied}) / 有効な教訓 ${r.learning.lessons.length} 件`);

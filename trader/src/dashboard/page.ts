@@ -542,6 +542,9 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
   var EXIT = { stop: "損切り", take_profit: "利確", trailing: "トレーリング", signal: "シグナル", time: "時間切れ", kill_switch: "キルスイッチ", manual: "手動" };
   var ADJ = { proposed: "提案のみ", applied: "適用", rejected: "却下", reverted: "差し戻し" };
   var DIR = { long: "買い", short: "売り" };
+  /** paper で再現した空売り (live では実行できない取引・腕) */
+  var SIM_SHORT = '空売り (paper 再現)';
+  function isSimArm(k) { return String(k).slice(-6) === '|short'; }
   var STRATS = ["scalp_obi", "scalp_vwap_revert", "scalp_momentum_burst", "short_ema_trend", "short_rsi_revert", "short_breakout", "mid_trend_follow", "long_momentum", "meme_momentum"];
   var REG = ["trend_up", "trend_down", "range", "high_vol", "low_liquidity"];
   var REG_L = { trend_up: "UP", trend_down: "DOWN", range: "RANGE", high_vol: "HIVOL", low_liquidity: "LOLIQ" };
@@ -947,6 +950,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
   function armGrid() {
     var by = {}, sids = {};
     ((LE && LE.arms) || []).forEach(function (a) {
+      if (isSimArm(a.key)) return; // 空売り (paper 再現) の腕は live の配分ではないので除く
       var p = String(a.key).split("|"), sid = p[0], rg = p[1];
       sids[sid] = true;
       var o = (by[sid] = by[sid] || {}), c = (o[rg] = o[rg] || { n: 0, sumR: 0, wins: 0, k: 0, dis: 0, wsum: 0 });
@@ -985,6 +989,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
   function renderAlloc() {
     var agg = {};
     ((LE && LE.arms) || []).forEach(function (a) {
+      if (isSimArm(a.key)) return; // 空売り (paper 再現) の腕は除く
       var sid = String(a.key).split("|")[0], o = (agg[sid] = agg[sid] || { n: 0, wn: 0, w: 0, k: 0, wins: 0 });
       o.n += a.n; o.wn += a.weight * a.n; o.w += a.weight; o.k++; o.wins += (a.winRate || 0) * a.n;
     });
@@ -1691,10 +1696,17 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
       var causes = x.attribution ? x.attribution.causes.map(function (c) {
         return '<span class="chip ' + esc(x.attribution.outcome) + '" title="' + esc(c.evidence) + '">' + esc(c.label) + " " + esc(num(c.weight, 2)) + "</span>";
       }).join("") : '<span class="muted">未分析</span>';
-      return [esc(time(x.exitTs)), esc(x.symbol) + (x.estimated ? ' <span class="muted" title="約定を確認できず推定した値を含む">(推定)</span>' : ""), esc(x.strategyId), esc(DIR[x.direction]), esc(EXIT[x.exitReason] || x.exitReason),
+      return [esc(time(x.exitTs)), esc(x.symbol) + (x.estimated ? ' <span class="muted" title="約定を確認できず推定した値を含む">(推定)</span>' : ""), esc(x.strategyId), esc(x.simulatedShort ? SIM_SHORT : DIR[x.direction]), esc(EXIT[x.exitReason] || x.exitReason),
         '<span class="' + cls(pnl) + '">' + esc(signed(pnl, 0)) + "</span>", '<span class="' + cls(x.rMultiple) + '">' + esc(num(x.rMultiple, 2)) + "</span>", causes];
     }), [false, false, false, false, false, true, true, false]));
-    set("byStrategy", table(["戦略", "取引", "勝率", "損益(" + ccy + ")", "平均R"], t.byStrategy.map(function (s) {
+    // 方向別 (買い / 売り / 空売り (paper 再現))。live で実際にできる成績は空売り (paper 再現) を除いたもの
+    var sides = t.bySide || [], live = { n: 0, w: 0, pnl: 0 }, hasSim = false;
+    sides.forEach(function (x) { if (x.side === 'simulated_short') { hasSim = true; return; } live.n += x.trades; live.w += x.wins; live.pnl += x.netPnl; });
+    var sideHtml = sides.length ? table(['方向', '取引', '勝率', '損益(' + ccy + ')', '平均R'], sides.map(function (x) {
+      return [esc(x.label), esc(x.trades), esc(pct(x.winRate, 1)), '<span class="' + cls(x.netPnl) + '">' + esc(signed(x.netPnl, 0)) + '</span>', esc(num(x.avgR, 2))];
+    }), [false, true, true, true, true]) + '<p class="note">live で実際にできる成績 (' + esc(SIM_SHORT) + 'を除く。現物は買いのみ): ' + esc(live.n) + ' 件 / 勝率 ' + esc(pct(live.n ? live.w / live.n : 0, 1)) + ' / 損益 ' + esc(signed(live.pnl, 0)) + '</p>' +
+      (hasSim ? '<p class="note">' + esc(SIM_SHORT) + ' = 取引所では空売りできない現物を paper でだけ売り建てた取引 (借入コストは手数料に含む)。live では空売りしません。戦略別は全方向の合計です。</p>' : '') : '';
+    set("byStrategy", sideHtml + table(["戦略", "取引", "勝率", "損益(" + ccy + ")", "平均R"], t.byStrategy.map(function (s) {
       return [esc(s.strategyId), esc(s.trades), esc(pct(s.winRate, 1)), '<span class="' + cls(s.netPnl) + '">' + esc(signed(s.netPnl, 0)) + "</span>", esc(num(s.avgR, 2))];
     }), [false, true, true, true, true]));
   }
@@ -1720,10 +1732,10 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     }), [false, true, true, true, true]) + '<p class="note">件数・的中はトレード由来。ニュースは値動きとの答え合わせ (的中/判定、重み 0.3)。</p>' + '<p class="note">情報の効き具合: ' + Object.keys(l.intelInfluence).map(function (k) { return esc(k + " " + num(l.intelInfluence[k], 2)); }).join(" / ") + "</p>");
     set("arms", table(["腕", "件数", "仮想", "勝率", "期待R", "仮想平均R", "配分倍率", "状態"], l.arms.slice().sort(function (a, b) { return b.n - a.n || (b.shadowN || 0) - (a.shadowN || 0); }).map(function (a) {
       var sn = a.shadowN || 0;
-      return [esc(a.key), esc(a.n), esc(sn), esc(pct(a.winRate, 1)), '<span class="' + cls(a.meanR) + '">' + esc(num(a.meanR, 3)) + "</span>",
+      return [esc(a.key) + (isSimArm(a.key) ? ' <span class="muted">(' + esc(SIM_SHORT) + ')</span>' : ''), esc(a.n), esc(sn), esc(pct(a.winRate, 1)), '<span class="' + cls(a.meanR) + '">' + esc(num(a.meanR, 3)) + "</span>",
         sn ? '<span class="' + cls(a.shadowMeanR) + '">' + esc(num(a.shadowMeanR, 3)) + "</span>" : "-", esc(num(a.weight, 2)),
         a.disabled ? '<span class="neg">停止</span>' : "有効"];
-    }), [false, true, true, true, true, true, true, false]));
+    }), [false, true, true, true, true, true, true, false]) + (l.arms.some(function (a) { return isSimArm(a.key); }) ? '<p class="note">末尾が |short の腕 = ' + esc(SIM_SHORT) + '。買いの腕とは別に学習し、live では使いません。</p>' : ''));
     safe("shadow", function () { renderShadow(l.shadow); });
     safe("newsCheck", function () { renderNewsCheck(l.news); });
     safe("forecast", function () { renderForecast(l.forecast); });
@@ -1743,6 +1755,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
       (ex ? " / " + ex : "") + "</p>" +
       '<p class="note">作成 ' + esc(c.created || 0) + " / 重複 " + esc(c.duplicate || 0) + " / 上限で破棄 " + esc((c.droppedCap || 0) + (c.droppedRate || 0)) + " / 監視終了 " + esc(c.unwatched || 0) + "</p>";
     var heads = ["件数", "勝率", "平均純R", "純R合計"], numc = [false, true, true, true, true];
+    if ((sh.bySide || []).some(function (g) { return g.key === SIM_SHORT; })) h += '<h2>BY SIDE · 方向ごと</h2>' + '<div class="scroll">' + table(['方向'].concat(heads), shadowRows(sh.bySide), numc) + '</div>';
     h += "<h2>BY REASON · 見送り理由ごと</h2>" + '<div class="scroll">' + table(["見送り理由"].concat(heads), shadowRows(sh.byReason || []), numc) + "</div>";
     h += "<h2>BY STRATEGY · 戦略ごと</h2>" + '<div class="scroll">' + table(["戦略"].concat(heads), shadowRows(sh.byStrategy || []), numc) + "</div>";
     h += '<p class="note">純R = 往復手数料・スプレッド・約定ずれ (片道 2bps) を差し引いた R。平均純R が正の見送り理由はフィルターが厳しすぎる可能性があります (設定は自動では変えません)。</p>';

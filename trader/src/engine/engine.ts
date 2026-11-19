@@ -3,6 +3,7 @@ import type { AppConfig } from "../core/config";
 import { D, Decimal } from "../core/decimal";
 import { redactSecrets } from "../core/http";
 import { createLogger, type Logger } from "../core/logger";
+import { DEFAULT_SHORT_BORROW_RATE_DAILY, isSimulatedShort } from "../core/short";
 import {
   systemClock, type Balance, type Broker, type BrokerPosition, type Clock, type EntryContext, type Instrument, type IntelBias, type MarketBrief,
   type IntelItem, type MarketView, type OrderRequest, type Params, type Quote, type RegimeFeatures, type Signal, type Store, type Strategy,
@@ -1090,7 +1091,12 @@ export class TradingEngine {
   private shadowRecord(key: string, inst: Instrument, view: MarketView, s: Strategy, signal: Signal, regime: RegimeFeatures, now: number, intelSentiment?: number): void {
     if (!this.shadow) return;
     try {
-      const created = this.shadow.record({ instrument: inst, quote: view.quote, signal: { ...signal, horizon: signal.horizon ?? s.horizon }, regime: regime.label, reason: key, now });
+      // paper で再現した空売りは方向別の腕 (…|short) で学習し、借入コストを仮想トレードの R に含める
+      const sim = isSimulatedShort(inst, this.mode, signal.direction);
+      const created = this.shadow.record({
+        instrument: inst, quote: view.quote, signal: { ...signal, horizon: signal.horizon ?? s.horizon }, regime: regime.label, reason: key, now,
+        ...(sim ? { simulatedShort: true, borrowRateDaily: this.shortBorrowRateDaily() } : {}),
+      });
       if (created && key === "direction_bias" && typeof intelSentiment === "number" && Number.isFinite(intelSentiment)) {
         const m = this.shadowIntelMap();
         m[`${inst.symbol}|${signal.strategyId}|${signal.direction}`] = { ts: now, s: intelSentiment };
@@ -1140,13 +1146,19 @@ export class TradingEngine {
     this.learning.onShadowClosed(t, intelSentiment !== undefined ? { intelSentiment } : {});
   }
 
+  /** paper で再現する空売りの借入コストの日率 (PAPER_SHORT_BORROW_RATE_DAILY) */
+  private shortBorrowRateDaily(): number {
+    const r = this.config.env.PAPER_SHORT_BORROW_RATE_DAILY;
+    return typeof r === "number" && Number.isFinite(r) && r >= 0 ? r : DEFAULT_SHORT_BORROW_RATE_DAILY;
+  }
+
   /** 新規停止中など、戦略を評価しない経路でも仮想トレード用にだけ評価する (腕の乱数・評価回数には触れない) */
   private shadowEvaluate(s: Strategy, inst: Instrument, view: MarketView, ctx: TickCtx, key: string): void {
     if (!this.shadow) return;
     try {
       const regime = this.regimeFor(view, s.primaryTimeframe, ctx);
       const intel = this.intelFor(inst, ctx);
-      const signal = s.evaluate({ market: view, regime, ...(intel ? { intel } : {}), params: this.paramsFor(s, inst) });
+      const signal = s.evaluate({ market: view, regime, ...(intel ? { intel } : {}), params: this.paramsFor(s, inst), mode: this.mode });
       if (signal) this.rememberSignal(inst.symbol, signal, ctx.now);
       if (signal && signal.direction !== "flat") this.shadowRecord(key, inst, view, s, signal, regime, ctx.now);
     } catch (e) {
@@ -1361,6 +1373,7 @@ export class TradingEngine {
       intelInfluence: { [inst.assetClass]: this.learning.intelInfluence(inst.assetClass) },
       lessons: [],
       now: ctx.now,
+      mode: this.mode,
     });
   }
 
@@ -1442,11 +1455,21 @@ export class TradingEngine {
       const regime = this.regimeFor(view, s.primaryTimeframe, ctx);
       let gate: Gate | undefined;
       let armWeight = 1;
+      // paper で空売りを再現する銘柄か (live では常に false。src/core/short.ts)
+      const simShortInst = isSimulatedShort(inst, this.mode);
+      /** 買いの腕が無効でも、再現した空売りの腕 (…|short) が有効なときの計画の判定 (空売りのシグナルにだけ使う) */
+      let shortOnly: { gate: Gate; armWeight: number } | undefined;
       if (!pos) {
         // 探索 (無効化中の腕を exploreProb で試す) の乱数はエントリー時のここだけで引く (計画は決定的な重み)
         armWeight = this.learning.armWeight(s.id, regime.label, inst.assetClass, this.rng);
         gate = this.gate(inst, s, regime, armWeight, ctx);
-        if (!gate.ok) {
+        if (!gate.ok && gate.reason === "arm_disabled" && simShortInst) {
+          // 買いと空売り (paper 再現) は別の腕。買いの腕が止まっていても空売りの腕が有効なら評価を続ける
+          const w = this.learning.armWeight(s.id, regime.label, inst.assetClass, this.rng, true);
+          const g = this.gate(inst, s, regime, w, ctx);
+          if (g.ok) shortOnly = { gate: g, armWeight: w };
+        }
+        if (!gate.ok && !shortOnly) {
           this.skip(gate.reason!);
           // 腕が無効なために外したときも戦略を評価し、シグナルは仮想トレードとしてだけ記録する (回復の判定に使う。発注しない)。
           // 評価は通常の評価と同じタイミング (新しい確定足ごと) に 1 回だけ
@@ -1462,6 +1485,8 @@ export class TradingEngine {
         ...(intel ? { intel } : {}),
         ...(owner ? { position: this.positions.view(owner) } : {}),
         params,
+        // 空売りの再現は paper だけ (戦略は canShort(inst, mode) で判定する)
+        mode: this.mode,
       };
       ctx.evaluations++;
       let signal: Signal | null;
@@ -1487,6 +1512,20 @@ export class TradingEngine {
         continue;
       }
       if (signal.direction === "flat") continue;
+      if (simShortInst && signal.direction === "short") {
+        // paper で再現した空売り: 配分倍率・停止は空売りの腕 (…|short) で決める (買いの腕の成績と混ぜない)
+        if (shortOnly) {
+          gate = shortOnly.gate;
+          armWeight = shortOnly.armWeight;
+        } else {
+          armWeight = this.learning.armWeight(s.id, regime.label, inst.assetClass, this.rng, true);
+        }
+      } else if (shortOnly) {
+        // 買いの腕が止まっている (空売りの腕だけ有効) ときの買いのシグナルは従来どおり仮想トレードとしてだけ記録する
+        this.skip("arm_disabled");
+        this.shadowRecord("arm_disabled", inst, view, s, signal, regime, ctx.now);
+        continue;
+      }
       if (gate!.directionBias !== "both" && gate!.directionBias !== signal.direction) {
         this.skip("direction_bias");
         // 情報の効き具合の答え合わせ用に、戦略へ渡したものと同じ (補正後の) 情報バイアスを添える
@@ -1600,6 +1639,8 @@ export class TradingEngine {
         strategyId: c.strategy.id,
         horizon: sig.horizon,
         direction: sig.direction === "long" ? "long" : "short",
+        // paper で再現した空売り (取引所では空売りできない現物)。TradeRecord に引き継ぎ、学習・表示を買いと分ける
+        ...(isSimulatedShort(inst, this.mode, sig.direction) ? { simulatedShort: true } : {}),
         entryTs: now,
         intendedEntryPrice: intended,
         initialStop: sig.stopLoss,
@@ -1613,6 +1654,7 @@ export class TradingEngine {
       },
       audit: {
         direction: sig.direction,
+        ...(isSimulatedShort(inst, this.mode, sig.direction) ? { simulatedShort: true } : {}),
         intendedPrice: intended,
         stop: sig.stopLoss,
         ...(sig.takeProfit !== undefined ? { takeProfit: sig.takeProfit } : {}),
@@ -1643,7 +1685,8 @@ export class TradingEngine {
     if (r.status === "opened") {
       ctx.entries++;
       // 値動きの予想: シグナルと同じ向きで発注に使われた予想を記録する (LIVE でなくても記録。LIVE 判定で「適用した予想の成績」を見るため)
-      if (fm && sig.direction !== "flat") {
+      // 再現した空売りは「適用した予想」に数えない (LIVE 判定の applied は live でも起こりうる発注での的中を見るため)
+      if (fm && sig.direction !== "flat" && !isSimulatedShort(inst, this.mode, sig.direction)) {
         try {
           this.forecast?.markApplied(sym, sig.direction, sig.horizon ?? c.strategy.horizon, now);
         } catch {
@@ -1721,6 +1764,7 @@ export class TradingEngine {
       intelInfluence: this.learning.intelInfluences(),
       lessons: this.store.listLessons({ status: "active", limit: 50 }),
       now,
+      mode: this.mode,
       ...(this.ai ? { ai: this.ai } : {}),
     });
   }

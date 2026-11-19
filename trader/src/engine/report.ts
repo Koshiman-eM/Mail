@@ -4,7 +4,8 @@ import { CAUSE_LABEL } from "../learning/attribution";
 import { FORECAST_FEATURES, FORECAST_FEATURE_LABEL, type ForecastSummary } from "../learning/forecast";
 import type { NewsCheckSummary } from "../learning/newsCheck";
 import type { CauseSummary, LearningSnapshot } from "../learning/service";
-import type { ShadowGroup, ShadowSummary } from "../learning/shadow";
+import { SIMULATED_SHORT_ARM_SUFFIX } from "../learning/allocator";
+import { sideLabel, SIMULATED_SHORT_LABEL, type ShadowGroup, type ShadowSummary } from "../learning/shadow";
 import { quoteCurrencyOfSymbol } from "./fx";
 
 export const EXIT_REASON_LABEL: Record<ExitReason, string> = {
@@ -88,6 +89,71 @@ export function summarizeByStrategy(
   return [...map.values()]
     .map(({ sumR, ...s }) => ({ ...s, winRate: s.trades ? s.wins / s.trades : 0, avgR: s.trades ? sumR / s.trades : 0 }))
     .sort((a, b) => b.trades - a.trades);
+}
+
+/** 方向別の成績 (買い / 売り (取引所で空売り可) / 空売り (paper 再現)) */
+export interface SideSummary extends Omit<StrategySummary, "strategyId"> {
+  /** "long" / "short" / "simulated_short" */
+  side: "long" | "short" | "simulated_short";
+  label: string;
+}
+
+const SIDE_ORDER: SideSummary["side"][] = ["long", "short", "simulated_short"];
+
+/** paper で再現した空売り (live では実行できない取引) か */
+export const isSimulatedShortTrade = (t: Pick<TradeRecord, "direction" | "simulatedShort">) => t.direction === "short" && t.simulatedShort === true;
+
+/** live でも実行できる取引だけ (paper で再現した空売りを除く。bitbank 現物なら買いのみ) */
+export const liveExecutableTrades = <T extends Pick<TradeRecord, "direction" | "simulatedShort">>(trades: T[]): T[] =>
+  trades.filter((t) => !isSimulatedShortTrade(t));
+
+/**
+ * 方向別の成績 (件数のある方向だけ。買い → 売り → 空売り (paper 再現) の順)。
+ * 空売り (paper 再現) は live では実行できないので、買い・取引所で可能な売りと分けて表示する
+ */
+export function summarizeBySide(
+  trades: TradeRecord[],
+  toAccount: (ccy: string) => number,
+  quoteOf?: (t: TradeRecord) => string | undefined,
+  exitRates?: Map<string, number>,
+): SideSummary[] {
+  const sideOf = (t: TradeRecord): SideSummary["side"] => (t.direction === "long" ? "long" : t.simulatedShort ? "simulated_short" : "short");
+  const rows = summarizeByStrategy(
+    trades.map((t) => ({ ...t, strategyId: sideOf(t) })),
+    toAccount,
+    quoteOf,
+    exitRates,
+  );
+  return rows
+    .map(({ strategyId, ...r }) => {
+      const side = strategyId as SideSummary["side"];
+      return { ...r, side, label: side === "long" ? sideLabel("long") : sideLabel("short", side === "simulated_short") };
+    })
+    .sort((a, b) => SIDE_ORDER.indexOf(a.side) - SIDE_ORDER.indexOf(b.side));
+}
+
+/** 方向別の成績の表と「live で実際にできる成績」の注記 */
+export function renderSideTable(rows: SideSummary[], ccy: string): string {
+  if (rows.length === 0) return "  (トレードなし)";
+  const table = formatTable(
+    ["方向", "取引数", "勝率", `純損益(${ccy})`, `手数料(${ccy})`, "平均R"],
+    rows.map((r) => [r.label, r.trades, fmtPct(r.winRate, 1), fmtSigned(r.netPnl), fmtNum(r.fees, 0), r.avgR.toFixed(2)]),
+  );
+  const sim = rows.find((r) => r.side === "simulated_short");
+  const live = rows.filter((r) => r.side !== "simulated_short");
+  const liveN = live.reduce((a, r) => a + r.trades, 0);
+  const liveWins = live.reduce((a, r) => a + r.wins, 0);
+  const livePnl = live.reduce((a, r) => a + r.netPnl, 0);
+  const lines = [table];
+  lines.push(
+    `  live で実際にできる成績 (${SIMULATED_SHORT_LABEL}を除く。現物は買いのみ): ${liveN} 件 / 勝率 ${fmtPct(liveN ? liveWins / liveN : 0, 1)} / 純損益 ${fmtSigned(livePnl)} ${ccy}`,
+  );
+  if (sim) {
+    lines.push(
+      `  ※ ${SIMULATED_SHORT_LABEL} = 取引所では空売りできない現物を paper でだけ売り建てた取引 (借入コストは手数料に含む)。live では空売りしません。`,
+    );
+  }
+  return lines.join("\n");
 }
 
 export function exitReasonCounts(trades: TradeRecord[]): Partial<Record<ExitReason, number>> {
@@ -210,6 +276,7 @@ export function renderShadow(s: ShadowSummary | undefined, opts: { limit?: numbe
     out.push("  (決済済みの仮想トレードはまだありません)");
     return out.join("\n");
   }
+  if (s.bySide && s.bySide.some((g) => g.key === SIMULATED_SHORT_LABEL)) out.push(shadowGroupTable("方向", s.bySide, limit), "");
   out.push(shadowGroupTable("見送り理由", s.byReason, limit));
   out.push("", shadowGroupTable("戦略", s.byStrategy, limit));
   out.push("  ※ 純R = 往復手数料・スプレッド・約定ずれ (片道 2bps 既定) を差し引いた値。平均純R が正の見送り理由は、フィルターが厳しすぎる可能性があります (設定は自動では変えません)。");
@@ -324,6 +391,9 @@ export function renderLearning(
   const out: string[] = [];
   const arms = [...s.arms].sort((a, b) => b.n - a.n || (b.shadowN ?? 0) - (a.shadowN ?? 0)).slice(0, opts.arms ?? 15);
   out.push("■ 腕の成績 (戦略×レジーム×資産クラス。仮想 = 見送ったシグナルの仮想トレード、重み 0.25 で反映)");
+  if (s.arms.some((a) => a.key.endsWith(SIMULATED_SHORT_ARM_SUFFIX))) {
+    out.push(`  ※ 末尾が ${SIMULATED_SHORT_ARM_SUFFIX} の腕 = ${SIMULATED_SHORT_LABEL}。買いの腕とは別に学習し、live では使いません`);
+  }
   out.push(
     arms.length
       ? formatTable(

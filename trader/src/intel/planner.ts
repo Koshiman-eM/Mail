@@ -14,6 +14,7 @@ import type {
   Strategy,
   StrategyPlan,
   SymbolPlan,
+  TradingMode,
 } from "../core/types";
 import { EVENT_POST_MS, EVENT_PRE_MS } from "./aggregate";
 import { buildPlannerPrompt, formatLessons, isPlannerScope, PLANNER_SYSTEM } from "./prompts";
@@ -47,6 +48,11 @@ export interface PlanInput {
   lessons: Lesson[];
   now: number;
   ai?: AiOptions;
+  /**
+   * 取引 mode (記録用)。片側バイアス "short" は取引所の allowShort だけで判定し、paper の空売り再現では使わない
+   * (再現の対象銘柄で買いを止めると、paper の買いの成績が live とずれるため)
+   */
+  mode?: TradingMode;
 }
 
 const CLASS_PSEUDO: Record<AssetClass, string> = { crypto: "CRYPTO", meme: "MEME", fx: "FX", stock: "STOCKS" };
@@ -160,6 +166,8 @@ export function buildBaselinePlan(input: PlanInput): StrategyPlan {
     let directionBias: SymbolPlan["directionBias"] = "both";
     if (enabled.length > 0 && bias.found && bias.confidence >= DIRECTION_MIN_CONFIDENCE && Math.abs(bias.sentiment) >= DIRECTION_MIN_ABS_SENTIMENT) {
       if (bias.sentiment > 0) directionBias = "long";
+      // 片側 "short" (買いを止める) は取引所で本当に空売りできる銘柄だけ。paper で空売りを再現する現物は
+      // "both" のままにして、買いの扱いを live と同じに保つ (再現の空売りは "both" の下で戦略が出す)
       else if (inst.allowShort) directionBias = "short";
       else {
         mult *= 0.6; // 売り建て不可の弱気は倍率を絞るだけ
@@ -210,7 +218,7 @@ const AiPlanSchema = z.object({
 export type AiPlan = z.infer<typeof AiPlanSchema>;
 
 /** AI の調整案を制約内でマージ (純粋関数)。ベースラインのブラックアウトは削除不可 */
-export function mergeAiPlan(base: StrategyPlan, ai: AiPlan, instruments: Instrument[], now: number): StrategyPlan {
+export function mergeAiPlan(base: StrategyPlan, ai: AiPlan, instruments: Instrument[], now: number, mode?: TradingMode): StrategyPlan {
   const byInst = new Map(instruments.map((i) => [i.symbol, i]));
   const perSymbol: Record<string, SymbolPlan> = Object.fromEntries(Object.entries(base.perSymbol).map(([k, v]) => [k, { ...v }]));
   for (const adj of ai.adjustments) {
@@ -257,7 +265,7 @@ export async function buildStrategyPlan(input: PlanInput): Promise<StrategyPlan>
       new Date(input.now).toISOString(),
     );
     const ai = await askStructured(input.ai!, AiPlanSchema, PLANNER_SYSTEM, prompt, "low");
-    return mergeAiPlan(base, ai, input.instruments, input.now);
+    return mergeAiPlan(base, ai, input.instruments, input.now, input.mode);
   } catch (e) {
     log.warn("AI 計画調整に失敗したためベースラインを使用", { error: e instanceof Error ? e.message : String(e) });
     return base;
