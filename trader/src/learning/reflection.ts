@@ -10,6 +10,7 @@ import type {
   Store,
   TradeAttribution,
   TradeRecord,
+  TradingMode,
 } from "../core/types";
 import { attributeTrade, CAUSE_LABEL, fmtNum, pct } from "./attribution";
 import { buildReflectionPrompt, REFLECTION_SYSTEM } from "./prompts";
@@ -66,6 +67,8 @@ export interface ReflectOptions {
   strategyRegimes?: Record<string, RegimeLabel[]>;
   /** 既知の戦略 (未知の strategyId・パラメータの提案を捨てる)。省略時は期間内のトレードと strategyRegimes の戦略を既知とする */
   getStrategy?: (strategyId: string) => StrategyParamInfo | undefined;
+  /** 集計する取引の mode (学習状態は mode 別)。省略時は全 mode */
+  mode?: TradingMode;
 }
 
 export interface GroupStats {
@@ -181,11 +184,13 @@ class Acc {
   }
 }
 
-/** 期間内のトレードを集計 */
+/** 期間内のトレードを集計 (opts.mode の取引のうち、推定約定 estimated を除く) */
 export function computeReflectionStats(opts: ReflectOptions): ReflectionStats {
   const { store, now, windowMs } = opts;
   const from = now - windowMs;
-  const trades = store.listTrades({ since: from, until: now });
+  const trades = store
+    .listTrades({ since: from, until: now, ...(opts.mode ? { mode: opts.mode } : {}) })
+    .filter((t) => !t.estimated);
   const atts = new Map<string, TradeAttribution>();
   for (const t of trades) {
     atts.set(t.id, store.getAttribution(t.id) ?? attributeTrade(t, { strategyRegimes: opts.strategyRegimes }));
@@ -443,7 +448,7 @@ export async function reflect(opts: ReflectOptions): Promise<ReflectionResult> {
   store.audit({
     ts: now,
     type: "learning.reflect",
-    data: { origin: result.origin, trades: stats.total.n, lessons: result.lessons.length, proposals: result.proposals.length },
+    data: { ...(opts.mode ? { mode: opts.mode } : {}), origin: result.origin, trades: stats.total.n, lessons: result.lessons.length, proposals: result.proposals.length },
   });
   return { ...result, stats };
 }

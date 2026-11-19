@@ -1,4 +1,4 @@
-import type { AssetClass, SourceReliability, Store, TradeRecord } from "../core/types";
+import type { AssetClass, SourceReliability, Store, TradeRecord, TradingMode } from "../core/types";
 
 /**
  * 収集情報のフィードバック。
@@ -59,21 +59,28 @@ export interface IntelInfluenceState {
   updatedAt: number;
 }
 
-/** 情報源信頼度の集約キー (情報収集側の aggregate がここから Record<source, SourceReliability> を読む) */
+/** mode で分ける前の情報源信頼度の旧キー (移行元。読み書きしない) */
 export const SOURCE_RELIABILITY_KV_KEY = "intel:sourceReliability";
-const influenceKey = (ac: AssetClass) => `intelInfluence:${ac}`;
+/** 情報源信頼度の集約キー (mode 別。情報収集側の aggregate がここから Record<source, SourceReliability> を読む) */
+export const sourceReliabilityKey = (mode: TradingMode) => `${SOURCE_RELIABILITY_KV_KEY}:${mode}`;
+/** 資産クラス別の情報の効き具合のキー (mode 別) */
+export const intelInfluenceKey = (mode: TradingMode, ac: AssetClass) => `intelInfluence:${mode}:${ac}`;
 const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, x));
 
 export class SourceReliabilityTracker {
   readonly opts: ReliabilityOptions;
   private sources: Record<string, SourceReliability>;
+  private readonly key: string;
 
+  /** 状態は mode 別のキーに保存する (省略時の mode は paper) */
   constructor(
     private readonly store: Store,
     opts: Partial<ReliabilityOptions> = {},
+    readonly mode: TradingMode = "paper",
   ) {
     this.opts = { ...DEFAULT_RELIABILITY_OPTIONS, ...opts };
-    this.sources = store.kvGet<Record<string, SourceReliability>>(SOURCE_RELIABILITY_KV_KEY) ?? {};
+    this.key = sourceReliabilityKey(mode);
+    this.sources = store.kvGet<Record<string, SourceReliability>>(this.key) ?? {};
   }
 
   /**
@@ -104,7 +111,7 @@ export class SourceReliabilityTracker {
         this.observe(source, hit, now);
         updated.push(source);
       }
-      if (updated.length) this.store.kvSet(SOURCE_RELIABILITY_KV_KEY, this.sources);
+      if (updated.length) this.store.kvSet(this.key, this.sources);
     }
     this.updateInfluence(trade, now);
     return updated;
@@ -116,7 +123,7 @@ export class SourceReliabilityTracker {
    */
   observeNews(source: string, hit: boolean, now: number, weight: number = this.opts.newsWeight): SourceReliability {
     this.observe(source, hit, now, weight, "news");
-    this.store.kvSet(SOURCE_RELIABILITY_KV_KEY, this.sources);
+    this.store.kvSet(this.key, this.sources);
     return { ...this.sources[source] };
   }
 
@@ -159,7 +166,7 @@ export class SourceReliabilityTracker {
     const x = (intel.sentiment ?? 0) * dir;
     const y = clamp(Number.isFinite(t.rMultiple) ? t.rMultiple : 0, -this.opts.rClip, this.opts.rClip);
     if (!Number.isFinite(x)) return;
-    const key = influenceKey(t.assetClass);
+    const key = intelInfluenceKey(this.mode, t.assetClass);
     const st = this.store.kvGet<IntelInfluenceState>(key) ?? {
       n: 0,
       mx: 0,
@@ -205,10 +212,10 @@ export class SourceReliabilityTracker {
 
   /** 資産クラス別の情報の効き具合 0〜1.5 (中立 1)。エンジンが情報バイアスの影響度に掛ける */
   intelInfluence(assetClass: AssetClass): number {
-    return this.store.kvGet<IntelInfluenceState>(influenceKey(assetClass))?.value ?? 1;
+    return this.store.kvGet<IntelInfluenceState>(intelInfluenceKey(this.mode, assetClass))?.value ?? 1;
   }
 
   influenceState(assetClass: AssetClass): IntelInfluenceState | undefined {
-    return this.store.kvGet<IntelInfluenceState>(influenceKey(assetClass));
+    return this.store.kvGet<IntelInfluenceState>(intelInfluenceKey(this.mode, assetClass));
   }
 }

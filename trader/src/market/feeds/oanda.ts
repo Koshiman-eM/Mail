@@ -1,4 +1,4 @@
-import { fetchJson, type FetchOptions } from "../../core/http";
+import { fetchJson, QUOTE_FETCH_OPTIONS, type FetchOptions } from "../../core/http";
 import type { Candle, Instrument, MarketDataFeed, Quote, Timeframe } from "../../core/types";
 
 export const OANDA_HOSTS = { practice: "https://api-fxpractice.oanda.com", live: "https://api-fxtrade.oanda.com" } as const;
@@ -36,8 +36,10 @@ export class OandaFeed implements MarketDataFeed {
     this.base = OANDA_HOSTS[o.env ?? "practice"];
   }
 
-  private get<T>(path: string): Promise<T> {
+  /** extra: 再試行回数・タイムアウトなどの上書き (気配取得は QUOTE_FETCH_OPTIONS) */
+  private get<T>(path: string, extra: FetchOptions = {}): Promise<T> {
     const opts: FetchOptions = {
+      ...extra,
       headers: { authorization: `Bearer ${this.o.token}` },
       ...(this.o.fetchImpl ? { fetchImpl: this.o.fetchImpl } : {}),
     };
@@ -95,7 +97,7 @@ export class OandaFeed implements MarketDataFeed {
 
   async fetchQuotes(symbols: string[]): Promise<Record<string, Quote>> {
     const q = new URLSearchParams({ instruments: symbols.map(toOandaSymbol).join(",") });
-    const res = await this.get<{ prices: any[] }>(`/v3/accounts/${this.o.accountId}/pricing?${q}`);
+    const res = await this.get<{ prices: any[] }>(`/v3/accounts/${this.o.accountId}/pricing?${q}`, QUOTE_FETCH_OPTIONS);
     const out: Record<string, Quote> = {};
     for (const p of res.prices ?? []) {
       const bid = Number(p.bids?.[0]?.price ?? p.closeoutBid);

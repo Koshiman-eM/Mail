@@ -265,8 +265,8 @@ describe("StrategyAllocator: 仮想トレードによる重み付き更新", () 
 
   it("仮想トレードだけの旧データ互換: wN が無い状態は n を使う", () => {
     const store = new MemoryStore();
-    store.kvSet(`arm:${key}`, { key, alpha: 3, beta: 2, n: 1, sumR: 1, sumR2: 1, ewmaR: 1, ewmaVarR: 0, updatedAt: T0 });
-    store.kvSet("arm:index", [key]);
+    store.kvSet(`arm:paper:${key}`, { key, alpha: 3, beta: 2, n: 1, sumR: 1, sumR2: 1, ewmaR: 1, ewmaVarR: 0, updatedAt: T0 });
+    store.kvSet("arm:paper:index", [key]);
     const al = new StrategyAllocator(store);
     expect(al.meanR(key)).toBeCloseTo(1 / 11, 10);
     al.updateShadow(shadowRec(1));
@@ -300,8 +300,8 @@ describe("LearningService: 仮想トレードの保存・腕の更新・集計",
     const svc = new LearningService({ store, shadowRetentionMs: 10 * MIN, tuneEveryMs: 1e12, reflectEveryMs: 1e12 });
     svc.onShadowClosed(shadowRec(1, { id: "old", exitTs: T0 }));
     svc.onShadowClosed(shadowRec(1, { id: "new", exitTs: T0 + 20 * MIN }));
-    store.kvSet("learning:lastTune", T0 + 30 * MIN);
-    store.kvSet("learning:lastReflect", T0 + 30 * MIN);
+    store.kvSet("learning:paper:lastTune", T0 + 30 * MIN);
+    store.kvSet("learning:paper:lastReflect", T0 + 30 * MIN);
     await svc.periodic(T0 + 25 * MIN);
     expect(store.listShadowTrades().map((t) => t.id)).toEqual(["new"]);
   });

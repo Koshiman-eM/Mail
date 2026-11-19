@@ -152,11 +152,13 @@ export class MemoryStore implements Store {
     this.adjustments.set(a.id, clone(a));
   }
 
-  listAdjustments(opts: { strategyId?: string; status?: ParamAdjustment["status"]; limit?: number } = {}): ParamAdjustment[] {
+  listAdjustments(opts: { strategyId?: string; status?: ParamAdjustment["status"]; mode?: TradingMode; limit?: number } = {}): ParamAdjustment[] {
     const items = [...this.adjustments.values()].filter(
       (a) =>
         (opts.strategyId === undefined || a.strategyId === opts.strategyId) &&
-        (opts.status === undefined || a.status === opts.status),
+        (opts.status === undefined || a.status === opts.status) &&
+        // mode が無い旧データは paper とみなす (SqliteStore の列の既定値と同じ)
+        (opts.mode === undefined || (a.mode ?? "paper") === opts.mode),
     );
     return latest(items, (a) => a.createdAt, opts.limit);
   }
@@ -284,6 +286,10 @@ export class MemoryStore implements Store {
       return;
     }
     this.kv.set(key, JSON.stringify(value));
+  }
+
+  kvKeys(prefix: string): string[] {
+    return [...this.kv.keys()].filter((k) => k.startsWith(prefix)).sort();
   }
 
   /** メモリ実装は途中で失敗しても巻き戻さない (そのまま実行する) */

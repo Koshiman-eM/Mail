@@ -8,8 +8,9 @@
  *    ノイズの範囲 = max(1 分足 ATR 比 × √分数 × noiseAtrMult, 往復コスト比) 未満の動きは判定しない (数えない)。
  *    当たり・外れを SourceReliabilityTracker.observeNews (重み newsWeight, 既定 0.3) に反映する。
  * 3. 判定待ちは最大 maxPending 件 (古い順に捨てる)。kv に保存し再起動後も続ける。監視をやめた銘柄の分は捨てる。
+ * 4. 状態 (判定待ち・集計・取り込み済み id) は mode 別のキー `newsCheck:<mode>:*` に保存する (情報源の信頼度が mode 別のため)。
  */
-import type { Instrument, IntelItem, Store } from "../core/types";
+import type { Instrument, IntelItem, Store, TradingMode } from "../core/types";
 import type { PriceAt } from "./journal";
 import type { SourceReliabilityTracker } from "./reliability";
 
@@ -98,9 +99,13 @@ export interface NewsCheckSummary {
   byHorizon: { horizon: string; n: number; hits: number; hitRate: number; noise: number; expired: number }[];
 }
 
+/** mode で分ける前の旧キー (移行元。読み書きしない) */
 export const NEWS_PENDING_KEY = "newsCheck:pending";
 export const NEWS_STATS_KEY = "newsCheck:stats";
 export const NEWS_SEEN_KEY = "newsCheck:seen";
+export const newsPendingKey = (mode: TradingMode) => `newsCheck:${mode}:pending`;
+export const newsStatsKey = (mode: TradingMode) => `newsCheck:${mode}:stats`;
+export const newsSeenKey = (mode: TradingMode) => `newsCheck:${mode}:seen`;
 
 const finite = (x: unknown): x is number => typeof x === "number" && Number.isFinite(x);
 const emptyCounts = (): NewsCounts => ({ n: 0, hits: 0, noise: 0, expired: 0 });
@@ -131,14 +136,16 @@ export class NewsOutcomeTracker {
     private readonly store: Store,
     private readonly reliability: Pick<SourceReliabilityTracker, "observeNews">,
     opts: Partial<NewsCheckOptions> = {},
+    /** 状態を保存する mode (省略時は paper) */
+    readonly mode: TradingMode = "paper",
   ) {
     this.opts = { ...DEFAULT_NEWS_CHECK_OPTIONS, ...opts };
-    const p = store.kvGet<NewsPending[]>(NEWS_PENDING_KEY);
+    const p = store.kvGet<NewsPending[]>(newsPendingKey(mode));
     this.pending = Array.isArray(p) ? p : [];
-    const s = store.kvGet<string[]>(NEWS_SEEN_KEY);
+    const s = store.kvGet<string[]>(newsSeenKey(mode));
     this.seen = Array.isArray(s) ? s : [];
     this.seenSet = new Set(this.seen);
-    this.stats = { sources: {}, recorded: 0, droppedCap: 0, droppedUnwatched: 0, ...(store.kvGet<Partial<NewsCheckStats>>(NEWS_STATS_KEY) ?? {}) };
+    this.stats = { sources: {}, recorded: 0, droppedCap: 0, droppedUnwatched: 0, ...(store.kvGet<Partial<NewsCheckStats>>(newsStatsKey(mode)) ?? {}) };
   }
 
   listPending(): NewsPending[] {
@@ -267,9 +274,9 @@ export class NewsOutcomeTracker {
   }
 
   private save(seen: boolean) {
-    this.store.kvSet(NEWS_PENDING_KEY, this.pending);
-    this.store.kvSet(NEWS_STATS_KEY, this.stats);
-    if (seen) this.store.kvSet(NEWS_SEEN_KEY, this.seen);
+    this.store.kvSet(newsPendingKey(this.mode), this.pending);
+    this.store.kvSet(newsStatsKey(this.mode), this.stats);
+    if (seen) this.store.kvSet(newsSeenKey(this.mode), this.seen);
   }
 
   getStats(): NewsCheckStats {

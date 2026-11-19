@@ -271,11 +271,8 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
   // リスク状態は実際の発注先の mode ごとに分ける (paper の基準で live の kill switch を誤作動させない)
   const risk = new RiskManager(config.risk, store, { mode: brokerSet.mode });
   const ai = opts.ai === null ? undefined : (opts.ai ?? (config.ai.enabled ? { apiKey: config.ai.apiKey, model: config.ai.model } : undefined));
-  const intel = new IntelService({
-    store,
-    sources: opts.intelSources ?? createDefaultSources({ env: { NEWS_RSS_FEEDS: env.NEWS_RSS_FEEDS, CRYPTOPANIC_TOKEN: env.CRYPTOPANIC_TOKEN } }),
-    ...(ai ? { ai } : {}),
-  });
+  // 学習状態は実際の発注先の mode ごとに分ける (paper の理想的な約定で学んだ内容を live に持ち込まない)。
+  // 初回起動時に旧キー (mode なし) から移行する: paper はコピー、live は初期状態から (src/learning/migration.ts)
   const learning = new LearningService({
     ...(opts.learning ?? {}),
     store,
@@ -288,6 +285,14 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
       maxPositionPct: config.risk.maxPositionPct,
     }),
     priceAt: createPriceAt(hub, clock),
+    ...(ai ? { ai } : {}),
+  });
+  // 情報源の信頼度は学習側 (mode 別) の現在値を読む
+  const intel = new IntelService({
+    store,
+    mode: brokerSet.mode,
+    getReliability: () => learning.sourceReliability(),
+    sources: opts.intelSources ?? createDefaultSources({ env: { NEWS_RSS_FEEDS: env.NEWS_RSS_FEEDS, CRYPTOPANIC_TOKEN: env.CRYPTOPANIC_TOKEN } }),
     ...(ai ? { ai } : {}),
   });
   const engine = new TradingEngine({

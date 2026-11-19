@@ -1,4 +1,4 @@
-import { fetchJson, type FetchOptions } from "../../core/http";
+import { fetchJson, QUOTE_FETCH_OPTIONS, type FetchOptions } from "../../core/http";
 import {
   systemClock, TIMEFRAME_MS, type Candle, type Clock, type Instrument, type MarketDataFeed, type Quote, type Timeframe,
 } from "../../core/types";
@@ -78,8 +78,9 @@ export class DexScreenerFeed implements MarketDataFeed {
     this.clock = o.clock ?? systemClock;
   }
 
-  private get<T>(path: string): Promise<T> {
-    const opts: FetchOptions = { ...(this.o.fetchImpl ? { fetchImpl: this.o.fetchImpl } : {}) };
+  /** extra: 再試行回数・タイムアウトなどの上書き (気配取得は QUOTE_FETCH_OPTIONS) */
+  private get<T>(path: string, extra: FetchOptions = {}): Promise<T> {
+    const opts: FetchOptions = { ...extra, ...(this.o.fetchImpl ? { fetchImpl: this.o.fetchImpl } : {}) };
     return fetchJson<T>(`${this.o.baseUrl ?? DEXSCREENER_URL}${path}`, opts);
   }
 
@@ -151,16 +152,17 @@ export class DexScreenerFeed implements MarketDataFeed {
     return r;
   }
 
-  private async fetchPair(symbol: string): Promise<any> {
+  private async fetchPair(symbol: string, extra: FetchOptions = {}): Promise<any> {
     const r = this.need(symbol);
-    const res = await this.get<{ pairs: any[] | null }>(`/latest/dex/pairs/${r.chainId}/${r.pairAddress}`);
+    const res = await this.get<{ pairs: any[] | null }>(`/latest/dex/pairs/${r.chainId}/${r.pairAddress}`, extra);
     const p = res.pairs?.[0];
     if (!p) throw new Error(`ペア情報が取得できません: ${symbol}`);
     return p;
   }
 
   async fetchQuote(symbol: string): Promise<Quote> {
-    const p = await this.fetchPair(symbol);
+    // 5 秒ループの気配取得なので再試行を減らす (ペア登録・統計は既定のまま)
+    const p = await this.fetchPair(symbol, QUOTE_FETCH_OPTIONS);
     // 流動性を Instrument.meta に反映 (USD 建てなので価格の有無と無関係)
     const r = this.need(symbol);
     r.instrument.meta = { ...r.instrument.meta, liquidityUsd: n(p.liquidity?.usd) };

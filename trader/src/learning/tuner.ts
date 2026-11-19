@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { createLogger } from "../core/logger";
-import type { AssetClass, CauseCode, ParamAdjustment, Params, RegimeLabel, Store, TradeRecord } from "../core/types";
+import type { AssetClass, CauseCode, ParamAdjustment, Params, RegimeLabel, Store, TradeRecord, TradingMode } from "../core/types";
 import { attributeTrade, CAUSE_LABEL, pct } from "./attribution";
 
 const log = createLogger("tuner");
@@ -75,9 +75,11 @@ export interface ParamTunerDeps {
   validate?: ParamValidator;
   strategyRegimes?: Record<string, RegimeLabel[]>;
   options?: Partial<TunerOptions>;
+  /** 学習状態 (パラメータ・調整履歴・集計対象の取引) の mode。省略時は paper */
+  mode?: TradingMode;
 }
 
-/** 適用した調整の評価用メタ情報 (kv "adjmeta:<id>") */
+/** 適用した調整の評価用メタ情報 (kv "adjmeta:<mode>:<id>") */
 interface AdjustmentMeta {
   preMeanR: number;
   preN: number;
@@ -118,20 +120,31 @@ const RULES: Rule[] = [
   { codes: ["time_decay"], pick: (p) => (has(p, "maxHoldBars") ? { param: "maxHoldBars", direction: "down" } : undefined) },
 ];
 
-const paramsKey = (strategyId: string, assetClass: AssetClass) => `params:${strategyId}:${assetClass}`;
-const metaKey = (id: string) => `adjmeta:${id}`;
+/** 学習済みパラメータの kv キー (mode 別) */
+export const paramsKey = (mode: TradingMode, strategyId: string, assetClass: AssetClass) => `params:${mode}:${strategyId}:${assetClass}`;
+/** 適用した調整の評価用メタ情報の kv キー (mode 別) */
+export const adjustmentMetaKey = (mode: TradingMode, id: string) => `adjmeta:${mode}:${id}`;
+/** 学習に使える取引 (推定約定 estimated を除く) */
+export const learnableTrades = (ts: TradeRecord[]) => ts.filter((t) => !t.estimated);
 const meanR = (ts: TradeRecord[]) => (ts.length ? ts.reduce((s, t) => s + (Number.isFinite(t.rMultiple) ? t.rMultiple : 0), 0) / ts.length : 0);
 const round6 = (x: number) => Number(x.toPrecision(6));
 
 /**
  * 要因分析の集計から標準名パラメータを小さく調整する。
  * 候補は validate (バックテスト) で現行と比較し、十分良い時だけ適用。悪化したら reviewApplied で元に戻す。
+ * パラメータ・調整履歴・集計対象の取引は mode 別 (集計は現在の mode かつ推定約定でない取引だけ)。
  */
 export class ParamTuner {
   readonly opts: TunerOptions;
+  readonly mode: TradingMode;
 
   constructor(private readonly deps: ParamTunerDeps) {
     this.opts = { ...DEFAULT_TUNER_OPTIONS, ...deps.options };
+    this.mode = deps.mode ?? "paper";
+  }
+
+  private metaKey(id: string) {
+    return adjustmentMetaKey(this.mode, id);
   }
 
   /**
@@ -140,7 +153,7 @@ export class ParamTuner {
    * bounds 省略時は getStrategy の paramBounds を使う。
    */
   currentParams(strategyId: string, assetClass: AssetClass, defaults: Params, bounds?: Record<string, [number, number]>): Params {
-    const saved = this.deps.store.kvGet<Params>(paramsKey(strategyId, assetClass)) ?? {};
+    const saved = this.deps.store.kvGet<Params>(paramsKey(this.mode, strategyId, assetClass)) ?? {};
     const b = bounds ?? this.deps.getStrategy(strategyId)?.paramBounds ?? {};
     const out: Params = { ...defaults };
     for (const [k, v] of Object.entries(saved)) {
@@ -158,7 +171,7 @@ export class ParamTuner {
   }
 
   private setParam(strategyId: string, assetClass: AssetClass, param: string, value: number) {
-    const key = paramsKey(strategyId, assetClass);
+    const key = paramsKey(this.mode, strategyId, assetClass);
     const saved = this.deps.store.kvGet<Params>(key) ?? {};
     this.deps.store.kvSet(key, { ...saved, [param]: value });
   }
@@ -186,7 +199,7 @@ export class ParamTuner {
 
   private groupTrades(now: number): Map<string, TradeRecord[]> {
     const groups = new Map<string, TradeRecord[]>();
-    for (const t of this.deps.store.listTrades({ since: now - this.opts.lookbackMs, until: now })) {
+    for (const t of learnableTrades(this.deps.store.listTrades({ since: now - this.opts.lookbackMs, until: now, mode: this.mode }))) {
       const k = `${t.strategyId}\u0000${t.assetClass}`;
       let g = groups.get(k);
       if (!g) groups.set(k, (g = []));
@@ -196,7 +209,7 @@ export class ParamTuner {
   }
 
   private groupAdjustments(strategyId: string, assetClass: AssetClass): ParamAdjustment[] {
-    return this.deps.store.listAdjustments({ strategyId }).filter((a) => a.assetClass === assetClass);
+    return this.deps.store.listAdjustments({ strategyId, mode: this.mode }).filter((a) => a.assetClass === assetClass);
   }
 
   /**
@@ -207,7 +220,7 @@ export class ParamTuner {
   private hasPendingReview(adjs: ParamAdjustment[]): boolean {
     return adjs.some((a) => {
       if (a.status !== "applied") return false;
-      const meta = this.deps.store.kvGet<AdjustmentMeta>(metaKey(a.id));
+      const meta = this.deps.store.kvGet<AdjustmentMeta>(this.metaKey(a.id));
       return meta !== undefined && !meta.reviewed;
     });
   }
@@ -301,8 +314,9 @@ export class ParamTuner {
       log.info("直近に同じ調整案があるため提案を見送り", { strategyId: p.strategyId, assetClass: p.assetClass, param: p.param, to });
       return undefined;
     }
-    const preTrades = this.deps.store
-      .listTrades({ strategyId: p.strategyId, assetClass: p.assetClass, until: now, limit: this.opts.window });
+    const preTrades = learnableTrades(
+      this.deps.store.listTrades({ strategyId: p.strategyId, assetClass: p.assetClass, until: now, mode: this.mode }),
+    ).slice(-this.opts.window);
     const reason = `[proposal] ${p.reason} → ${p.param} を ${from} → ${to}`;
     return this.evaluate({ strategyId: p.strategyId, assetClass: p.assetClass, param: p.param, from, to, reason, current, preTrades, now });
   }
@@ -349,12 +363,13 @@ export class ParamTuner {
       ...(base && cand ? { validation: { baselineScore: base.score, candidateScore: cand.score, trades: cand.trades } } : {}),
       status,
       createdAt: a.now,
+      mode: this.mode,
     };
     const store = this.deps.store;
     if (status === "applied") {
       this.setParam(a.strategyId, a.assetClass, a.param, a.to);
       const meta: AdjustmentMeta = { preMeanR: meanR(a.preTrades), preN: a.preTrades.length, reviewed: false };
-      store.kvSet(metaKey(adj.id), meta);
+      store.kvSet(this.metaKey(adj.id), meta);
     }
     store.saveAdjustment(adj);
     store.audit({
@@ -374,11 +389,12 @@ export class ParamTuner {
   reviewApplied(now: number): ParamAdjustment[] {
     const store = this.deps.store;
     const reverted: ParamAdjustment[] = [];
-    for (const adj of store.listAdjustments({ status: "applied" })) {
-      const meta = store.kvGet<AdjustmentMeta>(metaKey(adj.id));
+    for (const adj of store.listAdjustments({ status: "applied", mode: this.mode })) {
+      const meta = store.kvGet<AdjustmentMeta>(this.metaKey(adj.id));
       if (!meta || meta.reviewed) continue;
-      const post = store
-        .listTrades({ strategyId: adj.strategyId, assetClass: adj.assetClass, since: adj.createdAt, until: now })
+      const post = learnableTrades(
+        store.listTrades({ strategyId: adj.strategyId, assetClass: adj.assetClass, since: adj.createdAt, until: now, mode: this.mode }),
+      )
         .filter((t) => t.entryTs >= adj.createdAt)
         .slice(0, this.opts.window);
       if (post.length < this.opts.minReviewSamples) continue;
@@ -395,12 +411,12 @@ export class ParamTuner {
         store.audit({
           ts: now,
           type: "learning.param_revert",
-          data: { id: adj.id, strategyId: adj.strategyId, assetClass: adj.assetClass, param: adj.param, from: adj.to, to: adj.from, preMeanR: meta.preMeanR, postMeanR, postN: post.length },
+          data: { id: adj.id, mode: this.mode, strategyId: adj.strategyId, assetClass: adj.assetClass, param: adj.param, from: adj.to, to: adj.from, preMeanR: meta.preMeanR, postMeanR, postN: post.length },
         });
         log.info("パラメータ調整を元に戻した", { id: adj.id, param: adj.param, preMeanR: meta.preMeanR, postMeanR });
         reverted.push(r);
       }
-      store.kvSet(metaKey(adj.id), { ...meta, reviewed: true, postMeanR, postN: post.length });
+      store.kvSet(this.metaKey(adj.id), { ...meta, reviewed: true, postMeanR, postN: post.length });
     }
     return reverted;
   }

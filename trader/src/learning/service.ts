@@ -20,10 +20,11 @@ import { armKey, StrategyAllocator, type AllocatorOptions, type ArmSnapshot, typ
 import { attributeTrade } from "./attribution";
 import { DEFAULT_POST_EXIT_HORIZON_MS, fillPostExitMoves, type PriceAt } from "./journal";
 import { loadForecastSummary, type ForecastSummary, type ForecastTracker } from "./forecast";
+import { lastPostExitFillKey, lastReflectKey, lastTuneKey, migrateLearningModeSplit } from "./migration";
 import { NewsOutcomeTracker, type NewsCheckOptions, type NewsCheckSummary } from "./newsCheck";
 import { reflect, type ReflectionResult } from "./reflection";
 import { SourceReliabilityTracker, type ReliabilityOptions } from "./reliability";
-import { shadowCountersKey, shadowOpenKey, summarizeShadowTrades, sumShadowCounters, type ShadowCounters, type ShadowSummary } from "./shadow";
+import { isHaltShadowReason, shadowCountersKey, shadowOpenKey, summarizeShadowTrades, sumShadowCounters, type ShadowCounters, type ShadowSummary } from "./shadow";
 import { ParamTuner, type ParamValidator, type TunerOptions } from "./tuner";
 
 const log = createLogger("learning");
@@ -59,7 +60,10 @@ export interface LearningServiceDeps {
   shadowRetentionMs?: number;
   /** 運用ログ系の保持期間 (既定: audit/intel/briefs/plans 30 日、equity 180 日) */
   operationalRetention?: { auditMs?: number; intelMs?: number; briefsMs?: number; plansMs?: number; equityMs?: number };
-  /** 値動きの予想の集計を読む mode (エンジンが予想を attachForecast していないとき。省略時は記録の多い方) */
+  /**
+   * 学習状態 (腕・パラメータ・調整履歴・情報源の信頼度・ニュースの答え合わせ) の mode。省略時は paper。
+   * 値動きの予想の集計 (エンジンが attachForecast していないとき) もこの mode を読む (省略時は記録の多い方)
+   */
   mode?: TradingMode;
 }
 
@@ -100,9 +104,6 @@ export interface LearningSnapshot {
 }
 
 const ASSET_CLASSES: AssetClass[] = ["crypto", "meme", "fx", "stock"];
-const LAST_TUNE_KEY = "learning:lastTune";
-const LAST_REFLECT_KEY = "learning:lastReflect";
-const LAST_FILL_KEY = "learning:lastPostExitFill";
 const MODES = ["paper", "live"] as const;
 
 /**
@@ -112,6 +113,8 @@ const MODES = ["paper", "live"] as const;
  * - news: ニュースと値動きの答え合わせ (情報源の信頼度を重み 0.3 で更新。エンジンが ingest / evaluate を呼ぶ)
  * - periodic: エグジット後の値動きの補完 (と再分析) → 適用済み調整の事後評価 → tuner → 振り返り
  * - snapshot: ダッシュボード/レポート用の要約
+ * 学習状態は mode 別のキーに保存する (paper の理想的な約定で学んだ内容を live に持ち込まない)。
+ * 起動時に旧キー (mode なし) からの移行を 1 回だけ行う (migration.ts)。
  */
 export class LearningService {
   readonly store: Store;
@@ -119,6 +122,8 @@ export class LearningService {
   readonly reliability: SourceReliabilityTracker;
   readonly tuner: ParamTuner;
   readonly news: NewsOutcomeTracker;
+  /** 学習状態の mode */
+  readonly mode: TradingMode;
   private readonly deps: LearningServiceDeps;
   private running = false;
   /** エンジンが持つ値動きの予想 (無ければ kv から読む) */
@@ -127,10 +132,14 @@ export class LearningService {
   constructor(deps: LearningServiceDeps) {
     this.deps = deps;
     this.store = deps.store;
-    this.allocator = new StrategyAllocator(deps.store, deps.allocator);
-    this.reliability = new SourceReliabilityTracker(deps.store, deps.reliability);
-    this.news = new NewsOutcomeTracker(deps.store, this.reliability, deps.newsCheck);
+    this.mode = deps.mode ?? "paper";
+    // 部品が状態を読み込む前に旧キーからの移行を済ませる (2 回目以降は何もしない)
+    migrateLearningModeSplit(deps.store, this.mode);
+    this.allocator = new StrategyAllocator(deps.store, deps.allocator, this.mode);
+    this.reliability = new SourceReliabilityTracker(deps.store, deps.reliability, this.mode);
+    this.news = new NewsOutcomeTracker(deps.store, this.reliability, deps.newsCheck, this.mode);
     this.tuner = new ParamTuner({
+      mode: this.mode,
       store: deps.store,
       getStrategy: (id) => deps.getStrategy?.(id),
       validate: deps.validate,
@@ -153,6 +162,8 @@ export class LearningService {
     const existing = this.store.getAttribution(trade.id);
     this.store.saveTrade(trade);
     if (existing) return existing;
+    // 推定約定の取引は学習に使わない (呼び出し側でも除外しているが念のため)
+    if (trade.estimated) return this.attribute(trade);
     const att = this.attribute(trade);
     this.store.saveAttribution(att);
     const arm = this.allocator.update(trade);
@@ -177,11 +188,16 @@ export class LearningService {
 
   /**
    * 仮想トレード (見送ったシグナル) の決済時に呼ぶ。保存 → 同じ腕を重み shadowWeight で更新。
-   * 監視をやめて捨てたもの (unwatched) は学習に使わない。ParamTuner・要因分析には使わない
+   * 監視をやめて捨てたもの (unwatched) は学習に使わない。ParamTuner・要因分析には使わない。
+   * 次のものは保存だけして腕の更新には使わない:
+   * - 新規停止中 (halted / kill switch / 日次停止 / 状態不明の注文による一時停止) に記録したもの (isHaltShadowReason)
+   * - 別の mode の仮想トレード
    */
   onShadowClosed(t: ShadowTradeRecord): void {
     if (t.exitReason === "unwatched") return;
     this.store.saveShadowTrade(t);
+    if (t.mode !== undefined && t.mode !== this.mode) return;
+    if (isHaltShadowReason(t.reason)) return;
     this.allocator.updateShadow(t);
   }
 
@@ -240,7 +256,7 @@ export class LearningService {
       if (this.deps.priceAt) {
         const horizons = { ...DEFAULT_POST_EXIT_HORIZON_MS, ...this.deps.postExitHorizonMs };
         const maxH = Math.max(...Object.values(horizons));
-        const lastFill = this.store.kvGet<number>(LAST_FILL_KEY);
+        const lastFill = this.store.kvGet<number>(lastPostExitFillKey(this.mode));
         // 前回の補完以降 + 最長 horizon 分 (未補完分の再試行) だけを見る
         const since = lastFill !== undefined ? lastFill - 2 * maxH : now - this.tuner.opts.lookbackMs;
         const filled = fillPostExitMoves(this.store, this.deps.priceAt, horizons, { now, since });
@@ -250,7 +266,7 @@ export class LearningService {
           this.store.saveAttribution(this.attribute(t, prev?.createdAt));
           res.reattributed++;
         }
-        this.store.kvSet(LAST_FILL_KEY, now);
+        this.store.kvSet(lastPostExitFillKey(this.mode), now);
       }
 
       // 1b. 古い仮想トレードを消す (集計は直近だけを見る)
@@ -262,18 +278,19 @@ export class LearningService {
       res.reverted = this.tuner.reviewApplied(now);
 
       // 3. tuner
-      const lastTune = this.store.kvGet<number>(LAST_TUNE_KEY);
+      const lastTune = this.store.kvGet<number>(lastTuneKey(this.mode));
       if (lastTune === undefined || now - lastTune >= (this.deps.tuneEveryMs ?? 3_600_000)) {
         res.adjustments.push(...(await this.tuner.run(now)));
-        this.store.kvSet(LAST_TUNE_KEY, now);
+        this.store.kvSet(lastTuneKey(this.mode), now);
       }
 
       // 4. 振り返り (提案は tuner の検証経路を通す)
-      const lastReflect = this.store.kvGet<number>(LAST_REFLECT_KEY);
+      const lastReflect = this.store.kvGet<number>(lastReflectKey(this.mode));
       if (lastReflect === undefined || now - lastReflect >= (this.deps.reflectEveryMs ?? 86_400_000)) {
         const reflection = await reflect({
           store: this.store,
           now,
+          mode: this.mode,
           windowMs: this.deps.reflectWindowMs ?? 7 * 86_400_000,
           ai: this.deps.ai,
           strategyRegimes: this.deps.strategyRegimes,
@@ -284,7 +301,7 @@ export class LearningService {
           const adj = await this.tuner.propose(p, now);
           if (adj) res.adjustments.push(adj);
         }
-        this.store.kvSet(LAST_REFLECT_KEY, now);
+        this.store.kvSet(lastReflectKey(this.mode), now);
       }
       return res;
     } catch (e) {
@@ -337,7 +354,7 @@ export class LearningService {
       generatedAt: now,
       arms: this.allocator.snapshot(),
       lessons: this.store.listLessons({ status: "active", limit: opts.lessonLimit ?? 20 }),
-      adjustments: this.store.listAdjustments({ limit: opts.adjustmentLimit ?? 20 }),
+      adjustments: this.store.listAdjustments({ mode: this.mode, limit: opts.adjustmentLimit ?? 20 }),
       sources: this.reliability.all(),
       intelInfluence: Object.fromEntries(ASSET_CLASSES.map((c) => [c, this.reliability.intelInfluence(c)])) as Record<AssetClass, number>,
       causes: this.causeSummary(now - (opts.causeWindowMs ?? 30 * 86_400_000)),

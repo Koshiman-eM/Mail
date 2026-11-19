@@ -105,7 +105,8 @@ CREATE TABLE IF NOT EXISTS adjustments (
   assetClass TEXT NOT NULL,
   param TEXT NOT NULL,
   status TEXT NOT NULL,
-  data TEXT NOT NULL
+  data TEXT NOT NULL,
+  mode TEXT NOT NULL DEFAULT 'paper'
 );
 CREATE INDEX IF NOT EXISTS idx_adj_strategy ON adjustments(strategyId, createdAt);
 CREATE INDEX IF NOT EXISTS idx_adj_status ON adjustments(status, createdAt);
@@ -190,6 +191,21 @@ export class SqliteStore implements Store {
     this.db.exec("PRAGMA synchronous = NORMAL;");
     this.db.exec("PRAGMA busy_timeout = 5000;");
     this.db.exec(SCHEMA);
+    this.migrate();
+  }
+
+  /**
+   * 既存 DB のスキーマ移行 (冪等。トランザクション内で行い、途中で失敗しても元のまま)。
+   * - adjustments に mode 列を追加する。既存行は paper とみなす (列の既定値)。
+   *   data (JSON) にも mode が無い行は列の値を書き足す (行は消さない)
+   */
+  private migrate(): void {
+    this.tx(() => {
+      const cols = (this.db.prepare("PRAGMA table_info(adjustments)").all() as Row[]).map((r) => String(r.name));
+      if (!cols.includes("mode")) this.db.exec("ALTER TABLE adjustments ADD COLUMN mode TEXT NOT NULL DEFAULT 'paper'");
+      this.db.exec("UPDATE adjustments SET data = json_set(data, '$.mode', mode) WHERE json_extract(data, '$.mode') IS NULL");
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_adj_mode ON adjustments(mode, strategyId, createdAt)");
+    });
   }
 
   private stmt(sql: string): StatementSync {
@@ -377,16 +393,17 @@ export class SqliteStore implements Store {
 
   saveAdjustment(a: ParamAdjustment): void {
     this.stmt(
-      `INSERT INTO adjustments (id, createdAt, strategyId, assetClass, param, status, data) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO adjustments (id, createdAt, strategyId, assetClass, param, status, mode, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET createdAt = excluded.createdAt, strategyId = excluded.strategyId,
-         assetClass = excluded.assetClass, param = excluded.param, status = excluded.status, data = excluded.data`,
-    ).run(a.id, a.createdAt, a.strategyId, a.assetClass, a.param, a.status, JSON.stringify(a));
+         assetClass = excluded.assetClass, param = excluded.param, status = excluded.status, mode = excluded.mode, data = excluded.data`,
+    ).run(a.id, a.createdAt, a.strategyId, a.assetClass, a.param, a.status, a.mode ?? "paper", JSON.stringify(a));
   }
 
-  listAdjustments(opts: { strategyId?: string; status?: ParamAdjustment["status"]; limit?: number } = {}): ParamAdjustment[] {
+  listAdjustments(opts: { strategyId?: string; status?: ParamAdjustment["status"]; mode?: TradingMode; limit?: number } = {}): ParamAdjustment[] {
     const w = new Where();
     if (opts.strategyId !== undefined) w.add("strategyId = ?", opts.strategyId);
     if (opts.status !== undefined) w.add("status = ?", opts.status);
+    if (opts.mode !== undefined) w.add("mode = ?", opts.mode);
     return this.listLatest<ParamAdjustment>("adjustments", "createdAt", w, opts.limit);
   }
 
@@ -494,6 +511,11 @@ export class SqliteStore implements Store {
       `INSERT INTO kv (key, value, updatedAt) VALUES (?, ?, ?)
        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updatedAt = excluded.updatedAt`,
     ).run(key, JSON.stringify(value), Date.now());
+  }
+
+  kvKeys(prefix: string): string[] {
+    const rows = this.stmt("SELECT key FROM kv WHERE substr(key, 1, ?) = ? ORDER BY key ASC").all(prefix.length, prefix) as Row[];
+    return rows.map((r) => String(r.key));
   }
 
   close(): void {

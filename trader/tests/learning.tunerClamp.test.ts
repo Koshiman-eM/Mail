@@ -14,13 +14,13 @@ const NOW = 100 * DAY;
 describe("ParamTuner: 保存値のクランプと adjmeta 欠落", () => {
   it("currentParams: 保存値を paramBounds でクランプ (逆順の bounds も可)。bounds の無いキーはそのまま", () => {
     const store = new MemoryStore();
-    store.kvSet("params:s1:crypto", { stopAtr: 9, tpAtr: 0.2, lookback: 55 });
+    store.kvSet("params:paper:s1:crypto", { stopAtr: 9, tpAtr: 0.2, lookback: 55 });
     const t = new ParamTuner({ store, getStrategy });
     expect(t.currentParams("s1", "crypto", INFO.defaultParams)).toEqual({ stopAtr: 3, tpAtr: 1, lookback: 55 });
     // bounds を明示した場合はそれを使う
     expect(t.currentParams("s1", "crypto", INFO.defaultParams, { stopAtr: [1, 2] }).stopAtr).toBe(2);
     // 未知の戦略 (bounds 不明) はクランプしない
-    store.kvSet("params:zz:crypto", { stopAtr: 9 });
+    store.kvSet("params:paper:zz:crypto", { stopAtr: 9 });
     expect(t.currentParams("zz", "crypto", { stopAtr: 1 }).stopAtr).toBe(9);
   });
 

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { IntelItem } from "../src/core/types";
-import { NEWS_PENDING_KEY, NEWS_STATS_KEY, NewsOutcomeTracker, horizonLabel, noiseThreshold, type NewsMarketInfo } from "../src/learning/newsCheck";
-import { SourceReliabilityTracker, SOURCE_RELIABILITY_KV_KEY } from "../src/learning/reliability";
+import { newsPendingKey, newsStatsKey, NewsOutcomeTracker, horizonLabel, noiseThreshold, type NewsMarketInfo } from "../src/learning/newsCheck";
+import { SourceReliabilityTracker, sourceReliabilityKey } from "../src/learning/reliability";
 import { LearningService } from "../src/learning/service";
 import { MemoryStore } from "../src/storage/memory";
 
@@ -81,7 +81,7 @@ describe("ニュースと値動きの答え合わせ (NewsOutcomeTracker)", () =
     expect(r).toMatchObject({ n: 0, hits: 0, newsN: 3, newsHits: 2 });
     expect(r.effN).toBeCloseTo(0.9, 10);
     expect(news.listPending()).toEqual([]); // 3 つとも判定済み
-    expect(store.kvGet(SOURCE_RELIABILITY_KV_KEY)).toEqual(rel.all());
+    expect(store.kvGet(sourceReliabilityKey("paper"))).toEqual(rel.all());
     const sum = news.summary();
     expect(sum.horizons).toEqual(["15m", "1h", "4h"]);
     expect(sum.sources[0]).toMatchObject({ source: "rss:test", n: 3, hits: 2 });
@@ -158,8 +158,8 @@ describe("ニュースと値動きの答え合わせ (NewsOutcomeTracker)", () =
     const { store, rel, news } = setup();
     news.ingest([item("a")], markets, T0);
     news.evaluate(T0 + 15 * MIN, deps({ "BTC/USDT": () => 101 }));
-    expect(store.kvGet<unknown[]>(NEWS_PENDING_KEY)).toHaveLength(1);
-    expect(store.kvGet(NEWS_STATS_KEY)).toBeDefined();
+    expect(store.kvGet<unknown[]>(newsPendingKey("paper"))).toHaveLength(1);
+    expect(store.kvGet(newsStatsKey("paper"))).toBeDefined();
 
     const news2 = new NewsOutcomeTracker(store, rel);
     expect(news2.listPending()).toEqual(news.listPending());

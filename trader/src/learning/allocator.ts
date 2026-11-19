@@ -1,4 +1,4 @@
-import type { ArmStats, AssetClass, RegimeLabel, ShadowTradeRecord, Store, TradeRecord } from "../core/types";
+import type { ArmStats, AssetClass, RegimeLabel, ShadowTradeRecord, Store, TradeRecord, TradingMode } from "../core/types";
 import { tradeOutcome } from "./attribution";
 
 /** 腕のキー: 戦略×レジーム×資産クラス */
@@ -83,7 +83,12 @@ export interface ArmSnapshot extends ArmState {
 export type Rng = () => number;
 
 const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, x));
-const INDEX_KEY = "arm:index";
+/** 腕の状態の kv キー (mode 別。paper の学習を live に持ち込まない) */
+export const armStateKey = (mode: TradingMode, key: string) => `arm:${mode}:${key}`;
+/** 腕のキー一覧の kv キー (mode 別) */
+export const armIndexKey = (mode: TradingMode) => `arm:${mode}:index`;
+/** mode で分ける前の旧キー (移行元。読み書きしない) */
+export const LEGACY_ARM_INDEX_KEY = "arm:index";
 /** R の外れ値の影響を抑える */
 const R_CLIP = 10;
 
@@ -124,7 +129,7 @@ export function randBeta(a: number, b: number, rng: Rng): number {
  * - 勝率: ベータ事後分布 (忘却付き)
  * - 期待 R: 指数加重平均・分散 + 縮小推定
  * - weight: 0〜1.5 の配分倍率 (新しい腕は 1.0)。十分なサンプルで期待 R の上側信頼限界が負なら無効化 (0)
- * 状態は Store kv "arm:<key>" に保存。
+ * 状態は Store kv "arm:<mode>:<key>" に保存 (mode 別。省略時の mode は paper)。
  */
 export class StrategyAllocator {
   readonly opts: AllocatorOptions;
@@ -133,6 +138,7 @@ export class StrategyAllocator {
   constructor(
     private readonly store: Store,
     opts: Partial<AllocatorOptions> = {},
+    readonly mode: TradingMode = "paper",
   ) {
     this.opts = { ...DEFAULT_ALLOCATOR_OPTIONS, ...opts };
   }
@@ -145,7 +151,7 @@ export class StrategyAllocator {
   get(key: string): ArmState | undefined {
     const c = this.cache.get(key);
     if (c) return { ...c };
-    const s = this.store.kvGet<ArmState>(`arm:${key}`);
+    const s = this.store.kvGet<ArmState>(armStateKey(this.mode, key));
     if (s) this.cache.set(key, s);
     return s ? { ...s } : undefined;
   }
@@ -209,10 +215,10 @@ export class StrategyAllocator {
     s.updatedAt = now;
 
     this.cache.set(key, s);
-    this.store.kvSet(`arm:${key}`, s);
+    this.store.kvSet(armStateKey(this.mode, key), s);
     if (!prev) {
-      const idx = this.store.kvGet<string[]>(INDEX_KEY) ?? [];
-      if (!idx.includes(key)) this.store.kvSet(INDEX_KEY, [...idx, key]);
+      const idx = this.store.kvGet<string[]>(armIndexKey(this.mode)) ?? [];
+      if (!idx.includes(key)) this.store.kvSet(armIndexKey(this.mode), [...idx, key]);
     }
     return { ...s };
   }
@@ -290,7 +296,7 @@ export class StrategyAllocator {
   }
 
   keys(): string[] {
-    return this.store.kvGet<string[]>(INDEX_KEY) ?? [];
+    return this.store.kvGet<string[]>(armIndexKey(this.mode)) ?? [];
   }
 
   /** 全腕の成績表 */

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AssetClass, IntelBias, TradeRecord } from "../src/core/types";
-import { SOURCE_RELIABILITY_KV_KEY, SourceReliabilityTracker } from "../src/learning/reliability";
+import { SOURCE_RELIABILITY_KV_KEY, SourceReliabilityTracker, sourceReliabilityKey } from "../src/learning/reliability";
 import { MemoryStore } from "../src/storage/memory";
 
 let seq = 0;
@@ -86,13 +86,15 @@ describe("SourceReliabilityTracker", () => {
     expect(tr.get("good")).toMatchObject({ source: "good", n: 20, hits: 20 });
     expect(tr.get("bad")).toMatchObject({ n: 20, hits: 0 });
     expect(SOURCE_RELIABILITY_KV_KEY).toBe("intel:sourceReliability");
+    expect(sourceReliabilityKey("paper")).toBe("intel:sourceReliability:paper");
 
     // 外れが続くと下がる
     for (let i = 0; i < 15; i++) tr.update(trade({ move: -0.01, contrib: { good: 0.5 } }));
     expect(tr.weight("good")).toBeLessThan(1);
 
-    // 情報収集側が読む集約キーに全体が書かれている
-    expect(store.kvGet(SOURCE_RELIABILITY_KV_KEY)).toEqual(tr.all());
+    // 情報収集側が読む集約キー (mode 別。既定 paper) に全体が書かれている。旧キーには書かない
+    expect(store.kvGet(sourceReliabilityKey("paper"))).toEqual(tr.all());
+    expect(store.kvGet(SOURCE_RELIABILITY_KV_KEY)).toBeUndefined();
     // 永続化: 新しいインスタンスでも同じ
     const tr2 = new SourceReliabilityTracker(store);
     expect(tr2.all()).toEqual(tr.all());
@@ -136,7 +138,7 @@ describe("SourceReliabilityTracker", () => {
     expect(tr.intelInfluence("meme")).toBeLessThan(0.6);
     expect(tr.intelInfluence("meme")).toBeGreaterThanOrEqual(0);
     expect(tr.intelInfluence("fx")).toBe(1);
-    expect(store.kvGet("intelInfluence:crypto")).toMatchObject({ n: 40 });
+    expect(store.kvGet("intelInfluence:paper:crypto")).toMatchObject({ n: 40 });
     expect(new SourceReliabilityTracker(store).intelInfluence("crypto")).toBe(tr.intelInfluence("crypto"));
   });
 });

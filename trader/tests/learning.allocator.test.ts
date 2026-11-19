@@ -80,7 +80,7 @@ describe("StrategyAllocator", () => {
     expect(st.n).toBe(20);
     expect(st.alpha).toBeGreaterThan(st.beta);
     expect(st.sumR).toBeCloseTo(15 * 1.5 - 5, 10);
-    expect(store.kvGet(`arm:${KEY}`)).toMatchObject({ key: KEY, n: 20 });
+    expect(store.kvGet(`arm:paper:${KEY}`)).toMatchObject({ key: KEY, n: 20 }); // 状態は mode 別 (既定 paper)
 
     const b = new StrategyAllocator(store);
     expect(b.weight(KEY)).toBe(w);

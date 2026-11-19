@@ -71,6 +71,22 @@ export interface PriceRange {
   lastCandleTs: number;
 }
 
+/**
+ * エンジンが新規停止中に記録した仮想トレードの見送り理由 (腕の更新に使わない)。
+ * - "halted": リスク管理の停止中 (日次損失上限・kill switch)。engine.ts の ctx.halted の経路
+ * - "order_unknown": 状態不明の注文による新規エントリーの一時停止 (entriesPaused)
+ * - "risk: キルスイッチ作動中…" / "risk: 日次損失上限により…停止中": 同じティック内で停止に入り evaluateEntry が拒否したもの
+ *   (normalizeReason で数字は # に置き換わるので前方一致で見る)
+ */
+export const HALT_SHADOW_REASONS: readonly string[] = ["halted", "order_unknown"];
+export const HALT_SHADOW_REASON_PREFIXES: readonly string[] = ["risk: キルスイッチ作動中", "risk: 日次損失上限により"];
+
+/** 停止中に記録された仮想トレードか (腕の更新から外す) */
+export function isHaltShadowReason(reason: string | undefined): boolean {
+  if (typeof reason !== "string") return false;
+  return HALT_SHADOW_REASONS.includes(reason) || HALT_SHADOW_REASON_PREFIXES.some((p) => reason.startsWith(p));
+}
+
 export const shadowOpenKey = (mode: TradingMode) => `shadow:open:${mode}`;
 export const shadowCountersKey = (mode: TradingMode) => `shadow:counters:${mode}`;
 

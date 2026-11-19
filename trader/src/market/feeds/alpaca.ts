@@ -1,4 +1,4 @@
-import { fetchJson, type FetchOptions } from "../../core/http";
+import { fetchJson, QUOTE_FETCH_OPTIONS, type FetchOptions } from "../../core/http";
 import { systemClock, TIMEFRAME_MS, type Candle, type Clock, type Instrument, type MarketDataFeed, type Quote, type Timeframe } from "../../core/types";
 
 export const ALPACA_DATA_URL = "https://data.alpaca.markets";
@@ -30,8 +30,10 @@ export class AlpacaFeed implements MarketDataFeed {
     this.clock = o.clock ?? systemClock;
   }
 
-  private get<T>(path: string): Promise<T> {
+  /** extra: 再試行回数・タイムアウトなどの上書き (気配取得は QUOTE_FETCH_OPTIONS) */
+  private get<T>(path: string, extra: FetchOptions = {}): Promise<T> {
     const opts: FetchOptions = {
+      ...extra,
       headers: { "APCA-API-KEY-ID": this.o.keyId, "APCA-API-SECRET-KEY": this.o.secretKey },
       ...(this.o.fetchImpl ? { fetchImpl: this.o.fetchImpl } : {}),
     };
@@ -81,7 +83,7 @@ export class AlpacaFeed implements MarketDataFeed {
   }
 
   async fetchQuote(symbol: string): Promise<Quote> {
-    const res = await this.get<{ quote: any }>(`/v2/stocks/${encodeURIComponent(symbol)}/quotes/latest?feed=${this.o.dataFeed ?? "iex"}`);
+    const res = await this.get<{ quote: any }>(`/v2/stocks/${encodeURIComponent(symbol)}/quotes/latest?feed=${this.o.dataFeed ?? "iex"}`, QUOTE_FETCH_OPTIONS);
     const q = res.quote;
     const bid = Number(q?.bp);
     const ask = Number(q?.ap);

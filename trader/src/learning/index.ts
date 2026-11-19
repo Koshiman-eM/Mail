@@ -8,3 +8,4 @@ export * from "./tuner";
 export * from "./newsCheck";
 export * from "./shadow";
 export * from "./forecast";
+export * from "./migration";

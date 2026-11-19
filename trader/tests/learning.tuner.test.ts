@@ -107,7 +107,7 @@ describe("ParamTuner", () => {
 
   it("上限に達していれば調整しない", async () => {
     const store = new MemoryStore();
-    store.kvSet("params:s1:crypto", { stopAtr: 1.6 });
+    store.kvSet("params:paper:s1:crypto", { stopAtr: 1.6 });
     seed(store, many("stop_too_tight", 25));
     const tuner = new ParamTuner({ store, getStrategy, validate: favorStop });
     expect(await tuner.run(NOW)).toEqual([]);
@@ -176,7 +176,7 @@ describe("ParamTuner", () => {
     seed(store, many("good", 20), NOW + DAY, 0.8);
     expect(tuner.reviewApplied(NOW + 5 * DAY)).toEqual([]);
     expect(store.listAdjustments({ status: "applied" }).map((a) => a.id)).toEqual([adj.id]);
-    expect(store.kvGet(`adjmeta:${adj.id}`)).toMatchObject({ reviewed: true });
+    expect(store.kvGet(`adjmeta:paper:${adj.id}`)).toMatchObject({ reviewed: true });
     expect(tuner.currentParams("s1", "crypto", INFO.defaultParams).stopAtr).toBe(1.6);
   });
 
@@ -261,7 +261,7 @@ describe("ParamTuner", () => {
 
   it("currentParams: 既定値に無いキーや非数は無視", () => {
     const store = new MemoryStore();
-    store.kvSet("params:s1:crypto", { stopAtr: 1.2, unknown: 5, tpAtr: null });
+    store.kvSet("params:paper:s1:crypto", { stopAtr: 1.2, unknown: 5, tpAtr: null });
     const tuner = new ParamTuner({ store, getStrategy });
     const p = tuner.currentParams("s1", "crypto", INFO.defaultParams);
     expect(p.stopAtr).toBe(1.2);

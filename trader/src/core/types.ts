@@ -526,6 +526,8 @@ export interface ParamAdjustment {
   validation?: { baselineScore: number; candidateScore: number; trades: number };
   status: "proposed" | "applied" | "rejected" | "reverted";
   createdAt: number;
+  /** 調整した mode (学習状態は paper / live で分ける)。列追加前の旧データは paper とみなす */
+  mode?: TradingMode;
 }
 
 export interface Lesson {
@@ -721,8 +723,8 @@ export interface Store {
   listLessons(opts?: { status?: Lesson["status"]; scope?: string; limit?: number }): Lesson[];
 
   saveAdjustment(a: ParamAdjustment): void;
-  /** createdAt の昇順。limit を渡すと最新 N 件 (昇順) だけを返す */
-  listAdjustments(opts?: { strategyId?: string; status?: ParamAdjustment["status"]; limit?: number }): ParamAdjustment[];
+  /** createdAt の昇順。limit を渡すと最新 N 件 (昇順) だけを返す。mode は未記録 (旧データ) を paper とみなして絞り込む */
+  listAdjustments(opts?: { strategyId?: string; status?: ParamAdjustment["status"]; mode?: TradingMode; limit?: number }): ParamAdjustment[];
 
   saveEquity(p: EquityPoint): void;
   listEquity(opts?: { since?: number; mode?: TradingMode }): EquityPoint[];
@@ -752,6 +754,8 @@ export interface Store {
   /** 学習状態 (ArmStats, SourceReliability, 現行パラメータ, RiskState 等) の汎用 KV */
   kvGet<T>(key: string): T | undefined;
   kvSet<T>(key: string, value: T): void;
+  /** prefix で始まる kv のキー一覧 (昇順)。学習状態の移行などで使う */
+  kvKeys(prefix: string): string[];
 
   /**
    * fn の中の書き込み (trades・kv など) をまとめて確定する (途中で例外なら何も書かない)。
