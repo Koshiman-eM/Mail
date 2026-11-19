@@ -22,7 +22,7 @@ import { ALL_STRATEGIES } from "../strategies/registry";
 import { TradingEngine, type EngineOptions } from "./engine";
 import { ClosedCandleCacheFeed } from "./feedCache";
 import { createFxConverter, type FxConverter } from "./fx";
-import { createParamValidator, createPriceAt } from "./learningHooks";
+import { createParamValidator, createPriceAt, type ValidatorOptions } from "./learningHooks";
 
 const ASSET_CLASSES: AssetClass[] = ["crypto", "meme", "fx", "stock"];
 export const KNOWN_VENUES = ["synthetic", "ccxt", "oanda", "alpaca", "dex"] as const;
@@ -119,6 +119,8 @@ export interface RuntimeOptions {
   markets?: { feed: MarketDataFeed; instruments: Instrument[] }[];
   strategies?: readonly Strategy[];
   learning?: Partial<Omit<LearningServiceDeps, "store" | "getStrategy" | "validate" | "priceAt" | "ai">>;
+  /** パラメータ検証の設定の上書き (区間数・履歴の長さ・feed の差し替えなど) */
+  validation?: Partial<Omit<ValidatorOptions, "hub" | "strategies" | "clock">>;
   engine?: EngineOptions;
   logger?: Logger;
 }
@@ -273,16 +275,26 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
   const ai = opts.ai === null ? undefined : (opts.ai ?? (config.ai.enabled ? { apiKey: config.ai.apiKey, model: config.ai.model } : undefined));
   // 学習状態は実際の発注先の mode ごとに分ける (paper の理想的な約定で学んだ内容を live に持ち込まない)。
   // 初回起動時に旧キー (mode なし) から移行する: paper はコピー、live は初期状態から (src/learning/migration.ts)
-  const learning = new LearningService({
+  const learning: LearningService = new LearningService({
     ...(opts.learning ?? {}),
     store,
     mode: brokerSet.mode,
     getStrategy: (id) => strategies.find((s) => s.id === id),
+    // 検証は feed から長い履歴を取得して行う (hub の直近の足だけでは短すぎる)。
+    // 合成フィードはキャッシュ層 (直近 2000 本まで) を通さず内側から取る。DEX は履歴を持たないので検証に使わない
     validate: createParamValidator({
       hub, strategies, clock,
+      feedFor: (inst) => {
+        const f = pairs.find((p) => p.inst.symbol === inst.symbol)?.feed;
+        if (!f || f instanceof DexScreenerFeed) return undefined;
+        return f instanceof ClosedCandleCacheFeed ? f.inner : f;
+      },
+      briefsBetween: (since, until) => store.listBriefs?.({ since, until }) ?? [],
+      intelInfluence: (cls): number => learning.intelInfluence(cls),
       minEdgeToCostRatio: config.risk.minEdgeToCostRatio,
       riskPerTrade: config.risk.riskPerTrade,
       maxPositionPct: config.risk.maxPositionPct,
+      ...(opts.validation ?? {}),
     }),
     priceAt: createPriceAt(hub, clock),
     ...(ai ? { ai } : {}),

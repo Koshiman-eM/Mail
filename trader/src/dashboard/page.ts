@@ -9,6 +9,7 @@ export const DASHBOARD_HTML = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
+<meta name="csrf-token" content="__CSRF_TOKEN__">
 <title>TRADER // AUTO · 自動売買ダッシュボード</title>
 <style>
 :root {
@@ -69,6 +70,7 @@ nav#tabs button[aria-selected="true"] { color: var(--y); border-bottom-color: va
 nav#tabs button:focus-visible { outline: 1px solid var(--y); outline-offset: -3px; }
 nav#tabs .j { color: inherit; opacity: .7; }
 @media (max-width: 480px) { nav#tabs .hide-s { display: none; } nav#tabs { padding: 0 2px; } nav#tabs button { padding: 9px 7px 7px; letter-spacing: .04em; } }
+@media (max-width: 420px) { nav#tabs button { padding: 9px 5px 7px; letter-spacing: 0; } }
 
 /* ───── 流れる帯・ティッカー ───── */
 .marq { display: flex; height: 28px; border-bottom: 1px solid var(--line); background: #070b16; overflow: hidden; }
@@ -330,6 +332,40 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
 .tone.bull { color: var(--g); border-color: rgba(61,220,151,.5); } .tone.bear { color: var(--r); border-color: rgba(255,93,108,.5); }
 .scale { display: flex; justify-content: space-between; font-size: 10.5px; color: var(--mut); }
 @media (max-width: 600px) { .dbar { min-width: 56px; } .tone { min-width: 0; } th, td { padding: 4px 6px; } .big { font-size: 24px; } }
+/* ───── リスク設定タブ (390px 幅でも横にはみ出さない) ───── */
+.rs-top { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline; font-size: 12px; margin-bottom: 6px; }
+.rs-top b { color: var(--hi); }
+.rs-live { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 150px), 1fr)); gap: 4px 12px; font-size: 12px; padding: 6px 8px; border: 1px solid var(--line); background: #0a1020; }
+.rs-live span { color: var(--mut); font-size: 10.5px; letter-spacing: .08em; display: block; }
+.rs-live b { color: var(--hi); font-variant-numeric: tabular-nums; }
+.rs-h { font-size: 10.5px; letter-spacing: .18em; color: var(--y); margin: 12px 0 6px; font-weight: 700; }
+.rs-presets { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.rs-presets button, .rs-btns button { min-height: 42px; padding: 6px 6px; border: 1px solid var(--line2); border-radius: 3px; background: var(--chip); color: var(--fg); cursor: pointer; min-width: 0; overflow-wrap: anywhere; }
+.rs-presets button small { display: block; font-size: 10px; color: var(--mut); letter-spacing: 0; }
+.rs-presets button[aria-pressed="true"] { border-color: var(--y); color: var(--y); background: var(--yd); }
+.rs-presets button:focus-visible, .rs-btns button:focus-visible, .rsrow input:focus-visible { outline: 1px solid var(--y); outline-offset: 1px; }
+.rs-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 156px), 1fr)); gap: 8px; }
+.rsf { min-width: 0; border: 1px solid var(--line); border-radius: 3px; padding: 6px 8px; background: #0a1020; }
+.rsf.chg { border-color: var(--c); } .rsf.up { border-color: var(--o); } .rsf.bad { border-color: var(--r); }
+.rsf label { display: block; font-size: 11.5px; color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rsrow { display: flex; align-items: center; gap: 4px; margin: 3px 0 2px; }
+.rsrow input { flex: 1 1 auto; min-width: 0; width: 100%; font: inherit; font-size: 16px; padding: 4px 6px; color: var(--hi); background: #060a14; border: 1px solid var(--line2); border-radius: 2px; font-variant-numeric: tabular-nums; }
+.rsrow input:disabled { opacity: .6; }
+.rsrow .u { color: var(--mut); font-size: 12px; min-width: 1em; }
+.rsx { font-size: 10.5px; white-space: nowrap; } .rsx.up { color: var(--o); } .rsx.down { color: var(--g); }
+.rsm { font-size: 10.5px; color: var(--mut); line-height: 1.45; overflow-wrap: anywhere; }
+.rsm .d { color: var(--c); }
+.rse { font-size: 10.5px; color: var(--r); overflow-wrap: anywhere; }
+.rs-panel { margin: 10px 0 0; padding: 8px 10px; border: 1px solid var(--y); border-left-width: 4px; border-radius: 3px; background: rgba(245,197,66,.08); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.rs-panel.ng { border-color: var(--r); background: rgba(255,93,108,.09); }
+.rs-panel b { color: var(--hi); }
+.rs-panel input[type="text"], .rs-panel input[type="password"] { display: block; width: 100%; margin-top: 4px; font: inherit; font-size: 16px; padding: 5px 8px; color: var(--hi); background: #060a14; border: 1px solid var(--line2); border-radius: 2px; }
+.rs-panel label.ck { display: flex; gap: 8px; align-items: flex-start; margin-top: 6px; cursor: pointer; }
+.rs-panel label.ck input { width: 18px; height: 18px; margin: 2px 0 0; flex: 0 0 auto; }
+.rs-btns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
+.rs-btns .primary { border-color: var(--y); color: #0b0f1a; background: var(--y); font-weight: 700; }
+.rs-presets button:disabled, .rs-btns button:disabled { opacity: .45; cursor: not-allowed; }
+.rs-msg { margin-top: 8px; font-size: 12px; overflow-wrap: anywhere; min-height: 1.5em; } .rs-msg.ok { color: var(--g); } .rs-msg.ng { color: var(--r); }
 @media (prefers-reduced-motion: reduce) {
   .mt { animation: none; } .mv, .ticker { overflow-x: auto; } .flash, .log li.in { animation: none; } .cur { animation: none; }
 }
@@ -338,7 +374,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
 <body class="anim-off">
 <header class="top">
   <div class="brand">
-    <div class="sub">SIGNALS → STRATEGY → ORDER · 閲覧専用</div>
+    <div class="sub">SIGNALS → STRATEGY → ORDER · 閲覧 + リスク設定</div>
     <div class="name"><span>TRADER <i>//</i> AUTO</span><span id="mode" class="rb">RUN · -</span></div>
     <div class="sub2"><span id="riskBadge" class="rk">● -</span><span>更新 <span id="updated">-</span></span><span id="error" class="err"></span></div>
   </div>
@@ -360,6 +396,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
   <button type="button" role="tab" data-tab="positions">ポジション</button>
   <button type="button" role="tab" data-tab="trades">取引</button>
   <button type="button" role="tab" data-tab="learning">学習</button>
+  <button type="button" role="tab" data-tab="risk">リスク</button>
 </nav>
 <div class="marq bo" aria-label="処理の流れ"><span class="ml">FLOW</span><div class="mv"><div class="mt" id="marq"></div></div></div>
 
@@ -488,6 +525,10 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
   <section class="pn wide" data-pane="learning">
     <h2 class="ph"><span class="t">NEWS · PRICE CHECK<span class="jp">ニュースと値動きの答え合わせ</span></span></h2>
     <div class="pb"><div id="newsCheck"></div></div>
+  </section>
+  <section class="pn wide" data-pane="risk">
+    <h2 class="ph"><span class="t">RISK SETTINGS<span class="jp">リスクの許容度</span></span><span class="st" id="rsSt">● -</span></h2>
+    <div class="pb" id="rsBox"><p class="empty">読み込み中…</p></div>
   </section>
   <section class="pn wide" data-pane="learning">
     <h2 class="ph"><span class="t">FORECAST · ACCURACY<span class="jp">値動きの予想の答え合わせ</span></span><span class="st" id="fcState"></span></h2>
@@ -701,6 +742,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
       case "risk.halt_daily": return "日次損失の上限で当日停止";
       case "risk.kill_switch": return "キルスイッチ作動";
       case "risk.resume": return "停止を解除";
+      case "risk.limits_changed": return "リスク上限を変更" + (d.action === "reset" ? " (.env の値に戻す)" : "") + (d.raised ? " · 上げる変更" : "");
       case "learning.param_adjust": return "パラメータ調整 " + (d.strategyId || "") + " " + (d.param || "") + " " + (d.from != null ? d.from + "→" + d.to : "");
       case "learning.param_revert": return "パラメータを元に戻す " + (d.strategyId || "") + " " + (d.param || "");
       case "learning.reflect": return "振り返りを実行";
@@ -1785,6 +1827,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     safe("positions", function () { renderPositions(S); });
     if (TR) safe("trades", function () { renderTrades(TR); });
     if (LE) safe("learning", function () { renderLearning(LE); });
+    if (cur === "risk" && RS.data) safe("riskSettings", function () { rsLive(); rsUpdate(); });
   }
 
   // ───── 監査ログの取得 (差分) ─────
@@ -1809,8 +1852,227 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     return evInflight;
   }
 
+  // ───── リスク設定タブ ─────
+  // プリセット + 項目ごとの調整。割合は % で入力し、送るときに割合へ変換する (0.5 → 0.005)。
+  // live でリスクを上げる変更は確認語、最大ドローダウンを現在の DD 以下にする変更は確認が必要 (サーバーでも同じ判定をして 409 を返す)。
+  var CSRF = (function () { var m = document.querySelector('meta[name="csrf-token"]'); return m ? m.getAttribute('content') || '' : ''; })();
+  var RS = { data: null, draft: {}, token: '', busy: false, loading: null, msg: '', msgCls: '', needs: [], fieldErr: {} };
+  var RS_EPS = 1e-12, RS_SRC = { env: '.env', dashboard: 'ダッシュボード' };
+  function rsNorm(v) { return Number(v.toPrecision(12)); }
+  function rsFmt(f, v) { if (typeof v !== 'number' || !isFinite(v)) return '-'; return f.kind === 'ratio' ? Number((v * 100).toPrecision(6)) + '%' : String(v); }
+  function rsText(f, v) { return f.kind === 'ratio' ? String(Number((v * 100).toPrecision(10))) : String(v); }
+  function rsRange(f) {
+    if (f.lowerOnly) return f.min + '〜' + RS.data.env[f.key] + ' (下げる方向のみ)';
+    return f.kind === 'ratio' ? '0 超〜' + rsFmt(f, f.max) : f.min + '〜' + f.max;
+  }
+  function rsField(k) { var d = RS.data; for (var i = 0; i < d.fields.length; i++) if (d.fields[i].key === k) return d.fields[i]; return null; }
+  function rsParse(f, text) {
+    // 全角の数字・小数点も受け付ける
+    var t = String(text == null ? '' : text).trim().replace(/[０-９．]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) - 65248); });
+    if (!/^[0-9]+([.][0-9]*)?$|^[.][0-9]+$/.test(t)) return { err: '数値を入力してください' };
+    var x = Number(t), v = f.kind === 'ratio' ? rsNorm(x / 100) : x;
+    if (f.kind === 'ratio') { if (!(v > 0 && v <= f.max)) return { err: '0% より大きく ' + rsFmt(f, f.max) + ' 以下にしてください' }; }
+    else if (Math.floor(v) !== v || v < f.min || v > f.max) return { err: f.min + '〜' + f.max + ' の整数にしてください' };
+    if (f.lowerOnly && v > RS.data.env[f.key]) return { err: '安全装置のため .env の値 (' + RS.data.env[f.key] + ') より上げられません' };
+    return { v: v };
+  }
+  function rsMetrics() {
+    // 5 秒ごとの status を優先し、無ければ設定の取得時の値
+    var c = (RS.data && RS.data.current) || {}, o = { dd: c.drawdownPct, dl: c.dailyLossPct, kill: !!c.killSwitch };
+    if (S && S.risk && S.equity && typeof S.equity.current === 'number') {
+      if (S.risk.peakEquity > 0) o.dd = Math.max(0, (S.risk.peakEquity - S.equity.current) / S.risk.peakEquity);
+      if (S.risk.dayStartEquity > 0) o.dl = (S.risk.dayStartEquity - S.equity.current) / S.risk.dayStartEquity;
+      o.kill = !!S.risk.killSwitch;
+    }
+    return o;
+  }
+  /** after (項目 → 値) を現在の実効値と比べる */
+  function rsEval(after) {
+    var d = RS.data, changes = [], raised = [], m = rsMetrics();
+    d.fields.forEach(function (f) {
+      var cur = d.effective[f.key], v = after[f.key];
+      if (Math.abs(v - cur) > RS_EPS) { changes.push(f.key); if (v > cur + RS_EPS) raised.push(f.key); }
+    });
+    return {
+      changes: changes, raised: raised, m: m,
+      needRaise: d.mode === 'live' && raised.length > 0,
+      ddTrip: changes.indexOf('maxDrawdown') >= 0 && typeof m.dd === 'number' && !m.kill && after.maxDrawdown <= m.dd,
+      dlHalt: typeof m.dl === 'number' && after.maxDailyLoss < m.dl,
+    };
+  }
+  function rsPlan() {
+    var d = RS.data, after = {}, errs = {}, ok = true, send = {};
+    d.fields.forEach(function (f) {
+      var p = rsParse(f, RS.draft[f.key]);
+      if (p.err) { errs[f.key] = p.err; ok = false; after[f.key] = d.effective[f.key]; return; }
+      after[f.key] = p.v;
+      if (Math.abs(p.v - d.env[f.key]) > RS_EPS) send[f.key] = p.v; // .env と同じ値は上書きせず .env に従う
+    });
+    var e = rsEval(after), preset = null;
+    if (ok) d.presets.forEach(function (p) { if (Object.keys(p.values).every(function (k) { return Math.abs(p.values[k] - after[k]) <= RS_EPS; })) preset = p.id; });
+    var ov = d.override ? d.override.values : {}, ks = Object.keys(send);
+    var differ = ks.length !== Object.keys(ov).length || ks.some(function (k) { return ov[k] === undefined || Math.abs(ov[k] - send[k]) > RS_EPS; });
+    e.ok = ok; e.errs = errs; e.after = after; e.send = send; e.preset = preset; e.dirty = ok && (e.changes.length > 0 || differ);
+    return e;
+  }
+  function rsWritable() { var w = RS.data && RS.data.write; return !!w && (w.allowed || (w.needsToken && RS.token.length >= 16)); }
+  function rsResetDraft() { RS.draft = {}; RS.data.fields.forEach(function (f) { RS.draft[f.key] = rsText(f, RS.data.effective[f.key]); }); }
+  function rsLive() {
+    var d = RS.data, m = rsMetrics(), lim = (S && S.risk && S.risk.limits) || null;
+    var ddMax = lim ? lim.maxDrawdown : d.effective.maxDrawdown, dlMax = lim ? lim.maxDailyLoss : d.effective.maxDailyLoss;
+    var st = m.kill ? '<b class="neg">キルスイッチ作動中</b>' : S && S.risk && S.risk.halted ? '<b class="neg">停止中</b>' : '<b class="pos">通常</b>';
+    set('rsLive',
+      '<div><span>ドローダウン</span><b>' + esc(pct(m.dd)) + '</b> / 上限 ' + esc(pct(ddMax, 1)) + '</div>' +
+      '<div><span>当日の損益</span><b class="' + cls(typeof m.dl === 'number' ? -m.dl : null) + '">' + esc(typeof m.dl === 'number' ? (m.dl > 0 ? '-' : '+') + pct(Math.abs(m.dl)) : '-') + '</b> / 上限 -' + esc(pct(dlMax, 1)) + '</div>' +
+      '<div><span>状態</span>' + st + '</div>');
+  }
+  function rsRenderForm() {
+    var d = RS.data, live = d.mode === 'live', ov = d.override, w = d.write || {};
+    $('rsSt').textContent = '● ' + (live ? 'LIVE · 実弾' : 'PAPER');
+    var h = '<div class="rs-top"><span>モード <b class="' + (live ? 'neg' : '') + '">' + (live ? 'LIVE (実弾)' : 'PAPER (仮想)') + '</b></span>' +
+      '<span>' + (ov ? '最終変更 <b>' + esc(time(ov.updatedAt)) + '</b> (ダッシュボード' + (ov.preset ? ' · プリセット ' + esc(rsPresetLabel(ov.preset)) : '') + ')' : '上書きなし (.env の値)') + '</span></div>' +
+      '<div class="rs-live" id="rsLive"></div>';
+    if (!w.allowed && !w.needsToken) h += '<div class="rs-panel ng">' + esc(w.reason || '変更できません') + '</div>';
+    if (w.needsToken) h += '<div class="rs-panel"><label for="rsToken">書き込みトークン (DASHBOARD_WRITE_TOKEN)</label><input id="rsToken" type="password" autocomplete="off" spellcheck="false" value="' + esc(RS.token) + '"></div>';
+    h += '<div class="rs-h">PRESET · プリセット</div><div class="rs-presets" role="group" aria-label="プリセット">' + d.presets.map(function (p) {
+      return '<button type="button" data-preset="' + esc(p.id) + '" aria-pressed="false">' + esc(p.label) + '<small>1回 ' + esc(rsFmt({ kind: 'ratio' }, p.values.riskPerTrade)) + ' · DD ' + esc(rsFmt({ kind: 'ratio' }, p.values.maxDrawdown)) + '</small></button>';
+    }).join('') + '</div>';
+    h += '<div class="rs-h">LIMITS · 項目ごとの調整</div><div class="rs-grid">' + d.fields.map(function (f) {
+      var k = f.key;
+      return '<div class="rsf" id="rsf-' + esc(k) + '"><label for="rsi-' + esc(k) + '" title="' + esc(f.env) + '">' + esc(f.label) + '</label>' +
+        '<div class="rsrow"><input id="rsi-' + esc(k) + '" data-k="' + esc(k) + '" type="text" inputmode="' + (f.kind === 'ratio' ? 'decimal' : 'numeric') + '" autocomplete="off" value="' + esc(RS.draft[k]) + '">' +
+        '<span class="u">' + (f.kind === 'ratio' ? '%' : (k === 'maxOrdersPerMinute' ? '回' : '件')) + '</span><span class="rsx" id="rsx-' + esc(k) + '"></span></div>' +
+        '<div class="rsm">実効 <span class="d">' + esc(rsFmt(f, d.effective[k])) + '</span> (' + esc(RS_SRC[d.sources[k]] || d.sources[k]) + ')<br>.env ' + esc(rsFmt(f, d.env[k])) + ' · 範囲 ' + esc(rsRange(f)) + '</div>' +
+        '<div class="rse" id="rse-' + esc(k) + '"></div></div>';
+    }).join('') + '</div>';
+    h += '<div class="rs-panel ng" id="rsDdBox" hidden><b>キルスイッチが作動します</b><br><span id="rsDdText"></span>' +
+      '<label class="ck"><input type="checkbox" id="rsAck"><span>理解したうえで保存する (保存後、新規エントリーは手動の再開まで止まります)</span></label></div>';
+    h += '<div class="rs-panel" id="rsDlBox" hidden>日次損失の上限が当日の損失を下回ります。保存すると次の評価で当日の新規エントリーが止まります。</div>';
+    h += '<div class="rs-panel ng" id="rsConfirmBox" hidden><b>実弾 (live) でリスクを上げる変更です</b><br><span id="rsRaiseText"></span><br>確認のため「<b>' + esc(d.confirmPhrase) + '</b>」と入力してください。' +
+      '<input id="rsConfirm" type="text" autocomplete="off" spellcheck="false" placeholder="ここに確認語を入力" aria-label="確認語"></div>';
+    h += '<div class="rs-btns"><button type="button" class="primary" id="rsSave">保存</button><button type="button" id="rsReset">.env の値に戻す</button></div>' +
+      '<div class="rs-msg" id="rsMsg" role="status" aria-live="polite"></div>' +
+      '<p class="rsm">割合は % で入力します (0.5 = 0.5%)。下げる変更はすぐ反映、' + (live ? '上げる変更は確認語が必要です。' : 'paper は確認なしで変更できます。') + ' 変更は監査ログに残り、エンジンの次のティックから効きます (再起動後も保持)。発注数の上限は安全装置のためプリセットでは変わりません。</p>';
+    $('rsBox').innerHTML = h;
+    rsLive();
+    rsUpdate();
+  }
+  function rsPresetLabel(id) { var l = id; RS.data.presets.forEach(function (p) { if (p.id === id) l = p.label; }); return l; }
+  function rsUpdate() {
+    var d = RS.data;
+    if (!d || !$('rsSave')) return;
+    var plan = rsPlan(), wr = rsWritable();
+    d.fields.forEach(function (f) {
+      var k = f.key, el = $('rsf-' + k), x = $('rsx-' + k), err = plan.errs[k] || RS.fieldErr[k] || '';
+      var ch = !plan.errs[k] && plan.changes.indexOf(k) >= 0, up = ch && plan.raised.indexOf(k) >= 0;
+      el.className = 'rsf' + (err ? ' bad' : up ? ' up' : ch ? ' chg' : '');
+      x.className = 'rsx' + (up ? ' up' : ch ? ' down' : '');
+      x.textContent = up ? '↑ 上げる' : ch ? '↓ 下げる' : '';
+      $('rse-' + k).textContent = err;
+      $('rsi-' + k).disabled = !wr;
+    });
+    var pb = document.querySelectorAll('#rsBox button[data-preset]');
+    for (var i = 0; i < pb.length; i++) { pb[i].setAttribute('aria-pressed', plan.preset === pb[i].getAttribute('data-preset') ? 'true' : 'false'); pb[i].disabled = !wr; }
+    var needRaise = (plan.ok && plan.needRaise) || RS.needs.indexOf('raise') >= 0;
+    var ddTrip = (plan.ok && plan.ddTrip) || RS.needs.indexOf('drawdown') >= 0;
+    $('rsConfirmBox').hidden = !needRaise;
+    $('rsRaiseText').textContent = plan.raised.length ? '上がる項目: ' + plan.raised.map(function (k) { var f = rsField(k); return f.label + ' ' + rsFmt(f, d.effective[k]) + ' → ' + rsFmt(f, plan.after[k]); }).join('、') : '';
+    $('rsDdBox').hidden = !ddTrip;
+    $('rsDdText').textContent = '最大ドローダウン ' + rsFmt({ kind: 'ratio' }, plan.after.maxDrawdown) + ' は現在のドローダウン ' + pct(plan.m.dd) + ' 以下です。保存すると即キルスイッチが作動します。';
+    $('rsDlBox').hidden = !(plan.ok && plan.dlHalt);
+    var confOk = !needRaise || $('rsConfirm').value.trim() === d.confirmPhrase, ackOk = !ddTrip || $('rsAck').checked;
+    var save = $('rsSave');
+    save.disabled = !wr || RS.busy || !plan.dirty || !confOk || !ackOk;
+    save.textContent = RS.busy ? '保存中…' : plan.dirty ? '保存 (' + plan.changes.length + ' 項目)' : '変更なし';
+    $('rsReset').disabled = !wr || RS.busy || !d.override;
+    var msg = $('rsMsg');
+    msg.className = 'rs-msg' + (RS.msgCls ? ' ' + RS.msgCls : '');
+    msg.textContent = RS.msg || (!plan.ok ? '入力を確認してください' : needRaise && !confOk ? '確認語を入力すると保存できます' : ddTrip && !ackOk ? '警告を確認してチェックを入れると保存できます' : '');
+  }
+  function rsSubmit(reset) {
+    var d = RS.data;
+    if (!d || RS.busy || !rsWritable()) return;
+    var body;
+    if (reset) {
+      // .env の値に戻す: 戻すことでリスクが上がる (live) / 即キルスイッチになる場合は先に確認を求める
+      var e = rsEval(d.env), conf = $('rsConfirm').value.trim();
+      RS.needs = [];
+      if (e.needRaise && conf !== d.confirmPhrase) RS.needs.push('raise');
+      if (e.ddTrip && !$('rsAck').checked) RS.needs.push('drawdown');
+      if (RS.needs.length) { RS.msg = '確認してから、もう一度「.env の値に戻す」を押してください'; RS.msgCls = 'ng'; rsUpdate(); return; }
+      body = { action: 'reset' };
+    } else {
+      var plan = rsPlan();
+      if (!plan.ok || !plan.dirty) return;
+      body = Object.keys(plan.send).length ? { action: 'set', values: plan.send } : { action: 'reset' };
+      if (plan.preset && body.action === 'set') body.preset = plan.preset;
+    }
+    var c = $('rsConfirm').value.trim();
+    if (c) body.confirm = c;
+    if ($('rsAck').checked) body.acknowledgeDrawdown = true;
+    var headers = { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF };
+    if (RS.token) headers.Authorization = 'Bearer ' + RS.token;
+    RS.busy = true; RS.msg = ''; RS.msgCls = ''; RS.fieldErr = {};
+    rsUpdate();
+    fetch('/api/risk-settings', { method: 'POST', headers: headers, body: JSON.stringify(body), cache: 'no-store', credentials: 'same-origin' })
+      .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { status: r.status, j: j }; }); })
+      .then(function (res) {
+        RS.busy = false;
+        if (res.status === 200 && res.j.settings) {
+          var w = d.write;
+          RS.data = res.j.settings; RS.data.write = w; RS.needs = [];
+          rsResetDraft();
+          RS.msg = res.j.changed ? '保存しました。次のティックから反映されます。' + (res.j.warnings || []).join(' ') : '変更はありませんでした';
+          RS.msgCls = 'ok';
+          rsRenderForm();
+          refresh().catch(function () { /* 次の更新で同期する */ });
+          return;
+        }
+        if (res.status === 409) RS.needs = res.j.needs || [];
+        RS.fieldErr = res.j.fieldErrors || {};
+        RS.msg = res.j.error || '保存に失敗しました (' + res.status + ')';
+        RS.msgCls = 'ng';
+        rsUpdate();
+      }, function () { RS.busy = false; RS.msg = '通信に失敗しました'; RS.msgCls = 'ng'; rsUpdate(); });
+  }
+  function loadRisk() {
+    if (RS.loading) return RS.loading;
+    RS.loading = get('/api/risk-settings').then(function (d) {
+      var keep = RS.data && rsPlan().dirty; // 編集中の入力は残す
+      RS.data = d;
+      if (!keep) rsResetDraft();
+      rsRenderForm();
+    }, function () {
+      set('rsBox', '<p class="err">リスク設定を取得できません (このエンジンでは変更できないか、通信に失敗しました)</p>');
+    }).then(function () { RS.loading = null; });
+    return RS.loading;
+  }
+  $('rsBox').addEventListener('input', function (ev) {
+    var t = ev.target;
+    if (!t || !RS.data) return;
+    if (t.getAttribute('data-k')) { RS.draft[t.getAttribute('data-k')] = t.value; RS.needs = []; RS.msg = ''; RS.fieldErr = {}; }
+    else if (t.id === 'rsToken') RS.token = t.value.trim();
+    else if (t.id === 'rsConfirm') RS.msg = '';
+    rsUpdate();
+  });
+  $('rsBox').addEventListener('change', function (ev) { if (ev.target && ev.target.id === 'rsAck') { RS.msg = ''; rsUpdate(); } });
+  $('rsBox').addEventListener('click', function (ev) {
+    var t = ev.target && ev.target.closest ? ev.target.closest('button') : null;
+    if (!t || !RS.data || t.disabled) return;
+    var pid = t.getAttribute('data-preset');
+    if (pid) {
+      RS.data.presets.forEach(function (p) {
+        if (p.id !== pid) return;
+        Object.keys(p.values).forEach(function (k) { var f = rsField(k); RS.draft[k] = rsText(f, p.values[k]); var el = $('rsi-' + k); if (el) el.value = RS.draft[k]; });
+      });
+      RS.needs = []; RS.msg = ''; RS.fieldErr = {};
+      rsUpdate();
+    } else if (t.id === 'rsSave') rsSubmit(false);
+    else if (t.id === 'rsReset') rsSubmit(true);
+  });
+
   // ───── タブの切り替え (選んだタブはこの端末に記憶する) ─────
-  var TAB_KEY = "dashboard.tab", PANES = ["board", "overview", "market", "positions", "trades", "learning"];
+  var TAB_KEY = "dashboard.tab", PANES = ["board", "overview", "market", "positions", "trades", "learning", "risk"];
   function syncAnim() {
     document.body.classList.toggle("anim-off", !animOK());
     CLOUD.run(animOK());
@@ -1830,6 +2092,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     syncAnim();
     if (name === "board") { renderBoardWide(); loadCandles().catch(function () { /* 次の更新で再取得 */ }); }
     if (name === "overview" && S) set("chart", chart(S.equityHistory, S.baseCurrency));
+    if (name === "risk") loadRisk();
     try { localStorage.setItem(TAB_KEY, name); } catch (e) { /* 保存できなくても表示は続ける */ }
   }
   $("tabs").addEventListener("click", function (ev) {

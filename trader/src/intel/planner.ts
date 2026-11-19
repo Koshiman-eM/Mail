@@ -37,8 +37,13 @@ export interface PlanInput {
   instruments: Instrument[];
   regimes: Record<string, RegimeFeatures>;
   strategies: PlanStrategy[];
-  /** key: "strategyId|regimeLabel|assetClass" → 0〜1.5 */
+  /** key: "strategyId|regimeLabel|assetClass" → 0〜1.5 (決定的な重み。乱数入りの探索の重みを渡さない) */
   armWeights?: Record<string, number>;
+  /**
+   * 資産クラス別の情報の効き具合 (learning.intelInfluence, 0〜1.5, 中立 1)。片側バイアスの判定に使う
+   * sentiment / confidence に掛ける (戦略へ渡す情報バイアスと同じ補正。未指定は 1)
+   */
+  intelInfluence?: Partial<Record<AssetClass, number>>;
   lessons: Lesson[];
   now: number;
   ai?: AiOptions;
@@ -80,6 +85,21 @@ export function biasForInstrument(
   return { sentiment, confidence, eventRisk: ev, found };
 }
 
+/**
+ * 片側バイアスの判定に使うバイアス。biasForInstrument の sentiment / confidence に情報の効き具合を掛けてクランプする
+ * (engine/context.ts の intelBiasFor と同じ補正。情報が逆効果だと学習したら片側化もしにくくなる)
+ */
+export function influencedBias(
+  inst: Instrument,
+  biases: Record<string, IntelBias>,
+  influence: number | undefined,
+): ReturnType<typeof biasForInstrument> {
+  const b = biasForInstrument(inst, biases);
+  const k = influence !== undefined && Number.isFinite(influence) ? Math.max(0, influence) : 1;
+  if (k === 1) return b;
+  return { ...b, sentiment: clamp(b.sentiment * k, -1, 1), confidence: clamp(b.confidence * k, 0, 1) };
+}
+
 /** 経済指標からブラックアウト (高インパクトのみ)。影響クラスは通貨で決める */
 export function blackoutsFromEvents(events: EconEvent[], now: number, validUntil: number): StrategyPlan["blackouts"] {
   const out: StrategyPlan["blackouts"] = [];
@@ -95,16 +115,17 @@ export function blackoutsFromEvents(events: EconEvent[], now: number, validUntil
 }
 
 export function buildBaselinePlan(input: PlanInput): StrategyPlan {
-  const { brief, instruments, regimes, strategies, armWeights = {}, now } = input;
+  const { brief, instruments, regimes, strategies, armWeights = {}, intelInfluence = {}, now } = input;
   const validUntil = now + PLAN_TTL_MS;
   const perSymbol: Record<string, SymbolPlan> = {};
   const riskOn = clamp(brief.riskOn, -1, 1);
 
   for (const inst of instruments) {
     const regime = regimes[inst.symbol];
-    const bias = biasForInstrument(inst, brief.biases);
+    const bias = influencedBias(inst, brief.biases, intelInfluence[inst.assetClass]);
     const notes: string[] = [];
     let enabled: PlanStrategy[] = [];
+    const armDisabled: string[] = [];
     let mult = 0;
 
     if (regime?.label === "low_liquidity") {
@@ -115,7 +136,9 @@ export function buildBaselinePlan(input: PlanInput): StrategyPlan {
         if (!regime) return true; // レジーム不明は資産クラスのみで判定
         if (!s.regimes.includes(regime.label)) return false;
         const w = armWeights[`${s.id}|${regime.label}|${inst.assetClass}`];
-        return w === undefined || w >= ARM_DISABLE_BELOW;
+        if (w === undefined || w >= ARM_DISABLE_BELOW) return true;
+        armDisabled.push(s.id);
+        return false;
       });
       if (enabled.length === 0) notes.push("現レジームに合う有効戦略なし");
       else {
@@ -151,6 +174,7 @@ export function buildBaselinePlan(input: PlanInput): StrategyPlan {
       directionBias,
       riskMultiplier: enabled.length === 0 ? 0 : clamp(mult, 0, MAX_RISK_MULTIPLIER),
       notes: notes.length ? notes.join(" / ") : undefined,
+      ...(armDisabled.length ? { armDisabled } : {}),
     };
   }
 
@@ -224,6 +248,8 @@ export async function buildStrategyPlan(input: PlanInput): Promise<StrategyPlan>
       {
         baseline: base,
         brief: { riskOn: input.brief.riskOn, summary: input.brief.summary, watchlist: input.brief.watchlist, biases: Object.values(input.brief.biases).map((b) => ({ asset: b.asset, sentiment: +b.sentiment.toFixed(2), confidence: +b.confidence.toFixed(2), eventRisk: +b.eventRisk.toFixed(2) })) },
+        // 情報の効き具合 (1 未満なら情報に沿った取引の成績が悪い)。ベースラインの片側バイアスはこれで補正済み
+        ...(input.intelInfluence ? { intelInfluence: input.intelInfluence } : {}),
         regimes: input.regimes,
         strategies: input.strategies,
       },

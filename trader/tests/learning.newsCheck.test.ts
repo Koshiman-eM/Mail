@@ -65,7 +65,7 @@ describe("ニュースと値動きの答え合わせ (NewsOutcomeTracker)", () =
     expect(news.listPending()).toHaveLength(1);
   });
 
-  it("15 分・1 時間・4 時間で判定し、当たり・外れを重み 0.3 で情報源の信頼度へ反映する", () => {
+  it("15 分・1 時間・4 時間で判定し、当たり・外れを 1 記事あたり合計 0.3 (1 判定 0.3 ÷ 3) で情報源の信頼度へ反映する", () => {
     const { news, rel, store } = setup();
     news.ingest([item("a")], markets, T0);
     // 15 分後 +1% (当たり)、1 時間後 −1% (外れ)、4 時間後 +2% (当たり)
@@ -74,12 +74,12 @@ describe("ニュースと値動きの答え合わせ (NewsOutcomeTracker)", () =
     expect(news.evaluate(T0 + 15 * MIN, deps({ "BTC/USDT": px }))).toBe(1);
     let r = rel.get("rss:test")!;
     expect(r).toMatchObject({ n: 0, hits: 0, newsN: 1, newsHits: 1 });
-    expect(r.effN).toBeCloseTo(0.3, 10);
+    expect(r.effN).toBeCloseTo(0.1, 10);
     expect(news.evaluate(T0 + HOUR, deps({ "BTC/USDT": px }))).toBe(1);
     expect(news.evaluate(T0 + 4 * HOUR, deps({ "BTC/USDT": px }))).toBe(1);
     r = rel.get("rss:test")!;
     expect(r).toMatchObject({ n: 0, hits: 0, newsN: 3, newsHits: 2 });
-    expect(r.effN).toBeCloseTo(0.9, 10);
+    expect(r.effN).toBeCloseTo(0.3, 10);
     expect(news.listPending()).toEqual([]); // 3 つとも判定済み
     expect(store.kvGet(sourceReliabilityKey("paper"))).toEqual(rel.all());
     const sum = news.summary();

@@ -14,6 +14,7 @@ import { isHaltShadowReason } from "../src/learning/shadow";
 import { ParamTuner, type ParamValidator } from "../src/learning/tuner";
 import { MemoryStore } from "../src/storage/memory";
 import { SqliteStore } from "../src/storage/sqlite";
+import { stubValidator } from "./helpers/validation";
 
 const DAY = 86_400_000;
 const NOW = 100 * DAY;
@@ -256,13 +257,14 @@ function seedTrades(store: Store, n: number, mode: TradingMode, over: Partial<Tr
     store.saveAttribution(attributeTrade(t));
   }
 }
-const favorStop: ParamValidator = async (_s, _a, p) => ({ score: p.stopAtr === 1.5 ? 1 : 1.2, trades: 50 });
+const favorStop: ParamValidator = stubValidator((p) => (p.stopAtr === 1.5 ? 0 : 1));
 
 describe("ParamTuner / reflection: 現在の mode かつ estimated でない取引だけを集計する", () => {
   it("live の取引・推定約定の取引では paper の tuner は調整しない", async () => {
     const store = new MemoryStore();
-    seedTrades(store, 25, "live");
-    seedTrades(store, 25, "paper", { estimated: true });
+    // 判断用 + 事後評価の比較対象 (計 45 件) が要る
+    seedTrades(store, 45, "live");
+    seedTrades(store, 45, "paper", { estimated: true });
     const paper = new ParamTuner({ store, getStrategy, validate: favorStop, mode: "paper" });
     expect(await paper.run(NOW)).toEqual([]);
     // live の tuner は live の取引で調整し、調整履歴とパラメータは live 側に記録する
@@ -281,11 +283,11 @@ describe("ParamTuner / reflection: 現在の mode かつ estimated でない取�
   it("propose の事前集計・reviewApplied の事後集計も推定約定を除く", async () => {
     const store = new MemoryStore();
     const tuner = new ParamTuner({ store, getStrategy, validate: favorStop, mode: "paper" });
-    seedTrades(store, 5, "paper");
-    seedTrades(store, 5, "paper", { estimated: true, rMultiple: 10 });
+    seedTrades(store, 45, "paper");
+    seedTrades(store, 10, "paper", { estimated: true, rMultiple: 10 });
     const adj = await tuner.propose({ strategyId: "s1", assetClass: "crypto", param: "stopAtr", direction: "up", reason: "t" }, NOW);
     expect(adj?.status).toBe("applied");
-    expect(store.kvGet(`adjmeta:paper:${adj!.id}`)).toMatchObject({ preMeanR: -1, preN: 5 });
+    expect(store.kvGet(`adjmeta:paper:${adj!.id}`)).toMatchObject({ preMeanR: -1, preN: 20 });
   });
 
   it("computeReflectionStats は mode と estimated で絞る", () => {

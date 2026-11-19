@@ -6,7 +6,7 @@ import { createLogger, type Logger } from "../core/logger";
 import {
   systemClock, type Balance, type Broker, type BrokerPosition, type Clock, type EntryContext, type Instrument, type IntelBias, type MarketBrief,
   type IntelItem, type MarketView, type OrderRequest, type Params, type Quote, type RegimeFeatures, type Signal, type Store, type Strategy,
-  type StrategyContext, type StrategyPlan, type Timeframe, type TradeRecord, TIMEFRAME_MS,
+  type ShadowTradeRecord, type StrategyContext, type StrategyPlan, type Timeframe, type TradeRecord, TIMEFRAME_MS,
 } from "../core/types";
 import type { BrokerSet } from "../execution/router";
 import type { PaperSnapshot } from "../execution/paper";
@@ -370,6 +370,12 @@ export class TradingEngine {
 
   /** 銘柄×戦略ごとに最後に評価した主時間足の確定足の時刻 */
   private readonly lastEval = new Map<string, number>();
+  /**
+   * direction_bias で止めた仮想トレードのエントリー時の情報バイアス (戦略へ渡すものと同じ補正後の sentiment)。
+   * キーは仮想トレードの重複判定と同じ 銘柄|戦略|方向 (同時に 1 件だけ)。決済時に情報の効き具合の更新へ渡す。
+   * 再起動をまたぐため kv shadowIntel:<mode> に保存する (遅延読み込み)
+   */
+  private shadowIntel?: Record<string, { ts: number; s: number }>;
   private readonly skips = new Map<string, { count: number; sample: string }>();
   private initialized = false;
   private lastEquitySave?: number;
@@ -456,7 +462,7 @@ export class TradingEngine {
         store: deps.store,
         mode: deps.brokerSet.mode,
         options: shadowOpts,
-        onClosed: (t) => this.learning.onShadowClosed(t),
+        onClosed: (t) => this.onShadowClosed(t),
         onError: (where, e) => this.warnThrottled(where, this.clock.now(), "仮想トレードの処理に失敗 (取引は継続)", { error: errMsg(e) }),
       });
     }
@@ -1077,14 +1083,61 @@ export class TradingEngine {
   // ───────── 見送ったシグナルの答え合わせ (仮想トレード) ─────────
   // どれも実際の発注・リスク判定・建玉管理には触れず、例外は握りつぶす (ティックを止めない)
 
-  /** 見送ったシグナルを仮想トレードとして記録する */
-  private shadowRecord(key: string, inst: Instrument, view: MarketView, s: Strategy, signal: Signal, regime: RegimeFeatures, now: number): void {
+  /**
+   * 見送ったシグナルを仮想トレードとして記録する。
+   * intelSentiment (direction_bias のときだけ渡す) は決済時に情報の効き具合の更新へ使うため覚えておく
+   */
+  private shadowRecord(key: string, inst: Instrument, view: MarketView, s: Strategy, signal: Signal, regime: RegimeFeatures, now: number, intelSentiment?: number): void {
     if (!this.shadow) return;
     try {
-      this.shadow.record({ instrument: inst, quote: view.quote, signal: { ...signal, horizon: signal.horizon ?? s.horizon }, regime: regime.label, reason: key, now });
+      const created = this.shadow.record({ instrument: inst, quote: view.quote, signal: { ...signal, horizon: signal.horizon ?? s.horizon }, regime: regime.label, reason: key, now });
+      if (created && key === "direction_bias" && typeof intelSentiment === "number" && Number.isFinite(intelSentiment)) {
+        const m = this.shadowIntelMap();
+        m[`${inst.symbol}|${signal.strategyId}|${signal.direction}`] = { ts: now, s: intelSentiment };
+        this.saveShadowIntel(now);
+      }
     } catch (e) {
       this.warnThrottled("shadow.record", now, "仮想トレードの記録に失敗 (取引は継続)", { error: errMsg(e) });
     }
+  }
+
+  private shadowIntelKey(): string {
+    return `shadowIntel:${this.mode}`;
+  }
+
+  private shadowIntelMap(): Record<string, { ts: number; s: number }> {
+    if (!this.shadowIntel) {
+      const saved = this.store.kvGet<Record<string, { ts: number; s: number }>>(this.shadowIntelKey());
+      this.shadowIntel = saved && typeof saved === "object" ? { ...saved } : {};
+    }
+    return this.shadowIntel;
+  }
+
+  /** 保存 (決済されずに捨てられた分が残らないよう、8 日より古いものは消す) */
+  private saveShadowIntel(now: number): void {
+    const m = this.shadowIntelMap();
+    for (const [k, v] of Object.entries(m)) if (!v || !(now - v.ts < 8 * 86_400_000)) delete m[k];
+    this.store.kvSet(this.shadowIntelKey(), m);
+  }
+
+  /** 仮想トレードの決済 → 学習 (direction_bias はエントリー時の情報バイアスを添える) */
+  private onShadowClosed(t: ShadowTradeRecord): void {
+    let intelSentiment: number | undefined;
+    if (t.reason === "direction_bias") {
+      try {
+        const m = this.shadowIntelMap();
+        const k = `${t.symbol}|${t.strategyId}|${t.direction}`;
+        const e = m[k];
+        if (e && e.ts === t.entryTs) intelSentiment = e.s;
+        if (e && e.ts <= t.entryTs) {
+          delete m[k];
+          this.saveShadowIntel(t.exitTs);
+        }
+      } catch (e) {
+        this.warnThrottled("shadow.intel", t.exitTs, "仮想トレードの情報バイアスの読み書きに失敗 (取引は継続)", { error: errMsg(e) });
+      }
+    }
+    this.learning.onShadowClosed(t, intelSentiment !== undefined ? { intelSentiment } : {});
   }
 
   /** 新規停止中など、戦略を評価しない経路でも仮想トレード用にだけ評価する (腕の乱数・評価回数には触れない) */
@@ -1297,7 +1350,25 @@ export class TradingEngine {
     return resolveParams(s, this.learning.paramsFor(s.id, inst.assetClass) ?? s.defaultParams);
   }
 
-  /** 新規エントリーの可否 (計画 → 無ければベースライン計画相当)。ブラックアウトも確認する */
+  /** ベースライン計画と同じ規則で 1 戦略だけ計画する (片側バイアスは情報の効き具合で補正) */
+  private baselineFor(inst: Instrument, s: Strategy, regime: RegimeFeatures, armWeight: number, ctx: TickCtx): StrategyPlan {
+    return buildBaselinePlan({
+      brief: ctx.brief ?? emptyBrief(ctx.now),
+      instruments: [inst],
+      regimes: { [inst.symbol]: regime },
+      strategies: [s],
+      armWeights: { [armKey(s.id, regime.label, inst.assetClass)]: armWeight },
+      intelInfluence: { [inst.assetClass]: this.learning.intelInfluence(inst.assetClass) },
+      lessons: [],
+      now: ctx.now,
+    });
+  }
+
+  /**
+   * 新規エントリーの可否 (計画 → 無ければベースライン計画相当)。ブラックアウトも確認する。
+   * armWeight はエントリー時の腕の重み (無効化中の腕は探索に当たったときだけ exploreSize、外れたら 0)。
+   * 腕が無効なために外したときは reason "arm_disabled" (呼び出し側が仮想トレード用にだけ戦略を評価する)
+   */
   private gate(inst: Instrument, s: Strategy, regime: RegimeFeatures, armWeight: number, ctx: TickCtx): Gate {
     const { now } = ctx;
     const plan = ctx.plan && ctx.plan.validUntil > now ? ctx.plan : undefined;
@@ -1306,23 +1377,30 @@ export class TradingEngine {
     let directionBias: Gate["directionBias"];
     let riskMultiplier: number;
     if (plan && sp) {
-      if (!sp.enabledStrategies.includes(s.id)) return { ok: false, reason: "plan_disabled", directionBias: "both", riskMultiplier: 0 };
-      directionBias = sp.directionBias;
-      riskMultiplier = sp.riskMultiplier;
-      blackouts = plan.blackouts;
+      if (!sp.enabledStrategies.includes(s.id)) {
+        if (!sp.armDisabled?.includes(s.id)) return { ok: false, reason: "plan_disabled", directionBias: "both", riskMultiplier: 0 };
+        // 計画作成時に腕が無効だった戦略。今の腕の重みが 0 (無効のまま・探索に外れた) なら見送る
+        if (!(armWeight > 0)) return { ok: false, reason: "arm_disabled", directionBias: "both", riskMultiplier: 0 };
+        // 探索に当たった・回復した: ベースラインと同じ規則で許可し、計画側の判断 (方向・倍率・ブラックアウト) も守る
+        const bp = this.baselineFor(inst, s, regime, armWeight, ctx).perSymbol[inst.symbol];
+        if (!bp?.enabledStrategies.includes(s.id)) return { ok: false, reason: "baseline_disabled", directionBias: "both", riskMultiplier: 0 };
+        const planActive = sp.enabledStrategies.length > 0;
+        directionBias = planActive ? sp.directionBias : bp.directionBias;
+        riskMultiplier = planActive ? Math.min(sp.riskMultiplier, bp.riskMultiplier) : bp.riskMultiplier;
+        blackouts = plan.blackouts;
+      } else {
+        directionBias = sp.directionBias;
+        riskMultiplier = sp.riskMultiplier;
+        blackouts = plan.blackouts;
+      }
     } else {
       // 計画がまだ無い (期限切れ・計画後に追加した銘柄を含む): レジームに合う戦略をベースライン計画と同じ規則で許可
-      const base = buildBaselinePlan({
-        brief: ctx.brief ?? emptyBrief(now),
-        instruments: [inst],
-        regimes: { [inst.symbol]: regime },
-        strategies: [s],
-        armWeights: { [armKey(s.id, regime.label, inst.assetClass)]: armWeight },
-        lessons: [],
-        now,
-      });
+      const base = this.baselineFor(inst, s, regime, armWeight, ctx);
       const bp = base.perSymbol[inst.symbol];
-      if (!bp?.enabledStrategies.includes(s.id)) return { ok: false, reason: "baseline_disabled", directionBias: "both", riskMultiplier: 0 };
+      if (!bp?.enabledStrategies.includes(s.id)) {
+        const reason = bp?.armDisabled?.includes(s.id) ? "arm_disabled" : "baseline_disabled";
+        return { ok: false, reason, directionBias: "both", riskMultiplier: 0 };
+      }
       directionBias = bp.directionBias;
       riskMultiplier = bp.riskMultiplier;
       blackouts = base.blackouts;
@@ -1365,10 +1443,14 @@ export class TradingEngine {
       let gate: Gate | undefined;
       let armWeight = 1;
       if (!pos) {
+        // 探索 (無効化中の腕を exploreProb で試す) の乱数はエントリー時のここだけで引く (計画は決定的な重み)
         armWeight = this.learning.armWeight(s.id, regime.label, inst.assetClass, this.rng);
         gate = this.gate(inst, s, regime, armWeight, ctx);
         if (!gate.ok) {
           this.skip(gate.reason!);
+          // 腕が無効なために外したときも戦略を評価し、シグナルは仮想トレードとしてだけ記録する (回復の判定に使う。発注しない)。
+          // 評価は通常の評価と同じタイミング (新しい確定足ごと) に 1 回だけ
+          if (gate.reason === "arm_disabled") this.shadowEvaluate(s, inst, view, ctx, "arm_disabled");
           continue;
         }
       }
@@ -1407,7 +1489,8 @@ export class TradingEngine {
       if (signal.direction === "flat") continue;
       if (gate!.directionBias !== "both" && gate!.directionBias !== signal.direction) {
         this.skip("direction_bias");
-        this.shadowRecord("direction_bias", inst, view, s, signal, regime, ctx.now);
+        // 情報の効き具合の答え合わせ用に、戦略へ渡したものと同じ (補正後の) 情報バイアスを添える
+        this.shadowRecord("direction_bias", inst, view, s, signal, regime, ctx.now, intel?.sentiment);
         continue;
       }
       if (!(armWeight > 0)) {
@@ -1559,6 +1642,14 @@ export class TradingEngine {
     }
     if (r.status === "opened") {
       ctx.entries++;
+      // 値動きの予想: シグナルと同じ向きで発注に使われた予想を記録する (LIVE でなくても記録。LIVE 判定で「適用した予想の成績」を見るため)
+      if (fm && sig.direction !== "flat") {
+        try {
+          this.forecast?.markApplied(sym, sig.direction, sig.horizon ?? c.strategy.horizon, now);
+        } catch {
+          // 学習用の記録だけなので無視する
+        }
+      }
       this.saveSnapshot();
       ctx.account = await this.account(now, true);
       return;
@@ -1616,7 +1707,8 @@ export class TradingEngine {
       if (!r) continue;
       for (const s of this.strategies) {
         if (!s.assetClasses.includes(inst.assetClass)) continue;
-        armWeights[armKey(s.id, r.label, inst.assetClass)] = this.learning.armWeight(s.id, r.label, inst.assetClass, this.rng);
+        // 計画は乱数を使わない決定的な重み (無効化中の腕は 0 → armDisabled)。探索はエントリー時だけ
+        armWeights[armKey(s.id, r.label, inst.assetClass)] = this.learning.armPlanWeight(s.id, r.label, inst.assetClass);
       }
     }
     return buildStrategyPlan({
@@ -1625,6 +1717,8 @@ export class TradingEngine {
       regimes,
       strategies: [...this.strategies],
       armWeights,
+      // 片側バイアスも戦略へ渡す情報バイアスと同じく情報の効き具合で補正する
+      intelInfluence: this.learning.intelInfluences(),
       lessons: this.store.listLessons({ status: "active", limit: 50 }),
       now,
       ...(this.ai ? { ai: this.ai } : {}),
@@ -1911,7 +2005,8 @@ export class TradingEngine {
         ...(this.entriesPaused ? { entriesPaused: { since: this.entriesPaused.since, orders: [...this.entriesPaused.clientIds] } } : {}),
         peakEquity: rs.peakEquity,
         dayStartEquity: rs.dayStartEquity,
-        limits: this.config.risk,
+        // 実効値 (.env + ダッシュボードの上書き)。RiskManager の判定に使っている値を表示する
+        limits: this.risk.limits,
       },
       positions,
       pendingOrders: this.positions.pendingOrders().map((o) => ({

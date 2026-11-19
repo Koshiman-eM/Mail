@@ -8,15 +8,26 @@
  * - 実際の発注・リスク判定・建玉管理には一切関与しない (呼び出し側は例外を握りつぶす)。
  * - 未決済は kv `shadow:open:<mode>` に保存し、再起動後も続ける。
  * - R は統計値なので number で計算する (会計値ではない)。
+ * - 約定の見積もりはバックテスト (src/backtest/engine.ts) と同じ考え方で、楽観しない:
+ *   - 約定ずれ (片道) は資産クラス別のバックテストの既定値 (defaultCosts: crypto 1 / meme 20 / fx 0.5 / stock 1 bps)。手数料は銘柄の taker 手数料 (往復)
+ *   - エントリー: 買いは ask + 約定ずれ、売りは bid − 約定ずれ
+ *   - 損切り: 決済側 (買い: bid / 売り: ask) で判定し、ストップ価格 (窓開けで越えていれば現在の決済側の気配) に約定ずれを不利側に加えて約定
+ *   - 利確: 指値扱い (約定ずれなし)。時間切れ: 決済側の気配 ∓ 約定ずれ
+ *   - エントリーした 1m 足 (確定後) も判定に含める。その足にはエントリー前の値動きも入るので、不利側 (損切り・MAE) にだけ使い、
+ *     有利側 (利確・MFE) はエントリー時刻以降に始まった足と毎ティックの気配だけで判定する (保守的。確定足だけを使うので先読みはしない)
  */
 import { randomUUID } from "node:crypto";
+import { defaultCosts } from "../backtest/engine";
 import type {
   AssetClass, Horizon, Instrument, Quote, RegimeLabel, ShadowExitReason, ShadowTradeRecord, Signal, Store, TradingMode,
 } from "../core/types";
 
 export interface ShadowOptions {
-  /** 楽観を避けるための約定ずれ (片道, bps)。往復で 2 倍を差し引く */
-  slippageBps: number;
+  /**
+   * 約定ずれ (片道, bps) を全資産クラスで固定する上書き。
+   * 未指定ならバックテストと同じ資産クラス別の既定値 (shadowSlippageBps → backtest の defaultCosts)
+   */
+  slippageBps?: number;
   /** 未決済の上限 (全体)。超えた分は捨てる */
   maxOpen: number;
   /** 1 分あたりの新規作成の上限。超えた分は捨てる */
@@ -26,7 +37,6 @@ export interface ShadowOptions {
 }
 
 export const DEFAULT_SHADOW_OPTIONS: ShadowOptions = {
-  slippageBps: 2,
   maxOpen: 200,
   maxPerMinute: 30,
   defaultMaxHoldMs: 24 * 3_600_000,
@@ -94,20 +104,52 @@ const finite = (x: unknown): x is number => typeof x === "number" && Number.isFi
 const dedupeKey = (symbol: string, strategyId: string, direction: string) => `${symbol}|${strategyId}|${direction}`;
 const MINUTE = 60_000;
 
-/** 仮想トレードを閉じたときの R (純粋関数) */
+/** 仮想トレードの約定ずれ (片道, bps)。上書きが無ければバックテストと同じ資産クラス別の既定値 */
+export function shadowSlippageBps(assetClass: AssetClass, override?: number): number {
+  if (finite(override) && override >= 0) return override;
+  const c = defaultCosts(assetClass)?.slippageBps;
+  return finite(c) && c >= 0 ? c : 2;
+}
+
+/** 決済の約定 (価格) */
+export interface ShadowExitFill {
+  /** 決済の約定価格 (決済側の価格。買いの決済は bid 側、売りは ask 側。約定ずれ込み) */
+  fill: number;
+  /** 決済時のスプレッドの半分 */
+  halfSpread: number;
+  /** 決済の約定ずれ (≥ 0) */
+  slip: number;
+}
+
+/**
+ * 仮想トレードを閉じたときの R (純粋関数)。
+ * - 約定: エントリー = 仲値 ± (スプレッドの半分 + 約定ずれ)、決済 = exit.fill。手数料は約定価格 × taker 手数料 (往復)
+ * - netR = (方向 × (決済の約定 − エントリーの約定) − 手数料) / 1R
+ * - grossR = 方向 × (決済の仲値換算 − エントリーの仲値) / 1R (決済の仲値換算 = fill ± (半スプレッド + 約定ずれ))、costR = grossR − netR
+ * exit に数値を渡したときは仲値ベースの決済価格とみなし、エントリー時のスプレッドの半分と約定ずれ (片道) を差し引いて約定させる
+ */
 export function shadowR(
   o: Pick<ShadowOpen, "direction" | "entryMid" | "entrySpread" | "risk" | "takerFeeRate" | "slippageBps">,
-  exitPrice: number,
+  exit: number | ShadowExitFill,
 ): { grossR: number; costR: number; netR: number } {
   const dir = o.direction === "long" ? 1 : -1;
-  const grossR = (dir * (exitPrice - o.entryMid)) / o.risk;
-  // 往復の taker 手数料 + エントリー時のスプレッド (半分 × 2) + 約定ずれ (片道 × 2)
-  const notional = o.entryMid + exitPrice;
-  const fee = Math.max(0, o.takerFeeRate) * notional;
-  const spread = Math.max(0, o.entrySpread);
-  const slip = (Math.max(0, o.slippageBps) / 10_000) * notional;
-  const costR = (fee + spread + slip) / o.risk;
-  return { grossR, costR, netR: grossR - costR };
+  const rate = Math.max(0, finite(o.slippageBps) ? o.slippageBps : 0) / 10_000;
+  const entryHalf = Math.max(0, o.entrySpread) / 2;
+  const entrySlip = rate * o.entryMid;
+  let x: ShadowExitFill;
+  if (typeof exit === "number") {
+    const half = entryHalf;
+    const slip = rate * exit;
+    x = { fill: exit - dir * (half + slip), halfSpread: half, slip };
+  } else {
+    x = { fill: exit.fill, halfSpread: Math.max(0, exit.halfSpread), slip: Math.max(0, exit.slip) };
+  }
+  const entryFill = o.entryMid + dir * (entryHalf + entrySlip);
+  const exitRef = x.fill + dir * (x.halfSpread + x.slip);
+  const fee = Math.max(0, o.takerFeeRate) * (Math.abs(entryFill) + Math.abs(x.fill));
+  const grossR = (dir * (exitRef - o.entryMid)) / o.risk;
+  const netR = (dir * (x.fill - entryFill) - fee) / o.risk;
+  return { grossR, costR: grossR - netR, netR };
 }
 
 export interface ShadowTrackerDeps {
@@ -225,7 +267,7 @@ export class ShadowTracker {
       ...(tpOk ? { takeProfit: sig.takeProfit } : {}),
       maxHoldMs: finite(sig.maxHoldMs) && sig.maxHoldMs > 0 ? sig.maxHoldMs : this.opts.defaultMaxHoldMs,
       takerFeeRate: finite(inst.takerFeeRate) ? Math.max(0, inst.takerFeeRate) : 0,
-      slippageBps: this.opts.slippageBps,
+      slippageBps: shadowSlippageBps(inst.assetClass as AssetClass, this.opts.slippageBps),
       risk,
       mfeR: 0,
       maeR: 0,
@@ -244,7 +286,8 @@ export class ShadowTracker {
    * 新しい気配で全件を判定する (毎ティック)。
    * - 監視をやめた銘柄 (isWatched が false) の仮想トレードは捨てる (学習に使わない)
    * - 損切りは決済側 (買い: bid / 売り: ask) で判定。同じ判定で損切りと利確の両方に届きうる場合は損切りを先にする
-   * - 時間切れは仲値で閉じる
+   * - 損切りはストップ価格 (窓開けなら決済側の気配) に約定ずれを不利側に加えて約定。利確は指値。時間切れは決済側の気配 ∓ 約定ずれ
+   * - rangeOf の 1m 確定足: エントリーした足も含める (不利側だけ。ファイル冒頭)
    * 決済したものを返す。kv への保存は変化があったときだけ (1 回)
    */
   update(
@@ -268,14 +311,24 @@ export class ShadowTracker {
         keep.push(o);
         continue;
       }
-      let range: PriceRange | undefined;
+      let adverse: PriceRange | undefined;
+      let favorable: PriceRange | undefined;
       try {
-        range = opts.rangeOf?.(o.symbol, Math.max(o.entryTs, (o.lastCandleTs ?? o.entryTs - 1) + 1));
+        if (opts.rangeOf) {
+          if (o.lastCandleTs === undefined) {
+            // まだ足を使っていない: 不利側はエントリーした足から、有利側はエントリー時刻以降に始まった足から
+            const entryBar = Math.floor(o.entryTs / MINUTE) * MINUTE;
+            adverse = opts.rangeOf(o.symbol, entryBar);
+            favorable = entryBar === o.entryTs ? adverse : opts.rangeOf(o.symbol, o.entryTs);
+          } else {
+            adverse = favorable = opts.rangeOf(o.symbol, o.lastCandleTs + 1);
+          }
+        }
       } catch (e) {
         this.onError?.("shadow.range", e);
       }
       const before = `${o.mfeR}|${o.maeR}|${o.lastCandleTs ?? ""}`;
-      const res = this.step(o, q, now, range);
+      const res = this.step(o, q, now, adverse, favorable);
       if (!res) {
         if (before !== `${o.mfeR}|${o.maeR}|${o.lastCandleTs ?? ""}`) this.dirty = true;
         keep.push(o);
@@ -300,45 +353,55 @@ export class ShadowTracker {
     return closed;
   }
 
-  /** 1 件の判定 (決済したら記録を返す)。o の MFE / MAE は更新する */
-  private step(o: ShadowOpen, q: Pick<Quote, "bid" | "ask">, now: number, range?: PriceRange): ShadowTradeRecord | undefined {
+  /**
+   * 1 件の判定 (決済したら記録を返す)。o の MFE / MAE は更新する。
+   * adverse: 不利側 (損切り・MAE) に使う足の値幅、favorable: 有利側 (利確・MFE) に使う足の値幅 (どちらも仲値ベース)
+   */
+  private step(o: ShadowOpen, q: Pick<Quote, "bid" | "ask">, now: number, adverse?: PriceRange, favorable?: PriceRange): ShadowTradeRecord | undefined {
     const long = o.direction === "long";
+    const dir = long ? 1 : -1;
     const half = (q.ask - q.bid) / 2;
     const mid = (q.bid + q.ask) / 2;
-    const useRange = range && finite(range.high) && finite(range.low) && range.high >= range.low && range.high > 0;
+    const exitSide = long ? q.bid : q.ask;
+    const ok = (r?: PriceRange): r is PriceRange => !!r && finite(r.high) && finite(r.low) && r.high >= r.low && r.high > 0;
+    const adv = ok(adverse) ? adverse : undefined;
+    const fav = ok(favorable) ? favorable : undefined;
     // 決済側の価格の範囲 (足は仲値ベースなので現在のスプレッドの半分をずらす)
-    const exitSideLow = Math.min(long ? q.bid : q.ask, useRange ? (long ? range!.low - half : range!.low + half) : Infinity);
-    const exitSideHigh = Math.max(long ? q.bid : q.ask, useRange ? (long ? range!.high - half : range!.high + half) : -Infinity);
-    const midLow = Math.min(mid, useRange ? range!.low : Infinity);
-    const midHigh = Math.max(mid, useRange ? range!.high : -Infinity);
-    if (useRange) o.lastCandleTs = range!.lastCandleTs;
+    const advExit = long ? Math.min(q.bid, adv ? adv.low - half : Infinity) : Math.max(q.ask, adv ? adv.high + half : -Infinity);
+    const favExit = long ? Math.max(q.bid, fav ? fav.high - half : -Infinity) : Math.min(q.ask, fav ? fav.low + half : Infinity);
+    const advMid = long ? Math.min(mid, adv ? adv.low : Infinity) : Math.max(mid, adv ? adv.high : -Infinity);
+    const favMid = long ? Math.max(mid, fav ? fav.high : -Infinity) : Math.min(mid, fav ? fav.low : Infinity);
+    const lastTs = Math.max(adv?.lastCandleTs ?? -Infinity, fav?.lastCandleTs ?? -Infinity);
+    if (Number.isFinite(lastTs)) o.lastCandleTs = Math.max(o.lastCandleTs ?? -Infinity, lastTs);
 
     // MFE / MAE (仲値ベース, R)
-    const fav = long ? (midHigh - o.entryMid) / o.risk : (o.entryMid - midLow) / o.risk;
-    const adv = long ? (o.entryMid - midLow) / o.risk : (midHigh - o.entryMid) / o.risk;
-    o.mfeR = Math.max(o.mfeR, fav, 0);
-    o.maeR = Math.max(o.maeR, adv, 0);
+    o.mfeR = Math.max(o.mfeR, (dir * (favMid - o.entryMid)) / o.risk, 0);
+    o.maeR = Math.max(o.maeR, (dir * (o.entryMid - advMid)) / o.risk, 0);
 
-    const stopHit = long ? exitSideLow <= o.stopLoss : exitSideHigh >= o.stopLoss;
+    const stopHit = long ? advExit <= o.stopLoss : advExit >= o.stopLoss;
     const tp = o.takeProfit;
-    const tpHit = tp !== undefined && (long ? exitSideHigh >= tp : exitSideLow <= tp);
+    const tpHit = tp !== undefined && (long ? favExit >= tp : favExit <= tp);
+    const rate = Math.max(0, finite(o.slippageBps) ? o.slippageBps : 0) / 10_000;
     let reason: ShadowExitReason | undefined;
-    let exitPrice = mid;
+    let exit: ShadowExitFill | undefined;
     if (stopHit) {
-      // 保守的に損切りを先にする。窓開けで損切りを越えていれば現在の仲値
+      // 保守的に損切りを先にする。窓開けで損切りを越えていれば現在の決済側の気配。どちらも約定ずれを不利側に加える
       reason = "stop";
-      exitPrice = long ? Math.min(o.stopLoss, mid) : Math.max(o.stopLoss, mid);
+      const level = long ? Math.min(o.stopLoss, q.bid) : Math.max(o.stopLoss, q.ask);
+      const slip = rate * level;
+      exit = { fill: level - dir * slip, halfSpread: half, slip };
     } else if (tpHit) {
       reason = "take_profit";
-      exitPrice = tp!;
+      exit = { fill: tp!, halfSpread: half, slip: 0 };
     } else if (now - o.entryTs >= o.maxHoldMs) {
       reason = "time";
-      exitPrice = mid;
+      const slip = rate * exitSide;
+      exit = { fill: exitSide - dir * slip, halfSpread: half, slip };
     }
-    if (!reason) return undefined;
-    const r = shadowR(o, exitPrice);
+    if (!reason || !exit) return undefined;
+    const r = shadowR(o, exit);
     const { risk: _risk, lastCandleTs: _l, mfeR, maeR, ...base } = o;
-    return { ...base, exitTs: now, exitPrice, exitReason: reason, ...r, mfeR, maeR };
+    return { ...base, exitTs: now, exitPrice: exit.fill, exitReason: reason, ...r, mfeR, maeR };
   }
 
   /**

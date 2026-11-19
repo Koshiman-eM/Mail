@@ -19,10 +19,19 @@ export interface AllocatorOptions {
   priorVarR: number;
   /** 期待 R の縮小推定に使う事前の擬似件数 */
   shrinkN: number;
-  /** 無効化判定に必要な最小件数 */
+  /** 無効化判定に必要な最小件数 (実際の取引のみ。回復後は数え直す) */
   minSamplesToDisable: number;
-  /** 上側信頼限界の z 値 (片側 95%) */
+  /**
+   * 無効化の上側信頼限界の z 値。決済のたびに判定する逐次検定なので、固定標本の片側 95% (1.645) ではなく 2.5 を使う
+   * (合成の勝敗列 +1.5R/−1R での試算: 期待 R +0.1 の腕が 300 取引中に一度でも無効化される割合 約 1%、
+   * 期待 R −0.2 の腕が 300 取引以内に無効化される割合 約 88%。2.75 だと後者が約 82% で目標 80% の境目になる)
+   */
   ucbZ: number;
+  /**
+   * 無効化の判定に使う「実際の取引だけ」の R の指数加重係数。ewmaAlpha (0.05 ≒ 有効 39 件) では
+   * 標準誤差が下がらず期待 R −0.2 程度の腕を見分けられないため、より長い窓 (0.01 ≒ 有効 199 件) にする
+   */
+  realEwmaAlpha: number;
   /** 無効化された腕を試す確率 */
   exploreProb: number;
   /** 探索時の配分倍率 */
@@ -34,6 +43,19 @@ export interface AllocatorOptions {
   winTilt: number;
   /** 仮想トレード (見送ったシグナルの答え合わせ) 1 件の重み (実際の取引は 1) */
   shadowWeight: number;
+  /**
+   * 回復判定の事前の擬似重み。無効化した時点の (実取引のみの) 縮小推定を、この重みの事前観測として持ち、
+   * 無効化中の観測 (実取引 1 + 仮想 shadowWeight) で更新する。0 を越えたら回復。
+   * 合成データの試算 (期待 R −0.5 で止めた後に真の期待 R が変わる): 10 だと −0.2 の腕の約 5% が短い勝ち続きで
+   * 戻ってしまい、30 だと +0.1 の腕の回復が遅い (中央値 約 360 機会)。20 で −0.2 の誤回復 約 1%、
+   * +0.1 の回復 中央値 約 230 機会、+0.2 約 130 機会
+   */
+  recoverPriorW: number;
+  /**
+   * 回復判定の推定の指数加重係数 (観測 1 件あたり × 重み)。ewmaAlpha (0.05) だと仮想トレード中心の推定のぶれが大きく、
+   * 期待 R −0.2 の腕でも数百件で偶然 0 を越えて戻ってしまうため、無効化と同じ長さの窓 (0.01) にする
+   */
+  recoverEwmaAlpha: number;
 }
 
 export const DEFAULT_ALLOCATOR_OPTIONS: AllocatorOptions = {
@@ -44,20 +66,30 @@ export const DEFAULT_ALLOCATOR_OPTIONS: AllocatorOptions = {
   priorVarR: 1,
   shrinkN: 10,
   minSamplesToDisable: 30,
-  ucbZ: 1.645,
+  ucbZ: 2.5,
+  realEwmaAlpha: 0.01,
   exploreProb: 0.05,
   exploreSize: 0.25,
   minWeight: 0.25,
   maxWeight: 1.5,
   winTilt: 0.3,
   shadowWeight: 0.25,
+  recoverPriorW: 20,
+  recoverEwmaAlpha: 0.01,
 };
 
 /**
  * 保存する状態 (ArmStats + R の指数加重分散)。ewmaR / ewmaVarR は序盤は (重み付き) 単純平均・分散。
- * - n / sumR / sumR2: 実際の取引だけ (無効化の判定・表示の平均 R に使う)
- * - wN: 重み付きの件数 (実際の取引 1 + 仮想トレード shadowWeight)。EWMA の係数と有効件数に使う。無ければ n
+ * - ewmaR / ewmaVarR / wN: 実際の取引 (重み 1) + 仮想トレード (重み shadowWeight)。配分倍率 (weight / sample) にだけ使う
+ * - n / sumR / sumR2: 実際の取引だけの累計 (表示の平均 R)
+ * - wN: 重み付きの件数。EWMA の係数と有効件数に使う。無ければ n
  * - shadowN / shadowWins / shadowSumR: 仮想トレードの件数・勝ち数・R の合計 (表示用)
+ * 以下は無効化・回復の判定用 (無い旧データは get() で n / sumR / sumR2 から初期化する。保存済みの値は消さない)
+ * - realN / realMeanR / realVarR: 実際の取引だけの件数・指数加重平均・分散 (係数 realEwmaAlpha)。無効化の判定に使う。
+ *   回復したら 0 から数え直す (回復後に改めて minSamplesToDisable 件の実取引で判定する)
+ * - disabled: 無効化状態 (都度計算せず状態として持つ。止める条件と戻す条件が異なるヒステリシス)
+ * - recMeanR / recW: 無効化中の回復判定用の推定 (無効化時点の推定を事前値に、実取引 + 仮想トレードで更新)
+ * - disabledAt / recoveredAt / disableCount: 直近の無効化・回復の時刻と、無効化した回数
  */
 export interface ArmState extends ArmStats {
   ewmaVarR: number;
@@ -65,12 +97,26 @@ export interface ArmState extends ArmStats {
   shadowN?: number;
   shadowWins?: number;
   shadowSumR?: number;
+  realN?: number;
+  realMeanR?: number;
+  realVarR?: number;
+  disabled?: boolean;
+  recMeanR?: number;
+  recW?: number;
+  disabledAt?: number;
+  recoveredAt?: number;
+  disableCount?: number;
 }
+
+/** 腕の状態の変化 (無効化 / 回復)。observe の戻り値にだけ付ける (保存しない) */
+export type ArmTransition = "disabled" | "recovered";
+export type ArmUpdate = ArmState & { transition?: ArmTransition };
 
 export interface ArmSnapshot extends ArmState {
   winRate: number;
   /** 実際の取引の平均 R */
   meanR: number;
+  /** 無効化の判定に使う上側信頼限界 (実取引のみ。縮小推定 + z·SE。実取引が無ければ +∞) */
   upperR: number;
   weight: number;
   disabled: boolean;
@@ -127,8 +173,12 @@ export function randBeta(a: number, b: number, rng: Rng): number {
 /**
  * 戦略配分 (多腕バンディット)。
  * - 勝率: ベータ事後分布 (忘却付き)
- * - 期待 R: 指数加重平均・分散 + 縮小推定
- * - weight: 0〜1.5 の配分倍率 (新しい腕は 1.0)。十分なサンプルで期待 R の上側信頼限界が負なら無効化 (0)
+ * - 期待 R: 指数加重平均・分散 + 縮小推定 (実取引 + 仮想トレード)。配分倍率に使う
+ * - weight: 0〜1.5 の配分倍率 (新しい腕は 1.0)。無効化中は 0
+ * - 無効化 (止める): 実際の取引だけの統計で、件数 ≥ minSamplesToDisable かつ
+ *   縮小推定した平均 + ucbZ·SE < 0。仮想トレードは使わない (有効な腕では仮想トレードは配分倍率にだけ効く)
+ * - 回復 (戻す): 無効化中は、無効化時点の推定を事前値 (重み recoverPriorW) にして実取引 (重み 1) と
+ *   仮想トレード (重み shadowWeight) で更新した推定が 0 を越えたら戻す。止める条件より緩いのでばたつかない
  * 状態は Store kv "arm:<mode>:<key>" に保存 (mode 別。省略時の mode は paper)。
  */
 export class StrategyAllocator {
@@ -151,9 +201,39 @@ export class StrategyAllocator {
   get(key: string): ArmState | undefined {
     const c = this.cache.get(key);
     if (c) return { ...c };
-    const s = this.store.kvGet<ArmState>(armStateKey(this.mode, key));
+    const raw = this.store.kvGet<ArmState>(armStateKey(this.mode, key));
+    const s = raw ? this.upgrade({ ...raw }) : undefined;
     if (s) this.cache.set(key, s);
     return s ? { ...s } : undefined;
+  }
+
+  /**
+   * 旧データ (実取引のみの統計・無効化状態が無い) の初期化。実取引の累計 (n / sumR / sumR2) から
+   * 平均・分散を作り、無効化状態は新しい規則で決める。保存は次の更新時 (既存の項目は消さない)
+   */
+  private upgrade(s: ArmState): ArmState {
+    if (s.realN === undefined || !Number.isFinite(s.realN)) {
+      const n = Number.isFinite(s.n) && s.n > 0 ? s.n : 0;
+      const mean = n > 0 ? s.sumR / n : 0;
+      s.realN = n;
+      s.realMeanR = Number.isFinite(mean) ? mean : 0;
+      s.realVarR = n > 0 && Number.isFinite(s.sumR2) ? Math.max(0, s.sumR2 / n - mean * mean) : 0;
+    }
+    s.realMeanR = Number.isFinite(s.realMeanR) ? s.realMeanR : 0;
+    s.realVarR = Number.isFinite(s.realVarR) ? Math.max(0, s.realVarR!) : 0;
+    if (s.disabled === undefined) {
+      s.disabled = this.shouldDisable(s);
+      if (s.disabled) {
+        s.recMeanR = this.realShrunk(s);
+        s.recW = this.opts.recoverPriorW;
+        s.disabledAt = s.updatedAt;
+      }
+    }
+    if (s.disabled && !(Number.isFinite(s.recMeanR) && Number.isFinite(s.recW))) {
+      s.recMeanR = Math.min(0, this.realShrunk(s));
+      s.recW = this.opts.recoverPriorW;
+    }
+    return s;
   }
 
   private fresh(key: string, now: number): ArmState {
@@ -167,11 +247,15 @@ export class StrategyAllocator {
       ewmaR: 0,
       ewmaVarR: 0,
       updatedAt: now,
+      realN: 0,
+      realMeanR: 0,
+      realVarR: 0,
+      disabled: false,
     };
   }
 
   /** 決済済みトレードで腕を更新 (重み 1) */
-  update(trade: TradeRecord, now: number = trade.exitTs): ArmState {
+  update(trade: TradeRecord, now: number = trade.exitTs): ArmUpdate {
     const outcome = tradeOutcome(trade);
     const winInc = outcome === "win" ? 1 : outcome === "breakeven" ? 0.5 : 0;
     return this.observe(armKeyOf(trade), winInc, trade.rMultiple, 1, now, false);
@@ -179,15 +263,16 @@ export class StrategyAllocator {
 
   /**
    * 仮想トレード (見送ったシグナル) の結果で同じ腕を更新する。重みは shadowWeight (既定 0.25)。
-   * 無効化の判定に使う件数 (n) には数えない (仮想の結果だけでは腕を止めない)
+   * 有効な腕では配分倍率の統計にだけ入れ、無効化の判定には使わない (仮想の結果だけでは腕を止めない)。
+   * 無効化中の腕では回復の判定にも使う
    */
-  updateShadow(t: ShadowTradeRecord, now: number = t.exitTs): ArmState {
+  updateShadow(t: ShadowTradeRecord, now: number = t.exitTs): ArmUpdate {
     const winInc = t.netR > 0 ? 1 : t.netR < 0 ? 0 : 0.5;
     return this.observe(armKey(t.strategyId, t.regime, t.assetClass), winInc, t.netR, this.opts.shadowWeight, now, true);
   }
 
   /** 重み w の観測で腕を更新する (ベータ分布は w を足し、忘却も w 回分。EWMA の係数も w に比例) */
-  private observe(key: string, winInc: number, rRaw: number, w: number, now: number, shadow: boolean): ArmState {
+  private observe(key: string, winInc: number, rRaw: number, w: number, now: number, shadow: boolean): ArmUpdate {
     const o = this.opts;
     const prev = this.get(key);
     const s = prev ?? this.fresh(key, now);
@@ -211,8 +296,45 @@ export class StrategyAllocator {
       s.n += 1;
       s.sumR += r;
       s.sumR2 += r * r;
+      // 実際の取引だけの統計 (序盤は単純平均、以降は係数 realEwmaAlpha の指数加重)
+      s.realN = (s.realN ?? 0) + 1;
+      const ar = Math.min(1, Math.max(1 / s.realN, o.realEwmaAlpha));
+      const dr = r - (s.realMeanR ?? 0);
+      s.realMeanR = (s.realMeanR ?? 0) + ar * dr;
+      s.realVarR = (1 - ar) * ((s.realVarR ?? 0) + ar * dr * dr);
     }
     s.updatedAt = now;
+
+    let transition: ArmTransition | undefined;
+    if (!s.disabled) {
+      // 止める: 実際の取引で判定する (仮想トレードでは止めない)
+      if (!shadow && this.shouldDisable(s)) {
+        s.disabled = true;
+        s.disabledAt = now;
+        s.disableCount = (s.disableCount ?? 0) + 1;
+        // 回復判定の事前値 = 無効化時点の縮小推定 (負)。これを越える証拠が集まるまで戻さない
+        s.recMeanR = this.realShrunk(s);
+        s.recW = o.recoverPriorW;
+        transition = "disabled";
+      }
+    } else {
+      // 戻す: 無効化中は実取引 (重み 1) と仮想トレード (重み shadowWeight) で回復判定の推定を更新する。
+      // 係数は序盤 w / recW (事前値との重み付き平均)、以降は recoverEwmaAlpha × w (古い証拠を忘れる)
+      s.recW = (s.recW ?? o.recoverPriorW) + w;
+      const ak = Math.min(1, Math.max(w / s.recW, o.recoverEwmaAlpha * w));
+      s.recMeanR = (s.recMeanR ?? 0) + ak * (r - (s.recMeanR ?? 0));
+      if (s.recMeanR > 0) {
+        s.disabled = false;
+        s.recoveredAt = now;
+        delete s.recMeanR;
+        delete s.recW;
+        // 回復後は実取引の統計を数え直す (改めて minSamplesToDisable 件の実取引で判定する)
+        s.realN = 0;
+        s.realMeanR = 0;
+        s.realVarR = 0;
+        transition = "recovered";
+      }
+    }
 
     this.cache.set(key, s);
     this.store.kvSet(armStateKey(this.mode, key), s);
@@ -220,7 +342,36 @@ export class StrategyAllocator {
       const idx = this.store.kvGet<string[]>(armIndexKey(this.mode)) ?? [];
       if (!idx.includes(key)) this.store.kvSet(armIndexKey(this.mode), [...idx, key]);
     }
-    return { ...s };
+    return transition ? { ...s, transition } : { ...s };
+  }
+
+  /** 実取引だけの有効件数 (指数加重の上限で頭打ち) */
+  private realNEff(s: ArmState) {
+    return Math.min(s.realN ?? 0, (2 - this.opts.realEwmaAlpha) / this.opts.realEwmaAlpha);
+  }
+
+  /** 実取引だけの R の分散 (事前分散と件数で混ぜる。少数サンプルで過小評価しない) */
+  private realVar(s: ArmState) {
+    const n = this.realNEff(s);
+    return (n * Math.max(0, s.realVarR ?? 0) + this.opts.shrinkN * this.opts.priorVarR) / (n + this.opts.shrinkN);
+  }
+
+  /** 実取引だけの縮小推定した期待 R (実取引が無ければ 0) */
+  private realShrunk(s: ArmState) {
+    const n = this.realNEff(s);
+    return n > 0 ? (n * (s.realMeanR ?? 0)) / (n + this.opts.shrinkN) : 0;
+  }
+
+  /** 実取引だけの上側信頼限界 (縮小推定 + z·SE)。実取引が無ければ +∞ */
+  private realUpper(s: ArmState) {
+    const n = this.realNEff(s);
+    if (!(n > 0)) return Number.POSITIVE_INFINITY;
+    return this.realShrunk(s) + this.opts.ucbZ * Math.sqrt(this.realVar(s) / n);
+  }
+
+  /** 止める条件: 実取引の件数 (回復後は数え直し) ≥ minSamplesToDisable かつ 上側信頼限界 < 0 */
+  private shouldDisable(s: ArmState) {
+    return (s.realN ?? 0) >= this.opts.minSamplesToDisable && this.realUpper(s) < 0;
   }
 
   /** 重み付きの件数 (旧データは n) */
@@ -251,18 +402,21 @@ export class StrategyAllocator {
     return s ? s.alpha / (s.alpha + s.beta) : this.opts.priorAlpha / (this.opts.priorAlpha + this.opts.priorBeta);
   }
 
-  /** 期待 R の上側信頼限界 (指数加重平均ベース) */
+  /** 無効化の判定に使う期待 R の上側信頼限界 (実際の取引だけ。縮小推定 + ucbZ·SE。実取引が無ければ +∞) */
   upperConfidenceR(key: string): number {
     const s = this.get(key);
-    if (!s || !(this.wN(s) > 0)) return Number.POSITIVE_INFINITY;
-    return s.ewmaR + this.opts.ucbZ * Math.sqrt(this.varR(s) / this.nEff(s));
+    return s ? this.realUpper(s) : Number.POSITIVE_INFINITY;
   }
 
-  /** 実際の取引の件数 n ≥ minSamplesToDisable かつ 期待 R の上側信頼限界 < 0 (仮想トレードの件数は数えない) */
+  /** 無効化中か (保存した状態。止める・戻す判定は更新時に行う) */
   isDisabled(key: string): boolean {
+    return this.get(key)?.disabled === true;
+  }
+
+  /** 無効化中の回復判定の推定 (無効化中でなければ undefined) */
+  recoveryR(key: string): number | undefined {
     const s = this.get(key);
-    if (!s || s.n < this.opts.minSamplesToDisable) return false;
-    return this.upperConfidenceR(key) < 0;
+    return s?.disabled ? s.recMeanR : undefined;
   }
 
   private score(meanR: number, winP: number) {

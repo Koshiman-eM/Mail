@@ -1,4 +1,4 @@
-import type { Candle, EquityPoint, Instrument, Params, Strategy } from "../core/types";
+import type { Candle, EquityPoint, Instrument, Params, Strategy, TradeRecord } from "../core/types";
 import { TIMEFRAME_MS } from "../core/types";
 import { mean, sampleStdev } from "../indicators/series";
 import { inferTimeframe, runBacktest } from "./engine";
@@ -171,4 +171,56 @@ export function walkForward(
     });
   }
   return { folds: out, score: mean(out.map((f) => f.testScore)), chosenCounts: counts };
+}
+
+export type FoldedBacktestOptions = Omit<BacktestOptions, "strategy" | "instrument" | "candles" | "params" | "tradeFromTs">;
+
+export interface FoldedRun {
+  /** 区間 [from, to) (この区間にエントリーしたトレードだけを数える) */
+  from: number;
+  to: number;
+  trades: TradeRecord[];
+}
+
+/**
+ * [start, end) を時間で k 等分した境界 [b0, b1, ..., bk] (b0 = start, bk = end)。
+ * 区間ごとの比較 (現行 vs 候補) で、全銘柄・全候補に同じ区切りを使うために境界だけを先に決める。
+ */
+export function foldBoundaries(start: number, end: number, folds: number): number[] {
+  const k = Math.max(1, Math.round(folds));
+  if (!(end > start)) return [];
+  const step = (end - start) / k;
+  return Array.from({ length: k + 1 }, (_, i) => (i === k ? end : Math.floor(start + step * i)));
+}
+
+/**
+ * 区間ごとに独立したバックテスト (パラメータ調整の検証用)。
+ * 各区間 [b_i, b_{i+1}) の前に主時間足で warmup + 50 本分の足を付けてウォームアップし、
+ * b_i 以降の足からだけエントリーする (tradeFromTs)。区間末で保有中のポジションは決済する (区間をまたがない)。
+ * これで区間どうしの成績が (ポジション・評価額の持ち越しを通じて) 依存しないので、区間ごとの勝ち負けを符号検定にかけられる。
+ */
+export function foldedBacktest(
+  strategy: Strategy,
+  params: Params,
+  instrument: Instrument,
+  candles: Candle[],
+  boundaries: readonly number[],
+  opts: FoldedBacktestOptions = {},
+): FoldedRun[] {
+  const out: FoldedRun[] = [];
+  if (boundaries.length < 2 || candles.length === 0) return out;
+  const baseTf = opts.baseTimeframe ?? inferTimeframe(candles);
+  const leadMs = (strategy.warmup + 50) * TIMEFRAME_MS[strategy.primaryTimeframe];
+  for (let i = 0; i + 1 < boundaries.length; i++) {
+    const from = boundaries[i];
+    const to = boundaries[i + 1];
+    const slice = candles.filter((c) => c.ts >= from - leadMs && c.ts < to);
+    if (!slice.some((c) => c.ts >= from)) {
+      out.push({ from, to, trades: [] });
+      continue;
+    }
+    const r = runBacktest({ ...opts, baseTimeframe: baseTf, strategy, instrument, candles: slice, params, tradeFromTs: from, closeAtEnd: true });
+    out.push({ from, to, trades: r.trades.filter((t) => t.entryTs >= from && t.entryTs < to) });
+  }
+  return out;
 }

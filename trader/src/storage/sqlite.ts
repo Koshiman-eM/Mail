@@ -358,6 +358,14 @@ export class SqliteStore implements Store {
     );
   }
 
+  listBriefs(opts: { since?: number; until?: number } = {}): MarketBrief[] {
+    const rows = this.stmt("SELECT data FROM briefs WHERE generatedAt >= ? AND generatedAt <= ? ORDER BY generatedAt ASC, id ASC").all(
+      opts.since ?? Number.MIN_SAFE_INTEGER,
+      opts.until ?? Number.MAX_SAFE_INTEGER,
+    ) as Row[];
+    return rows.map((r) => parse<MarketBrief>(r)).filter((b): b is MarketBrief => b !== undefined);
+  }
+
   savePlan(p: StrategyPlan): void {
     this.stmt("INSERT INTO plans (generatedAt, validUntil, data) VALUES (?, ?, ?)").run(
       p.generatedAt,

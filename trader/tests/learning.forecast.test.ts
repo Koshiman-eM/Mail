@@ -203,7 +203,10 @@ describe("答え合わせ (期限・ノイズ・的中率・Brier・較正)", ()
     const store = new MemoryStore();
     const day = String(Math.floor(T0 / 86_400_000) * 86_400_000);
     const c = { n: 258, hits: 165, flatPred: 0, flatHits: 0, noise: 0, expired: 0, brierSum: 60, brierN: 258 };
-    store.kvSet(forecastStatsKey("paper"), { days: { [day]: { "c|15m|fx": c, "c|4h|fx": c } } });
+    // LIVE の判定は基礎モデル (b|) のクラスタ単位の集計で行う (1 銘柄なのでクラスタ = 予想 1 件)
+    // クラスタ 300 個・的中の割合の合計 195: z = 5.14 → 15 分 (√3 で割る) 2.97 ≥ 2.64 / 4 時間 (√48) 0.74
+    const b = { ...c, n: 300, hits: 195, cn: 300, cs: 195 };
+    store.kvSet(forecastStatsKey("paper"), { days: { [day]: { "c|15m|fx": c, "c|4h|fx": c, "b|15m|fx": b, "b|4h|fx": b } } });
     const t = new ForecastTracker({ store, mode: "paper" });
     expect(t.skill(15 * MIN, "fx", T0).live).toBe(true);
     expect(t.skill(4 * HOUR, "fx", T0).live).toBe(false);
@@ -327,8 +330,10 @@ describe("取引への反映の倍率", () => {
     const strength = (1 / (1 + Math.exp(-1)) - 0.5) * 2;
     expect(t.multiplierFor("BTC/USDT", "long", "scalp", now)).toMatchObject({ mult: 1, live: false, direction: "up" });
 
-    // 判定済み 200 件・的中 130 件 (z ≈ 4.2) を入れて再起動
-    store.kvSet(forecastStatsKey("paper"), { days: { [day]: { "c|15m|crypto": { n: 200, hits: 130, flatPred: 0, flatHits: 0, noise: 0, expired: 0, brierSum: 45, brierN: 200 } } }, recorded: 0, droppedCap: 0, droppedUnwatched: 0, learned: 0, sinceAudit: { judged: 0, hits: 0, n: 0, noise: 0, expired: 0 }, live: [] });
+    // 判定済み 200 件・的中 130 件 (表示用) と、基礎モデルのクラスタ 300 個・的中の割合の合計 210 (z ≈ 6.8 / √3 ≈ 4.0 ≥ 2.64) を入れて再起動
+    const cc = { n: 200, hits: 130, flatPred: 0, flatHits: 0, noise: 0, expired: 0, brierSum: 45, brierN: 200 };
+    const bc = { n: 300, hits: 210, flatPred: 0, flatHits: 0, noise: 0, expired: 0, brierSum: 60, brierN: 300, cn: 300, cs: 210 };
+    store.kvSet(forecastStatsKey("paper"), { days: { [day]: { "c|15m|crypto": cc, "b|15m|crypto": bc } }, recorded: 0, droppedCap: 0, droppedUnwatched: 0, learned: 0, sinceAudit: { judged: 0, hits: 0, n: 0, noise: 0, expired: 0 }, live: [] });
     const t2 = new ForecastTracker({ store, mode: "paper" });
     t2.forecast({ instrument: { symbol: "BTC/USDT", assetClass: "crypto" }, candles: candlesFrom(closes), now, mid: closes[399] });
     expect(t2.multiplierFor("BTC/USDT", "long", "scalp", now).mult).toBeCloseTo(1 + 0.2 * strength, 9);
@@ -405,12 +410,14 @@ describe("永続化と上限", () => {
 
   it("監査ログには要約と反映状態の変化だけを残す", () => {
     const store = new MemoryStore();
-    const many = Array.from({ length: 150 }, (_, i) => pending({ id: "p" + i, pUp: 0.8, dir: "up", madeAt: T0 + i }));
+    // 基礎モデルの予想 (pb / db) つき。5 分ごとに出した予想 (= 別々のクラスタ)
+    const many = Array.from({ length: 150 }, (_, i) => pending({ id: "p" + i, pUp: 0.8, dir: "up", pb: 0.8, db: "up", madeAt: T0 + 5 * MIN - i * 5 * MIN }));
     store.kvSet(forecastPendingKey("paper"), many);
     const t = new ForecastTracker({ store, mode: "paper", options: { auditEveryMs: HOUR } });
-    t.evaluate(T0 + 10 * MIN, { isWatched: () => true, midNow: () => 105 }); // 期限前 (要約の起点だけ記録)
-    t.evaluate(T0 + 20 * MIN, { isWatched: () => true, midNow: () => 105 }); // 150 件判定 (全部的中)
-    t.evaluate(T0 + 80 * MIN, { isWatched: () => true, midNow: () => 105 });
+    const d = { isWatched: () => true, midNow: () => 105, priceAt: () => 105 };
+    t.evaluate(T0 + 10 * MIN, d); // 148 件判定 (要約は起点だけ記録)
+    t.evaluate(T0 + 20 * MIN, d); // 残り 2 件 (計 150 件、全部的中)
+    t.evaluate(T0 + 80 * MIN, d);
     const types = store.listAudit({}).map((a) => a.type);
     expect(types.filter((x) => x === "learning.forecast_live")).toHaveLength(1);
     expect(types.filter((x) => x === "learning.forecast_summary")).toHaveLength(1);

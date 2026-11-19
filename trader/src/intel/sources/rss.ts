@@ -11,6 +11,14 @@ export const DEFAULT_RSS_FEEDS = [
 ];
 
 const MAX_ITEMS_PER_FEED = 50;
+/** これより先の未来の公開時刻 (時計のずれ・タイムゾーンの誤り・予約投稿) は取得時刻に丸める */
+export const MAX_FUTURE_SKEW_MS = 5 * 60_000;
+
+/** 公開時刻を解釈する。解釈できなければ now、now より MAX_FUTURE_SKEW_MS 以上未来なら now に丸める */
+export function normalizePublishedAt(t: number, now: number): number {
+  if (!Number.isFinite(t)) return now;
+  return t > now + MAX_FUTURE_SKEW_MS ? now : t;
+}
 const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_", textNodeName: "#text" });
 
 /** "rss:<host>" (www. は除く) */
@@ -89,7 +97,7 @@ export function parseFeed(xml: string, ctx: { source: string; now: number; tag?:
       title,
       summary,
       url: r.url || undefined,
-      publishedAt: Number.isFinite(t) ? t : ctx.now,
+      publishedAt: normalizePublishedAt(t, ctx.now),
       fetchedAt: ctx.now,
       assets: tagAssets(`${title} ${summary ?? ""}`, ctx.tag),
     });

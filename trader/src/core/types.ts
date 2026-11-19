@@ -193,6 +193,11 @@ export interface SymbolPlan {
   /** 0〜1.5。リスク予算に掛ける倍率 */
   riskMultiplier: number;
   notes?: string;
+  /**
+   * 腕 (戦略×レジーム×資産クラス) が無効化されているため外した戦略。
+   * エンジンはエントリー時の探索 (既定 5%) と仮想トレードの記録 (arm_disabled) にだけ使う。AI では再開できない
+   */
+  armDisabled?: string[];
 }
 
 export interface StrategyPlan {
@@ -581,8 +586,9 @@ export type ShadowExitReason = "stop" | "take_profit" | "time" | "unwatched";
 /**
  * 見送ったシグナルの仮想トレード (決済済み)。R は統計値なので number。
  * - 1R = |エントリー価格 (買い: ask / 売り: bid) − 損切り|
- * - grossR = 方向 × (決済の基準価格 − エントリー時の仲値) / 1R
- * - costR = (往復 taker 手数料 + エントリー時のスプレッド (半分 × 2) + 約定ずれ 片道 × 2) / 1R
+ * - grossR = 方向 × (決済の仲値換算 − エントリー時の仲値) / 1R (決済の仲値換算 = exitPrice ± (決済時の半スプレッド + 約定ずれ))
+ * - netR = (方向 × (exitPrice − エントリーの約定) − 往復 taker 手数料) / 1R (エントリーの約定 = 仲値 ± (半スプレッド + 約定ずれ))
+ * - costR = grossR − netR (手数料 + スプレッド + 約定ずれ。約定ずれは資産クラス別 = バックテストの既定値)
  * - netR = grossR − costR
  */
 export interface ShadowTradeRecord {
@@ -609,7 +615,11 @@ export interface ShadowTradeRecord {
   takerFeeRate: number;
   slippageBps: number;
   exitTs: number;
-  /** 決済の基準価格 (損切り・利確は水準、時間切れは仲値。窓開けで損切りを越えた場合は仲値) */
+  /**
+   * 決済の約定価格 (推定。決済側 = 買いは bid 側、売りは ask 側)。損切りはストップ価格 (窓開けで越えていれば決済側の気配) に
+   * 約定ずれを不利側に加えた値、利確は指値、時間切れは決済側の気配 ∓ 約定ずれ。
+   * (以前の記録は仲値ベースの基準価格: 損切り・利確は水準、時間切れ・窓開けは仲値)
+   */
   exitPrice: number;
   exitReason: ShadowExitReason;
   grossR: number;
@@ -716,6 +726,8 @@ export interface Store {
 
   saveBrief(b: MarketBrief): void;
   latestBrief(): MarketBrief | undefined;
+  /** generatedAt が [since, until] のブリーフ (昇順)。パラメータ検証で「その時点のバイアス」を再現するのに使う (未対応の実装は省略可) */
+  listBriefs?(opts?: { since?: number; until?: number }): MarketBrief[];
   savePlan(p: StrategyPlan): void;
   latestPlan(): StrategyPlan | undefined;
 

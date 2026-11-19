@@ -64,11 +64,14 @@ function orderTrail(store: MemoryStore) {
 function injectLive(store: MemoryStore, bias: number) {
   const day = String(Math.floor(START / 86_400_000) * 86_400_000);
   const counts = { n: 200, hits: 140, flatPred: 0, flatHits: 0, noise: 0, expired: 0, brierSum: 40, brierN: 200 };
+  // LIVE の判定に使う基礎モデル (consensus を除く) の集計: クラスタ 3,000 個・的中の割合 70% (4 時間の重複補正 √48 の後も z ≈ 3.2)
+  const base = { n: 3000, hits: 2100, flatPred: 0, flatHits: 0, noise: 0, expired: 0, brierSum: 600, brierN: 3000, cn: 3000, cs: 2100 };
   const groups: Record<string, typeof counts> = {};
   const models: Record<string, unknown> = {};
   for (const h of ["15m", "1h", "4h"]) {
     for (const c of ["crypto", "meme", "fx", "stock"]) {
       groups[`c|${h}|${c}`] = counts;
+      groups[`b|${h}|${c}`] = base;
       models[`${h}|${c}`] = { w: { trend: 0, momentum: 0, meanRevert: 0, news: 0, consensus: 0 }, b: bias, updates: 0 };
     }
   }

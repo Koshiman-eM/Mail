@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { EntryContext, TradeRecord } from "../src/core/types";
 import { TradeJournal } from "../src/learning/journal";
 import { LearningService, type StrategyInfo } from "../src/learning/service";
-import type { ParamValidator } from "../src/learning/tuner";
 import { MemoryStore } from "../src/storage/memory";
+import { stubValidator } from "./helpers/validation";
 
 const DAY = 86_400_000;
 const T0 = 50 * DAY;
@@ -56,11 +56,8 @@ function stoppedTrades(journal: TradeJournal, n: number): TradeRecord[] {
 describe("LearningService", () => {
   it("決済 → 要因分析・配分・情報源 → 定期処理 (後追い値動き・tuner・振り返り) → snapshot", async () => {
     const store = new MemoryStore();
-    const validated: number[] = [];
-    const validate: ParamValidator = async (_s, _a, p) => {
-      validated.push(p.stopAtr);
-      return { score: 2 * p.stopAtr - 2, trades: 60 };
-    };
+    // 区間ごとの成績が stopAtr に比例して良くなる検証器 (1.5 → 1.65 で全区間 +1.5R)
+    const validate = stubValidator((p) => 10 * p.stopAtr);
     const svc = new LearningService({
       store,
       getStrategy: (id) => (id === "s1" ? S1 : undefined),
@@ -70,11 +67,17 @@ describe("LearningService", () => {
       priceAt: (symbol) => (symbol === "BTC/USDT" ? 102.5 : undefined),
     });
     const journal = new TradeJournal({ store });
-    const trades = stoppedTrades(journal, 25);
+    // 判断用 25 件 + 事後評価の比較対象 (それより前の 20 件。配分・信頼度の集計に影響しないよう保存だけする)
+    const all = stoppedTrades(journal, 45);
+    for (const t of all.slice(0, 20)) {
+      store.saveTrade(t);
+      store.saveAttribution(svc.attribute(t));
+    }
+    const trades = all.slice(20);
 
     for (const t of trades) svc.onTradeClosed(t);
-    expect(store.listTrades()).toHaveLength(25);
-    expect(store.listAttributions()).toHaveLength(25);
+    expect(store.listTrades()).toHaveLength(45);
+    expect(store.listAttributions()).toHaveLength(45);
     // 後追いの値動きが無い段階では計画通りの損切り
     expect(store.getAttribution(trades[0].id)!.causes.map((c) => c.code)).toEqual(["good_process"]);
     expect(svc.allocator.get("s1|range|crypto")!.n).toBe(25);
@@ -87,16 +90,16 @@ describe("LearningService", () => {
     expect(svc.allocator.get("s1|range|crypto")!.n).toBe(25);
     expect(svc.sourceReliability()["rss:a"].n).toBe(25);
 
-    const now = T0 + 2 * DAY;
+    const now = T0 + 3 * DAY;
     const res = await svc.periodic(now);
-    expect(res.postExitFilled).toBe(25);
-    expect(res.reattributed).toBe(25);
+    expect(res.postExitFilled).toBe(45);
+    expect(res.reattributed).toBe(45);
     expect(store.listTrades()[0].postExitMovePct).toBeCloseTo((102.5 - 98) / 98, 12);
     expect(store.getAttribution(trades[0].id)!.causes.map((c) => c.code)).toEqual(["stop_too_tight"]);
-    // stop_too_tight → stopAtr +10% を検証して適用
+    // stop_too_tight が検証データの基準より有意に多い → stopAtr +10% を区間検証して適用
     expect(res.adjustments).toHaveLength(1);
     expect(res.adjustments[0]).toMatchObject({ param: "stopAtr", from: 1.5, to: 1.65, status: "applied" });
-    expect(validated).toEqual([1.5, 1.65]);
+    expect(validate.calls.map((p) => p.stopAtr)).toEqual([1.5, 1.65]);
     expect(svc.paramsFor("s1", "crypto")).toMatchObject({ stopAtr: 1.65, tpAtr: 2 });
     expect(svc.paramsFor("unknown", "crypto")).toBeUndefined();
     // 振り返り (ルールベース)
@@ -116,9 +119,9 @@ describe("LearningService", () => {
     expect(snap.adjustments.map((a) => a.status)).toEqual(["applied"]);
     expect(snap.sources["rss:a"].n).toBe(25);
     expect(Object.keys(snap.intelInfluence).sort()).toEqual(["crypto", "fx", "meme", "stock"]);
-    expect(snap.causes.trades).toBe(25);
-    expect(snap.causes.all.stop_too_tight).toBe(25);
-    expect(snap.causes.outcomes.loss).toBe(25);
+    expect(snap.causes.trades).toBe(45);
+    expect(snap.causes.all.stop_too_tight).toBe(45);
+    expect(snap.causes.outcomes.loss).toBe(45);
 
     const w = svc.armWeight("s1", "range", "crypto", () => 0.5);
     expect(w).toBeGreaterThanOrEqual(0.25);
@@ -127,14 +130,14 @@ describe("LearningService", () => {
     expect(svc.intelInfluence("crypto")).toBeGreaterThanOrEqual(0);
   });
 
-  it("validate・priceAt なしでも動き、調整は proposed のまま", async () => {
+  it("validate・priceAt なしでも動く。検証器が無ければ規則による調整はしない (基準比率も検証も無いので記録もしない)", async () => {
     const store = new MemoryStore();
     const svc = new LearningService({ store, getStrategy: (id) => (id === "s1" ? S1 : undefined) });
     const trades = stoppedTrades(new TradeJournal(), 25).map((t) => ({ ...t, exitReason: "time" as const, exitPrice: 99.9 }));
     for (const t of trades) svc.onTradeClosed({ ...t, grossPnl: -0.1, netPnl: -0.1, returnPct: -0.001, rMultiple: -0.05 });
     const res = await svc.periodic(T0 + 2 * DAY);
     expect(res.postExitFilled).toBe(0);
-    expect(res.adjustments[0]).toMatchObject({ param: "maxHoldBars", from: 10, to: 9, status: "proposed" });
+    expect(res.adjustments).toEqual([]);
     expect(svc.paramsFor("s1", "crypto")!.maxHoldBars).toBe(10);
   });
 });

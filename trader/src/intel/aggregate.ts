@@ -16,6 +16,19 @@ const MAX_SOURCE_IDS = 50;
 /** USD 指標が波及するクラス擬似資産 (eventRisk のみ、ブラックアウトは付けない) */
 const USD_SPILLOVER = ["CRYPTO", "MEME", "STOCKS"];
 const SPILLOVER_SCALE = 0.5;
+/** now よりこれ以上未来の公開時刻は信用しない (情報源側の丸めと同じ 5 分) */
+export const MAX_FUTURE_SKEW_MS = 5 * 60_000;
+
+/**
+ * 集計に使う公開時刻。now より MAX_FUTURE_SKEW_MS 以上未来なら、取得時刻 (それも未来・不正なら now) に丸める。
+ * 丸めないと未来の記事は「経過時間 0」の最大の重みのまま、その時刻が来るまで残り続ける
+ */
+export function effectivePublishedAt(it: Pick<IntelItem, "publishedAt" | "fetchedAt">, now: number): number {
+  const p = it.publishedAt;
+  if (!Number.isFinite(p)) return Number.isFinite(it.fetchedAt) && it.fetchedAt <= now ? it.fetchedAt : now;
+  if (p <= now + MAX_FUTURE_SKEW_MS) return p;
+  return Number.isFinite(it.fetchedAt) && it.fetchedAt <= now ? it.fetchedAt : now;
+}
 
 export interface BuildBiasesOpts {
   now: number;
@@ -46,7 +59,7 @@ export function buildBiases(items: IntelItem[], opts: BuildBiasesOpts): Record<s
     seen.add(it.id);
     if (it.kind === "calendar" || it.kind === "metric") continue;
     if (it.sentiment === undefined || !Number.isFinite(it.sentiment)) continue;
-    const age = Math.max(0, now - it.publishedAt);
+    const age = Math.max(0, now - effectivePublishedAt(it, now));
     const decay = 0.5 ** (age / halfLifeMs);
     const base = decay * clamp(it.importance ?? 0.5, 0, 1);
     const rw = clamp(reliability[it.source]?.weight ?? 1, 0, 2);

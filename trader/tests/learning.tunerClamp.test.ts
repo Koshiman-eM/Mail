@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { ParamAdjustment } from "../src/core/types";
 import { ParamTuner, type StrategyParamInfo } from "../src/learning/tuner";
 import { MemoryStore } from "../src/storage/memory";
+import { neutralTrades, stubValidator } from "./helpers/validation";
 
 const INFO: StrategyParamInfo = {
   defaultParams: { stopAtr: 1.5, tpAtr: 2, lookback: 20 },
@@ -30,7 +31,9 @@ describe("ParamTuner: 保存値のクランプと adjmeta 欠落", () => {
       id: "orphan", strategyId: "s1", assetClass: "crypto", param: "stopAtr", from: 1.4, to: 1.5, reason: "古い調整", status: "applied", createdAt: NOW - 30 * DAY,
     };
     store.saveAdjustment(orphan);
-    const t = new ParamTuner({ store, getStrategy, validate: async (_s, _a, p) => ({ score: p.stopAtr, trades: 50 }) });
+    // propose には判断用 20 件 + 比較対象 20 件以上の取引が要る
+    neutralTrades(45).forEach((t, i) => store.saveTrade({ ...t, id: `t${i}`, mode: "paper", entryTs: NOW - 10 * DAY + i * 3_600_000, exitTs: NOW - 10 * DAY + i * 3_600_000 + 60_000 }));
+    const t = new ParamTuner({ store, getStrategy, validate: stubValidator((p) => 10 * p.stopAtr) });
     const adj = await t.propose({ strategyId: "s1", assetClass: "crypto", param: "stopAtr", direction: "up", reason: "test" }, NOW);
     expect(adj?.status).toBe("applied");
     // 新しい調整はメタを持つので、こちらは評価待ちとして扱われる (次の提案は保留)

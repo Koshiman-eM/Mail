@@ -3,8 +3,9 @@ import type { ShadowTradeRecord } from "../src/core/types";
 import { StrategyAllocator, armKey } from "../src/learning/allocator";
 import { LearningService } from "../src/learning/service";
 import {
-  ShadowTracker, shadowCountersKey, shadowOpenKey, shadowR, summarizeShadowTrades, type ShadowRecordInput,
+  ShadowTracker, shadowCountersKey, shadowOpenKey, shadowR, shadowSlippageBps, summarizeShadowTrades, type ShadowRecordInput,
 } from "../src/learning/shadow";
+import { defaultCosts } from "../src/backtest/engine";
 import { MemoryStore } from "../src/storage/memory";
 
 const T0 = Date.UTC(2026, 0, 5);
@@ -48,49 +49,114 @@ describe("ShadowTracker (見送ったシグナルの仮想トレード)", () => 
     expect(tr.stats().invalid).toBe(1);
   });
 
-  it("利確で閉じ、往復手数料・スプレッド・約定ずれ (片道 2bps) を差し引いた純 R になる", () => {
+  it("利確で閉じ (指値・約定ずれなし)、往復手数料・スプレッド・約定ずれ (crypto は片道 1bps) を差し引いた純 R になる", () => {
     const closed: ShadowTradeRecord[] = [];
     const tr = tracker(new MemoryStore(), {}, (t) => closed.push(t));
     tr.record(input());
+    expect(tr.list()[0].slippageBps).toBe(1); // バックテストの crypto と同じ
     expect(tr.update(T0 + MIN, () => q(102, 102.2))).toEqual([]); // 未到達
     const res = tr.update(T0 + 2 * MIN, () => q(104.2, 104.4)); // bid ≥ 104.1
     expect(res).toHaveLength(1);
     const r = res[0];
     expect(r.exitReason).toBe("take_profit");
     expect(r.exitPrice).toBe(104.1);
-    // gross = (104.1 − 100) / 2 = 2.05
-    expect(r.grossR).toBeCloseTo(2.05, 10);
-    // cost = (0.001 × (100 + 104.1) + 0.2 + 0.0002 × (100 + 104.1)) / 2
-    const cost = (0.001 * 204.1 + 0.2 + 0.0002 * 204.1) / 2;
-    expect(r.costR).toBeCloseTo(cost, 10);
-    expect(r.netR).toBeCloseTo(2.05 - cost, 10);
+    // エントリーの約定 = 仲値 100 + 半スプレッド 0.1 + 約定ずれ 0.01、決済 = 指値 104.1、手数料 = 0.001 × 両方の約定価格
+    const entryFill = 100 + 0.1 + 0.0001 * 100;
+    const fee = 0.001 * (entryFill + 104.1);
+    expect(r.netR).toBeCloseTo((104.1 - entryFill - fee) / 2, 10);
+    // gross は仲値換算 (決済の仲値換算 = 104.1 + 決済時の半スプレッド 0.1)
+    expect(r.grossR).toBeCloseTo((104.2 - 100) / 2, 10);
+    expect(r.costR).toBeCloseTo(r.grossR - r.netR, 10);
     expect(r.netR).toBeLessThan(r.grossR);
     expect(r.mfeR).toBeCloseTo((104.3 - 100) / 2, 10);
     expect(closed).toEqual(res);
     expect(tr.size).toBe(0);
-    // 約定ずれのオプション
-    const r0 = shadowR({ direction: "long", entryMid: 100, entrySpread: 0.2, risk: 2, takerFeeRate: 0.001, slippageBps: 0 }, 104.1);
-    const r10 = shadowR({ direction: "long", entryMid: 100, entrySpread: 0.2, risk: 2, takerFeeRate: 0.001, slippageBps: 10 }, 104.1);
+    // 約定ずれのオプション (数値の決済価格 = 仲値ベース: 半スプレッドと約定ずれを差し引いて約定)
+    const r0 = shadowR({ direction: "long", entryMid: 100, entrySpread: 0.2, risk: 2, takerFeeRate: 0, slippageBps: 0 }, 104.1);
+    const r10 = shadowR({ direction: "long", entryMid: 100, entrySpread: 0.2, risk: 2, takerFeeRate: 0, slippageBps: 10 }, 104.1);
     expect(r10.netR).toBeCloseTo(r0.netR - (0.001 * 204.1) / 2, 10);
+    expect(r10.grossR).toBeCloseTo(r0.grossR, 10);
     const tr2 = tracker(new MemoryStore(), { slippageBps: 10 });
     tr2.record(input());
     expect(tr2.list()[0].slippageBps).toBe(10);
   });
 
-  it("損切りは決済側 (買い: bid / 売り: ask) で判定する。窓開けで越えたら仲値", () => {
+  it("約定ずれは資産クラス別 (バックテストの既定値と同じ。meme は片道 20bps)", () => {
+    for (const [ac, bps] of [["crypto", 1], ["meme", 20], ["fx", 0.5], ["stock", 1]] as const) {
+      expect(shadowSlippageBps(ac)).toBe(defaultCosts(ac).slippageBps);
+      expect(shadowSlippageBps(ac)).toBe(bps);
+    }
+    expect(shadowSlippageBps("meme", 3)).toBe(3); // 上書き
+    const tr = tracker();
+    tr.record(input({ instrument: { ...inst, symbol: "PEPE/USDT", assetClass: "meme" } }));
+    expect(tr.list()[0].slippageBps).toBe(20);
+    // 時間切れ: meme は crypto より約定ずれの分だけ純 R が悪い
+    const a = tracker();
+    a.record(input());
+    const b = tracker();
+    b.record(input({ instrument: { ...inst, assetClass: "meme" } }));
+    const ra = a.update(T0 + 10 * MIN, () => q(100.9, 101.1))[0];
+    const rb = b.update(T0 + 10 * MIN, () => q(100.9, 101.1))[0];
+    expect(rb.netR).toBeCloseTo(ra.netR - ((0.0019 * 100 + 0.0019 * 100.9) * (1 - 0.001 * 0) ) / 2, 3);
+    expect(rb.netR).toBeLessThan(ra.netR);
+  });
+
+  it("損切りは決済側 (買い: bid / 売り: ask) で判定し、ストップ価格に約定ずれを不利側に加えて約定。窓開けで越えたら決済側の気配", () => {
     const tr = tracker();
     tr.record(input());
     tr.record(input({ sig: { strategyId: "short_y", direction: "short", stopLoss: 101.9, takeProfit: 96 } }));
-    // 仲値 98.2 は損切り 98.1 より上だが bid 98.05 ≤ 98.1 → 買いは損切り。売りは ask 98.35 で利確に届かない
-    const res = tr.update(T0 + MIN, () => q(98.05, 98.35));
+    // 足の値幅: 安値 98.12 (仲値) → 決済側 98.02 ≤ 98.1 で損切り。現在の bid 98.3 は損切りより上 → ストップ価格 98.1 − 約定ずれ
+    const res = tr.update(T0 + MIN, () => q(98.3, 98.5), { rangeOf: () => ({ high: 98.6, low: 98.12, lastCandleTs: T0 + MIN }) });
     expect(res.map((r) => [r.direction, r.exitReason])).toEqual([["long", "stop"]]);
-    expect(res[0].exitPrice).toBe(98.1);
-    const cost = (0.001 * 198.1 + 0.2 + 0.0002 * 198.1) / 2;
-    expect(res[0].netR).toBeCloseTo((98.1 - 100) / 2 - cost, 10);
-    // 売り: ask ≥ 101.9 で損切り。窓開け (仲値 103 > 101.9) なら仲値で閉じる
+    expect(res[0].exitPrice).toBeCloseTo(98.1 * (1 - 0.0001), 10);
+    const entryFill = 100.1 + 0.01;
+    expect(res[0].netR).toBeCloseTo((res[0].exitPrice - entryFill - 0.001 * (entryFill + res[0].exitPrice)) / 2, 10);
+    // 損失は 1R + 約定ずれ (両側) + 手数料 (仲値で約定する扱いより悪い)
+    expect(res[0].netR).toBeLessThan(-1 - (0.01 + 98.1 * 0.0001) / 2);
+    // 売り: ask ≥ 101.9 で損切り。窓開け (ask 103.1 > 101.9) なら現在の ask + 約定ずれ
     const res2 = tr.update(T0 + 2 * MIN, () => q(102.9, 103.1));
-    expect(res2[0]).toMatchObject({ direction: "short", exitReason: "stop", exitPrice: 103 });
-    expect(res2[0].grossR).toBeCloseTo(-(103 - 100) / 2, 10);
+    expect(res2[0]).toMatchObject({ direction: "short", exitReason: "stop" });
+    expect(res2[0].exitPrice).toBeCloseTo(103.1 * (1 + 0.0001), 10);
+    expect(res2[0].netR).toBeLessThan(-(103.1 - 99.9) / 2);
+  });
+
+  it("エントリーした 1m 足も判定に含める: 不利側 (損切り・MAE) には使い、有利側 (利確・MFE) には使わない", () => {
+    const entryTs = T0 + 30_000; // 1m 足の途中でエントリー
+    const calls: number[] = [];
+    // エントリーした足 (T0〜T0+1m): 安値 97.9 (損切りに届く)。高値 105 (利確に届く) はエントリー前かもしれない
+    const rangeOf = (_s: string, since: number) => {
+      calls.push(since);
+      return since <= T0 ? { high: 105, low: 97.9, lastCandleTs: T0 } : undefined;
+    };
+    const tr = tracker();
+    tr.record(input({ now: entryTs }));
+    const res = tr.update(T0 + MIN + 1000, () => q(100, 100.2), { rangeOf });
+    expect(calls).toEqual([T0, entryTs]); // 不利側はエントリーした足の始まりから、有利側はエントリー時刻から
+    expect(res).toHaveLength(1);
+    expect(res[0].exitReason).toBe("stop");
+    expect(res[0].mfeR).toBeCloseTo((100.1 - 100) / 2, 10); // 有利側はエントリー足を使わない (現在の仲値だけ)
+    expect(res[0].maeR).toBeCloseTo((100 - 97.9) / 2, 10);
+
+    // 高値だけが届く場合は利確しない (エントリー前の高値かもしれない)。次の足からは両側に使う
+    const tr2 = tracker();
+    tr2.record(input({ now: entryTs }));
+    let nextClosed = false; // 次の足 (T0+1m〜) が確定したか
+    const only = (_s: string, since: number) => {
+      const next = nextClosed && since <= T0 + MIN ? { high: 104.5, low: 100, lastCandleTs: T0 + MIN } : undefined;
+      if (since <= T0) return { high: Math.max(105, next?.high ?? 0), low: Math.min(99.5, next?.low ?? Infinity), lastCandleTs: next?.lastCandleTs ?? T0 };
+      return next;
+    };
+    expect(tr2.update(T0 + MIN + 1000, () => q(100, 100.2), { rangeOf: only })).toEqual([]);
+    nextClosed = true;
+    expect(tr2.list()[0].lastCandleTs).toBe(T0);
+    const r2 = tr2.update(T0 + 2 * MIN + 1000, () => q(100, 100.2), { rangeOf: only });
+    expect(r2.map((x) => x.exitReason)).toEqual(["take_profit"]);
+
+    // 足の始まりちょうどにエントリーしたら、その足は両側に使う
+    const tr3 = tracker();
+    tr3.record(input({ now: T0 }));
+    const r3 = tr3.update(T0 + MIN + 1000, () => q(100, 100.2), { rangeOf: (_s, since) => (since <= T0 ? { high: 104.5, low: 99.5, lastCandleTs: T0 } : undefined) });
+    expect(r3.map((x) => x.exitReason)).toEqual(["take_profit"]);
   });
 
   it("同じ判定で損切りと利確の両方に届きうる場合は損切りを先にする", () => {
@@ -105,13 +171,14 @@ describe("ShadowTracker (見送ったシグナルの仮想トレード)", () => 
     expect(res[0].mfeR).toBeGreaterThan(2);
   });
 
-  it("時間切れは仲値で閉じる", () => {
+  it("時間切れは決済側の気配 (買い: bid) から約定ずれを引いて閉じる", () => {
     const tr = tracker();
     tr.record(input());
     expect(tr.update(T0 + 9 * MIN, () => q(100.9, 101.1))).toEqual([]);
     const res = tr.update(T0 + 10 * MIN, () => q(100.9, 101.1));
-    expect(res[0]).toMatchObject({ exitReason: "time", exitPrice: 101, exitTs: T0 + 10 * MIN });
-    expect(res[0].grossR).toBeCloseTo(0.5, 10);
+    expect(res[0]).toMatchObject({ exitReason: "time", exitTs: T0 + 10 * MIN });
+    expect(res[0].exitPrice).toBeCloseTo(100.9 * (1 - 0.0001), 10);
+    expect(res[0].grossR).toBeCloseTo(0.5, 10); // 仲値換算の値動きは 101 − 100
   });
 
   it("重複 (同じ銘柄・戦略・方向で未決済あり) は作らない。決済後は再び作れる", () => {
@@ -138,7 +205,8 @@ describe("ShadowTracker (見送ったシグナルの仮想トレード)", () => 
     expect(tr2.stats().droppedRate).toBe(2);
     expect(tr2.record(input({ sig: { strategyId: "late" }, now: T0 + 61_000 }))).toBe(true);
     // 既定は 200 件・30 件/分
-    expect(tracker().opts).toMatchObject({ maxOpen: 200, maxPerMinute: 30, slippageBps: 2 });
+    expect(tracker().opts).toMatchObject({ maxOpen: 200, maxPerMinute: 30 });
+    expect(tracker().opts.slippageBps).toBeUndefined(); // 既定は資産クラス別
   });
 
   it("再起動後も続く (未決済は kv shadow:open:<mode> に保存)", () => {
@@ -252,7 +320,9 @@ describe("StrategyAllocator: 仮想トレードによる重み付き更新", () 
     const al = new StrategyAllocator(new MemoryStore());
     for (let i = 0; i < 500; i++) al.updateShadow(shadowRec(-1.5));
     expect(al.get(key)!.n).toBe(0);
-    expect(al.upperConfidenceR(key)).toBeLessThan(0);
+    // 無効化の上側信頼限界は実際の取引だけで計算する (実取引が無ければ +∞)。配分倍率の期待 R は下がる
+    expect(al.upperConfidenceR(key)).toBe(Number.POSITIVE_INFINITY);
+    expect(al.meanR(key)).toBeLessThan(0);
     expect(al.isDisabled(key)).toBe(false);
     expect(al.weight(key)).toBeGreaterThan(0);
     // 実際の取引が minSamplesToDisable に達して初めて止まりうる

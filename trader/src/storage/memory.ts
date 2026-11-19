@@ -128,6 +128,13 @@ export class MemoryStore implements Store {
     return all[0];
   }
 
+  listBriefs(opts: { since?: number; until?: number } = {}): MarketBrief[] {
+    return this.briefs
+      .filter((b) => (opts.since === undefined || b.generatedAt >= opts.since) && (opts.until === undefined || b.generatedAt <= opts.until))
+      .sort((a, b) => a.generatedAt - b.generatedAt)
+      .map(clone);
+  }
+
   savePlan(p: StrategyPlan): void {
     this.plans.push(clone(p));
   }

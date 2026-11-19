@@ -39,6 +39,9 @@ export class ReadOnlyOverlayStore implements Store {
   latestBrief() {
     return this.base.latestBrief();
   }
+  listBriefs(...a: Parameters<NonNullable<Store["listBriefs"]>>) {
+    return this.base.listBriefs?.(...a) ?? [];
+  }
   savePlan(): void {}
   latestPlan() {
     return this.base.latestPlan();

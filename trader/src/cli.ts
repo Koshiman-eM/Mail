@@ -25,6 +25,7 @@ import { LearningService } from "./learning/service";
 import { CcxtFeed } from "./market/feeds/ccxt";
 import { RiskManager } from "./risk/manager";
 import { requestResume } from "./risk/resumeRequest";
+import { riskOverrideLines } from "./risk/settings";
 import { createStore } from "./storage";
 import { ReadOnlyOverlayStore } from "./storage/readonly";
 import { getStrategy } from "./strategies/registry";
@@ -194,7 +195,7 @@ function modeLines(c: AppConfig): { out: string[]; warn: string[] } {
 function riskLines(c: AppConfig): string[] {
   const r = c.risk;
   return [
-    "リスク上限:",
+    "リスク上限 (.env):",
     `  1 トレードのリスク ${fmtPct(r.riskPerTrade)} / 日次損失 ${fmtPct(r.maxDailyLoss)} / 最大ドローダウン ${fmtPct(r.maxDrawdown)}`,
     `  最大保有数 ${r.maxOpenPositions} / 1 銘柄 ${fmtPct(r.maxPositionPct, 0)} / 発注 ${r.maxOrdersPerMinute} 回/分 / 期待値幅 ≥ コスト × ${r.minEdgeToCostRatio}`,
     `  資産クラス上限: ${Object.entries(r.maxExposureByClass).map(([k, v]) => `${k} ${fmtPct(v, 0)}`).join(" / ")} / ミーム最低流動性 $${fmtNum(r.memeMinLiquidityUsd, 0)}`,
@@ -243,6 +244,7 @@ async function cmdRun(io: Io): Promise<number> {
   io.out(`銘柄: ${rt.instruments.map((i) => `${i.symbol} (${i.assetClass}, ${i.venue})`).join(", ")}`);
   io.out(`時間足: ${rt.timeframes.join(", ")} / 口座通貨: ${config.env.BASE_CURRENCY} / DB: ${resolveDbPath(config)}`);
   riskLines(config).forEach((l) => io.out(l));
+  riskOverrideLines(rt.store, rt.engine.mode, config.risk, fmtTime).forEach((l) => io.out(l));
   io.out(`AI: ${rt.ai ? `有効 (${rt.ai.model})` : "無効 (ルールベース)"}`);
 
   // 同じ mode のエンジンの二重起動防止 (同じ DB の kv にロックを書き、15 秒ごとに heartbeat を更新する)
@@ -288,11 +290,20 @@ async function cmdRun(io: Io): Promise<number> {
         quoteCurrencyOf: (s) => rt.hub.instrument(s)?.quoteCurrency,
         chartTimeframes: () => rt.hub.timeframes(),
         candles: (s, tf, n) => (rt.hub.timeframes() as string[]).includes(tf) ? rt.hub.chartCandles(s, tf as Timeframe, n) : undefined,
+        // リスク設定タブ: 保存したら動作中の RiskManager に即座に読み直させる (エンジンの再起動は不要)
+        riskSettings: { mode, envLimits: config.risk, onChange: () => rt.engine.risk.refreshLimits() },
       },
-      { host: config.env.DASHBOARD_HOST, port: config.env.DASHBOARD_PORT },
+      { host: config.env.DASHBOARD_HOST, port: config.env.DASHBOARD_PORT, writeToken: config.env.DASHBOARD_WRITE_TOKEN },
     );
-    io.out(`ダッシュボード: ${dash.url} (閲覧専用)`);
-    if (!isLoopbackHost(config.env.DASHBOARD_HOST)) io.err("警告: ダッシュボードがループバック以外で待ち受けています。認証が無いため外部公開は避けてください。");
+    io.out(`ダッシュボード: ${dash.url} (閲覧 + リスク設定の変更)`);
+    if (!isLoopbackHost(config.env.DASHBOARD_HOST)) {
+      io.err("警告: ダッシュボードがループバック以外で待ち受けています。認証が無いため外部公開は避けてください。");
+      io.err(
+        config.env.DASHBOARD_WRITE_TOKEN.length >= 16
+          ? "  リスク設定の変更には DASHBOARD_WRITE_TOKEN の入力が必要です。"
+          : "  DASHBOARD_WRITE_TOKEN (16 文字以上) が未設定のため、リスク設定は変更できません (閲覧のみ)。",
+      );
+    }
   } catch (e) {
     io.err(`警告: ダッシュボードを起動できませんでした (${e instanceof Error ? e.message : String(e)})。取引は続行します`);
   }
@@ -667,6 +678,8 @@ function cmdStatus(io: Io): number {
   try {
     const now = Date.now();
     const mode = config.mode;
+    // .env の値 (上の riskLines) に対する、ダッシュボードの上書き値と実効値
+    riskOverrideLines(store, mode, config.risk, fmtTime).forEach((l) => io.out(l));
     const risk = new RiskManager(config.risk, store, { mode });
     const h = risk.isHalted(now);
     io.out(`停止状態 (${mode}): ${h.halted ? h.reason : "なし"}`);

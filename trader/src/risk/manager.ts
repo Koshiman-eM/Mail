@@ -3,6 +3,7 @@ import { createLogger } from "../core/logger";
 import { sweepOld } from "../core/sweep";
 import { normalizeReason } from "../engine/context";
 import type { AssetClass, Instrument, PositionView, Quote, RiskDecision, RiskLimits, RiskState, Signal, Store, TradingMode } from "../core/types";
+import { effectiveRiskLimits } from "./settings";
 
 const log = createLogger("risk");
 const DAY_MS = 86_400_000;
@@ -121,28 +122,45 @@ export function exposureByClass(
  */
 export const MAX_SIZE_MULTIPLIER = 1.5;
 
+/**
+ * ダッシュボードの上書き値 (kv `risk:limits:<mode>`) を読み直す間隔 (ms)。
+ * 評価のたびに kv を読まないための短いキャッシュ。エンジンは毎ティックの onEquity で必ず読み直すので、
+ * 変更は次のティックから効く (ティック間隔 SCALP_LOOP_MS の既定 5 秒より短くしておく)。
+ */
+export const RISK_OVERRIDE_CACHE_MS = 2_000;
+
 export class RiskManager {
   private st: InternalState;
   private lastAudit = new Map<string, number>();
   private lastAuditSweep = 0;
   private readonly key: string;
+  /** 上書き値を読む mode (文字列キー指定・store なしのときは読まない = 渡された limits をそのまま使う) */
+  private readonly overrideMode?: TradingMode;
+  private readonly overrideCacheMs: number;
+  private limitsCache?: { at: number; limits: RiskLimits; updatedAt: number };
 
   /**
    * 状態は kv `risk:state:<mode>` に保存する (既定 paper)。paper は旧キー `risk:state` からも引き継ぐ。
    * live は live のキーだけを読む (初回は最初の onEquity で現在の評価額を基準にする)。
    * 第 3 引数に文字列を渡すとそのキーをそのまま使う。
+   *
+   * envLimits は .env の値。mode 指定 (オブジェクト形式) で store があれば、ダッシュボードの上書き値
+   * (kv `risk:limits:<mode>`) を重ねた実効値を `limits` として使う (再起動後も kv から読むので残る)。
    */
   constructor(
-    readonly limits: RiskLimits,
+    private readonly envLimits: RiskLimits,
     private readonly store?: Store,
-    keyOrOpts: string | { mode?: TradingMode } = {},
+    keyOrOpts: string | { mode?: TradingMode; overrideCacheMs?: number } = {},
   ) {
     let saved: InternalState | undefined;
+    this.overrideCacheMs = RISK_OVERRIDE_CACHE_MS;
     if (typeof keyOrOpts === "string") {
       this.key = keyOrOpts;
       saved = store?.kvGet<InternalState>(this.key);
     } else {
       const mode = keyOrOpts.mode ?? "paper";
+      if (store) this.overrideMode = mode;
+      if (keyOrOpts.overrideCacheMs !== undefined) this.overrideCacheMs = keyOrOpts.overrideCacheMs;
       this.key = riskStateKey(mode);
       saved = store?.kvGet<InternalState>(this.key);
       if (saved === undefined && mode === "paper") saved = store?.kvGet<InternalState>(LEGACY_RISK_STATE_KEY);
@@ -150,6 +168,42 @@ export class RiskManager {
     this.st = saved && typeof saved === "object"
       ? { ...saved, recentOrderTs: Array.isArray(saved.recentOrderTs) ? saved.recentOrderTs : [] }
       : { dayStartEquity: 0, peakEquity: 0, recentOrderTs: [] };
+  }
+
+  /** 実効のリスク上限 (.env の値 + ダッシュボードの上書き値)。短時間キャッシュする */
+  get limits(): RiskLimits {
+    if (this.overrideMode === undefined) return this.envLimits;
+    const c = this.limitsCache;
+    if (c && Date.now() - c.at < this.overrideCacheMs) return c.limits;
+    return this.refreshLimits();
+  }
+
+  /** .env の値 (上書き前) */
+  get baseLimits(): RiskLimits {
+    return this.envLimits;
+  }
+
+  /**
+   * 上書き値を kv から読み直す (エンジンは毎ティックの onEquity で呼ぶ。ダッシュボードの保存直後にも呼ぶ)。
+   * 読めない場合 (DB の一時的な失敗など) は直前の値を使い続ける (失敗で上限を緩めも締めもしない)
+   */
+  refreshLimits(): RiskLimits {
+    if (this.overrideMode === undefined) return this.envLimits;
+    const prev = this.limitsCache;
+    try {
+      const { limits, override } = effectiveRiskLimits(this.envLimits, this.store, this.overrideMode);
+      const updatedAt = override?.updatedAt ?? 0;
+      if (prev && prev.updatedAt !== updatedAt) log.warn("リスク上限の変更を反映しました", { mode: this.overrideMode, overridden: Boolean(override) });
+      this.limitsCache = { at: Date.now(), limits, updatedAt };
+      return limits;
+    } catch (e) {
+      log.warn("リスク上限の上書き値を読めません。直前の値を使います", { error: e instanceof Error ? e.message : String(e) });
+      if (prev) {
+        this.limitsCache = { ...prev, at: Date.now() };
+        return prev.limits;
+      }
+      return this.envLimits;
+    }
   }
 
   state(): RiskState {
@@ -176,6 +230,8 @@ export class RiskManager {
   /** 口座評価額の更新。日次損失・ドローダウンの停止判定もここで行う */
   onEquity(equity: number, now: number): { halted: boolean; killSwitch: boolean; dailyLossPct: number; drawdownPct: number } {
     const st = this.st;
+    // 毎ティックここで上書き値を読み直す (ダッシュボードの変更を次のティックから反映。再起動は不要)
+    const L = this.refreshLimits();
     // 取得失敗などで NaN / 非有限になった評価額では状態を更新しない (基準の破壊・誤った停止を防ぐ)
     if (typeof equity !== "number" || !Number.isFinite(equity)) {
       log.warn("評価額が不正なため無視します", { equity: String(equity) });
@@ -196,13 +252,13 @@ export class RiskManager {
     const dailyLossPct = st.dayStartEquity > 0 ? (st.dayStartEquity - equity) / st.dayStartEquity : 0;
     const drawdownPct = st.peakEquity > 0 ? (st.peakEquity - equity) / st.peakEquity : 0;
 
-    if (dailyLossPct > this.limits.maxDailyLoss && (st.haltedUntil === undefined || now >= st.haltedUntil)) {
+    if (dailyLossPct > L.maxDailyLoss && (st.haltedUntil === undefined || now >= st.haltedUntil)) {
       st.haltedUntil = nextUtcMidnight(now);
       changed = true;
       log.warn("日次損失上限に到達: 当日の新規エントリーを停止", { dailyLossPct });
       this.audit("risk.halt_daily", now, { equity, dayStartEquity: st.dayStartEquity, dailyLossPct, haltedUntil: st.haltedUntil });
     }
-    if (drawdownPct > this.limits.maxDrawdown && !st.killSwitch) {
+    if (drawdownPct > L.maxDrawdown && !st.killSwitch) {
       st.killSwitch = { at: now, reason: `最大ドローダウン超過 ${(drawdownPct * 100).toFixed(2)}%` };
       changed = true;
       log.error("最大ドローダウン超過: キルスイッチ作動", { drawdownPct });

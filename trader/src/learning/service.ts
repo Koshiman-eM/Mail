@@ -16,12 +16,13 @@ import type {
   TradeRecord,
   TradingMode,
 } from "../core/types";
-import { armKey, StrategyAllocator, type AllocatorOptions, type ArmSnapshot, type Rng } from "./allocator";
+import { armKey, StrategyAllocator, type AllocatorOptions, type ArmSnapshot, type ArmUpdate, type Rng } from "./allocator";
 import { attributeTrade } from "./attribution";
 import { DEFAULT_POST_EXIT_HORIZON_MS, fillPostExitMoves, type PriceAt } from "./journal";
 import { loadForecastSummary, type ForecastSummary, type ForecastTracker } from "./forecast";
 import { lastPostExitFillKey, lastReflectKey, lastTuneKey, migrateLearningModeSplit } from "./migration";
 import { NewsOutcomeTracker, type NewsCheckOptions, type NewsCheckSummary } from "./newsCheck";
+import { DEFAULT_INFLUENCE_SHADOW_WEIGHT, observeInfluenceWeighted } from "./influence";
 import { reflect, type ReflectionResult } from "./reflection";
 import { SourceReliabilityTracker, type ReliabilityOptions } from "./reliability";
 import { isHaltShadowReason, shadowCountersKey, shadowOpenKey, summarizeShadowTrades, sumShadowCounters, type ShadowCounters, type ShadowSummary } from "./shadow";
@@ -38,7 +39,7 @@ export interface LearningServiceDeps {
   getStrategy?: (strategyId: string) => StrategyInfo | undefined;
   /** strategyId → 適合レジーム (getStrategy の regimes より優先) */
   strategyRegimes?: Record<string, RegimeLabel[]>;
-  /** パラメータ候補のバックテスト検証 (無ければ調整は "proposed" のまま適用しない) */
+  /** パラメータ候補の検証 (長い履歴を区間に分けたバックテスト)。無ければ規則による調整はせず、提案は "proposed" のまま適用しない */
   validate?: ParamValidator;
   /** Claude API (キー空ならルールベース) */
   ai?: AiOptions;
@@ -58,6 +59,8 @@ export interface LearningServiceDeps {
   newsCheck?: Partial<NewsCheckOptions>;
   /** 決済済みの仮想トレードを残す期間 (既定 30 日。periodic で古いものを消す) */
   shadowRetentionMs?: number;
+  /** direction_bias で止めたシグナルの仮想トレードを情報の効き具合 (intelInfluence) に入れる重み (既定 0.25。0 で無効) */
+  influenceShadowWeight?: number;
   /** 運用ログ系の保持期間 (既定: audit/intel/briefs/plans 30 日、equity 180 日) */
   operationalRetention?: { auditMs?: number; intelMs?: number; briefsMs?: number; plansMs?: number; equityMs?: number };
   /**
@@ -70,6 +73,8 @@ export interface LearningServiceDeps {
 export interface PeriodicResult {
   postExitFilled: number;
   reattributed: number;
+  /** エグジット後の値動きの補完で情報源の信頼度を直したトレードの数 */
+  reliabilityRevised?: number;
   reverted: ParamAdjustment[];
   adjustments: ParamAdjustment[];
   reflection?: ReflectionResult;
@@ -167,6 +172,7 @@ export class LearningService {
     const att = this.attribute(trade);
     this.store.saveAttribution(att);
     const arm = this.allocator.update(trade);
+    this.auditArmTransition(arm, trade.exitTs, { tradeId: trade.id, source: "trade" });
     const sources = this.reliability.update(trade);
     this.store.audit({
       ts: trade.exitTs,
@@ -192,13 +198,44 @@ export class LearningService {
    * 次のものは保存だけして腕の更新には使わない:
    * - 新規停止中 (halted / kill switch / 日次停止 / 状態不明の注文による一時停止) に記録したもの (isHaltShadowReason)
    * - 別の mode の仮想トレード
+   * 有効な腕では配分倍率にだけ効き、無効化中の腕では回復の判定にも使う (allocator)。
+   * 計画の片側バイアスで止めたもの (reason "direction_bias") は、エントリー時の情報バイアス
+   * (opts.intelSentiment。エンジンが記録時に覚えておく) があれば、情報の効き具合にも重み influenceShadowWeight で入れる
    */
-  onShadowClosed(t: ShadowTradeRecord): void {
+  onShadowClosed(t: ShadowTradeRecord, opts: { intelSentiment?: number } = {}): void {
     if (t.exitReason === "unwatched") return;
     this.store.saveShadowTrade(t);
     if (t.mode !== undefined && t.mode !== this.mode) return;
     if (isHaltShadowReason(t.reason)) return;
-    this.allocator.updateShadow(t);
+    const arm = this.allocator.updateShadow(t);
+    this.auditArmTransition(arm, t.exitTs, { shadowId: t.id, source: "shadow", reason: t.reason });
+    const w = this.deps.influenceShadowWeight ?? DEFAULT_INFLUENCE_SHADOW_WEIGHT;
+    if (t.reason === "direction_bias" && w > 0 && typeof opts.intelSentiment === "number" && Number.isFinite(opts.intelSentiment)) {
+      // 決済済みトレードの更新 (reliability.updateInfluence) と同じ尺度: x = 情報バイアス × 取引方向、y = R (仮想は純 R)
+      const dir = t.direction === "long" ? 1 : -1;
+      observeInfluenceWeighted(this.store, this.mode, this.reliability.opts, t.assetClass, opts.intelSentiment * dir, t.netR, w, t.exitTs);
+    }
+  }
+
+  /** 腕の無効化・回復を監査ログに残す */
+  private auditArmTransition(arm: ArmUpdate, ts: number, extra: Record<string, unknown>): void {
+    if (!arm.transition) return;
+    const r3 = (x: number | undefined) => (typeof x === "number" && Number.isFinite(x) ? Number(x.toFixed(3)) : x);
+    this.store.audit({
+      ts,
+      type: arm.transition === "disabled" ? "learning.arm_disabled" : "learning.arm_recovered",
+      data: {
+        arm: arm.key,
+        n: arm.n,
+        realN: arm.realN,
+        realMeanR: r3(arm.realMeanR),
+        // 回復直後は実取引の統計を数え直すので上側信頼限界は +∞ (JSON で null になるため載せない)
+        ...(Number.isFinite(this.allocator.upperConfidenceR(arm.key)) ? { upperR: r3(this.allocator.upperConfidenceR(arm.key)) } : {}),
+        ...(arm.transition === "disabled" ? { recoveryR: r3(arm.recMeanR), disableCount: arm.disableCount } : { disabledAt: arm.disabledAt }),
+        shadowN: arm.shadowN ?? 0,
+        ...extra,
+      },
+    });
   }
 
   /** 見送ったシグナルの答え合わせの集計 (既定は直近 30 日) */
@@ -265,6 +302,14 @@ export class LearningService {
           const prev = this.store.getAttribution(t.id);
           this.store.saveAttribution(this.attribute(t, prev?.createdAt));
           res.reattributed++;
+          // 情報源の信頼度: 決済時の更新をエグジット後の値動きで差分だけ直す (決済時の記録が無ければ何もしない = 二重に数えない)
+          if (!t.estimated && (t.mode === undefined || t.mode === this.mode)) {
+            try {
+              if (this.reliability.reviseWithPostExit(t, now).length > 0) res.reliabilityRevised = (res.reliabilityRevised ?? 0) + 1;
+            } catch (e) {
+              log.warn("情報源の信頼度の補正に失敗 (学習は継続)", { tradeId: t.id, error: e instanceof Error ? e.message : String(e) });
+            }
+          }
         }
         this.store.kvSet(lastPostExitFillKey(this.mode), now);
       }
@@ -298,7 +343,8 @@ export class LearningService {
         });
         res.reflection = reflection;
         for (const p of reflection.proposals) {
-          const adj = await this.tuner.propose(p, now);
+          // 振り返りの対象期間 = 提案の判断に使った期間。事後評価の比較対象はこれより前の取引にする (tuner.propose)
+          const adj = await this.tuner.propose(p, now, { decisionFrom: now - (this.deps.reflectWindowMs ?? 7 * 86_400_000) });
           if (adj) res.adjustments.push(adj);
         }
         this.store.kvSet(lastReflectKey(this.mode), now);
@@ -312,9 +358,19 @@ export class LearningService {
     }
   }
 
-  /** 腕の配分倍率 (探索込み)。エンジンがリスク予算に掛ける */
+  /** 腕の配分倍率 (探索込み)。エンジンがエントリー時にリスク予算に掛ける (無効化中の腕は exploreProb で探索) */
   armWeight(strategyId: string, regime: RegimeLabel, assetClass: AssetClass, rng?: Rng): number {
     return this.allocator.explorationWeight(armKey(strategyId, regime, assetClass), rng);
+  }
+
+  /** 計画用の腕の配分倍率 (乱数なし・決定的。無効化中は 0) */
+  armPlanWeight(strategyId: string, regime: RegimeLabel, assetClass: AssetClass): number {
+    return this.allocator.weight(armKey(strategyId, regime, assetClass));
+  }
+
+  /** 腕が無効化中か (保存した状態) */
+  isArmDisabled(strategyId: string, regime: RegimeLabel, assetClass: AssetClass): boolean {
+    return this.allocator.isDisabled(armKey(strategyId, regime, assetClass));
   }
 
   /** 学習済みの現行パラメータ (未知の戦略は undefined) */
@@ -325,6 +381,11 @@ export class LearningService {
 
   intelInfluence(assetClass: AssetClass): number {
     return this.reliability.intelInfluence(assetClass);
+  }
+
+  /** 全資産クラスの情報の効き具合 (計画の片側バイアスの補正に使う) */
+  intelInfluences(): Record<AssetClass, number> {
+    return Object.fromEntries(ASSET_CLASSES.map((c) => [c, this.reliability.intelInfluence(c)])) as Record<AssetClass, number>;
   }
 
   sourceReliability(): Record<string, SourceReliability> {

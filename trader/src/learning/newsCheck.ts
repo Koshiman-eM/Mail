@@ -6,7 +6,8 @@
  *    同じ id は 1 回だけ。
  * 2. 判定 (evaluate): 取り込みから 15 分・1 時間・4 時間 (horizonsMs) 後の価格と比べる。
  *    ノイズの範囲 = max(1 分足 ATR 比 × √分数 × noiseAtrMult, 往復コスト比) 未満の動きは判定しない (数えない)。
- *    当たり・外れを SourceReliabilityTracker.observeNews (重み newsWeight, 既定 0.3) に反映する。
+ *    当たり・外れを SourceReliabilityTracker.observeNews に反映する。1 記事あたりの合計の重みが newsWeight (既定 0.3) になるよう、
+ *    1 判定の重みは newsWeight ÷ (時間の数 × その記事で判定する資産の数)。ノイズ・期限切れの判定の分は使わない (合計 ≤ 0.3)。
  * 3. 判定待ちは最大 maxPending 件 (古い順に捨てる)。kv に保存し再起動後も続ける。監視をやめた銘柄の分は捨てる。
  * 4. 状態 (判定待ち・集計・取り込み済み id) は mode 別のキー `newsCheck:<mode>:*` に保存する (情報源の信頼度が mode 別のため)。
  */
@@ -61,6 +62,11 @@ export interface NewsPending {
   costPct: number;
   /** 判定済み (またはノイズ・期限切れで終えた) horizon (ms) */
   done: number[];
+  /**
+   * 1 判定の重みの割合 = 1 ÷ (時間の数 × その記事で判定する資産の数)。
+   * 保存済みの判定待ち (この項目が無いもの) は読み込み時に同じ記事 id の件数から補う
+   */
+  share?: number;
 }
 
 export interface NewsCounts {
@@ -142,6 +148,11 @@ export class NewsOutcomeTracker {
     this.opts = { ...DEFAULT_NEWS_CHECK_OPTIONS, ...opts };
     const p = store.kvGet<NewsPending[]>(newsPendingKey(mode));
     this.pending = Array.isArray(p) ? p : [];
+    // 旧形式の判定待ち (share なし): 同じ記事 id の判定待ちの件数 (= 資産の数) から割合を補う
+    const perItem = new Map<string, number>();
+    for (const x of this.pending) if (x && !finite(x.share)) perItem.set(x.itemId, (perItem.get(x.itemId) ?? 0) + 1);
+    const h = Math.max(1, this.opts.horizonsMs.length);
+    for (const x of this.pending) if (x && !finite(x.share)) x.share = 1 / (h * Math.max(1, perItem.get(x.itemId) ?? 1));
     const s = store.kvGet<string[]>(newsSeenKey(mode));
     this.seen = Array.isArray(s) ? s : [];
     this.seenSet = new Set(this.seen);
@@ -171,6 +182,7 @@ export class NewsOutcomeTracker {
       const assets = [...new Set((it.assets ?? []).map((a) => String(a).toUpperCase()))].filter((a) => byAsset.has(a)).slice(0, this.opts.maxAssetsPerItem);
       if (assets.length === 0) continue;
       this.markSeen(it.id);
+      const share = 1 / (Math.max(1, this.opts.horizonsMs.length) * assets.length);
       for (const asset of assets) {
         const m = byAsset.get(asset)!;
         this.pending.push({
@@ -186,6 +198,7 @@ export class NewsOutcomeTracker {
           atrPctPerMin: finite(m.atrPctPerMin) && m.atrPctPerMin > 0 ? m.atrPctPerMin : 0,
           costPct: finite(m.costPct) && m.costPct > 0 ? m.costPct : 0,
           done: [],
+          share,
         });
         added++;
         this.stats.recorded++;
@@ -263,7 +276,7 @@ export class NewsOutcomeTracker {
           src.hits++;
           hc.hits++;
         }
-        this.reliability.observeNews(p.source, hit, now);
+        this.reliability.observeNews(p.source, hit, now, undefined, finite(p.share) && p.share > 0 ? p.share : 1);
         judged++;
       }
       if (this.opts.horizonsMs.some((h) => !p.done.includes(h))) keep.push(p);

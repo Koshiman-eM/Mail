@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/core/config";
 import type { Candle } from "../src/core/types";
-import { createParamValidator, createPriceAt, pickValidationData } from "../src/engine/learningHooks";
+import { createParamValidator, createPriceAt } from "../src/engine/learningHooks";
 import { brokerVenues, buildRuntime, hubTimeframesFor, parseVenues, parseWatchlist, resolveDbPath, syntheticDbPath } from "../src/engine/setup";
 import { assertSimulationDb } from "../src/engine/simulate";
 import { ClosedCandleCacheFeed } from "../src/engine/feedCache";
@@ -122,21 +122,17 @@ describe("学習フック", () => {
     return { hub, clock };
   }
 
-  it("validate: 履歴で evaluateParams を実行。板必須・データ不足は undefined", async () => {
+  it("validate: hub の短い足では検証しない (feed から長い履歴を取れなければ undefined)", async () => {
     const candles = generateCandles({ seed: 4, bars: 1500, timeframe: "1m", startTs: START, vol: 0.0006 });
     const now = candles[candles.length - 1].ts + 60_000;
     const { hub, clock } = await hubWith(candles, now);
-    const validate = createParamValidator({ hub, strategies: ALL_STRATEGIES, clock, minEdgeToCostRatio: 0 });
     const s = getStrategy("scalp_momentum_burst")!;
-    expect(pickValidationData(s, "crypto", hub, now)?.baseTimeframe).toBe("1m");
-    const r = await validate("scalp_momentum_burst", "crypto", s.defaultParams);
-    expect(r).toBeDefined();
-    expect(Number.isFinite(r!.score)).toBe(true);
-    expect(r!.trades).toBeGreaterThanOrEqual(0);
-    expect(await validate("scalp_obi", "crypto", getStrategy("scalp_obi")!.defaultParams)).toBeUndefined();
-    expect(await validate("scalp_momentum_burst", "fx", s.defaultParams)).toBeUndefined();
-    expect(await validate("long_momentum", "crypto", getStrategy("long_momentum")!.defaultParams)).toBeUndefined();
-    expect(await validate("unknown", "crypto", {})).toBeUndefined();
+    // feed も 1500 本 (約 1 日) しか持たない: 要求 (14 日) の半分に満たないので検証しない
+    const feed = { fetchCandles: async (_s: string, _tf: string, limit: number, since?: number) => candles.filter((c) => since === undefined || c.ts >= since).slice(0, limit) };
+    const validate = createParamValidator({ hub, strategies: ALL_STRATEGIES, clock, minEdgeToCostRatio: 0, feedFor: () => feed });
+    expect(await validate("scalp_momentum_burst", "crypto", s.defaultParams)).toBeUndefined();
+    const noFeed = createParamValidator({ hub, strategies: ALL_STRATEGIES, clock, feedFor: () => undefined });
+    expect(await noFeed("scalp_momentum_burst", "crypto", s.defaultParams)).toBeUndefined();
   });
 
   it("priceAt: ts を含む 1m 足の終値。範囲外は undefined", async () => {

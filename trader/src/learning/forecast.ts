@@ -20,15 +20,26 @@
  * - 学習: オンラインのロジスティック回帰 (SGD、L2 正則化、重みの上限)。
  *
  * 取引への反映 (multiplierFor):
- * - (予想時間, 資産クラス) の判定済み (方向の予想 × 方向の結果) が minSamples 件以上、
- *   かつ的中率が 50% を有意に上回る (片側 95%、二項検定の正規近似・連続修正あり) ときだけ「LIVE」。
- *   重複する予想 (4 時間後の予想を 5 分ごと) は独立ではないので、z を √(予想時間 ÷ 間隔) で割って補正する。
+ * - 取引に使う予想は「戦略の合意 (consensus) を除いたモデル」(基礎モデル、kv forecast:modelBase:<mode>) の予想。
+ *   consensus は戦略のシグナルそのものなので、それを含む予想でシグナルのサイズを増やすと同じ情報を二重に数える (循環)。
+ *   全特徴量のモデルは表示・学習の比較用に残す。基礎モデルが無いときは全特徴量のモデルから consensus を除いて始める。
+ * - LIVE の判定 (予想時間, 資産クラス) は基礎モデルの判定済み (方向の予想 × 方向の結果) で行う:
+ *   1. クラスタ単位: 同じ予想の間隔 (intervalMs) に出した同じ資産クラスの予想はまとめて 1 観測 (的中の割合) に数える
+ *      (相関した銘柄が同時に同じ動きをするのを独立な観測と数えない)。時間の重複は z を √(予想時間 ÷ 間隔) で割って補正する。
+ *   2. 多重検定: 予想時間 × 資産クラス (既定 3 × 4 = 12 グループ) を常に判定し続けるので、片側 α = 1 − Φ(zCritical) を
+ *      グループ数で割る (Bonferroni)。既定は z ≥ 2.64 で LIVE に入る。
+ *   3. ヒステリシス: LIVE を止めるのは z < 入る閾値 − liveHysteresisZ (既定 0.5) になったとき (境界でのばたつきを防ぐ)。
+ *   4. 判定済みの件数 (予想の数) が minSamples 未満なら LIVE にしない。
+ *   5. 適用した予想 (エンジンが markApplied で記録した、シグナルと同じ向きで発注に使われた予想) が minAppliedSamples 件以上あれば、
+ *      そのクラスタ単位の z が appliedMinZ (既定 0) 未満のとき LIVE にしない (実際に使われた場面で効いていなければ止める)。
+ *      markApplied が呼ばれない間はこの条件は効かない (1〜4 だけ。従来より厳しい)。
  * - LIVE のとき、シグナルと予想の向きが一致すれば 1 + maxBoost × 強さ (最大 1.2)、逆なら 1 − maxCut × 強さ (最大 0.7 まで下げる)。
  *   強さ = |pUp − 0.5| × 2。LIVE でない間・予想が flat・古い予想は 1.0 (まったく影響しない)。
  *
  * 永続化 (mode 別の kv。SQLite / memory 共通):
  * - forecast:pending:<mode> 未判定の予想 (上限 maxPending、古い順に捨てる)
- * - forecast:model:<mode>   重み
+ * - forecast:model:<mode>   重み (全特徴量)
+ * - forecast:modelBase:<mode> 重み (consensus を除く基礎モデル。取引への反映に使う)
  * - forecast:stats:<mode>   集計 (日ごとのバケツ。retentionMs を過ぎた日は捨てる)
  * - 判定済みの 1 件ずつは Store.saveForecastOutcomes (retentionMs で削除)
  * 監査ログには要約 (learning.forecast_summary) と反映状態の変化 (learning.forecast_live) だけを残す。
@@ -80,8 +91,16 @@ export interface ForecastOptions {
   initialWeight: number;
   /** 取引に反映するのに必要な判定済みの件数 ((予想時間, 資産クラス) ごと) */
   minSamples: number;
-  /** 片側検定の臨界値 (1.645 = 片側 95%) */
+  /** 片側検定の臨界値 (1.645 = 片側 95%)。LIVE の判定ではこれを有意水準とみなし、グループ数で Bonferroni 補正する */
   zCritical: number;
+  /** 多重検定の補正に使うグループ数 (0 以下なら 予想時間の数 × 資産クラスの数 4) */
+  liveGroups: number;
+  /** LIVE を止める閾値 = 入る閾値 − liveHysteresisZ */
+  liveHysteresisZ: number;
+  /** 適用した予想 (markApplied) の判定済みがこの件数以上なら、その的中も LIVE の条件にする */
+  minAppliedSamples: number;
+  /** 適用した予想のクラスタ単位の z がこれ未満なら LIVE にしない (0 = 50% を上回っていない) */
+  appliedMinZ: number;
   /** 判定済みの記録・集計を残す期間 (既定 30 日) */
   retentionMs: number;
   /** 一致時のサイズの上乗せの上限 (0.2 → 最大 1.2 倍) */
@@ -110,6 +129,10 @@ export const DEFAULT_FORECAST_OPTIONS: ForecastOptions = {
   initialWeight: 0.05,
   minSamples: 100,
   zCritical: 1.645,
+  liveGroups: 0,
+  liveHysteresisZ: 0.5,
+  minAppliedSamples: 30,
+  appliedMinZ: 0,
   retentionMs: 30 * 86_400_000,
   maxBoost: 0.2,
   maxCut: 0.3,
@@ -197,6 +220,76 @@ export function skillConfirmed(n: number, hits: number, o: Pick<ForecastOptions,
 
 /** 予想の重複の度合い (予想時間 ÷ 予想の間隔、1 以上) */
 export const forecastOverlap = (horizonMs: number, intervalMs: number) => (horizonMs > 0 && intervalMs > 0 ? Math.max(1, horizonMs / intervalMs) : 1);
+
+/** 標準正規分布の累積分布関数 (Abramowitz-Stegun 7.1.26、誤差 1.5e-7 程度) */
+export function normalCdf(z: number): number {
+  if (!Number.isFinite(z)) return z > 0 ? 1 : 0;
+  const x = Math.abs(z) / Math.SQRT2;
+  const t = 1 / (1 + 0.3275911 * x);
+  const y = 1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
+  return z >= 0 ? 0.5 * (1 + y) : 0.5 * (1 - y);
+}
+
+/** 標準正規分布の分位点 (Acklam の近似、相対誤差 1.2e-9 程度) */
+export function normalQuantile(p: number): number {
+  if (!(p > 0)) return -Infinity;
+  if (!(p < 1)) return Infinity;
+  const a = [-39.69683028665376, 220.9460984245205, -275.9285104469687, 138.357751867269, -30.66479806614716, 2.506628277459239];
+  const b = [-54.47609879822406, 161.5858368580409, -155.6989798598866, 66.80131188771972, -13.28068155288572];
+  const c = [-0.007784894002430293, -0.3223964580411365, -2.400758277161838, -2.549732539343734, 4.374664141464968, 2.938163982698783];
+  const d = [0.007784695709041462, 0.3224671290700398, 2.445134137142996, 3.754408661907416];
+  const lo = 0.02425;
+  if (p < lo) {
+    const q = Math.sqrt(-2 * Math.log(p));
+    return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+  }
+  if (p > 1 - lo) {
+    const q = Math.sqrt(-2 * Math.log(1 - p));
+    return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+  }
+  const q = p - 0.5;
+  const r = q * q;
+  return ((((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q) / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1);
+}
+
+/** 資産クラスの数 (LIVE の判定のグループ数の既定に使う) */
+export const FORECAST_ASSET_CLASS_COUNT = 4;
+
+/** LIVE に入る/止める z の閾値 (Bonferroni 補正とヒステリシス) */
+export function liveThresholds(o: Pick<ForecastOptions, "zCritical" | "liveGroups" | "liveHysteresisZ" | "horizonsMs">): { zOn: number; zOff: number; groups: number; alpha: number } {
+  const groups = o.liveGroups > 0 ? Math.floor(o.liveGroups) : Math.max(1, o.horizonsMs.length * FORECAST_ASSET_CLASS_COUNT);
+  const alpha = clamp(1 - normalCdf(o.zCritical), 1e-12, 0.5);
+  const zOn = normalQuantile(1 - alpha / groups);
+  return { zOn, zOff: zOn - Math.max(0, finite(o.liveHysteresisZ) ? o.liveHysteresisZ : 0), groups, alpha };
+}
+
+/**
+ * クラスタ単位の z (クラスタ = 同じ間隔に出した同じ資産クラスの予想。的中の割合を 1 観測とする)。
+ * cn: クラスタの数、cs: クラスタごとの的中の割合の合計。時間の重複 overlap で割って補正する
+ */
+export function clusterZ(c: Pick<ForecastCounts, "cn" | "cs"> | undefined, overlap = 1): number {
+  const cn = finite(c?.cn) ? c!.cn! : 0;
+  const cs = finite(c?.cs) ? c!.cs! : 0;
+  return hitRateZ(cn, cs) / Math.sqrt(Math.max(1, overlap));
+}
+
+/**
+ * LIVE の判定 (純粋関数)。prev: 今 LIVE か (ヒステリシス)。base: 基礎モデルの集計、applied: 適用した予想の集計
+ */
+export function liveDecision(
+  prev: boolean,
+  base: ForecastCounts | undefined,
+  applied: ForecastCounts | undefined,
+  overlap: number,
+  o: Pick<ForecastOptions, "minSamples" | "minAppliedSamples" | "appliedMinZ">,
+  th: { zOn: number; zOff: number },
+): boolean {
+  if (!base || !(base.n >= o.minSamples)) return false;
+  const z = clusterZ(base, overlap);
+  let on = prev ? z >= th.zOff : z >= th.zOn;
+  if (on && applied && applied.n >= o.minAppliedSamples && clusterZ(applied, 1) < o.appliedMinZ) on = false;
+  return on;
+}
 
 /**
  * 新規エントリーのサイズの倍率。LIVE でない・予想が無い・flat なら 1.0。
@@ -391,6 +484,9 @@ export interface ForecastCounts {
   /** Brier スコアの合計と件数 (方向の結果が出たもの) */
   brierSum: number;
   brierN: number;
+  /** クラスタ (同じ間隔・同じ資産クラスの予想) の数と、クラスタごとの的中の割合の合計 (基礎モデル・適用した予想のグループだけ持つ) */
+  cn?: number;
+  cs?: number;
   /** 較正 (pUp の 0.1 刻み): 件数・上昇数・pUp の合計 (資産クラスのグループだけ持つ) */
   calN?: number[];
   calUp?: number[];
@@ -411,6 +507,10 @@ function addCounts(into: ForecastCounts, x: ForecastCounts): void {
   into.expired += x.expired ?? 0;
   into.brierSum += x.brierSum ?? 0;
   into.brierN += x.brierN ?? 0;
+  if (finite(x.cn) || finite(x.cs)) {
+    into.cn = (into.cn ?? 0) + (finite(x.cn) ? x.cn : 0);
+    into.cs = (into.cs ?? 0) + (finite(x.cs) ? x.cs : 0);
+  }
   if (into.calN && x.calN) {
     for (let i = 0; i < CAL_BINS; i++) {
       into.calN[i] += x.calN[i] ?? 0;
@@ -463,7 +563,12 @@ export interface ForecastStatsState {
   sinceAudit: { judged: number; hits: number; n: number; noise: number; expired: number };
   /** 取引に反映中の (予想時間|資産クラス) */
   live: string[];
+  /** live を決めた規則の版 (LIVE_RULE と違えば live は無視して判定し直す) */
+  liveRule?: number;
 }
+
+/** LIVE の判定規則の版 (2: 基礎モデル・クラスタ単位・Bonferroni・ヒステリシス・適用した予想) */
+export const LIVE_RULE = 2;
 
 const emptyStats = (): ForecastStatsState => ({
   days: {}, recorded: 0, droppedCap: 0, droppedUnwatched: 0, learned: 0, sinceAudit: { judged: 0, hits: 0, n: 0, noise: 0, expired: 0 }, live: [],
@@ -473,9 +578,14 @@ const DAY = 86_400_000;
 export const classKey = (label: string, assetClass: string) => `c|${label}|${assetClass}`;
 export const symbolKey = (label: string, symbol: string) => `s|${label}|${symbol}`;
 export const modelKey = (label: string, assetClass: string) => `${label}|${assetClass}`;
+/** 基礎モデル (consensus を除く) の予想の集計 */
+export const baseClassKey = (label: string, assetClass: string) => `b|${label}|${assetClass}`;
+/** 適用した予想 (markApplied) の集計 */
+export const appliedClassKey = (label: string, assetClass: string) => `a|${label}|${assetClass}`;
 
 export const forecastPendingKey = (mode: TradingMode) => `forecast:pending:${mode}`;
 export const forecastModelKey = (mode: TradingMode) => `forecast:model:${mode}`;
+export const forecastBaseModelKey = (mode: TradingMode) => `forecast:modelBase:${mode}`;
 export const forecastStatsKey = (mode: TradingMode) => `forecast:stats:${mode}`;
 
 /** 未判定の予想 (kv に保存するので短い形) */
@@ -492,6 +602,11 @@ export interface PendingForecast {
   f: number[];
   atrPctPerMin: number;
   costPct: number;
+  /** 基礎モデル (consensus を除く) の pUp と向き (取引への反映に使う。旧形式には無い) */
+  pb?: number;
+  db?: ForecastDirection;
+  /** 1: シグナルと同じ向きで発注に使われた (markApplied) */
+  ap?: 1;
 }
 
 export interface ForecastHorizonView {
@@ -505,6 +620,8 @@ export interface ForecastHorizonView {
   features: ForecastFeatures;
   /** 根拠の内訳: w_i × f_i とバイアス */
   contributions: ForecastFeatures & { bias: number };
+  /** 基礎モデル (consensus を除く) の予想。取引への反映 (multiplierFor) はこちらを使う */
+  base: { pUp: number; direction: ForecastDirection };
 }
 
 export interface SymbolForecast {
@@ -531,6 +648,9 @@ export interface ForecastStatusView {
     live: boolean;
     /** 根拠の内訳 (w_i × f_i、bias) */
     contributions: Record<string, number>;
+    /** 取引への反映に使う基礎モデル (consensus を除く) の予想 */
+    baseDirection: ForecastDirection;
+    basePUp: number;
   }[];
   /** 予想時間をまとめた的中率と件数 */
   accuracy: { n: number; hits: number; hitRate: number; minSamples: number };
@@ -558,6 +678,9 @@ export interface ForecastGroupSummary {
   /** 予想時間 ÷ 予想の間隔 */
   overlap: number;
   live: boolean;
+  /** LIVE の判定に使う基礎モデルの集計 (クラスタ単位の z) と、適用した予想の集計 (資産クラスのグループだけ) */
+  base?: { n: number; hits: number; hitRate: number; clusters: number; z: number };
+  applied?: { n: number; hits: number; hitRate: number; clusters: number; z: number };
 }
 
 export interface ForecastCalibrationBin {
@@ -591,8 +714,17 @@ export interface ForecastSummary {
   calibration: { horizon: string; bins: ForecastCalibrationBin[] }[];
   /** 学習した重み ((予想時間, 資産クラス) ごと) */
   models: { key: string; horizon: string; assetClass: string; weights: ForecastFeatures; bias: number; updates: number }[];
-  options: Pick<ForecastOptions, "minSamples" | "zCritical" | "flatThreshold" | "noiseAtrMult" | "maxBoost" | "maxCut" | "intervalMs">;
+  options: Pick<ForecastOptions, "minSamples" | "zCritical" | "flatThreshold" | "noiseAtrMult" | "maxBoost" | "maxCut" | "intervalMs" | "minAppliedSamples"> & {
+    /** LIVE に入る/止める z (Bonferroni 補正・ヒステリシス後) と補正のグループ数 */
+    zOn: number;
+    zOff: number;
+    liveGroups: number;
+  };
 }
+
+const subSummary = (c: ForecastCounts | undefined, overlap: number) => ({
+  n: c?.n ?? 0, hits: c?.hits ?? 0, hitRate: c?.n ? round(c.hits / c.n) : 0, clusters: c?.cn ?? 0, z: round(clusterZ(c, overlap), 3),
+});
 
 function groupSummary(key: string, c: ForecastCounts, o: Pick<ForecastOptions, "minSamples" | "zCritical">, overlapOf: (label: string) => number, live?: boolean): ForecastGroupSummary {
   const [kind, horizon, ...rest] = key.split("|");
@@ -664,7 +796,14 @@ export class ForecastTracker {
   private readonly readOnly: boolean;
   private pending: PendingForecast[];
   private models: Record<string, ForecastModel>;
+  /** 基礎モデル (consensus を除く) */
+  private baseModels: Record<string, ForecastModel>;
   private stats: ForecastStatsState;
+  /** 判定途中のクラスタ (グループ|間隔の番号 → 件数)。メモリだけ (再起動で途中のクラスタは別に数える) */
+  private readonly clusters = new Map<string, { n: number; hits: number; day: string; at: number }>();
+  /** 読み込み後に LIVE を判定し直したか */
+  private liveReady = false;
+  private dirtyBaseModel = false;
   private readonly latestBySymbol = new Map<string, SymbolForecast>();
   private aggCache?: { at: number; map: Map<string, ForecastCounts> };
   private dirtyPending = false;
@@ -683,6 +822,8 @@ export class ForecastTracker {
     this.pending = Array.isArray(p) ? p.filter((x) => x && finite(x.madeAt) && finite(x.horizonMs) && finite(x.mid0) && Array.isArray(x.f)) : [];
     const m = deps.store.kvGet<Record<string, ForecastModel>>(forecastModelKey(deps.mode));
     this.models = m && typeof m === "object" ? m : {};
+    const bm = deps.store.kvGet<Record<string, ForecastModel>>(forecastBaseModelKey(deps.mode));
+    this.baseModels = bm && typeof bm === "object" ? bm : {};
     const s = deps.store.kvGet<Partial<ForecastStatsState>>(forecastStatsKey(deps.mode));
     this.stats = { ...emptyStats(), ...(s ?? {}) };
     this.stats.sinceAudit = { ...emptyStats().sinceAudit, ...(this.stats.sinceAudit ?? {}) };
@@ -712,6 +853,19 @@ export class ForecastTracker {
     return initialModel(this.opts.initialWeight);
   }
 
+  /**
+   * 基礎モデル (consensus を除く) の重み。無ければ全特徴量のモデルから consensus の重みを 0 にして始める
+   * (それまでの学習を引き継ぐだけで、LIVE の判定に使う集計は基礎モデルの予想が判定されてから数える)
+   */
+  baseModel(horizonMs: number, assetClass: string): ForecastModel {
+    const k = modelKey(horizonLabel(horizonMs), assetClass);
+    const m = this.baseModels[k];
+    const init = initialModel(this.opts.initialWeight).w;
+    if (m && m.w) return { w: { ...init, ...m.w, consensus: 0 }, b: finite(m.b) ? m.b : 0, updates: m.updates ?? 0, ...(m.updatedAt ? { updatedAt: m.updatedAt } : {}) };
+    const full = this.model(horizonMs, assetClass);
+    return { w: { ...full.w, consensus: 0 }, b: full.b, updates: 0 };
+  }
+
   /** 最新の予想 (無ければ undefined) */
   latest(symbol: string): SymbolForecast | undefined {
     return this.latestBySymbol.get(symbol);
@@ -739,7 +893,9 @@ export class ForecastTracker {
       const pUp = predictUp(m, fr.features);
       const direction = classifyForecast(pUp, this.opts.flatThreshold);
       const contributions = { ...(Object.fromEntries(FORECAST_FEATURES.map((k) => [k, round(m.w[k] * fr.features[k])])) as ForecastFeatures), bias: round(m.b) };
-      horizons.push({ horizon: horizonLabel(h), horizonMs: h, direction, pUp, rangePct: fr.rangePct, timeframe: fr.timeframe, features: fr.features, contributions });
+      const pb = predictUp(this.baseModel(h, inst.assetClass), { ...fr.features, consensus: 0 });
+      const db = classifyForecast(pb, this.opts.flatThreshold);
+      horizons.push({ horizon: horizonLabel(h), horizonMs: h, direction, pUp, rangePct: fr.rangePct, timeframe: fr.timeframe, features: fr.features, contributions, base: { pUp: pb, direction: db } });
       this.pending.push({
         id: `fc_${now.toString(36)}_${randomUUID().slice(0, 8)}`,
         symbol: inst.symbol,
@@ -752,6 +908,8 @@ export class ForecastTracker {
         f: featureArray(fr.features),
         atrPctPerMin: atrMin,
         costPct: finite(input.costPct) && input.costPct > 0 ? input.costPct : 0,
+        pb: round(pb, 6),
+        db,
       });
       this.stats.recorded++;
       this.dirtyPending = true;
@@ -819,6 +977,11 @@ export class ForecastTracker {
       }
       recordOutcome(cc, p.dir, p.pUp, outcome);
       recordOutcome(sc, p.dir, p.pUp, outcome);
+      // 基礎モデル (LIVE の判定に使う) と適用した予想: クラスタ単位でも数える。旧形式 (pb なし) は数えない
+      if (p.db !== undefined && finite(p.pb)) {
+        this.recordClustered(day, dayKey, baseClassKey(label, p.assetClass), p, p.db, p.pb, outcome);
+        if (p.ap) this.recordClustered(day, dayKey, appliedClassKey(label, p.assetClass), p, p.db, p.pb, outcome);
+      }
       const hit = p.dir !== "flat" && (outcome === "up" || outcome === "down") ? p.dir === outcome : undefined;
       if (outcome !== "expired") res.judged++;
       if (outcome === "flat") res.noise++;
@@ -828,7 +991,9 @@ export class ForecastTracker {
       if (outcome === "up" || outcome === "down") {
         const k = modelKey(label, p.assetClass);
         this.models[k] = sgdUpdate(this.model(p.horizonMs, p.assetClass), featureObject(p.f), outcome === "up" ? 1 : 0, this.opts, now);
+        this.baseModels[k] = sgdUpdate(this.baseModel(p.horizonMs, p.assetClass), { ...featureObject(p.f), consensus: 0 }, outcome === "up" ? 1 : 0, this.opts, now);
         this.dirtyModel = true;
+        this.dirtyBaseModel = true;
         this.stats.learned++;
         res.learned++;
       }
@@ -842,15 +1007,70 @@ export class ForecastTracker {
       });
     }
     this.pending = keep;
+    this.pruneClusters(now);
     this.stats.sinceAudit.judged += res.judged;
     this.stats.sinceAudit.noise += res.noise;
     this.stats.sinceAudit.expired += res.expired;
     if (records.length > 0) this.aggCache = undefined;
     if (!this.readOnly && records.length > 0) this.store.saveForecastOutcomes(records);
     this.maybePrune(now);
-    this.auditLive(now);
+    this.updateLive(now);
     this.maybeAudit(now);
     return res;
+  }
+
+  /**
+   * 結果を集計に加え、方向の予想 × 方向の結果ならクラスタ (同じグループ・同じ間隔の番号) の的中の割合も更新する。
+   * クラスタの数 cn は最初の 1 件で数え、割合の合計 cs は「新しい割合 − 前の割合」を足す (最初に数えた日のバケツへ)
+   */
+  private recordClustered(
+    day: Record<string, ForecastCounts>, dayKey: string, g: string, p: PendingForecast,
+    pred: ForecastDirection, pUp: number, outcome: ForecastDirection | "expired",
+  ): void {
+    const c = (day[g] ??= emptyCounts(false));
+    recordOutcome(c, pred, pUp, outcome);
+    if (pred === "flat" || (outcome !== "up" && outcome !== "down")) return;
+    const hit = pred === outcome;
+    const ck = `${g}|${Math.floor(p.madeAt / Math.max(1, this.opts.intervalMs))}`;
+    let cl = this.clusters.get(ck);
+    if (!cl) {
+      cl = { n: 0, hits: 0, day: dayKey, at: p.madeAt };
+      this.clusters.set(ck, cl);
+      c.cn = (c.cn ?? 0) + 1;
+    }
+    const target = cl.day === dayKey ? c : this.stats.days[cl.day]?.[g];
+    const before = cl.n > 0 ? cl.hits / cl.n : 0;
+    cl.n++;
+    if (hit) cl.hits++;
+    if (target) target.cs = (target.cs ?? 0) + cl.hits / cl.n - before;
+  }
+
+  /** 判定が終わったはずのクラスタを忘れる */
+  private pruneClusters(now: number): void {
+    const maxH = Math.max(0, ...this.opts.horizonsMs);
+    const cutoff = now - maxH - this.opts.lateToleranceMs - 3 * this.opts.intervalMs;
+    for (const [k, v] of this.clusters) if (v.at < cutoff) this.clusters.delete(k);
+  }
+
+  /**
+   * シグナルと同じ向きで発注に使われた予想を記録する (エンジンが新規エントリーの発注が通ったときに呼ぶ)。
+   * multiplierFor と同じ予想 (戦略の時間軸に合う予想時間の、最新で古すぎない予想) を探し、基礎モデルの向きが
+   * シグナルと同じなら「適用した予想」として判定時に別に集計する (LIVE の条件 5)。LIVE でなくても記録する。
+   * 記録したら true。何度呼んでも 1 回だけ数える
+   */
+  markApplied(symbol: string, signal: "long" | "short", strategyHorizon: Horizon, now: number): boolean {
+    const h = horizonForStrategy(strategyHorizon, this.opts.horizonsMs);
+    const sf = this.latestBySymbol.get(symbol);
+    if (h === undefined || !sf || now - sf.madeAt > this.opts.maxForecastAgeMs || now < sf.madeAt) return false;
+    const p = this.pending.find((x) => x.symbol === symbol && x.horizonMs === h && x.madeAt === sf.madeAt);
+    if (!p || p.db === undefined) return false;
+    const agree = (signal === "long" && p.db === "up") || (signal === "short" && p.db === "down");
+    if (!agree) return false;
+    if (!p.ap) {
+      p.ap = 1;
+      this.dirtyPending = true;
+    }
+    return true;
   }
 
   /** 古い日の集計と判定済みの記録を消す (1 日 1 回) */
@@ -885,13 +1105,19 @@ export class ForecastTracker {
     return map;
   }
 
-  /** (予想時間, 資産クラス) の実力 */
+  /**
+   * (予想時間, 資産クラス) の実力。n / hits / hitRate は表示する予想 (全特徴量) の集計、
+   * z は LIVE の判定に使う基礎モデルのクラスタ単位の z、live は LIVE の判定 (updateLive) の結果
+   */
   skill(horizonMs: number, assetClass: string, now: number): { n: number; hits: number; hitRate: number; z: number; live: boolean } {
-    const c = this.aggregate(now).get(classKey(horizonLabel(horizonMs), assetClass));
+    if (!this.liveReady) this.updateLive(now);
+    const label = horizonLabel(horizonMs);
+    const agg = this.aggregate(now);
+    const c = agg.get(classKey(label, assetClass));
     const n = c?.n ?? 0;
     const hits = c?.hits ?? 0;
     const overlap = forecastOverlap(horizonMs, this.opts.intervalMs);
-    return { n, hits, hitRate: n ? hits / n : 0, z: hitRateZ(n, hits) / Math.sqrt(overlap), live: skillConfirmed(n, hits, this.opts, overlap) };
+    return { n, hits, hitRate: n ? hits / n : 0, z: clusterZ(agg.get(baseClassKey(label, assetClass)), overlap), live: this.stats.live.includes(`${label}|${assetClass}`) };
   }
 
   /**
@@ -903,14 +1129,16 @@ export class ForecastTracker {
     signal: "long" | "short",
     strategyHorizon: Horizon,
     now: number,
-  ): { mult: number; horizon?: string; direction?: ForecastDirection; pUp?: number; live: boolean } {
+  ): { mult: number; horizon?: string; horizonMs?: number; madeAt?: number; direction?: ForecastDirection; pUp?: number; live: boolean } {
     const h = horizonForStrategy(strategyHorizon, this.opts.horizonsMs);
     const sf = this.latestBySymbol.get(symbol);
     if (h === undefined || !sf || now - sf.madeAt > this.opts.maxForecastAgeMs || now < sf.madeAt) return { mult: 1, live: false };
     const hv = sf.horizons.find((x) => x.horizonMs === h);
     if (!hv) return { mult: 1, live: false };
     const live = this.skill(h, sf.assetClass, now).live;
-    return { mult: forecastSizeMultiplier(signal, hv, live, this.opts), horizon: hv.horizon, direction: hv.direction, pUp: hv.pUp, live };
+    // 取引に使うのは基礎モデル (consensus を除く) の予想
+    const b = hv.base ?? { pUp: 0.5, direction: "flat" as ForecastDirection };
+    return { mult: forecastSizeMultiplier(signal, b, live, this.opts), horizon: hv.horizon, horizonMs: h, madeAt: sf.madeAt, direction: b.direction, pUp: b.pUp, live };
   }
 
   /** /api/status 用 */
@@ -927,6 +1155,7 @@ export class ForecastTracker {
         horizon: h.horizon, direction: h.direction, pUp: round(h.pUp), rangePct: round(h.rangePct, 6),
         hitRate: round(sk.hitRate), n: sk.n, live: sk.live,
         contributions: h.contributions as Record<string, number>,
+        baseDirection: h.base?.direction ?? "flat", basePUp: round(h.base?.pUp ?? 0.5),
       };
     });
     return {
@@ -937,15 +1166,31 @@ export class ForecastTracker {
     };
   }
 
-  /** 反映状態が変わったものを監査ログへ */
-  private auditLive(now: number): void {
+  /**
+   * LIVE の判定をし直し (liveDecision。ファイル冒頭の 1〜5)、変わったものを監査ログへ。
+   * 保存済みの live が古い規則 (liveRule ≠ LIVE_RULE) のものならヒステリシスを使わずに判定し直す
+   */
+  private updateLive(now: number): void {
+    this.liveReady = true;
     const agg = this.aggregate(now);
+    const th = liveThresholds(this.opts);
+    const sameRule = this.stats.liveRule === LIVE_RULE;
+    const prevLive = new Set(sameRule ? this.stats.live : []);
+    const groups = new Set<string>();
+    for (const k of agg.keys()) if (k.startsWith("b|")) groups.add(k.slice(2));
     const live: string[] = [];
-    for (const [k, c] of agg) if (k.startsWith("c|") && skillConfirmed(c.n, c.hits, this.opts, this.overlapOf(k.split("|")[1]))) live.push(k.slice(2));
+    for (const k of groups) {
+      const label = k.split("|")[0];
+      if (liveDecision(prevLive.has(k), agg.get(`b|${k}`), agg.get(`a|${k}`), this.overlapOf(label), this.opts, th)) live.push(k);
+    }
     live.sort();
     const prev = new Set(this.stats.live);
     const cur = new Set(live);
     const changed = [...live.filter((k) => !prev.has(k)).map((k) => [k, true] as const), ...[...prev].filter((k) => !cur.has(k)).map((k) => [k, false] as const)];
+    if (!sameRule) {
+      this.stats.liveRule = LIVE_RULE;
+      this.dirtyStats = true;
+    }
     if (changed.length === 0) return;
     this.stats.live = live;
     this.dirtyStats = true;
@@ -953,10 +1198,16 @@ export class ForecastTracker {
     for (const [k, on] of changed) {
       const [h, cls] = k.split("|");
       const c = agg.get(`c|${k}`);
+      const b = agg.get(`b|${k}`);
+      const a = agg.get(`a|${k}`);
       this.store.audit({
         ts: now,
         type: "learning.forecast_live",
-        data: { mode: this.mode, horizon: h, assetClass: cls, live: on, n: c?.n ?? 0, hitRate: c && c.n ? round(c.hits / c.n) : 0, z: round(hitRateZ(c?.n ?? 0, c?.hits ?? 0) / Math.sqrt(this.overlapOf(h)), 3) },
+        data: {
+          mode: this.mode, horizon: h, assetClass: cls, live: on, n: c?.n ?? 0, hitRate: c && c.n ? round(c.hits / c.n) : 0,
+          z: round(clusterZ(b, this.overlapOf(h)), 3), zOn: round(th.zOn, 3), zOff: round(th.zOff, 3),
+          base: subSummary(b, this.overlapOf(h)), applied: subSummary(a, 1),
+        },
       });
     }
   }
@@ -974,7 +1225,7 @@ export class ForecastTracker {
       const agg = this.aggregate(now);
       const groups = [...agg]
         .filter(([k]) => k.startsWith("c|"))
-        .map(([k, c]) => ({ key: k.slice(2), n: c.n, hitRate: c.n ? round(c.hits / c.n) : 0, brier: c.brierN ? round(c.brierSum / c.brierN) : 0, live: skillConfirmed(c.n, c.hits, this.opts, this.overlapOf(k.split("|")[1])) }));
+        .map(([k, c]) => ({ key: k.slice(2), n: c.n, hitRate: c.n ? round(c.hits / c.n) : 0, brier: c.brierN ? round(c.brierSum / c.brierN) : 0, live: this.stats.live.includes(k.slice(2)) }));
       this.store.audit({
         ts: now,
         type: "learning.forecast_summary",
@@ -992,16 +1243,19 @@ export class ForecastTracker {
     const write = () => {
       if (this.dirtyPending) this.store.kvSet(forecastPendingKey(this.mode), this.pending);
       if (this.dirtyModel) this.store.kvSet(forecastModelKey(this.mode), this.models);
+      if (this.dirtyBaseModel) this.store.kvSet(forecastBaseModelKey(this.mode), this.baseModels);
       if (this.dirtyStats) this.store.kvSet(forecastStatsKey(this.mode), this.stats);
     };
     if (this.store.transaction) this.store.transaction(write);
     else write();
-    this.dirtyPending = this.dirtyModel = this.dirtyStats = false;
+    this.dirtyPending = this.dirtyModel = this.dirtyStats = this.dirtyBaseModel = false;
   }
 
   /** ダッシュボード・レポート用の集計 (直近 retentionMs) */
   summary(now: number): ForecastSummary {
+    if (!this.liveReady) this.updateLive(now);
     const agg = this.aggregate(now);
+    const th = liveThresholds(this.opts);
     const o = this.opts;
     const labels = this.horizonLabels;
     const order = (h: string) => {
@@ -1013,12 +1267,15 @@ export class ForecastTracker {
     const horizonTotals = new Map<string, ForecastCounts>();
     for (const [k, c] of agg) {
       if (k.startsWith("c|")) {
-        const g = groupSummary(k, c, o, this.overlapOf);
+        const name = k.slice(2);
+        const g = groupSummary(k, c, o, this.overlapOf, this.stats.live.includes(name));
+        g.base = subSummary(agg.get(`b|${name}`), this.overlapOf(g.horizon));
+        g.applied = subSummary(agg.get(`a|${name}`), 1);
         byClass.push(g);
         let t = horizonTotals.get(g.horizon);
         if (!t) horizonTotals.set(g.horizon, (t = emptyCounts(true)));
         addCounts(t, c);
-      } else if (k.startsWith("s|")) bySymbol.push(groupSummary(k, c, o, this.overlapOf));
+      } else if (k.startsWith("s|")) bySymbol.push(groupSummary(k, c, o, this.overlapOf, false)); // LIVE は資産クラス単位
     }
     const sortG = (a: ForecastGroupSummary, b: ForecastGroupSummary) =>
       order(a.horizon) - order(b.horizon) || (a.assetClass ?? a.symbol ?? "").localeCompare(b.assetClass ?? b.symbol ?? "");
@@ -1050,7 +1307,10 @@ export class ForecastTracker {
       bySymbol,
       calibration,
       models,
-      options: { minSamples: o.minSamples, zCritical: o.zCritical, flatThreshold: o.flatThreshold, noiseAtrMult: o.noiseAtrMult, maxBoost: o.maxBoost, maxCut: o.maxCut, intervalMs: o.intervalMs },
+      options: {
+        minSamples: o.minSamples, zCritical: o.zCritical, flatThreshold: o.flatThreshold, noiseAtrMult: o.noiseAtrMult, maxBoost: o.maxBoost, maxCut: o.maxCut, intervalMs: o.intervalMs,
+        minAppliedSamples: o.minAppliedSamples, zOn: round(th.zOn, 3), zOff: round(th.zOff, 3), liveGroups: th.groups,
+      },
     };
   }
 }

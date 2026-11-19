@@ -46,6 +46,29 @@ describe("planner baseline", () => {
     expect(s).not.toContain("scalp_obi");
     expect(s).toContain("momo_short");
   });
+  it("腕が無効なため外した戦略は armDisabled に載る (AI でも再開できない)", async () => {
+    const p = await plan({ armWeights: { "scalp_obi|trend_up|crypto": 0, "momo_short|trend_up|crypto": 0.9 } });
+    expect(p.perSymbol["BTC/USDT"].armDisabled).toEqual(["scalp_obi"]);
+    const none = await plan();
+    expect(none.perSymbol["BTC/USDT"].armDisabled).toBeUndefined();
+    const merged = mergeAiPlan(p, { rationale: "", adjustments: [{ symbol: "BTC/USDT", enabledStrategies: ["scalp_obi", "momo_short"], directionBias: "both", riskMultiplier: 1, notes: "" }], extraBlackouts: [] }, [BTC], NOW);
+    expect(merged.perSymbol["BTC/USDT"].enabledStrategies).toEqual(["momo_short"]);
+    expect(merged.perSymbol["BTC/USDT"].armDisabled).toEqual(["scalp_obi"]);
+  });
+  it("片側バイアスは情報の効き具合 (intelInfluence) で補正したバイアスで決める", async () => {
+    const dir = async (influence?: number) =>
+      (await plan({ brief: brief([bias("BTC", 0.6, 0.7)]), ...(influence !== undefined ? { intelInfluence: { crypto: influence } } : {}) })).perSymbol["BTC/USDT"].directionBias;
+    expect(await dir()).toBe("long");
+    expect(await dir(1)).toBe("long");
+    // 情報が逆効果だと学習した (0.5): sentiment 0.3・信頼度 0.35 になり片側化しない
+    expect(await dir(0.5)).toBe("both");
+    expect(await dir(0)).toBe("both");
+    // 別の資産クラスの効き具合は影響しない
+    expect((await plan({ brief: brief([bias("BTC", 0.6, 0.7)]), intelInfluence: { fx: 0 } })).perSymbol["BTC/USDT"].directionBias).toBe("long");
+    // 効いている (1.5) なら弱いバイアスでも片側化しうる
+    expect((await plan({ brief: brief([bias("BTC", 0.3, 0.4)]) })).perSymbol["BTC/USDT"].directionBias).toBe("both");
+    expect((await plan({ brief: brief([bias("BTC", 0.3, 0.4)]), intelInfluence: { crypto: 1.5 } })).perSymbol["BTC/USDT"].directionBias).toBe("long");
+  });
   it("片側バイアスは信頼度と強さが十分な時だけ", async () => {
     const dir = async (s: number, c: number, i = BTC) =>
       (await plan({ instruments: [i], regimes: { [i.symbol]: regime("trend_up") }, brief: brief([bias(i.baseCurrency, s, c)]) })).perSymbol[i.symbol].directionBias;
