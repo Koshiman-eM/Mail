@@ -72,6 +72,7 @@ describe("registry", () => {
       "scalp_obi",
       "scalp_vwap_revert",
       "scalp_momentum_burst",
+      "scalp_micro",
       "short_ema_trend",
       "short_rsi_revert",
       "short_breakout",
@@ -87,7 +88,7 @@ describe("registry", () => {
     const meme = strategiesFor("meme").map((s) => s.id);
     expect(meme).toContain("meme_momentum");
     expect(meme).not.toContain("scalp_obi");
-    expect(strategiesFor("crypto", "scalp").map((s) => s.id)).toEqual(["scalp_obi", "scalp_vwap_revert", "scalp_momentum_burst"]);
+    expect(strategiesFor("crypto", "scalp").map((s) => s.id)).toEqual(["scalp_obi", "scalp_vwap_revert", "scalp_momentum_burst", "scalp_micro"]);
     expect(strategiesFor("fx", "short").length).toBe(3);
     expect(strategiesFor("crypto").map((s) => s.id)).not.toContain("meme_momentum");
   });

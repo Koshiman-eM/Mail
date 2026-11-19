@@ -1,6 +1,7 @@
 /** 戦略モジュールの公開 API */
 export * from "./common";
 export * from "./scalp";
+export * from "./scalpMicro";
 export * from "./short";
 export * from "./mid";
 export * from "./long";
