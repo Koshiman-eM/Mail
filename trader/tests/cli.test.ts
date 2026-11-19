@@ -145,7 +145,7 @@ describe("report / resume", () => {
     expect(audit).toHaveLength(1);
     expect(audit[0].data.by).toBe("cli");
     // 実行中のエンジンへ伝えるための再開要求が kv に残る
-    expect(store.kvGet(RESUME_REQUEST_KEY)).toEqual({ at: 2000, by: "cli" });
+    expect(store.kvGet(RESUME_REQUEST_KEY)).toEqual({ at: 2000, by: "cli", mode: "paper" });
   });
 
   it("resume: 停止状態でなければ再開要求を書かない", () => {

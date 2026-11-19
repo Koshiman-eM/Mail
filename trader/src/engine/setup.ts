@@ -1,4 +1,5 @@
 /** 設定 (VENUES / WATCHLIST) から実行に必要な部品一式を組み立てる */
+import { basename, dirname, extname, join } from "node:path";
 import type { AiOptions } from "../core/ai";
 import type { AppConfig } from "../core/config";
 import { createLogger, type Logger } from "../core/logger";
@@ -72,6 +73,23 @@ export function hubTimeframesFor(instruments: Pick<Instrument, "assetClass">[], 
   return [...tfs].sort((a, b) => TIMEFRAME_MS[a] - TIMEFRAME_MS[b]);
 }
 
+/** 合成データ用の DB パス (<DB_PATH のベース名>-synthetic.db)。memory / :memory: はそのまま */
+export function syntheticDbPath(dbPath: string): string {
+  if (dbPath === "" || dbPath === "memory" || dbPath === ":memory:") return dbPath;
+  const ext = extname(dbPath);
+  return join(dirname(dbPath), `${basename(dbPath, ext)}-synthetic.db`);
+}
+
+/**
+ * 実際に使う DB パス。VENUES が synthetic だけなら DB_PATH の代わりに syntheticDbPath を使う
+ * (合成データの学習結果・追跡ポジションを実データ用の DB に混ぜない)。
+ */
+export function resolveDbPath(config: Pick<AppConfig, "env">): string {
+  const venues = config.env.VENUES.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+  const syntheticOnly = venues.length > 0 && venues.every((v) => v === "synthetic");
+  return syntheticOnly ? syntheticDbPath(config.env.DB_PATH) : config.env.DB_PATH;
+}
+
 /** createBrokers 用に VENUES を instrument.venue の表記へそろえる (ccxt → ccxt:<CCXT_EXCHANGE>) */
 export function brokerVenues(venues: string[], ccxtExchange: string): string {
   return venues.map((v) => (v === "ccxt" ? `ccxt:${ccxtExchange}` : v)).join(",");
@@ -79,8 +97,13 @@ export function brokerVenues(venues: string[], ccxtExchange: string): string {
 
 export interface RuntimeOptions {
   clock?: Clock;
-  /** 省略時は createStore(DB_PATH) */
+  /** 省略時は createStore(resolveDbPath(config)) */
   store?: Store;
+  /**
+   * テスト用: 発注先を差し替える (Broker を実装した偽のブローカーで live の経路を試す)。
+   * 実口座アダプターはここでは生成しない。mode はこの brokerSet.mode に従う。
+   */
+  brokerSet?: BrokerSet;
   /** 情報源 (省略時は既定の一式。[] で情報収集なし) */
   intelSources?: IntelSource[];
   /** 合成フィードのシード */
@@ -235,14 +258,18 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
   const fx = createFxConverter({ baseCurrency: env.BASE_CURRENCY, getQuote: (s) => hub.latestQuote(s) });
   // mode は config (resolveMode の結果) のまま。VENUES の表記だけ instrument.venue にそろえる
   const brokerConfig: AppConfig = { ...config, env: { ...env, VENUES: brokerVenues(venues, env.CCXT_EXCHANGE) } };
-  const brokerSet = createBrokers(brokerConfig, instruments, {
-    clock,
-    ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
-    paper: { toAccount: (ccy) => fx.toAccount(ccy), quoteProvider: (s) => hub.latestQuote(s) },
-  });
+  const brokerSet =
+    opts.brokerSet ??
+    createBrokers(brokerConfig, instruments, {
+      clock,
+      ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+      toAccount: (ccy) => fx.toAccount(ccy),
+      quoteProvider: (s) => hub.latestQuote(s),
+    });
 
-  const store = opts.store ?? createStore(env.DB_PATH);
-  const risk = new RiskManager(config.risk, store);
+  const store = opts.store ?? createStore(resolveDbPath(config));
+  // リスク状態は実際の発注先の mode ごとに分ける (paper の基準で live の kill switch を誤作動させない)
+  const risk = new RiskManager(config.risk, store, { mode: brokerSet.mode });
   const ai = opts.ai === null ? undefined : (opts.ai ?? (config.ai.enabled ? { apiKey: config.ai.apiKey, model: config.ai.model } : undefined));
   const intel = new IntelService({
     store,

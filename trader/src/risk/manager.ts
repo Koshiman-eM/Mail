@@ -1,10 +1,14 @@
 import { D, floorToStep, Decimal } from "../core/decimal";
 import { createLogger } from "../core/logger";
-import type { AssetClass, Instrument, PositionView, Quote, RiskDecision, RiskLimits, RiskState, Signal, Store } from "../core/types";
+import type { AssetClass, Instrument, PositionView, Quote, RiskDecision, RiskLimits, RiskState, Signal, Store, TradingMode } from "../core/types";
 
 const log = createLogger("risk");
 const DAY_MS = 86_400_000;
-const STATE_KEY = "risk:state";
+/** 旧キー (mode なし)。paper 用として扱い、live では読まない */
+export const LEGACY_RISK_STATE_KEY = "risk:state";
+export const riskStateKey = (mode: TradingMode) => `${LEGACY_RISK_STATE_KEY}:${mode}`;
+/** 損切りと決済側の価格 (ロング: bid / ショート: ask) の距離の下限 (スプレッドの倍数) */
+export const MIN_STOP_DISTANCE_SPREADS = 2;
 
 /** 往復の想定コスト (bps) = 往復 taker 手数料 + スプレッド */
 export function costBps(instrument: Pick<Instrument, "takerFeeRate">, quote: Pick<Quote, "bid" | "ask">): number {
@@ -71,13 +75,31 @@ export function exposureByClass(
 export class RiskManager {
   private st: InternalState;
   private lastAudit = new Map<string, number>();
+  private readonly key: string;
 
+  /**
+   * 状態は kv `risk:state:<mode>` に保存する (既定 paper)。paper は旧キー `risk:state` からも引き継ぐ。
+   * live は live のキーだけを読む (初回は最初の onEquity で現在の評価額を基準にする)。
+   * 第 3 引数に文字列を渡すとそのキーをそのまま使う。
+   */
   constructor(
     readonly limits: RiskLimits,
     private readonly store?: Store,
-    private readonly key: string = STATE_KEY,
+    keyOrOpts: string | { mode?: TradingMode } = {},
   ) {
-    this.st = (store?.kvGet<InternalState>(key) as InternalState | undefined) ?? { dayStartEquity: 0, peakEquity: 0, recentOrderTs: [] };
+    let saved: InternalState | undefined;
+    if (typeof keyOrOpts === "string") {
+      this.key = keyOrOpts;
+      saved = store?.kvGet<InternalState>(this.key);
+    } else {
+      const mode = keyOrOpts.mode ?? "paper";
+      this.key = riskStateKey(mode);
+      saved = store?.kvGet<InternalState>(this.key);
+      if (saved === undefined && mode === "paper") saved = store?.kvGet<InternalState>(LEGACY_RISK_STATE_KEY);
+    }
+    this.st = saved && typeof saved === "object"
+      ? { ...saved, recentOrderTs: Array.isArray(saved.recentOrderTs) ? saved.recentOrderTs : [] }
+      : { dayStartEquity: 0, peakEquity: 0, recentOrderTs: [] };
   }
 
   state(): RiskState {
@@ -104,6 +126,11 @@ export class RiskManager {
   /** 口座評価額の更新。日次損失・ドローダウンの停止判定もここで行う */
   onEquity(equity: number, now: number): { halted: boolean; killSwitch: boolean; dailyLossPct: number; drawdownPct: number } {
     const st = this.st;
+    // 取得失敗などで NaN / 非有限になった評価額では状態を更新しない (基準の破壊・誤った停止を防ぐ)
+    if (typeof equity !== "number" || !Number.isFinite(equity)) {
+      log.warn("評価額が不正なため無視します", { equity: String(equity) });
+      return { halted: this.isHalted(now).halted, killSwitch: !!st.killSwitch, dailyLossPct: 0, drawdownPct: 0 };
+    }
     const key = dayKeyOf(now);
     let changed = false;
     if (st.dayKey !== key || st.dayStartEquity <= 0) {
@@ -206,6 +233,17 @@ export class RiskManager {
     const dist = Math.abs(entry - signal.stopLoss);
     if (!(signal.stopLoss > 0) || !(dist > 0) || (isLong ? signal.stopLoss >= entry : signal.stopLoss <= entry)) {
       return { ok: false, reason: `損切り価格が不正 (entry=${entry}, stop=${signal.stopLoss})` };
+    }
+    // 損切りは決済側の価格 (ロング: bid / ショート: ask) より外側で、スプレッドの MIN_STOP_DISTANCE_SPREADS 倍以上離す
+    // (スプレッドの内側の損切りは約定直後に発動してしまう)
+    const exitPx = isLong ? quote.bid : quote.ask;
+    const spread = Math.max(0, quote.ask - quote.bid);
+    const room = isLong ? exitPx - signal.stopLoss : signal.stopLoss - exitPx;
+    if (!(exitPx > 0) || !(room > 0)) {
+      return { ok: false, reason: `損切りがスプレッドの内側 (stop=${signal.stopLoss}, ${isLong ? "bid" : "ask"}=${exitPx})` };
+    }
+    if (room < MIN_STOP_DISTANCE_SPREADS * spread) {
+      return { ok: false, reason: `損切りが決済側の価格に近すぎます (距離 ${room} < スプレッド ${spread} × ${MIN_STOP_DISTANCE_SPREADS})` };
     }
     const toAcct = p.toAccount ?? (() => 1);
     const fx = D(inst.quoteCurrency ? toAcct(inst.quoteCurrency) : 1);

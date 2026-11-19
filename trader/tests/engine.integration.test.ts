@@ -265,7 +265,7 @@ describe("TradingEngine 統合 (合成データ + 仮想時計 + MemoryStore)", 
     await second.rt.engine.init();
     expect(await second.rt.brokerSet.paper!.getPositions()).toEqual(before);
     expect(second.rt.engine.positions.list().map((p) => p.symbol).sort()).toEqual(["BTC/USDT", "ETH/USDT"]);
-    expect(store.listAudit({ type: "engine.position_orphaned" })).toHaveLength(0);
+    expect(store.listAudit({ type: "reconcile.external_close" })).toHaveLength(0);
     // 復元後も同じ銘柄に重ねて建てない
     const r = await second.rt.engine.tick(START + MIN);
     expect(r.entries).toBe(0);

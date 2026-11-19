@@ -132,6 +132,25 @@ describe("dexscreener feed", () => {
     expect((await feed.search("bonk"))[0].liquidityUsd).toBe(850000);
     expect((await feed.fetchTokenPairs("solana", ["TOK1"]))[0].symbol).toBe("BONK/SOL");
   });
+  it("priceNative が無い更新は priceUsd で代用せずスキップする (単位の混在を防ぐ)", async () => {
+    const pair = fx("dex_pair").pairs[0];
+    let body: any = { pairs: [pair] };
+    const fetchImpl = vi.fn(async () => jsonRes(body)) as unknown as typeof fetch;
+    let now = Date.parse("2025-01-01T00:00:10Z");
+    const feed = new DexScreenerFeed({ fetchImpl, clock: { now: () => now } });
+    await feed.trackPair("solana", "PAIR123");
+    const ok = await feed.fetchQuote("BONK/SOL");
+    expect(ok.last).toBeCloseTo(Number(pair.priceNative), 12);
+    body = { pairs: [{ ...pair, priceNative: undefined, priceUsd: "1234", liquidity: { usd: 777 } }] };
+    now += 70_000;
+    await expect(feed.fetchQuote("BONK/SOL")).rejects.toThrow(/priceNative/);
+    // 足にも USD 価格が混ざらない・流動性は更新する
+    const c = await feed.fetchCandles("BONK/SOL", "1m", 10);
+    expect(c.every((x) => x.high <= Number(pair.priceNative))).toBe(true);
+    expect((await feed.listInstruments())[0].meta?.liquidityUsd).toBe(777);
+    // 刻みの推定にも priceUsd を使わない
+    expect(feed.pairToInstrument({ ...pair, priceNative: undefined, priceUsd: "1234" }).tickSize).toBe(1e-12);
+  });
   it("SnapshotCandleBuilder", () => {
     const b = new SnapshotCandleBuilder(["1m"]);
     b.push(0, 10); b.push(30_000, 12); b.push(50_000, 9); b.push(61_000, 11);

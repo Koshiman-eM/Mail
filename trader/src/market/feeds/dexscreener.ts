@@ -85,7 +85,8 @@ export class DexScreenerFeed implements MarketDataFeed {
 
   /** ペア情報 (API レスポンス) -> Instrument */
   pairToInstrument(p: any): Instrument {
-    const price = n(p.priceNative) || n(p.priceUsd);
+    // 価格はクオート通貨建て (priceNative)。priceUsd は単位が違うので刻みの推定にも使わない
+    const price = n(p.priceNative);
     // 価格の有効数字 4 桁程度を刻みにする
     const tick = price > 0 ? Number(`1e${Math.floor(Math.log10(price)) - 3}`) : 1e-12;
     const liquidityUsd = n(p.liquidity?.usd);
@@ -160,13 +161,15 @@ export class DexScreenerFeed implements MarketDataFeed {
 
   async fetchQuote(symbol: string): Promise<Quote> {
     const p = await this.fetchPair(symbol);
-    const price = n(p.priceNative) || n(p.priceUsd);
-    if (!(price > 0)) throw new Error(`価格が無効: ${symbol}`);
-    const half = ((this.o.assumedSpreadBps ?? 30) / 10_000) / 2;
-    const ts = this.clock.now();
-    // 流動性を Instrument.meta に反映
+    // 流動性を Instrument.meta に反映 (USD 建てなので価格の有無と無関係)
     const r = this.need(symbol);
     r.instrument.meta = { ...r.instrument.meta, liquidityUsd: n(p.liquidity?.usd) };
+    // 価格はクオート通貨建て (priceNative) だけを使う。priceUsd で代用すると単位が混ざるので、
+    // priceNative が無いときはこの回の更新をスキップする (例外 → MarketHub は前回の気配を保持する)
+    const price = n(p.priceNative);
+    if (!(price > 0)) throw new Error(`priceNative が無いため価格の更新をスキップ: ${symbol}`);
+    const half = ((this.o.assumedSpreadBps ?? 30) / 10_000) / 2;
+    const ts = this.clock.now();
     this.builders.get(symbol)?.push(ts, price, 0);
     return { ts, bid: price * (1 - half), ask: price * (1 + half), last: price };
   }

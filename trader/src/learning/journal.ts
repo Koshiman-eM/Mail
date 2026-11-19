@@ -46,6 +46,8 @@ export interface OpenTrade extends OpenTradeInput {
   lowWater: number;
   lastPrice: number;
   lastTs: number;
+  /** 一部決済 (reduce) の回数。一部決済の TradeRecord.id は `${id}#${n}` */
+  partials?: number;
 }
 
 export interface CloseTradeInput {
@@ -60,23 +62,39 @@ export interface CloseTradeInput {
   fees?: number;
 }
 
-const OPEN_KV_KEY = "journal:open";
+/** 一部決済の入力。qty は決済した数量 (正の値) */
+export type ReduceTradeInput = Omit<CloseTradeInput, "id"> & { qty: number };
+
+/** 旧キー (mode なし)。paper 用として扱い、live では読まない */
+export const LEGACY_OPEN_KV_KEY = "journal:open";
+export const openKvKey = (mode: TradingMode) => `${LEGACY_OPEN_KV_KEY}:${mode}`;
 
 /**
- * ポジションのライフサイクル追跡。open → mark (MFE/MAE 更新) → close で TradeRecord を作る。
- * store を渡すと、保有中ポジションを kv に保存 (再起動時に復元) し、close で saveTrade する。
+ * ポジションのライフサイクル追跡。open → mark (MFE/MAE 更新) → reduce (一部決済) / close で TradeRecord を作る。
+ * store を渡すと、保有中ポジションを kv (mode 別のキー) に保存 (再起動時に復元) し、reduce / close で saveTrade する。
+ * mode を指定すると、その mode のポジションだけを読み込み・受け付ける (paper と live の混在防止)。
  */
 export class TradeJournal {
   private readonly open_ = new Map<string, OpenTrade>();
   private readonly store?: Store;
+  readonly mode: TradingMode;
+  private readonly strict: boolean;
 
-  constructor(opts: { store?: Store } = {}) {
+  constructor(opts: { store?: Store; mode?: TradingMode } = {}) {
     this.store = opts.store;
-    const saved = this.store?.kvGet<OpenTrade[]>(OPEN_KV_KEY);
-    for (const p of saved ?? []) this.open_.set(p.id, p);
+    this.mode = opts.mode ?? "paper";
+    this.strict = opts.mode !== undefined;
+    let saved = this.store?.kvGet<OpenTrade[]>(openKvKey(this.mode));
+    if (saved === undefined && this.mode === "paper") saved = this.store?.kvGet<OpenTrade[]>(LEGACY_OPEN_KV_KEY);
+    for (const p of Array.isArray(saved) ? saved : []) {
+      // 他の mode の追跡ポジションは読み込まない (旧キーに live が残っていても paper へ混ぜない)
+      if (!p || typeof p.id !== "string" || (p.mode ?? "paper") !== this.mode) continue;
+      this.open_.set(p.id, p);
+    }
   }
 
   open(input: OpenTradeInput): OpenTrade {
+    if (this.strict && input.mode !== this.mode) throw new Error(`mode が違います (journal=${this.mode}, input=${input.mode})`);
     if (!(input.qty > 0)) throw new Error(`qty は正の値が必要です: ${input.qty}`);
     if (!(input.entryPrice > 0)) throw new Error(`entryPrice が不正です: ${input.entryPrice}`);
     const id = input.id ?? randomUUID();
@@ -139,6 +157,7 @@ export class TradeJournal {
   close(input: CloseTradeInput): TradeRecord {
     const p = this.open_.get(input.id);
     if (!p) throw new Error(`ポジション ${input.id} は追跡されていません`);
+    if (!(input.exitPrice > 0)) throw new Error(`exitPrice が不正です: ${input.exitPrice}`);
     const trade = buildTradeRecord(p, input);
     this.open_.delete(input.id);
     this.persist();
@@ -146,8 +165,32 @@ export class TradeJournal {
     return trade;
   }
 
+  /**
+   * 一部決済。決済した数量分の TradeRecord (id は `${id}#${n}`) を返し、残りは追跡を続ける。
+   * エントリー手数料は数量比で按分する。qty が保有数量以上なら close と同じ。
+   */
+  reduce(id: string, input: ReduceTradeInput): TradeRecord {
+    const p = this.open_.get(id);
+    if (!p) throw new Error(`ポジション ${id} は追跡されていません`);
+    const qty = D(input.qty);
+    if (!qty.isFinite() || !qty.gt(0)) throw new Error(`qty は正の値が必要です: ${input.qty}`);
+    const { qty: _q, ...rest } = input;
+    if (qty.gte(p.qty)) return this.close({ ...rest, id });
+    if (!(input.exitPrice > 0)) throw new Error(`exitPrice が不正です: ${input.exitPrice}`);
+    const n = (p.partials ?? 0) + 1;
+    const feePart = D(p.entryFees).mul(qty).div(p.qty);
+    const part: OpenTrade = { ...p, id: `${p.id}#${n}`, qty: qty.toNumber(), entryFees: feePart.toNumber() };
+    const trade = buildTradeRecord(part, { ...rest, id: part.id });
+    p.qty = D(p.qty).minus(qty).toNumber();
+    p.entryFees = D(p.entryFees).minus(feePart).toNumber();
+    p.partials = n;
+    this.persist();
+    this.store?.saveTrade(trade);
+    return trade;
+  }
+
   private persist() {
-    this.store?.kvSet(OPEN_KV_KEY, [...this.open_.values()]);
+    this.store?.kvSet(openKvKey(this.mode), [...this.open_.values()]);
   }
 }
 

@@ -185,11 +185,51 @@ export class MarketHub {
   }
   private readonly aggregated = new Map<string, Set<Timeframe>>();
 
-  /** 全監視銘柄を更新 */
-  async poll(): Promise<void> {
-    for (const symbol of this.symbols.keys()) await this.pollSymbol(symbol);
+  /**
+   * 全監視銘柄を更新する。feed (venue) ごとに並列で、同じ feed の銘柄は順に取得する (レート制限のため)。
+   * timeoutMs を指定すると、その時間で待つのをやめて戻る。終わらなかった venue の取得は裏で続け、
+   * 次回の poll はその完了を待つ (同じ venue を二重に取得しない = 次回へ持ち越し)。
+   * 戻り値の timedOut は時間内に終わらなかった venue。
+   */
+  async poll(opts: { timeoutMs?: number } = {}): Promise<{ timedOut: string[] }> {
+    const byFeed = new Map<MarketDataFeed, string[]>();
+    for (const [symbol, s] of this.symbols) {
+      const list = byFeed.get(s.feed) ?? [];
+      list.push(symbol);
+      byFeed.set(s.feed, list);
+    }
+    const done = new Set<MarketDataFeed>();
+    const tasks: Promise<void>[] = [];
+    for (const [feed, symbols] of byFeed) {
+      let p = this.inflight.get(feed);
+      if (!p) {
+        const run = (async () => {
+          for (const symbol of symbols) await this.pollSymbol(symbol);
+        })().catch((e) => log.warn("poll 失敗", { venue: feed.venue, error: e instanceof Error ? e.message : String(e) }));
+        p = run.finally(() => {
+          if (this.inflight.get(feed) === p) this.inflight.delete(feed);
+        });
+        this.inflight.set(feed, p);
+      }
+      tasks.push(p.then(() => void done.add(feed)));
+    }
+    const all = Promise.all(tasks).then(() => undefined);
+    const timeoutMs = opts.timeoutMs;
+    if (timeoutMs === undefined || !(timeoutMs > 0)) {
+      await all;
+      return { timedOut: [] };
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([all, new Promise<void>((r) => (timer = setTimeout(r, timeoutMs)))]);
+    if (timer) clearTimeout(timer);
+    const timedOut = [...byFeed.keys()].filter((f) => !done.has(f)).map((f) => f.venue);
+    if (timedOut.length) log.warn("poll が時間内に終わらない venue を次回へ持ち越します", { venues: timedOut, timeoutMs });
+    return { timedOut };
   }
+  /** 取得中の venue (feed) ごとの poll */
+  private readonly inflight = new Map<MarketDataFeed, Promise<void>>();
 
+  /** 最後の poll が失敗した銘柄のエラー (成功すれば消える)。エンジンはこの銘柄の新規エントリーを止める */
   lastError(symbol: string): string | undefined {
     return this.symbols.get(symbol)?.lastError;
   }

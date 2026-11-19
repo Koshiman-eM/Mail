@@ -1,7 +1,10 @@
+import { request } from "node:http";
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "../src/core/config";
 import type { Signal, Strategy, StrategyContext } from "../src/core/types";
-import { createDashboardHandler, parseLimit, routeDashboard, startDashboard, type DashboardDeps } from "../src/dashboard/server";
+import {
+  createDashboardHandler, dashboardAllowedHosts, isAllowedHost, parseLimit, routeDashboard, startDashboard, type DashboardDeps,
+} from "../src/dashboard/server";
 import { buildRuntime } from "../src/engine/setup";
 import { mulberry32 } from "../src/market/feeds/synthetic";
 import { MemoryStore } from "../src/storage/memory";
@@ -145,11 +148,12 @@ describe("ダッシュボード (listen せずにハンドラーを呼ぶ)", () 
         body = b ?? "";
       },
     };
-    await handler({ method: "GET", url: "/api/status" } as never, res as never);
+    const req = (method: string, url: string, host = "127.0.0.1:8787") => ({ method, url, headers: { host }, socket: { localPort: 8787 } }) as never;
+    await handler(req("GET", "/api/status"), res as never);
     expect(status).toBe(200);
     expect(headers["content-type"]).toMatch(/json/);
     expect(JSON.parse(body).mode).toBe("paper");
-    await handler({ method: "HEAD", url: "/" } as never, res as never);
+    await handler(req("HEAD", "/"), res as never);
     expect(body).toBe("");
   });
 
@@ -163,5 +167,95 @@ describe("ダッシュボード (listen せずにハンドラーを呼ぶ)", () 
     } finally {
       await srv.close();
     }
+  });
+});
+
+/** buildRuntime を使わない最小の deps */
+const lightDeps = (status: () => unknown = () => ({ ok: true })): DashboardDeps => ({
+  status,
+  store: new MemoryStore(),
+  learning: { snapshot: () => ({}) } as unknown as DashboardDeps["learning"],
+});
+
+/** Host ヘッダーを指定して GET (node:http はループバック内で完結する) */
+function getWithHost(port: number, path: string, host: string): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const r = request({ host: "127.0.0.1", port, path, method: "GET", headers: { host } }, (res) => {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (c) => (body += c));
+      res.on("end", () => resolve({ status: res.statusCode ?? 0, body }));
+    });
+    r.on("error", reject);
+    r.end();
+  });
+}
+
+describe("ダッシュボード: Host 検証 (DNS rebinding 対策) と 500 応答", () => {
+  it("許可 Host はループバック名 + ポート。DASHBOARD_HOST が別の値ならその値だけ追加", () => {
+    const a = dashboardAllowedHosts(8787);
+    expect([...a].sort()).toEqual(["127.0.0.1:8787", "[::1]:8787", "localhost:8787"]);
+    expect(dashboardAllowedHosts(8787, "127.0.0.1")).toEqual(a);
+    expect(dashboardAllowedHosts(8787, "localhost")).toEqual(a);
+    expect(dashboardAllowedHosts(8787, "::1")).toEqual(a);
+    const lan = dashboardAllowedHosts(8787, "192.168.1.5");
+    expect(lan.has("192.168.1.5:8787")).toBe(true);
+    expect(lan.size).toBe(4);
+    expect(dashboardAllowedHosts(8787, "fe80::1").has("[fe80::1]:8787")).toBe(true);
+    // 既定ポート 80 ではポート省略も許可
+    expect(dashboardAllowedHosts(80).has("localhost")).toBe(true);
+    expect(dashboardAllowedHosts(8787).has("localhost")).toBe(false);
+  });
+
+  it("isAllowedHost: 大文字小文字は無視、欠落・別ポート・別名は不許可", () => {
+    const a = dashboardAllowedHosts(8787);
+    expect(isAllowedHost("LOCALHOST:8787", a)).toBe(true);
+    expect(isAllowedHost(" 127.0.0.1:8787 ", a)).toBe(true);
+    expect(isAllowedHost(undefined, a)).toBe(false);
+    expect(isAllowedHost("", a)).toBe(false);
+    expect(isAllowedHost(["127.0.0.1:8787"], a)).toBe(false);
+    expect(isAllowedHost("127.0.0.1:9999", a)).toBe(false);
+    expect(isAllowedHost("attacker.example:8787", a)).toBe(false);
+    expect(isAllowedHost("localhost.attacker.example:8787", a)).toBe(false);
+  });
+
+  it("ハンドラー: 許可外の Host は 403 (本文は返さない)。localPort が分からなければ拒否", async () => {
+    const handler = createDashboardHandler(lightDeps());
+    const calls: { status: number; body: string }[] = [];
+    const res = { writeHead: (s: number) => calls.push({ status: s, body: "" }), end: (b?: string) => (calls[calls.length - 1].body = b ?? "") };
+    const req = (host: string | undefined, socket: { localPort?: number } = { localPort: 8787 }) =>
+      ({ method: "GET", url: "/api/status", headers: host === undefined ? {} : { host }, socket }) as never;
+    await handler(req("evil.example:8787"), res as never);
+    await handler(req(undefined), res as never);
+    await handler(req("127.0.0.1:8787", {}), res as never);
+    await handler(req("localhost:8787"), res as never);
+    expect(calls.map((c) => c.status)).toEqual([403, 403, 403, 200]);
+    expect(calls[0].body).not.toContain("ok");
+  });
+
+  it("startDashboard: 実ポートで Host を検証する (rebinding された Host は 403)", async () => {
+    const srv = await startDashboard(lightDeps(), { port: 0 });
+    try {
+      const addr = srv.server.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      expect((await getWithHost(port, "/api/status", `127.0.0.1:${port}`)).status).toBe(200);
+      expect((await getWithHost(port, "/api/status", `localhost:${port}`)).status).toBe(200);
+      const evil = await getWithHost(port, "/api/status", `attacker.example:${port}`);
+      expect(evil.status).toBe(403);
+      expect(evil.body).not.toContain("ok");
+      expect((await getWithHost(port, "/", "127.0.0.1:1")).status).toBe(403);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it("500 応答に内部エラーの本文を出さない", async () => {
+    const d = lightDeps(() => {
+      throw new Error("db at /home/secret/path.sqlite token=abc");
+    });
+    const r = await routeDashboard(d, "GET", "/api/status");
+    expect(r.status).toBe(500);
+    expect(r.body).not.toMatch(/secret|token|sqlite/);
+    expect(JSON.parse(r.body).error).toBe("内部エラー");
   });
 });

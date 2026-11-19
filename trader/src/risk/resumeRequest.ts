@@ -6,6 +6,8 @@ export const RESUME_REQUEST_KEY = "risk:resumeRequested";
 export interface ResumeRequest {
   at: number;
   by: string;
+  /** 対象の mode。省略時は paper とみなす (live のエンジンは live 宛ての要求だけを適用する) */
+  mode?: "paper" | "live";
 }
 
 /** 再開要求を書く (エンジンが次のティックで risk.resume() を実行する) */

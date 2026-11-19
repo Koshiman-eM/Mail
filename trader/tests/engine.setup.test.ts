@@ -3,7 +3,8 @@ import { describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/core/config";
 import type { Candle } from "../src/core/types";
 import { createParamValidator, createPriceAt, pickValidationData } from "../src/engine/learningHooks";
-import { brokerVenues, buildRuntime, hubTimeframesFor, parseVenues, parseWatchlist } from "../src/engine/setup";
+import { brokerVenues, buildRuntime, hubTimeframesFor, parseVenues, parseWatchlist, resolveDbPath, syntheticDbPath } from "../src/engine/setup";
+import { assertSimulationDb } from "../src/engine/simulate";
 import { ClosedCandleCacheFeed } from "../src/engine/feedCache";
 import { CcxtFeed, PRECISION, type CcxtLike } from "../src/market/feeds/ccxt";
 import { PaperBroker } from "../src/execution/paper";
@@ -39,6 +40,27 @@ describe("設定の解析", () => {
     expect(hubTimeframesFor([{ assetClass: "meme" }], ALL_STRATEGIES)).toEqual(["1m", "5m"]);
     expect(hubTimeframesFor([{ assetClass: "fx" }], ALL_STRATEGIES)).toEqual(["1m", "15m", "1h", "4h", "1d"]);
     expect(hubTimeframesFor([{ assetClass: "crypto" }, { assetClass: "meme" }], ALL_STRATEGIES)).toEqual(["1m", "5m", "15m", "1h", "4h", "1d"]);
+  });
+});
+
+describe("DB の分離", () => {
+  it("VENUES が synthetic だけなら <DB_PATH のベース名>-synthetic.db を使う", () => {
+    expect(syntheticDbPath("./data/trader.db")).toBe("data/trader-synthetic.db");
+    expect(syntheticDbPath("/var/db/x.sqlite")).toBe("/var/db/x-synthetic.db");
+    expect(syntheticDbPath("memory")).toBe("memory");
+    expect(resolveDbPath(cfg({ VENUES: "synthetic", DB_PATH: "./data/trader.db" }))).toBe("data/trader-synthetic.db");
+    expect(resolveDbPath(cfg({ VENUES: "synthetic,ccxt", DB_PATH: "./data/trader.db" }))).toBe("./data/trader.db");
+    expect(resolveDbPath(cfg({ VENUES: "ccxt", DB_PATH: "./data/trader.db" }))).toBe("./data/trader.db");
+  });
+
+  it("simulate は DB_PATH (と合成データ用の DB) を使えない。memory と別ファイルは可", () => {
+    const env = { DB_PATH: "./data/trader.db" };
+    expect(() => assertSimulationDb("./data/trader.db", env)).toThrow(/DB_PATH/);
+    expect(() => assertSimulationDb("data/../data/trader.db", env)).toThrow(/DB_PATH/);
+    expect(() => assertSimulationDb("./data/trader-synthetic.db", env)).toThrow(/DB_PATH/);
+    expect(() => assertSimulationDb("./data/trader.db", {})).toThrow(/DB_PATH/); // 既定値
+    expect(() => assertSimulationDb("memory", env)).not.toThrow();
+    expect(() => assertSimulationDb("./data/sim.db", env)).not.toThrow();
   });
 });
 

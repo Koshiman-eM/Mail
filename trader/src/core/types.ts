@@ -299,6 +299,11 @@ export interface OrderRequest {
   tif?: TimeInForce;
   reduceOnly?: boolean;
   strategyId: string;
+  /**
+   * 取引所側に置く保護用ストップ価格 (対応アダプターのみ。エンジン側の損切りが主で、これはプロセス停止時の保険)。
+   * 決済時に取引所側で自動的に取り消されることが保証できるアダプターだけが付ける。
+   */
+  protectiveStop?: number;
 }
 
 export interface Fill {
@@ -306,17 +311,30 @@ export interface Fill {
   clientId: string;
   ts: number;
   price: number;
-  /** 数量 (decimal 文字列) */
+  /**
+   * 実際に増減した数量 (decimal 文字列)。手数料がベース通貨で差し引かれた場合は差し引き後の数量
+   * (アダプターが補正する)。
+   */
   qty: string;
-  /** 手数料 (クオート通貨建て, decimal 文字列) */
+  /**
+   * 手数料 (decimal 文字列)。feeCurrency が無ければクオート通貨建て。
+   * アダプターは可能ならクオート通貨建てへ換算して feeCurrency を省く。
+   * 換算できない通貨 (BNB、口座通貨など) のときだけ feeCurrency を付け、エンジンが為替換算する。
+   */
   fee: string;
+  feeCurrency?: string;
   liquidity: "maker" | "taker";
 }
 
+/**
+ * 発注結果。status が "open" / "partially_filled" の注文は「保留中」として扱い、
+ * Broker.getOrder で確定させてから建玉管理 (journal) に反映する (未約定を不成立とみなして再送しない)。
+ */
 export interface OrderResult {
   orderId: string;
   clientId: string;
   status: OrderStatus;
+  /** これまでの全約定 (getOrder の結果では累計) */
   fills: Fill[];
   reason?: string;
 }
@@ -345,6 +363,11 @@ export interface Broker {
   getPositions(): Promise<BrokerPosition[]>;
   placeOrder(req: OrderRequest): Promise<OrderResult>;
   cancelOrder(orderId: string, symbol: string): Promise<void>;
+  /**
+   * 注文の最新状態 (累計の約定を含む)。clientId で照会し、取引所が clientId 照会に未対応なら orderId を使う。
+   * 見つからなければ undefined。
+   */
+  getOrder(clientId: string, symbol: string, orderId?: string): Promise<OrderResult | undefined>;
 }
 
 /** 市場データの取得元 */

@@ -1,8 +1,10 @@
 /**
  * 閲覧専用のダッシュボード (node:http)。既定は 127.0.0.1 のみで待ち受ける。
  * 変更系のエンドポイントは作らない (GET / HEAD 以外は 405)。
+ * DNS rebinding 対策として Host ヘッダーを検証し、許可外は 403 にする。
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createLogger } from "../core/logger";
 import { systemClock, type Clock, type Store } from "../core/types";
 import { quoteCurrencyOfSymbol } from "../engine/fx";
 import { exitFxRates, exitReasonCounts, summarizeByStrategy, tradePnlAccount } from "../engine/report";
@@ -37,6 +39,8 @@ const SECURITY_HEADERS: Record<string, string> = {
   "x-frame-options": "DENY",
 };
 const CSP = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'";
+
+const log = createLogger("dashboard");
 
 const json = (status: number, data: unknown): DashboardResponse => ({
   status,
@@ -122,14 +126,59 @@ export async function routeDashboard(deps: DashboardDeps, method: string, rawUrl
         return json(404, { error: "見つかりません" });
     }
   } catch (e) {
-    return json(500, { error: e instanceof Error ? e.message : String(e) });
+    // 内部エラーの本文 (パス・設定値など) は応答に出さず、ログにだけ残す
+    log.error("ダッシュボードの処理に失敗", { path: url.pathname, error: e instanceof Error ? e.message : String(e) });
+    return json(500, { error: "内部エラー" });
   }
 }
 
+/** ループバック以外へ bind するか (認証が無いので外部公開は非推奨) */
+export const isLoopbackHost = (host: string) => ["127.0.0.1", "localhost", "::1", "[::1]", ""].includes(host.trim().toLowerCase());
+
+/** 待ち受けアドレス → Host ヘッダー表記 (IPv6 は角括弧で囲む) */
+const hostForHeader = (h: string) => (h.includes(":") && !h.startsWith("[") ? `[${h}]` : h);
+
+/**
+ * 許可する Host ヘッダー: 127.0.0.1:<port>, localhost:<port>, [::1]:<port>。
+ * bindHost (DASHBOARD_HOST) が明示的にループバック以外なら、その値:<port> だけを追加で許可する。
+ */
+export function dashboardAllowedHosts(port: number, bindHost?: string): Set<string> {
+  const names = ["127.0.0.1", "localhost", "[::1]"];
+  const b = bindHost?.trim().toLowerCase();
+  if (b && !isLoopbackHost(b)) names.push(hostForHeader(b));
+  const out = new Set<string>();
+  for (const n of names) {
+    out.add(`${n}:${port}`);
+    if (port === 80) out.add(n); // 既定ポートではブラウザーがポートを省く
+  }
+  return out;
+}
+
+/** Host ヘッダーが許可リストにあるか (大文字小文字は区別しない。欠落は不許可) */
+export function isAllowedHost(hostHeader: string | string[] | undefined, allowed: Set<string>): boolean {
+  if (typeof hostHeader !== "string") return false;
+  const h = hostHeader.trim().toLowerCase();
+  return h !== "" && allowed.has(h);
+}
+
+export interface DashboardHandlerOptions {
+  /** 許可する Host (省略時は req.socket.localPort からループバック名だけを許可) */
+  allowedHosts?: Set<string>;
+}
+
+const forbidden = (): DashboardResponse => json(403, { error: "許可されていない Host です" });
+
 /** node:http 用のハンドラー */
-export function createDashboardHandler(deps: DashboardDeps): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
+export function createDashboardHandler(
+  deps: DashboardDeps,
+  opts: DashboardHandlerOptions = {},
+): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
   return async (req, res) => {
-    const r = await routeDashboard(deps, req.method ?? "GET", req.url ?? "/");
+    const port = req.socket?.localPort;
+    const allowed = opts.allowedHosts ?? (port !== undefined ? dashboardAllowedHosts(port) : new Set<string>());
+    const r = isAllowedHost(req.headers?.host, allowed)
+      ? await routeDashboard(deps, req.method ?? "GET", req.url ?? "/")
+      : forbidden();
     res.writeHead(r.status, r.headers);
     res.end(req.method === "HEAD" ? undefined : r.body);
   };
@@ -141,17 +190,17 @@ export interface DashboardServer {
   close(): Promise<void>;
 }
 
-/** ループバック以外へ bind するか (認証が無いので外部公開は非推奨) */
-export const isLoopbackHost = (host: string) => ["127.0.0.1", "localhost", "::1", ""].includes(host.trim().toLowerCase());
-
 /** 待ち受け開始 (既定 127.0.0.1) */
 export function startDashboard(deps: DashboardDeps, opts: { host?: string; port: number }): Promise<DashboardServer> {
   const host = opts.host || "127.0.0.1";
-  const handler = createDashboardHandler(deps);
+  // 許可 Host は listen 後に実ポートで確定する (port: 0 の場合があるため)。確定前は全て拒否
+  const allowedHosts = new Set<string>();
+  const handler = createDashboardHandler(deps, { allowedHosts });
   const server = createServer((req, res) => {
     handler(req, res).catch((e) => {
-      res.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
-      res.end(String(e));
+      log.error("ダッシュボードの応答に失敗", { error: e instanceof Error ? e.message : String(e) });
+      if (!res.headersSent) res.writeHead(500, { ...SECURITY_HEADERS, "content-type": "text/plain; charset=utf-8" });
+      res.end("内部エラー");
     });
   });
   return new Promise((resolve, reject) => {
@@ -160,6 +209,7 @@ export function startDashboard(deps: DashboardDeps, opts: { host?: string; port:
       server.off("error", reject);
       const addr = server.address();
       const port = typeof addr === "object" && addr ? addr.port : opts.port;
+      for (const h of dashboardAllowedHosts(port, host)) allowedHosts.add(h);
       const shownHost = host.includes(":") ? `[${host}]` : host;
       resolve({
         server,

@@ -2,13 +2,14 @@
  * 合成データ + 仮想時計による高速ペーパー運転 (ネット接続不要のデモ)。
  * 情報源は使わず (sources = [] のスタブ brief)、AI も使わない。学習ループは仮想時間 1 時間ごと。
  */
+import { resolve } from "node:path";
 import { loadConfig } from "../core/config";
 import type { Clock, ExitReason, Lesson, ParamAdjustment, Store } from "../core/types";
 import type { ArmSnapshot } from "../learning/allocator";
 import type { CauseSummary, LearningSnapshot } from "../learning/service";
 import { mulberry32 } from "../market/feeds/synthetic";
 import { createStore, MemoryStore } from "../storage";
-import { buildRuntime, type Runtime } from "./setup";
+import { buildRuntime, syntheticDbPath, type Runtime } from "./setup";
 import {
   equityStats, EXIT_REASON_LABEL, exitFxRates, exitReasonCounts, fmtNum, fmtPct, fmtSigned, fmtTime, renderLearning, renderStrategyTable, summarizeByStrategy,
   type StrategySummary,
@@ -94,12 +95,26 @@ export function simulationConfig(env: Record<string, string | undefined>, db: st
   });
 }
 
+/**
+ * simulate が使えない DB か。DB_PATH (実運転用) とその合成データ用 (<ベース名>-synthetic.db) は拒否する
+ * (仮想時間の取引・追跡ポジション・リスク状態を運転中の DB に混ぜない)。memory / :memory: は可。
+ */
+export function assertSimulationDb(db: string, env: Record<string, string | undefined>): void {
+  if (db === "memory" || db === ":memory:") return;
+  const dbPath = loadConfig(env).env.DB_PATH;
+  const guarded = [dbPath, syntheticDbPath(dbPath)].filter((p) => p !== "" && p !== "memory" && p !== ":memory:").map((p) => resolve(p));
+  if (guarded.includes(resolve(db))) {
+    throw new Error(`simulate は DB_PATH (${dbPath}) と同じファイル (合成データ用を含む) を使えません。--db に別のファイルを指定してください`);
+  }
+}
+
 export async function runSimulation(o: SimulationOptions = {}): Promise<{ report: SimulationReport; runtime: Runtime }> {
   const seed = o.seed ?? 1;
   const durationMs = Math.round(((o.days ?? (o.hours === undefined ? 3 : 0)) * 24 + (o.hours ?? 0)) * HOUR);
   if (!(durationMs > 0)) throw new Error("期間が 0 です (--days / --hours を確認してください)");
   const stepMs = Math.max(1_000, Math.round(o.stepMs ?? 15_000));
   const db = o.db ?? "memory";
+  if (!o.store) assertSimulationDb(db, o.env ?? process.env);
   const config = simulationConfig(o.env ?? process.env, db);
   const store = o.store ?? (db === "memory" ? new MemoryStore() : createStore(db));
 

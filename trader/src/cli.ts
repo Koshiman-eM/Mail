@@ -12,7 +12,8 @@ import { createFxConverter, quoteCurrencyOfSymbol } from "./engine/fx";
 import {
   equityStats, EXIT_REASON_LABEL, exitFxRates, exitReasonCounts, fmtNum, fmtPct, fmtSigned, fmtTime, renderLearning, renderStrategyTable, summarizeByStrategy,
 } from "./engine/report";
-import { buildRuntime } from "./engine/setup";
+import { PendingOrders } from "./engine/orders";
+import { buildRuntime, resolveDbPath } from "./engine/setup";
 import { formatSimulationReport, runSimulation } from "./engine/simulate";
 import { createDefaultSources, IntelService } from "./intel/service";
 import { TradeJournal } from "./learning/journal";
@@ -190,7 +191,7 @@ async function cmdRun(io: Io): Promise<number> {
   io.out(venuesLine(config));
   const rt = await buildRuntime(config);
   io.out(`銘柄: ${rt.instruments.map((i) => `${i.symbol} (${i.assetClass}, ${i.venue})`).join(", ")}`);
-  io.out(`時間足: ${rt.timeframes.join(", ")} / 口座通貨: ${config.env.BASE_CURRENCY} / DB: ${config.env.DB_PATH}`);
+  io.out(`時間足: ${rt.timeframes.join(", ")} / 口座通貨: ${config.env.BASE_CURRENCY} / DB: ${resolveDbPath(config)}`);
   riskLines(config).forEach((l) => io.out(l));
   io.out(`AI: ${rt.ai ? `有効 (${rt.ai.model})` : "無効 (ルールベース)"}`);
 
@@ -277,9 +278,12 @@ async function cmdBacktest(flags: ParsedArgs["flags"], io: Io): Promise<number> 
   return 0;
 }
 
+/** 外部から集めた文字列を端末に出す前に、制御文字と双方向制御文字を取り除く (表示の乗っ取り防止) */
+const cleanText = (s: string) => s.replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F\u202A-\u202E\u2066-\u2069]/g, "");
+
 async function cmdIntel(io: Io): Promise<number> {
   const config = loadConfig();
-  const store = createStore(config.env.DB_PATH);
+  const store = createStore(resolveDbPath(config));
   try {
     const ai = config.ai.enabled ? { apiKey: config.ai.apiKey, model: config.ai.model } : undefined;
     const svc = new IntelService({
@@ -292,18 +296,18 @@ async function cmdIntel(io: Io): Promise<number> {
     const b = await svc.refresh(now);
     io.out(`=== マーケットブリーフ (${fmtTime(b.generatedAt)}, ${b.stub ? "ルールベース" : "AI 分析"}) ===`);
     io.out(`リスクオン指数: ${b.riskOn.toFixed(2)} (-1 リスクオフ 〜 1 リスクオン)`);
-    io.out(`要約: ${b.summary}`);
+    io.out(`要約: ${cleanText(b.summary)}`);
     const biases = Object.values(b.biases).sort((x, y) => y.confidence - x.confidence).slice(0, 15);
-    io.out("", );
+    io.out("");
     io.out("■ 資産別のバイアス (信頼度の高い順)");
     for (const x of biases) {
-      io.out(`  ${x.asset.padEnd(8)} センチメント ${fmtSigned(x.sentiment, 2).padStart(6)} / 信頼度 ${x.confidence.toFixed(2)} / イベント ${x.eventRisk.toFixed(2)}${x.blackoutUntil && x.blackoutUntil > now ? ` / ${fmtTime(x.blackoutUntil)} まで停止` : ""}`);
+      io.out(`  ${cleanText(x.asset).padEnd(8)} センチメント ${fmtSigned(x.sentiment, 2).padStart(6)} / 信頼度 ${x.confidence.toFixed(2)} / イベント ${x.eventRisk.toFixed(2)}${x.blackoutUntil && x.blackoutUntil > now ? ` / ${fmtTime(x.blackoutUntil)} まで停止` : ""}`);
     }
     if (biases.length === 0) io.out("  (なし)");
-    io.out(`監視候補: ${b.watchlist.length ? b.watchlist.join(", ") : "(なし)"}`);
+    io.out(`監視候補: ${b.watchlist.length ? b.watchlist.map(cleanText).join(", ") : "(なし)"}`);
     const ev = b.events.filter((e) => e.ts >= now - 3_600_000 && e.impact === "high").sort((x, y) => x.ts - y.ts).slice(0, 10);
     io.out("■ 重要イベント");
-    for (const e of ev) io.out(`  ${fmtTime(e.ts)} ${e.currency ?? ""} ${e.title}`);
+    for (const e of ev) io.out(`  ${fmtTime(e.ts)} ${cleanText(e.currency ?? "")} ${cleanText(e.title)}`);
     if (ev.length === 0) io.out("  (なし)");
     return 0;
   } finally {
@@ -315,7 +319,7 @@ async function cmdIntel(io: Io): Promise<number> {
 export function buildReportText(config: AppConfig, store: Store, now: number = Date.now()): string {
   const ccy = config.env.BASE_CURRENCY;
   const lines: string[] = [];
-  lines.push(`=== レポート (${fmtTime(now)}, DB: ${config.env.DB_PATH}) ===`);
+  lines.push(`=== レポート (${fmtTime(now)}, DB: ${resolveDbPath(config)}) ===`);
   for (const mode of ["paper", "live"] as const) {
     const st = equityStats(store.listEquity({ mode }));
     if (!st) continue;
@@ -340,7 +344,7 @@ export function buildReportText(config: AppConfig, store: Store, now: number = D
 
 function cmdReport(io: Io): number {
   const config = loadConfig();
-  const store = createStore(config.env.DB_PATH);
+  const store = createStore(resolveDbPath(config));
   try {
     io.out(buildReportText(config, store));
     return 0;
@@ -349,22 +353,23 @@ function cmdReport(io: Io): number {
   }
 }
 
-/** キルスイッチ・日次停止の解除。解除した場合 true */
+/** キルスイッチ・日次停止の解除 (config.mode のリスク状態だけ)。解除した場合 true */
 export function resumeTrading(config: AppConfig, store: Store, now: number = Date.now(), by = "cli"): { resumed: boolean; message: string } {
-  const risk = new RiskManager(config.risk, store);
+  const mode = config.mode;
+  const risk = new RiskManager(config.risk, store, { mode });
   const st = risk.state();
-  if (!st.killSwitch && st.haltedUntil === undefined) return { resumed: false, message: "停止状態ではありません (変更なし)" };
-  const last = store.listEquity().at(-1);
+  if (!st.killSwitch && st.haltedUntil === undefined) return { resumed: false, message: `停止状態ではありません (${mode}、変更なし)` };
+  const last = store.listEquity({ mode }).at(-1);
   risk.resume({ ...(last ? { equity: last.equity } : {}), now, by });
-  // 別プロセスで動作中のエンジンはメモリ上の状態を持つので、kv の再開要求でも依頼する (エンジンが次のティックで適用)
-  requestResume(store, { at: now, by });
+  // 別プロセスで動作中のエンジンはメモリ上の状態を持つので、kv の再開要求でも依頼する (同じ mode のエンジンが次のティックで適用)
+  requestResume(store, { at: now, by, mode });
   const what = st.killSwitch ? `キルスイッチ (${st.killSwitch.reason})` : `日次停止 (${fmtTime(st.haltedUntil)} まで)`;
   return { resumed: true, message: `${what} を解除しました。監査ログに記録しました。` };
 }
 
 function cmdResume(io: Io): number {
   const config = loadConfig();
-  const store = createStore(config.env.DB_PATH);
+  const store = createStore(resolveDbPath(config));
   try {
     const r = resumeTrading(config, store);
     io.out(r.message);
@@ -382,19 +387,28 @@ function cmdStatus(io: Io): number {
   m.warn.forEach((l) => io.err(l));
   io.out(venuesLine(config));
   io.out(`監視銘柄 (WATCHLIST): ${config.env.WATCHLIST || "(既定)"}`);
-  io.out(`口座通貨: ${config.env.BASE_CURRENCY} / DB: ${config.env.DB_PATH} / AI: ${config.ai.enabled ? config.ai.model : "無効"}`);
+  const dbPath = resolveDbPath(config);
+  io.out(`口座通貨: ${config.env.BASE_CURRENCY} / DB: ${dbPath} / AI: ${config.ai.enabled ? config.ai.model : "無効"}`);
   riskLines(config).forEach((l) => io.out(l));
-  const store = createStore(config.env.DB_PATH);
+  const store = createStore(dbPath);
   try {
     const now = Date.now();
-    const risk = new RiskManager(config.risk, store);
+    const mode = config.mode;
+    const risk = new RiskManager(config.risk, store, { mode });
     const h = risk.isHalted(now);
-    io.out(`停止状態: ${h.halted ? h.reason : "なし"}`);
-    const eq = store.listEquity().at(-1);
+    io.out(`停止状態 (${mode}): ${h.halted ? h.reason : "なし"}`);
+    const eq = store.listEquity({ mode }).at(-1);
     io.out(`最新の評価額: ${eq ? `${fmtNum(eq.equity, 0)} ${config.env.BASE_CURRENCY} (${fmtTime(eq.ts)}, ${eq.mode})` : "(記録なし)"}`);
-    const open = new TradeJournal({ store }).list();
-    io.out(`保有ポジション: ${open.length} 件`);
+    const open = new TradeJournal({ store, mode }).list();
+    io.out(`保有ポジション (${mode}): ${open.length} 件`);
     for (const p of open) io.out(`  ${p.symbol} ${p.direction === "long" ? "買い" : "売り"} ${p.qty} @ ${p.entryPrice} (${p.strategyId}, ${fmtTime(p.entryTs)})`);
+    const pending = new PendingOrders({ store, mode }).list();
+    if (pending.length) {
+      io.out(`保留中の注文 (${mode}): ${pending.length} 件 (取引所で状態を確認してください)`);
+      for (const o of pending) {
+        io.out(`  ${o.symbol} ${o.kind === "entry" ? "エントリー" : "決済"} ${o.side} ${o.qty} clientId=${o.clientId}${o.orderId ? ` orderId=${o.orderId}` : ""} 状態 ${o.status} (${fmtTime(o.createdAt)})${o.lastError ? ` ${o.lastError}` : ""}`);
+      }
+    }
     const plan = store.latestPlan();
     io.out(`最新の計画: ${plan ? `${fmtTime(plan.generatedAt)} (有効期限 ${fmtTime(plan.validUntil)})` : "(なし)"}`);
     const brief = store.latestBrief();

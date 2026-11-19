@@ -134,12 +134,25 @@ export class ParamTuner {
     this.opts = { ...DEFAULT_TUNER_OPTIONS, ...deps.options };
   }
 
-  /** 現行パラメータ (既定値に学習済みの値を上書き。既定値に無いキーは無視) */
-  currentParams(strategyId: string, assetClass: AssetClass, defaults: Params): Params {
+  /**
+   * 現行パラメータ (既定値に学習済みの値を上書き。既定値に無いキーは無視)。
+   * 保存値は paramBounds でクランプする (bounds 変更後の古い値や壊れた kv を範囲外のまま使わない)。
+   * bounds 省略時は getStrategy の paramBounds を使う。
+   */
+  currentParams(strategyId: string, assetClass: AssetClass, defaults: Params, bounds?: Record<string, [number, number]>): Params {
     const saved = this.deps.store.kvGet<Params>(paramsKey(strategyId, assetClass)) ?? {};
+    const b = bounds ?? this.deps.getStrategy(strategyId)?.paramBounds ?? {};
     const out: Params = { ...defaults };
     for (const [k, v] of Object.entries(saved)) {
-      if (k in defaults && Number.isFinite(v)) out[k] = v;
+      if (!(k in defaults) || typeof v !== "number" || !Number.isFinite(v)) continue;
+      const range = b[k];
+      if (range && Number.isFinite(range[0]) && Number.isFinite(range[1])) {
+        const lo = Math.min(range[0], range[1]);
+        const hi = Math.max(range[0], range[1]);
+        out[k] = Math.min(hi, Math.max(lo, v));
+      } else {
+        out[k] = v;
+      }
     }
     return out;
   }
@@ -186,9 +199,17 @@ export class ParamTuner {
     return this.deps.store.listAdjustments({ strategyId }).filter((a) => a.assetClass === assetClass);
   }
 
-  /** 評価待ちの適用済み調整があるか */
+  /**
+   * 評価待ちの適用済み調整があるか。
+   * 評価用メタ (adjmeta) が無い applied は reviewApplied で評価できないので、評価待ちとみなさない
+   * (欠けたメタで調整が永久に止まるのを防ぐ)。
+   */
   private hasPendingReview(adjs: ParamAdjustment[]): boolean {
-    return adjs.some((a) => a.status === "applied" && !this.deps.store.kvGet<AdjustmentMeta>(metaKey(a.id))?.reviewed);
+    return adjs.some((a) => {
+      if (a.status !== "applied") return false;
+      const meta = this.deps.store.kvGet<AdjustmentMeta>(metaKey(a.id));
+      return meta !== undefined && !meta.reviewed;
+    });
   }
 
   /** 直近 dedupeMs 以内に同じ内容の proposed / rejected があるか (同じ案の繰り返し記録を防ぐ) */
@@ -230,7 +251,7 @@ export class ParamTuner {
       if (recent.length < this.opts.minSamples) continue;
 
       const shares = this.causeShares(recent);
-      const current = this.currentParams(strategyId, assetClass, info.defaultParams);
+      const current = this.currentParams(strategyId, assetClass, info.defaultParams, info.paramBounds);
       const ranked = RULES.map((r) => ({ rule: r, share: r.codes.reduce((s, c) => s + (shares[c] ?? 0), 0) }))
         .filter((x) => x.share >= this.opts.causeShare)
         .sort((a, b) => b.share - a.share);
@@ -272,7 +293,7 @@ export class ParamTuner {
       log.info("評価待ちの調整があるため提案を保留", { strategyId: p.strategyId, assetClass: p.assetClass });
       return undefined;
     }
-    const current = this.currentParams(p.strategyId, p.assetClass, info.defaultParams);
+    const current = this.currentParams(p.strategyId, p.assetClass, info.defaultParams, info.paramBounds);
     const from = current[p.param];
     const to = this.nextValue(p.param, from, p.direction, bounds);
     if (to === undefined) return undefined;

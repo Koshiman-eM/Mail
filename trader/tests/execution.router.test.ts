@@ -22,7 +22,7 @@ const fakeEx = (): CcxtTradeLike => ({
   id: "bitflyer",
   has: {},
   fetchBalance: vi.fn(async () => ({ total: { JPY: 1000, BTC: 0.5 }, free: { JPY: 900 } })),
-  createOrder: vi.fn(async () => ({ id: "o1", status: "closed", filled: 1, average: 100, fee: { cost: 0.1 } })),
+  createOrder: vi.fn(async () => ({ id: "o1", status: "closed", filled: 1, average: 100, fee: { cost: 0.1, currency: "JPY" } })),
   cancelOrder: vi.fn(async () => ({})),
 });
 
@@ -125,10 +125,13 @@ describe("実口座アダプターの挙動 (モック・NODE_ENV を一時変�
       }) as unknown as typeof fetch;
       const b = new OandaBroker({ mode: "live", token: "tok", accountId: "101-1", fetchImpl });
       const r = await b.placeOrder({ clientId: "c1", symbol: "USD/JPY", side: "sell", type: "market", qty: "100", strategyId: "s" });
-      const body = JSON.parse(calls[0].init.body);
-      expect(calls[0].url).toBe("https://api-fxpractice.oanda.com/v3/accounts/101-1/orders");
+      // 発注前に口座通貨 (commission の通貨) を summary から取得する
+      const post = calls.find((c) => c.init.method === "POST")!;
+      expect(calls.filter((c) => c.init.method === "POST")).toHaveLength(1);
+      const body = JSON.parse(post.init.body);
+      expect(post.url).toBe("https://api-fxpractice.oanda.com/v3/accounts/101-1/orders");
       expect(body.order).toMatchObject({ type: "MARKET", instrument: "USD_JPY", units: "-100", clientExtensions: { id: "c1" } });
-      expect(r).toMatchObject({ status: "filled", fills: [{ price: 150.01, qty: "100" }] });
+      expect(r).toMatchObject({ status: "filled", fills: [{ price: 150.01, qty: "100", feeCurrency: "JPY" }] });
       expect(await b.getPositions()).toEqual([{ symbol: "USD/JPY", qty: "-100", avgPrice: 150.01 }]);
       expect((await b.getBalance()).equity).toBe("1000000");
     });

@@ -46,6 +46,15 @@ export function parseCryptoPanic(json: unknown, now: number): IntelItem[] {
   return items;
 }
 
+/** メッセージからトークンを伏せる (生の値と encodeURIComponent した値の両方) */
+export function redactToken(msg: string, token: string): string {
+  let out = msg;
+  for (const t of new Set([token, encodeURIComponent(token)])) {
+    if (t) out = out.split(t).join("***");
+  }
+  return out;
+}
+
 /** トークン未設定なら undefined (無効) */
 export function createCryptoPanicSource(
   opts: { token?: string; fetchJson?: FetchJsonFn } = {},
@@ -60,9 +69,8 @@ export function createCryptoPanicSource(
       try {
         return parseCryptoPanic(await get(url), now);
       } catch (e) {
-        // エラーメッセージに含まれるトークンを伏せる
-        const msg = (e instanceof Error ? e.message : String(e)).split(token).join("***");
-        throw new Error(msg);
+        // エラーメッセージに含まれるトークン (生・URL エンコード済み) を伏せる
+        throw new Error(redactToken(e instanceof Error ? e.message : String(e), token));
       }
     },
   };

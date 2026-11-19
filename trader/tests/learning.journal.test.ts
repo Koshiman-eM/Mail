@@ -120,6 +120,67 @@ describe("TradeJournal", () => {
   });
 });
 
+describe("TradeJournal.reduce (一部決済)", () => {
+  it("約定分の TradeRecord を返し、残りは追跡を続ける (エントリー手数料は按分)", () => {
+    const store = new MemoryStore();
+    const j = new TradeJournal({ store });
+    const p = j.open(openInput({ id: "r1", qty: 3, entryFees: 0.3 }));
+    j.mark("BTC/USDT", 103, 2_000);
+    const t1 = j.reduce(p.id, { qty: 1, exitPrice: 102, exitTs: 3_000, exitReason: "stop", fees: 0.1 });
+    expect(t1.id).toBe("r1#1");
+    expect(t1.qty).toBe(1);
+    expect(t1.grossPnl).toBe(2);
+    expect(t1.fees).toBe(0.2); // 0.3 × 1/3 + 0.1
+    expect(t1.netPnl).toBe(1.8);
+    const rest = j.get("r1")!;
+    expect(rest.qty).toBe(2);
+    expect(rest.entryFees).toBe(0.2);
+    expect(rest.highWater).toBe(103);
+    // 残りの全量を決済すると元の id で記録
+    const t2 = j.reduce(p.id, { qty: 2, exitPrice: 104, exitTs: 4_000, exitReason: "stop" });
+    expect(t2.id).toBe("r1");
+    expect(t2.qty).toBe(2);
+    expect(t2.fees).toBe(0.2);
+    expect(j.list()).toHaveLength(0);
+    expect(store.listTrades().map((t) => t.id).sort()).toEqual(["r1", "r1#1"]);
+  });
+
+  it("異常な数量・価格は例外", () => {
+    const j = new TradeJournal();
+    const p = j.open(openInput({ qty: 2 }));
+    expect(() => j.reduce(p.id, { qty: 0, exitPrice: 100, exitTs: 1, exitReason: "stop" })).toThrow();
+    expect(() => j.reduce(p.id, { qty: 1, exitPrice: 0, exitTs: 1, exitReason: "stop" })).toThrow();
+    expect(() => j.close({ id: p.id, exitPrice: Number.NaN, exitTs: 1, exitReason: "stop" })).toThrow();
+    expect(() => j.reduce("none", { qty: 1, exitPrice: 100, exitTs: 1, exitReason: "stop" })).toThrow();
+  });
+});
+
+describe("TradeJournal の mode 別の保存", () => {
+  it("paper と live は別のキーに保存し、互いに読み込まない", () => {
+    const store = new MemoryStore();
+    new TradeJournal({ store, mode: "paper" }).open(openInput({ id: "p1" }));
+    const live = new TradeJournal({ store, mode: "live" });
+    expect(live.list()).toEqual([]);
+    expect(() => live.open(openInput({ id: "x", mode: "paper" }))).toThrow(/mode/);
+    live.open(openInput({ id: "l1", mode: "live" }));
+    expect(new TradeJournal({ store, mode: "paper" }).list().map((p) => p.id)).toEqual(["p1"]);
+    expect(new TradeJournal({ store, mode: "live" }).list().map((p) => p.id)).toEqual(["l1"]);
+    expect(store.kvGet("journal:open:paper")).toHaveLength(1);
+    expect(store.kvGet("journal:open:live")).toHaveLength(1);
+  });
+
+  it("旧キー (mode なし) は paper として引き継ぎ、live では読まない。旧キー中の live のポジションは paper に混ぜない", () => {
+    const store = new MemoryStore();
+    const old = new TradeJournal();
+    const a = old.open(openInput({ id: "legacy-paper" }));
+    const b = old.open(openInput({ id: "legacy-live", symbol: "ETH/USDT", mode: "live" }));
+    store.kvSet("journal:open", [old.get(a.id), old.get(b.id)]);
+    expect(new TradeJournal({ store, mode: "live" }).list()).toEqual([]);
+    expect(new TradeJournal({ store, mode: "paper" }).list().map((p) => p.id)).toEqual(["legacy-paper"]);
+    expect(new TradeJournal({ store }).list().map((p) => p.id)).toEqual(["legacy-paper"]);
+  });
+});
+
 function closed(id: string, over: Partial<TradeRecord>): TradeRecord {
   const j = new TradeJournal();
   const p = j.open(openInput({ id, ...over }));

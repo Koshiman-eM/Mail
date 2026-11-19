@@ -89,7 +89,7 @@ describe("PaperBroker", () => {
     expect(fills).toHaveLength(1);
     expect(fills[0]).toMatchObject({ price: 95, liquidity: "maker" });
     expect(Number(fills[0].fee)).toBeCloseTo(0.0475, 6);
-    expect(b.getOrder(r2.clientId)!.status).toBe("filled");
+    expect((await b.getOrder(r2.clientId, "BTC/USDT"))!.status).toBe("filled");
     expect(b.openOrders()).toHaveLength(0);
   });
 

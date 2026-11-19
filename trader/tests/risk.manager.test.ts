@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_RISK } from "../src/core/config";
-import { costBps, exposureByClass, RiskManager, type EntryParams } from "../src/risk/manager";
+import { costBps, exposureByClass, MIN_STOP_DISTANCE_SPREADS, RiskManager, type EntryParams } from "../src/risk/manager";
 import type { AuditEvent, Instrument, RiskLimits, Signal, Store } from "../src/core/types";
 
 const NOW = Date.parse("2025-03-01T12:00:00Z");
@@ -112,7 +112,66 @@ describe("RiskManager.evaluateEntry", () => {
   });
 });
 
+describe("損切りとスプレッド", () => {
+  const wide = { ts: NOW, bid: 99, ask: 101 }; // スプレッド 2
+
+  it("ロングの損切りが bid 以上 (スプレッドの内側) なら拒否", () => {
+    const rm = new RiskManager({ ...limits, minEdgeToCostRatio: 0 });
+    expect(rm.evaluateEntry(params({ quote: wide, signal: sig({ stopLoss: 100 }) }))).toMatchObject({ ok: false, reason: expect.stringContaining("スプレッドの内側") });
+    expect(rm.evaluateEntry(params({ quote: wide, signal: sig({ stopLoss: 99 }) }))).toMatchObject({ ok: false, reason: expect.stringContaining("スプレッドの内側") });
+  });
+
+  it("ショートの損切りが ask 以下なら拒否", () => {
+    const rm = new RiskManager({ ...limits, minEdgeToCostRatio: 0 });
+    const inst = { ...btc, allowShort: true };
+    expect(rm.evaluateEntry(params({ instrument: inst, quote: wide, signal: sig({ direction: "short", stopLoss: 100.5 }) }))).toMatchObject({
+      ok: false, reason: expect.stringContaining("スプレッドの内側"),
+    });
+    // ask + スプレッド × 2 以上離れていれば可
+    expect(rm.evaluateEntry(params({ instrument: inst, quote: wide, signal: sig({ direction: "short", stopLoss: 101 + 2 * MIN_STOP_DISTANCE_SPREADS }) })).ok).toBe(true);
+  });
+
+  it("決済側の価格からの距離はスプレッドの 2 倍以上", () => {
+    const rm = new RiskManager({ ...limits, minEdgeToCostRatio: 0 });
+    expect(MIN_STOP_DISTANCE_SPREADS).toBe(2);
+    // bid 99 - stop 95.5 = 3.5 < 2 × 2
+    expect(rm.evaluateEntry(params({ quote: wide, signal: sig({ stopLoss: 95.5 }) }))).toMatchObject({ ok: false, reason: expect.stringContaining("近すぎ") });
+    expect(rm.evaluateEntry(params({ quote: wide, signal: sig({ stopLoss: 95 }) })).ok).toBe(true);
+  });
+});
+
 describe("停止・再開", () => {
+  it("NaN・非有限の評価額では状態を更新しない", () => {
+    const { store } = memStore();
+    const rm = new RiskManager(limits, store);
+    rm.onEquity(10_000, NOW);
+    const before = rm.state();
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      const r = rm.onEquity(bad, NOW + 1000);
+      expect(r.killSwitch).toBe(false);
+    }
+    expect(rm.state()).toEqual(before);
+    expect(rm.onEquity(9_000, NOW + 2000).dailyLossPct).toBeCloseTo(0.1, 9);
+  });
+
+  it("状態は mode 別のキーに保存し、paper は旧キーを引き継ぐ。live は旧キー・paper の状態を読まない", () => {
+    const { store } = memStore();
+    store.kvSet("risk:state", { dayStartEquity: 1_000_000, peakEquity: 1_200_000, recentOrderTs: [], killSwitch: { at: 1, reason: "old" } });
+    const paper = new RiskManager(limits, store, { mode: "paper" });
+    expect(paper.state()).toMatchObject({ peakEquity: 1_200_000, killSwitch: { reason: "old" } });
+    const live = new RiskManager(limits, store, { mode: "live" });
+    expect(live.state()).toMatchObject({ peakEquity: 0, dayStartEquity: 0 });
+    expect(live.state().killSwitch).toBeUndefined();
+    // live の初回は現在の評価額で初期化 (paper の基準で kill switch を作動させない)
+    expect(live.onEquity(1_000, NOW).killSwitch).toBe(false);
+    expect(live.state()).toMatchObject({ peakEquity: 1_000, dayStartEquity: 1_000 });
+    expect(store.kvGet("risk:state:live")).toMatchObject({ peakEquity: 1_000 });
+    paper.onEquity(1_300_000, NOW);
+    expect(store.kvGet("risk:state:paper")).toMatchObject({ peakEquity: 1_300_000 });
+    expect(new RiskManager(limits, store, { mode: "live" }).state().peakEquity).toBe(1_000);
+  });
+
+
   it("日次損失で当日停止、翌日 0:00 UTC に解除。監査ログが残る", () => {
     const { store, audits } = memStore();
     const rm = new RiskManager(limits, store);
