@@ -3,6 +3,7 @@
  * 依存なしの簡易引数解析。表示はすべて日本語。
  */
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { loadConfig, type AppConfig } from "./core/config";
@@ -189,6 +190,17 @@ function riskLines(c: AppConfig): string[] {
   ];
 }
 
+/**
+ * 読み取り系コマンド用: DB ファイルが無いときは新規作成せずエラーにする
+ * (作業ディレクトリ違いで空の DB を作って「記録なし」と誤解するのを防ぐ)。メモリ DB は対象外
+ */
+function openExistingStore(dbPath: string): Store {
+  if (dbPath !== "memory" && dbPath !== ":memory:" && !existsSync(dbPath)) {
+    throw new CliError(`DB_PATH が見つかりません: ${resolve(dbPath)}。作業ディレクトリを確認してください`);
+  }
+  return createStore(dbPath);
+}
+
 // ───────── コマンド ─────────
 
 async function cmdRun(io: Io): Promise<number> {
@@ -225,7 +237,20 @@ async function cmdRun(io: Io): Promise<number> {
     io.err(`警告: ダッシュボードを起動できませんでした (${e instanceof Error ? e.message : String(e)})。取引は続行します`);
   }
 
-  await rt.engine.start();
+  try {
+    await rt.engine.start();
+  } catch (e) {
+    // 起動に失敗したら後始末して異常終了 (systemd の Restart= で再起動できるようにする)
+    io.err(`エラー: エンジンの起動に失敗しました: ${e instanceof Error ? e.message : String(e)}`);
+    await rt.engine.stop().catch(() => undefined);
+    await dash?.close().catch(() => undefined);
+    try {
+      rt.close();
+    } catch {
+      /* 既に閉じている */
+    }
+    throw e;
+  }
   io.out("起動しました。Ctrl+C で停止します (保有ポジションは自動決済しません)。");
   await new Promise<void>((done) => {
     let stopping = false;
@@ -354,7 +379,7 @@ export function buildReportText(config: AppConfig, store: Store, now: number = D
 
 function cmdReport(io: Io): number {
   const config = loadConfig();
-  const store = createStore(resolveDbPath(config));
+  const store = openExistingStore(resolveDbPath(config));
   try {
     io.out(buildReportText(config, store));
     return 0;
@@ -414,7 +439,7 @@ export function resumeTrading(
 
 function cmdResume(io: Io): number {
   const config = loadConfig();
-  const store = createStore(resolveDbPath(config));
+  const store = openExistingStore(resolveDbPath(config));
   try {
     const r = resumeTrading(config, store);
     io.out(r.message);
@@ -522,7 +547,7 @@ function cmdOrders(positionals: string[], flags: ParsedArgs["flags"], io: Io): n
   if (sub !== undefined && sub !== "list" && sub !== "resolve") throw new CliError(`未知のサブコマンド: orders ${sub} (orders / orders resolve)`);
   const args = sub === "resolve" ? parseResolveArgs(positionals.slice(1), flags) : undefined;
   const config = loadConfig();
-  const store = createStore(resolveDbPath(config));
+  const store = openExistingStore(resolveDbPath(config));
   try {
     if (!args) {
       io.out(pendingOrdersText(config, store));
@@ -545,7 +570,7 @@ function cmdStatus(io: Io): number {
   const dbPath = resolveDbPath(config);
   io.out(`口座通貨: ${config.env.BASE_CURRENCY} / DB: ${dbPath} / AI: ${config.ai.enabled ? config.ai.model : "無効"}`);
   riskLines(config).forEach((l) => io.out(l));
-  const store = createStore(dbPath);
+  const store = openExistingStore(dbPath);
   try {
     const now = Date.now();
     const mode = config.mode;
@@ -614,6 +639,8 @@ if (invokedDirectly) {
   main().then(
     (code) => {
       process.exitCode = code;
+      // 異常終了時は残ったタイマー等があっても確実に終わらせる
+      if (code !== 0) setTimeout(() => process.exit(code), 500).unref();
     },
     (e) => {
       console.error(e);

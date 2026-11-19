@@ -1,5 +1,7 @@
 import { D, floorToStep, Decimal } from "../core/decimal";
 import { createLogger } from "../core/logger";
+import { sweepOld } from "../core/sweep";
+import { normalizeReason } from "../engine/context";
 import type { AssetClass, Instrument, PositionView, Quote, RiskDecision, RiskLimits, RiskState, Signal, Store, TradingMode } from "../core/types";
 
 const log = createLogger("risk");
@@ -75,6 +77,7 @@ export function exposureByClass(
 export class RiskManager {
   private st: InternalState;
   private lastAudit = new Map<string, number>();
+  private lastAuditSweep = 0;
   private readonly key: string;
 
   /**
@@ -191,10 +194,14 @@ export class RiskManager {
   }
 
   private auditReject(p: EntryParams, reason: string): void {
-    const k = `${p.instrument.symbol}|${reason}`;
+    const k = `${p.instrument.symbol}|${normalizeReason(reason)}`;
     const last = this.lastAudit.get(k);
     if (last !== undefined && p.now - last < 60_000) return;
     this.lastAudit.set(k, p.now);
+    if (this.lastAudit.size > 200 || p.now - this.lastAuditSweep > 60_000) {
+      this.lastAuditSweep = p.now;
+      sweepOld(this.lastAudit, p.now, 10 * 60_000);
+    }
     this.audit("risk.reject", p.now, { symbol: p.instrument.symbol, strategyId: p.signal.strategyId, reason });
   }
 

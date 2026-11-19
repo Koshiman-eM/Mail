@@ -1748,6 +1748,11 @@ export class TradingEngine {
     this.saveSnapshot();
     this.flushSkips(now);
     try {
+      this.shadow?.flush();
+    } catch (e) {
+      this.log.warn("停止時の仮想トレードの保存に失敗", { error: errMsg(e) });
+    }
+    try {
       this.forecast?.flush();
     } catch (e) {
       this.log.warn("停止時の予想の保存に失敗", { error: errMsg(e) });

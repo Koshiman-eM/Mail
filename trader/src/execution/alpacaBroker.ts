@@ -1,4 +1,5 @@
 import { D, Decimal } from "../core/decimal";
+import { TerminalMap, isTerminalOrder } from "../core/sweep";
 import { fetchJson, fetchWithRetry, HttpError, redactSecrets, type FetchOptions } from "../core/http";
 import { assertLive, type LiveGuard } from "./guard";
 import type { Balance, Broker, BrokerPosition, Fill, OrderLookupHint, OrderRequest, OrderResult, OrderStatus } from "../core/types";
@@ -43,7 +44,7 @@ export class AlpacaBroker implements Broker {
   readonly venue = "alpaca";
   readonly mode = "live" as const;
   private readonly base: string;
-  private readonly done = new Map<string, OrderResult>();
+  private readonly done = new TerminalMap<OrderResult>({ isTerminal: isTerminalOrder });
 
   constructor(private readonly o: AlpacaBrokerOptions) {
     assertLive("AlpacaBroker", o);

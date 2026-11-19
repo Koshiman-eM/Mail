@@ -6,7 +6,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { redactSecrets } from "../core/http";
 import { createLogger } from "../core/logger";
-import { systemClock, type Clock, type Store } from "../core/types";
+import { systemClock, type Clock, type Store, type TradingMode } from "../core/types";
 import { quoteCurrencyOfSymbol } from "../engine/fx";
 import { exitFxRates, exitReasonCounts, summarizeByStrategy, tradePnlAccount } from "../engine/report";
 import { CAUSE_LABEL } from "../learning/attribution";
@@ -60,14 +60,19 @@ export function parseLimit(v: string | null, def = 50, max = 500): number {
 }
 
 /** トレード一覧 (新しい順) と要因分析 */
-export function tradesPayload(deps: DashboardDeps, limit: number) {
-  const trades = deps.store.listTrades({ limit }).reverse();
+export function tradesPayload(deps: DashboardDeps, limit: number, mode?: TradingMode) {
+  // mode 指定時はその mode だけ (paper と live を混ぜない)。集計 (byStrategy) は mode の全期間、一覧は直近 limit 件
+  const allInMode = mode ? deps.store.listTrades({ mode }).filter((t) => t.mode === mode) : deps.store.listTrades();
+  const trades = allInMode.slice(-limit).reverse();
   const quoteOf = (sym: string) => deps.quoteCurrencyOf?.(sym) ?? quoteCurrencyOfSymbol(sym);
   const toAccount = deps.toAccount;
   // 決済時点の為替 (エンジンの監査ログ)。無ければ現在のレート
-  const rates = trades.length ? exitFxRates(deps.store, trades[trades.length - 1].exitTs) : new Map<string, number>();
+  const rates = allInMode.length ? exitFxRates(deps.store, Math.min(...allInMode.map((t) => t.exitTs))) : new Map<string, number>();
   return {
     baseCurrency: deps.baseCurrency ?? "",
+    ...(mode ? { mode } : {}),
+    /** byStrategy の集計対象 (mode の全期間) の件数。trades は直近 limit 件だけ */
+    totalTrades: allInMode.length,
     trades: trades.map((t) => {
       const att = deps.store.getAttribution(t.id);
       const pnl = toAccount ? tradePnlAccount(t, toAccount, quoteOf(t.symbol), rates.get(t.id)) : undefined;
@@ -106,7 +111,7 @@ export function tradesPayload(deps: DashboardDeps, limit: number) {
           : null,
       };
     }),
-    byStrategy: summarizeByStrategy(trades, toAccount ?? (() => 1), (t) => quoteOf(t.symbol), rates),
+    byStrategy: summarizeByStrategy(allInMode, toAccount ?? (() => 1), (t) => quoteOf(t.symbol), rates),
     exitReasons: exitReasonCounts(trades),
   };
 }
@@ -130,12 +135,12 @@ export interface LiveEvent {
   data: Record<string, string | number | boolean>;
 }
 
-/** 監査ログをライブ画面用に変換する (新しい順。since より後だけ) */
+/** 監査ログをライブ画面用に変換する (新しい順。since 以降。同じミリ秒の記録の取りこぼしを避けるため since 自体を含む。重複はクライアントで除く) */
 export function liveEvents(store: Store, opts: { since?: number; limit: number }): LiveEvent[] {
   const out: LiveEvent[] = [];
   for (const e of store.listAudit({ ...(opts.since !== undefined ? { since: opts.since } : {}), limit: opts.limit * 4 }).slice().sort((a, b) => b.ts - a.ts)) {
     const kind = EVENT_KIND[e.type];
-    if (!kind || (opts.since !== undefined && e.ts <= opts.since)) continue;
+    if (!kind || (opts.since !== undefined && e.ts < opts.since)) continue;
     const data: Record<string, string | number | boolean> = {};
     for (const k of EVENT_FIELDS) {
       const v = (e.data as Record<string, unknown>)[k];
@@ -168,8 +173,19 @@ export async function routeDashboard(deps: DashboardDeps, method: string, rawUrl
         return { status: 200, headers: { ...SECURITY_HEADERS, "content-type": "text/html; charset=utf-8", "content-security-policy": CSP }, body: DASHBOARD_HTML };
       case "/api/status":
         return json(200, await deps.status());
-      case "/api/trades":
-        return json(200, tradesPayload(deps, parseLimit(url.searchParams.get("limit"))));
+      case "/api/trades": {
+        let mode: TradingMode | undefined;
+        const q = url.searchParams.get("mode");
+        if (q === "paper" || q === "live") mode = q;
+        else {
+          // 指定が無ければ現在の mode で絞る (取れなければ絞らない)
+          try {
+            const m = ((await deps.status()) as { mode?: unknown } | null)?.mode;
+            if (m === "paper" || m === "live") mode = m;
+          } catch { /* 絞り込みなしで返す */ }
+        }
+        return json(200, tradesPayload(deps, parseLimit(url.searchParams.get("limit")), mode));
+      }
       case "/api/candles": {
         const symbol = url.searchParams.get("symbol") ?? "";
         const tfs = deps.chartTimeframes?.() ?? [];
@@ -201,14 +217,21 @@ export const isLoopbackHost = (host: string) => ["127.0.0.1", "localhost", "::1"
 const hostForHeader = (h: string) => (h.includes(":") && !h.startsWith("[") ? `[${h}]` : h);
 
 /**
- * 許可する Host ヘッダー: 127.0.0.1:<port>, localhost:<port>, [::1]:<port>。
- * bindHost (DASHBOARD_HOST) が明示的にループバック以外なら、その値:<port> だけを追加で許可する。
+ * 許可する Host ヘッダーの集合。
+ * - 待ち受けがループバック (既定): ホスト名 127.0.0.1 / localhost / [::1] だけを検証し、ポートは問わない
+ *   (SSH 転送で手元のポートが変わっても開けるように。エントリー末尾 ":*" = 任意のポート)。
+ * - ループバック以外を明示 bind した場合 (DASHBOARD_HOST): ループバック名 + その値は従来どおり <host>:<port> に厳密一致。
+ * どちらもホスト名の検証は維持する (DNS rebinding 対策)。
  */
 export function dashboardAllowedHosts(port: number, bindHost?: string): Set<string> {
   const names = ["127.0.0.1", "localhost", "[::1]"];
   const b = bindHost?.trim().toLowerCase();
-  if (b && !isLoopbackHost(b)) names.push(hostForHeader(b));
   const out = new Set<string>();
+  if (!b || isLoopbackHost(b)) {
+    for (const n of names) out.add(`${n}:*`);
+    return out;
+  }
+  names.push(hostForHeader(b));
   for (const n of names) {
     out.add(`${n}:${port}`);
     if (port === 80) out.add(n); // 既定ポートではブラウザーがポートを省く
@@ -216,16 +239,57 @@ export function dashboardAllowedHosts(port: number, bindHost?: string): Set<stri
   return out;
 }
 
+/** Host ヘッダー → [ホスト名, ポート文字列 ("" = 省略)]。形式が不正なら undefined */
+function splitHost(h: string): [string, string] | undefined {
+  const m = /^(\[[0-9a-f:.]+\]|[^:\[\]\s]+)(?::(\d{1,5}))?$/.exec(h);
+  return m ? [m[1], m[2] ?? ""] : undefined;
+}
+
 /** Host ヘッダーが許可リストにあるか (大文字小文字は区別しない。欠落は不許可) */
 export function isAllowedHost(hostHeader: string | string[] | undefined, allowed: Set<string>): boolean {
   if (typeof hostHeader !== "string") return false;
   const h = hostHeader.trim().toLowerCase();
-  return h !== "" && allowed.has(h);
+  if (h === "") return false;
+  if (allowed.has(h)) return true;
+  const sp = splitHost(h);
+  return sp !== undefined && allowed.has(`${sp[0]}:*`);
 }
 
 export interface DashboardHandlerOptions {
   /** 許可する Host (省略時は req.socket.localPort からループバック名だけを許可) */
   allowedHosts?: Set<string>;
+}
+
+const STATUS_TTL_MS = 2_000;
+const LEARNING_TTL_MS = 30_000;
+
+/**
+ * 重い取得 (status はブローカー API を呼ぶことがある / learning snapshot は集計) の短いキャッシュ。
+ * 失敗はキャッシュしない。同時の呼び出しは同じ Promise を共有する。サーバー単位で 1 つ作る。
+ */
+export function withDashboardCaches(deps: DashboardDeps, nowMs: () => number = Date.now): DashboardDeps {
+  let st: { at: number; p: Promise<unknown> } | undefined;
+  let le: { at: number; v: ReturnType<DashboardDeps["learning"]["snapshot"]> } | undefined;
+  return {
+    ...deps,
+    status: () => {
+      const t = nowMs();
+      if (st && t - st.at < STATUS_TTL_MS) return st.p;
+      const entry = { at: t, p: Promise.resolve().then(() => deps.status()) };
+      st = entry;
+      entry.p.catch(() => { if (st === entry) st = undefined; });
+      return entry.p;
+    },
+    learning: {
+      snapshot: (...args: Parameters<DashboardDeps["learning"]["snapshot"]>) => {
+        const t = nowMs();
+        if (le && t - le.at < LEARNING_TTL_MS) return le.v;
+        const v = deps.learning.snapshot(...args);
+        le = { at: t, v };
+        return v;
+      },
+    },
+  };
 }
 
 const forbidden = (): DashboardResponse => json(403, { error: "許可されていない Host です" });
@@ -235,11 +299,12 @@ export function createDashboardHandler(
   deps: DashboardDeps,
   opts: DashboardHandlerOptions = {},
 ): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
+  const cached = withDashboardCaches(deps);
   return async (req, res) => {
     const port = req.socket?.localPort;
     const allowed = opts.allowedHosts ?? (port !== undefined ? dashboardAllowedHosts(port) : new Set<string>());
     const r = isAllowedHost(req.headers?.host, allowed)
-      ? await routeDashboard(deps, req.method ?? "GET", req.url ?? "/")
+      ? await routeDashboard(cached, req.method ?? "GET", req.url ?? "/")
       : forbidden();
     res.writeHead(r.status, r.headers);
     res.end(req.method === "HEAD" ? undefined : r.body);

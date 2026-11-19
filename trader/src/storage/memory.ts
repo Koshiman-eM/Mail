@@ -10,6 +10,7 @@ import type {
   ParamAdjustment,
   ShadowTradeFilter,
   ShadowTradeRecord,
+  OperationalCutoffs,
   Store,
   StrategyPlan,
   TradeAttribution,
@@ -151,13 +152,48 @@ export class MemoryStore implements Store {
     this.adjustments.set(a.id, clone(a));
   }
 
-  listAdjustments(opts: { strategyId?: string; status?: ParamAdjustment["status"] } = {}): ParamAdjustment[] {
+  listAdjustments(opts: { strategyId?: string; status?: ParamAdjustment["status"]; limit?: number } = {}): ParamAdjustment[] {
     const items = [...this.adjustments.values()].filter(
       (a) =>
         (opts.strategyId === undefined || a.strategyId === opts.strategyId) &&
         (opts.status === undefined || a.status === opts.status),
     );
-    return latest(items, (a) => a.createdAt);
+    return latest(items, (a) => a.createdAt, opts.limit);
+  }
+
+  pruneOperational(c: OperationalCutoffs): Record<keyof OperationalCutoffs, number> {
+    const out = { audit: 0, intel: 0, briefs: 0, plans: 0, equity: 0 };
+    if (c.audit !== undefined) {
+      const n = this.audits.length;
+      this.audits = this.audits.filter((e) => e.ts >= c.audit!);
+      out.audit = n - this.audits.length;
+    }
+    if (c.intel !== undefined) {
+      for (const [id, it] of this.intel) {
+        if (it.fetchedAt < c.intel) {
+          this.intel.delete(id);
+          out.intel++;
+        }
+      }
+    }
+    const keepNewest = <T>(arr: T[], ts: (x: T) => number, cutoff: number | undefined): T[] => {
+      if (cutoff === undefined || arr.length === 0) return arr;
+      let newest = arr[0];
+      for (const x of arr) if (ts(x) >= ts(newest)) newest = x;
+      return arr.filter((x) => x === newest || ts(x) >= cutoff);
+    };
+    const nb = this.briefs.length;
+    this.briefs = keepNewest(this.briefs, (b) => b.generatedAt, c.briefs);
+    out.briefs = nb - this.briefs.length;
+    const np = this.plans.length;
+    this.plans = keepNewest(this.plans, (p) => p.generatedAt, c.plans);
+    out.plans = np - this.plans.length;
+    if (c.equity !== undefined) {
+      const n = this.equity.length;
+      this.equity = this.equity.filter((p) => p.ts >= c.equity!);
+      out.equity = n - this.equity.length;
+    }
+    return out;
   }
 
   saveEquity(p: EquityPoint): void {

@@ -57,6 +57,8 @@ export interface LearningServiceDeps {
   newsCheck?: Partial<NewsCheckOptions>;
   /** 決済済みの仮想トレードを残す期間 (既定 30 日。periodic で古いものを消す) */
   shadowRetentionMs?: number;
+  /** 運用ログ系の保持期間 (既定: audit/intel/briefs/plans 30 日、equity 180 日) */
+  operationalRetention?: { auditMs?: number; intelMs?: number; briefsMs?: number; plansMs?: number; equityMs?: number };
   /** 値動きの予想の集計を読む mode (エンジンが予想を attachForecast していないとき。省略時は記録の多い方) */
   mode?: TradingMode;
 }
@@ -206,6 +208,27 @@ export class LearningService {
     return this.forecastTracker ? this.forecastTracker.summary(now) : loadForecastSummary(this.store, now, this.deps.mode);
   }
 
+  private lastOperationalPrune = 0;
+
+  /** 運用ログの剪定 (1 時間に 1 回まで。失敗しても学習の定期処理は止めない) */
+  private pruneOperational(now: number): void {
+    if (now - this.lastOperationalPrune < 3_600_000) return;
+    this.lastOperationalPrune = now;
+    const r = this.deps.operationalRetention ?? {};
+    const DAY = 86_400_000;
+    try {
+      this.store.pruneOperational({
+        audit: now - (r.auditMs ?? 30 * DAY),
+        intel: now - (r.intelMs ?? 30 * DAY),
+        briefs: now - (r.briefsMs ?? 30 * DAY),
+        plans: now - (r.plansMs ?? 30 * DAY),
+        equity: now - (r.equityMs ?? 180 * DAY),
+      });
+    } catch (e) {
+      log.warn("運用ログの剪定に失敗 (学習は継続)", { error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
   /** 定期処理 (学習ループから呼ぶ)。同時実行はスキップ */
   async periodic(now: number): Promise<PeriodicResult> {
     if (this.running) return { postExitFilled: 0, reattributed: 0, reverted: [], adjustments: [], skipped: true };
@@ -232,6 +255,8 @@ export class LearningService {
 
       // 1b. 古い仮想トレードを消す (集計は直近だけを見る)
       this.store.pruneShadowTrades(now - (this.deps.shadowRetentionMs ?? 30 * 86_400_000));
+      // 1c. 運用ログ系 (監査・ニュース・ブリーフ・計画・資産推移) の古い行を消す。学習データは消さない
+      this.pruneOperational(now);
 
       // 2. 適用済み調整の事後評価 (悪化していれば元に戻す)
       res.reverted = this.tuner.reviewApplied(now);
@@ -312,7 +337,7 @@ export class LearningService {
       generatedAt: now,
       arms: this.allocator.snapshot(),
       lessons: this.store.listLessons({ status: "active", limit: opts.lessonLimit ?? 20 }),
-      adjustments: this.store.listAdjustments().slice(-(opts.adjustmentLimit ?? 20)),
+      adjustments: this.store.listAdjustments({ limit: opts.adjustmentLimit ?? 20 }),
       sources: this.reliability.all(),
       intelInfluence: Object.fromEntries(ASSET_CLASSES.map((c) => [c, this.reliability.intelInfluence(c)])) as Record<AssetClass, number>,
       causes: this.causeSummary(now - (opts.causeWindowMs ?? 30 * 86_400_000)),

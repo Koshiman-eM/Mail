@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { loadConfig } from "../src/core/config";
 import type { IntelItem, Signal, Strategy, StrategyContext } from "../src/core/types";
 import {
-  createDashboardHandler, dashboardAllowedHosts, isAllowedHost, parseLimit, routeDashboard, startDashboard, type DashboardDeps,
+  createDashboardHandler, dashboardAllowedHosts, isAllowedHost, parseLimit, routeDashboard, startDashboard, withDashboardCaches, type DashboardDeps,
 } from "../src/dashboard/server";
 import { briefHeadlines } from "../src/engine/engine";
 import { buildRuntime } from "../src/engine/setup";
@@ -70,7 +70,8 @@ describe("ダッシュボード (listen せずにハンドラーを呼ぶ)", () 
     expect(r.events[0].kind).toBe("order");
     expect(r.events[0].data.reason).not.toMatch(/abcdef123456|deadbeef/);
     const later = JSON.parse((await routeDashboard(d, "GET", "/api/events?since=1000")).body);
-    expect(later.events.map((e: { ts: number }) => e.ts)).toEqual([2000]);
+    // since と同じミリ秒の記録も返す (取りこぼし防止。重複はクライアントで除く)
+    expect(later.events.map((e: { ts: number }) => e.ts)).toEqual([2000, 1000]);
   });
 
   it("GET /api/candles: 監視銘柄のローソク足を時間足ごとに返し、監視外の銘柄・時間足は 404", async () => {
@@ -235,7 +236,10 @@ describe("ダッシュボード (listen せずにハンドラーを呼ぶ)", () 
     expect(html).toContain("ニュースと値動きの答え合わせ");
     expect(html).toMatch(/BY REASON[\s\S]*'<div class="scroll">'/);
     expect(html).toContain("仮想平均R");
-    expect(html).toContain("setInterval(refresh, 5000)");
+    expect(html).toContain("setTimeout(pollCycle, POLL_MS)");
+    expect(html).not.toContain("setInterval(refresh");
+    expect(html).toContain("IntersectionObserver");
+    expect(html).toContain("order.manual_resolve");
     expect(html).toContain('name="color-scheme" content="dark"');
     // ボードタブ (コックピット風の一覧)
     expect(html).toContain("TRADER <i>//</i> AUTO");
@@ -327,31 +331,42 @@ function getWithHost(port: number, path: string, host: string): Promise<{ status
 }
 
 describe("ダッシュボード: Host 検証 (DNS rebinding 対策) と 500 応答", () => {
-  it("許可 Host はループバック名 + ポート。DASHBOARD_HOST が別の値ならその値だけ追加", () => {
+  it("許可 Host: ループバック待ち受けならホスト名だけ (ポート不問)。ループバック以外を bind したら <host>:<port> に厳密", () => {
     const a = dashboardAllowedHosts(8787);
-    expect([...a].sort()).toEqual(["127.0.0.1:8787", "[::1]:8787", "localhost:8787"]);
+    expect([...a].sort()).toEqual(["127.0.0.1:*", "[::1]:*", "localhost:*"]);
     expect(dashboardAllowedHosts(8787, "127.0.0.1")).toEqual(a);
     expect(dashboardAllowedHosts(8787, "localhost")).toEqual(a);
     expect(dashboardAllowedHosts(8787, "::1")).toEqual(a);
     const lan = dashboardAllowedHosts(8787, "192.168.1.5");
     expect(lan.has("192.168.1.5:8787")).toBe(true);
+    expect(lan.has("localhost:8787")).toBe(true);
     expect(lan.size).toBe(4);
     expect(dashboardAllowedHosts(8787, "fe80::1").has("[fe80::1]:8787")).toBe(true);
-    // 既定ポート 80 ではポート省略も許可
-    expect(dashboardAllowedHosts(80).has("localhost")).toBe(true);
-    expect(dashboardAllowedHosts(8787).has("localhost")).toBe(false);
+    // 既定ポート 80 ではポート省略も許可 (厳密モード)
+    expect(dashboardAllowedHosts(80, "192.168.1.5").has("localhost")).toBe(true);
+    expect(dashboardAllowedHosts(8787, "192.168.1.5").has("localhost")).toBe(false);
   });
 
-  it("isAllowedHost: 大文字小文字は無視、欠落・別ポート・別名は不許可", () => {
+  it("isAllowedHost: 大文字小文字は無視。ループバックならポート違いは許可、欠落・別名・不正形式は不許可", () => {
     const a = dashboardAllowedHosts(8787);
     expect(isAllowedHost("LOCALHOST:8787", a)).toBe(true);
     expect(isAllowedHost(" 127.0.0.1:8787 ", a)).toBe(true);
+    expect(isAllowedHost("127.0.0.1:9999", a)).toBe(true);
+    expect(isAllowedHost("localhost", a)).toBe(true);
+    expect(isAllowedHost("[::1]:5555", a)).toBe(true);
     expect(isAllowedHost(undefined, a)).toBe(false);
     expect(isAllowedHost("", a)).toBe(false);
     expect(isAllowedHost(["127.0.0.1:8787"], a)).toBe(false);
-    expect(isAllowedHost("127.0.0.1:9999", a)).toBe(false);
     expect(isAllowedHost("attacker.example:8787", a)).toBe(false);
     expect(isAllowedHost("localhost.attacker.example:8787", a)).toBe(false);
+    expect(isAllowedHost("localhost:80:80", a)).toBe(false);
+    expect(isAllowedHost("localhost:abc", a)).toBe(false);
+    expect(isAllowedHost("evil.example:8787", dashboardAllowedHosts(8787, "127.0.0.1"))).toBe(false);
+    // 厳密モード: ポート違いは不許可
+    const lan = dashboardAllowedHosts(8787, "192.168.1.5");
+    expect(isAllowedHost("192.168.1.5:8787", lan)).toBe(true);
+    expect(isAllowedHost("192.168.1.5:9999", lan)).toBe(false);
+    expect(isAllowedHost("127.0.0.1:9999", lan)).toBe(false);
   });
 
   it("ハンドラー: 許可外の Host は 403 (本文は返さない)。localPort が分からなければ拒否", async () => {
@@ -378,10 +393,51 @@ describe("ダッシュボード: Host 検証 (DNS rebinding 対策) と 500 応�
       const evil = await getWithHost(port, "/api/status", `attacker.example:${port}`);
       expect(evil.status).toBe(403);
       expect(evil.body).not.toContain("ok");
-      expect((await getWithHost(port, "/", "127.0.0.1:1")).status).toBe(403);
+      // ループバック待ち受けではポートは問わない (SSH 転送で手元のポートが違っても開ける)
+      expect((await getWithHost(port, "/api/status", "127.0.0.1:1")).status).toBe(200);
+      expect((await getWithHost(port, "/api/status", "attacker.example:1")).status).toBe(403);
     } finally {
       await srv.close();
     }
+  });
+
+  it("status は 2 秒、learning は 30 秒キャッシュする (失敗は残さない)", async () => {
+    let sCalls = 0, lCalls = 0, t = 1_000_000;
+    const base = { status: async () => ({ n: ++sCalls }), store: new MemoryStore(), learning: { snapshot: () => ({ n: ++lCalls }) } } as unknown as DashboardDeps;
+    const c = withDashboardCaches(base, () => t);
+    await c.status(); await c.status();
+    expect(sCalls).toBe(1);
+    t += 2_100; await c.status();
+    expect(sCalls).toBe(2);
+    c.learning.snapshot({ now: 1 }); t += 100; c.learning.snapshot({ now: 2 });
+    expect(lCalls).toBe(1);
+    t += 30_000; c.learning.snapshot({ now: 3 });
+    expect(lCalls).toBe(2);
+    let fail = true;
+    const f = withDashboardCaches({ ...base, status: async () => { if (fail) throw new Error("x"); return {}; } } as DashboardDeps, () => t);
+    await expect(f.status()).rejects.toThrow();
+    fail = false;
+    await expect(f.status()).resolves.toEqual({});
+  });
+
+  it("GET /api/trades: 現在の mode (または ?mode=) の取引だけ。集計は mode の全期間", async () => {
+    const store = new MemoryStore();
+    const mk = (id: string, mode: "paper" | "live", ts: number) => ({
+      id, mode, symbol: "BTC/USDT", assetClass: "crypto", strategyId: "s", horizon: "scalp", direction: "long", qty: 1, entryTs: ts - 1, entryPrice: 1,
+      exitTs: ts, exitPrice: 2, exitReason: "signal", netPnl: 1, fees: 0.1, rMultiple: 1, returnPct: 1, mfePct: 1, maePct: 0,
+      entryContext: { regime: { label: "range" }, reason: "t" },
+    }) as never;
+    for (let i = 0; i < 5; i++) store.saveTrade(mk(`p${i}`, "paper", 1000 + i));
+    for (let i = 0; i < 3; i++) store.saveTrade(mk(`l${i}`, "live", 2000 + i));
+    const d = { status: () => ({ mode: "live" }), store, learning: { snapshot: () => ({}) } } as unknown as DashboardDeps;
+    const live = JSON.parse((await routeDashboard(d, "GET", "/api/trades?limit=2")).body);
+    expect(live.mode).toBe("live");
+    expect(live.trades.map((t: { id: string }) => t.id)).toEqual(["l2", "l1"]);
+    expect(live.totalTrades).toBe(3);
+    expect(live.byStrategy[0].trades).toBe(3);
+    const paper = JSON.parse((await routeDashboard(d, "GET", "/api/trades?limit=100&mode=paper")).body);
+    expect(paper.trades).toHaveLength(5);
+    expect(paper.byStrategy[0].trades).toBe(5);
   });
 
   it("500 応答に内部エラーの本文を出さない", async () => {

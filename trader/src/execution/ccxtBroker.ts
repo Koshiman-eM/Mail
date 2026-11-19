@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import { TerminalMap, isTerminalOrder } from "../core/sweep";
 import { D, Decimal, floorToStep } from "../core/decimal";
 import { createLogger } from "../core/logger";
 import { assertLive, type LiveGuard } from "./guard";
@@ -165,7 +166,14 @@ export class CcxtBroker implements Broker {
   readonly mode = "live" as const;
   private readonly ex: CcxtTradeLike;
   private readonly inst = new Map<string, Instrument>();
-  private readonly done = new Map<string, OrderResult>();
+  private readonly done = new TerminalMap<OrderResult>({
+    isTerminal: isTerminalOrder,
+    // 確定済みの注文を消すときだけ、関連する clientId の情報も消す (未確定分は残る)
+    onEvict: (cid) => {
+      this.orderIds.delete(cid);
+      this.sentQty.delete(cid);
+    },
+  });
   /** clientId -> 取引所の注文 ID (getOrder の照会用) */
   private readonly orderIds = new Map<string, string>();
   /** clientId -> 実際に送った数量 (reduceOnly で丸めた後。getOrder の突き合わせ用) */

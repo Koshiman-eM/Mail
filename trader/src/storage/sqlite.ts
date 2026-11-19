@@ -13,6 +13,7 @@ import type {
   ParamAdjustment,
   ShadowTradeFilter,
   ShadowTradeRecord,
+  OperationalCutoffs,
   Store,
   StrategyPlan,
   TradeAttribution,
@@ -382,11 +383,25 @@ export class SqliteStore implements Store {
     ).run(a.id, a.createdAt, a.strategyId, a.assetClass, a.param, a.status, JSON.stringify(a));
   }
 
-  listAdjustments(opts: { strategyId?: string; status?: ParamAdjustment["status"] } = {}): ParamAdjustment[] {
+  listAdjustments(opts: { strategyId?: string; status?: ParamAdjustment["status"]; limit?: number } = {}): ParamAdjustment[] {
     const w = new Where();
     if (opts.strategyId !== undefined) w.add("strategyId = ?", opts.strategyId);
     if (opts.status !== undefined) w.add("status = ?", opts.status);
-    return this.listLatest<ParamAdjustment>("adjustments", "createdAt", w, undefined);
+    return this.listLatest<ParamAdjustment>("adjustments", "createdAt", w, opts.limit);
+  }
+
+  // ───────── 運用ログの剪定 (学習データは対象外) ─────────
+
+  pruneOperational(c: OperationalCutoffs): Record<keyof OperationalCutoffs, number> {
+    const run = (sql: string, v: number | undefined): number => (v === undefined ? 0 : Number(this.stmt(sql).run(v).changes));
+    return {
+      audit: run("DELETE FROM audit WHERE ts < ?", c.audit),
+      intel: run("DELETE FROM intel WHERE fetchedAt < ?", c.intel),
+      // 最新の 1 件は (長く止まっていても) 残す
+      briefs: run("DELETE FROM briefs WHERE generatedAt < ? AND id <> (SELECT id FROM briefs ORDER BY generatedAt DESC, id DESC LIMIT 1)", c.briefs),
+      plans: run("DELETE FROM plans WHERE generatedAt < ? AND id <> (SELECT id FROM plans ORDER BY generatedAt DESC, id DESC LIMIT 1)", c.plans),
+      equity: run("DELETE FROM equity WHERE ts < ?", c.equity),
+    };
   }
 
   // ───────── equity ─────────

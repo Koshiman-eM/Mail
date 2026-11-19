@@ -28,6 +28,9 @@ export interface IntelServiceOptions {
   logger?: Logger;
 }
 
+/** AI 分析結果のキャッシュの最大件数 */
+const AI_CACHE_MAX = 2000;
+
 export class IntelService {
   private readonly log: Logger;
   private events: EconEvent[];
@@ -82,7 +85,16 @@ export class IntelService {
     const analyzed = new Map(items.map((i) => [i.id, i]));
     for (const id of aiAnalyzedIds) {
       const it = analyzed.get(id);
-      if (it) this.aiCache.set(id, { sentiment: it.sentiment, importance: it.importance, assets: it.assets });
+      if (it) {
+        this.aiCache.delete(id); // 挿入順を最新にする
+        this.aiCache.set(id, { sentiment: it.sentiment, importance: it.importance, assets: it.assets });
+      }
+    }
+    // 上限を超えたら古い順に捨てる (捨てても次回の分析で再計算されるだけ)
+    while (this.aiCache.size > AI_CACHE_MAX) {
+      const oldest = this.aiCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.aiCache.delete(oldest);
     }
     store.saveBrief(brief);
     return brief;

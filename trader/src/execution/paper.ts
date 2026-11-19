@@ -1,4 +1,5 @@
 import { D, floorToStep, roundToStep, Decimal } from "../core/decimal";
+import { TerminalMap, isTerminalOrder } from "../core/sweep";
 import { createLogger } from "../core/logger";
 import {
   systemClock, type Balance, type Broker, type BrokerPosition, type Clock, type Fill, type Instrument, type OrderRequest, type OrderResult, type Quote,
@@ -70,7 +71,7 @@ export class PaperBroker implements Broker {
   private seq = 0;
   private positions = new Map<string, Pos>();
   private resting = new Map<string, RestingOrder>();
-  private results = new Map<string, OrderResult>(); // clientId -> 結果 (冪等性)
+  private results = new TerminalMap<OrderResult>({ isTerminal: isTerminalOrder }); // clientId -> 結果 (冪等性)
   private quotes = new Map<string, Quote>();
   /** 最後に分かった換算レート (クオート通貨 -> 口座通貨) */
   private lastRates = new Map<string, Decimal>();
@@ -386,7 +387,8 @@ export class PaperBroker implements Broker {
     this.seq = s.seq;
     this.positions = new Map(s.positions.map((p) => [p.symbol, { qty: D(p.qty), avg: D(p.avg), openedAt: p.openedAt }]));
     this.resting = new Map(s.resting.map((r) => [r.orderId, { orderId: r.orderId, req: r.req, qty: D(r.qty), limitPrice: D(r.limitPrice), createdAt: r.createdAt }]));
-    this.results = new Map(Object.entries(s.results));
+    this.results = new TerminalMap<OrderResult>({ isTerminal: isTerminalOrder });
+    for (const [k, v] of Object.entries(s.results)) this.results.set(k, v);
     this.quotes = new Map(Object.entries(s.quotes));
     for (const i of s.instruments ?? []) {
       if (i && typeof i.symbol === "string" && !this.inst.has(i.symbol)) this.inst.set(i.symbol, i);

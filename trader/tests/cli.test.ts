@@ -62,6 +62,26 @@ describe("CLI の引数解析", () => {
     expect(await main(["simulate", "--days", "x"], c.io)).toBe(2);
     expect(c.err[0]).toMatch(/^エラー: --days/);
   });
+
+  it("読み取り系コマンドは DB ファイルが無ければ新規作成せずエラー", async () => {
+    const { existsSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dbPath = join(tmpdir(), `nonexistent-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    const old = process.env.DB_PATH;
+    process.env.DB_PATH = dbPath;
+    try {
+      for (const argv of [["status"], ["report"], ["orders"], ["resume"]]) {
+        const d = io();
+        expect(await main(argv, d.io)).toBe(2);
+        expect(d.err.join("\n")).toMatch(/DB_PATH が見つかりません: .*作業ディレクトリを確認してください/);
+      }
+      expect(existsSync(dbPath)).toBe(false);
+    } finally {
+      if (old === undefined) delete process.env.DB_PATH;
+      else process.env.DB_PATH = old;
+    }
+  });
 });
 
 describe("simulate コマンド", () => {

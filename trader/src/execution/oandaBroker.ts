@@ -1,4 +1,5 @@
 import { D, Decimal } from "../core/decimal";
+import { TerminalMap, isTerminalOrder } from "../core/sweep";
 import { fetchJson, HttpError, redactSecrets, type FetchOptions } from "../core/http";
 import { createLogger } from "../core/logger";
 import { OANDA_HOSTS, toOandaSymbol, fromOandaSymbol, parseOandaTime } from "../market/feeds/oanda";
@@ -26,7 +27,7 @@ export class OandaBroker implements Broker {
   readonly venue = "oanda";
   readonly mode = "live" as const;
   private readonly base: string;
-  private readonly done = new Map<string, OrderResult>();
+  private readonly done = new TerminalMap<OrderResult>({ isTerminal: isTerminalOrder });
   private readonly inst = new Map<string, Instrument>();
   /** 口座通貨 (commission の通貨)。getBalance か発注前に取得してキャッシュする */
   private homeCcy?: string;

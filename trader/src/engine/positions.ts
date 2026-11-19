@@ -1,5 +1,6 @@
 import { D, Decimal } from "../core/decimal";
 import { redactSecrets } from "../core/http";
+import { sweepOld } from "../core/sweep";
 import { createLogger, type Logger } from "../core/logger";
 import type {
   Broker, BrokerPosition, ExitReason, Fill, Instrument, OrderRequest, OrderResult, PositionView, Quote, Store, TradeRecord,
@@ -217,6 +218,7 @@ export class PositionManager {
   private seq = 0;
   private readonly closing = new Set<string>();
   private readonly lastAudit = new Map<string, number>();
+  private lastAuditSweep = 0;
   private readonly log: Logger;
   private readonly plansKey: string;
   readonly policy: OrderPolicy;
@@ -1263,6 +1265,10 @@ export class PositionManager {
     const last = this.lastAudit.get(key);
     if (last !== undefined && now - last < AUDIT_THROTTLE_MS) return;
     this.lastAudit.set(key, now);
+    if (this.lastAudit.size > 200 || now - this.lastAuditSweep > 60_000) {
+      this.lastAuditSweep = now;
+      sweepOld(this.lastAudit, now, 10 * 60_000);
+    }
     this.deps.store?.audit({ ts: now, type, data });
   }
 }

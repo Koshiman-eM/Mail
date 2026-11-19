@@ -37,6 +37,11 @@ header.top { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px 24px
 .rb.live { color: #fff; border-color: var(--r); background: var(--r); box-shadow: 0 0 12px rgba(255,93,108,.5); }
 .sub2 { display: flex; flex-wrap: wrap; gap: 2px 14px; font-size: 10.5px; letter-spacing: .1em; color: var(--mut); margin-top: 2px; }
 .rk { font-weight: 700; } .rk.ok { color: var(--g); } .rk.warn { color: var(--y); } .rk.ng { color: var(--r); }
+.rk.stale { color: #0b0f1a; background: #ff9f43; padding: 0 6px; border-radius: 3px; }
+.alert { margin: 8px 12px; padding: 8px 12px; border: 1px solid var(--y); border-left-width: 4px; border-radius: 4px; background: rgba(245,197,66,.08); font-size: 12.5px; line-height: 1.6; overflow-wrap: anywhere; }
+.alert[hidden] { display: none; }
+.alert.ng { border-color: var(--r); background: rgba(255,93,108,.09); } .alert.stale { border-color: #ff9f43; background: rgba(255,159,67,.1); }
+.alert b { color: var(--fg, #e6edf7); } .alert code { display: block; margin: 2px 0 6px; padding: 3px 6px; background: rgba(0,0,0,.35); border-radius: 3px; font-size: 11.5px; user-select: all; }
 .dots { display: none; color: var(--hi); font-size: 15px; letter-spacing: .5em; text-align: center; white-space: nowrap; }
 .ctrs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px 10px; }
 .ctr { min-width: 0; }
@@ -347,6 +352,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     <div class="ctr clock"><div class="v" id="clock">--:--:--</div><span class="tz">JST</span></div>
   </div>
 </header>
+<div id="alert" class="alert" role="alert" hidden></div>
 <nav id="tabs" role="tablist" aria-label="表示の切り替え">
   <button type="button" role="tab" data-tab="board">◆ BOARD <span class="j hide-s">ボード</span></button>
   <button type="button" role="tab" data-tab="overview">概要</button>
@@ -553,7 +559,10 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
   function toneOf(x) { return x >= 0.3 ? ["強気", "bull"] : x >= 0.1 ? ["やや強気", "bull"] : x <= -0.3 ? ["弱気", "bear"] : x <= -0.1 ? ["やや弱気", "bear"] : ["中立", ""]; }
 
   // ───── 状態 ─────
-  var S = null, TR = null, LE = null, EV = [], evSince = 0, evBooted = false, cur = "board";
+  var S = null, TR = null, LE = null, EV = [], evSince = 0, evBooted = false, evSeen = {}, evInflight = null, cur = "board";
+  // ポーリングの状態 (status の連続失敗数・最後に status を取れた時刻・learning の最終取得)
+  var POLL = { busy: false, timer: 0, fails: 0, lastOk: 0, lastLearn: 0 };
+  var POLL_MS = 5000, LEARN_MS = 45000, LEARN_TAB_MS = 15000, STALE_FAILS = 3, STALE_DEFAULT_MS = 20000;
   function animOK() { return cur === "board" && !document.hidden; }
   function tradeStats() {
     var o = { n: 0, wins: 0, losses: 0, pnl: 0, fees: 0, winRate: null };
@@ -598,10 +607,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     m.textContent = s.mode === "live" ? "RUN · LIVE" : "RUN · PAPER";
     m.className = "rb " + (s.mode === "live" ? "live" : "paper");
     m.title = s.mode === "live" ? "実弾 (LIVE)" : "ペーパー (仮想の資金)";
-    var rb = $("riskBadge");
-    if (s.risk.killSwitch) { rb.textContent = "● KILL SWITCH キルスイッチ作動中"; rb.className = "rk ng"; }
-    else if (s.risk.halted) { rb.textContent = "● HALTED 新規停止中"; rb.className = "rk warn"; }
-    else { rb.textContent = "● ACTIVE 稼働中"; rb.className = "rk ok"; }
+    renderBadge();
     set("kEq", 'EQUITY <span class="j">' + esc(s.baseCurrency) + "</span>");
     countTo($("cEq"), s.equity.current, big);
     var diff = s.equity.current - s.equity.initial, pe = $("cPnl");
@@ -612,10 +618,52 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     countTo($("cTr"), st.n, function (v) { return num(Math.round(v), 0); });
     countTo($("cTick"), s.tickCount, function (v) { return num(Math.round(v), 0); });
   }
+
+  // ───── 状態バッジと警告 (キルスイッチ・停止=赤 / 新規停止・状態不明の注文=黄 / 更新停止=橙) ─────
+  function staleReason() {
+    if (POLL.fails >= STALE_FAILS) return "状態の取得に " + POLL.fails + " 回連続で失敗しています";
+    if (!S || document.hidden) return "";
+    var tickMs = typeof S.tickMs === "number" && S.tickMs > 0 ? S.tickMs : 0;
+    var limit = tickMs ? tickMs * 3 : STALE_DEFAULT_MS;
+    if (typeof S.lastTickAt === "number" && typeof S.now === "number" && S.now - S.lastTickAt > limit) return "エンジンの最終 tick が " + Math.round((S.now - S.lastTickAt) / 1000) + " 秒前です";
+    if (POLL.lastOk && Date.now() - POLL.lastOk > Math.max(limit, 3 * POLL_MS)) return "状態を " + Math.round((Date.now() - POLL.lastOk) / 1000) + " 秒間取得できていません";
+    return "";
+  }
+  function renderBadge() {
+    var s = S, rb = $("riskBadge"), box = $("alert");
+    if (!s) { return; }
+    var stale = staleReason(), esc2 = (s.pendingOrders || []).filter(function (o) { return o.escalated; });
+    var paused = s.risk.entriesPaused, ids = esc2.map(function (o) { return o.clientId; });
+    if (paused && paused.orders) paused.orders.forEach(function (id) { if (ids.indexOf(id) < 0) ids.push(id); });
+    var html = "", kind = "";
+    if (s.risk.killSwitch) { rb.textContent = "● KILL SWITCH キルスイッチ作動中"; rb.className = "rk ng"; kind = "ng"; html += "<b>キルスイッチ作動中</b>: " + esc(s.risk.killSwitch.reason || "") + " (手動の resume まで新規停止)<br>"; }
+    else if (s.risk.halted) { rb.textContent = "● HALTED 停止中"; rb.className = "rk ng"; kind = "ng"; html += "<b>停止中</b>: " + esc(s.risk.reason || "") + "<br>"; }
+    else if (paused || ids.length) { rb.textContent = "● PAUSED 新規停止中 (状態不明の注文)"; rb.className = "rk warn"; kind = "warn"; }
+    else { rb.textContent = "● ACTIVE 稼働中"; rb.className = "rk ok"; }
+    if (ids.length) {
+      if (!kind || kind === "warn") kind = "warn";
+      html += "<b>状態不明の注文があります (新規エントリーを停止中)</b>。取引所で約定の有無を確認し、次のコマンドで解消してください:<br>";
+      ids.forEach(function (id) {
+        var o = null; esc2.forEach(function (x) { if (x.clientId === id) o = x; });
+        html += "<span>" + esc(id) + (o ? " (" + esc(o.symbol + " " + (o.kind === "exit" ? "決済" : "新規") + ", 不明 " + o.unknownCount + " 回") + ")" : "") + "</span>" +
+          "<code>npm run trader -- orders resolve " + esc(id) + " --none|--filled --qty &lt;数量&gt; --price &lt;価格&gt;</code>";
+      });
+      html += '<span class="muted">約定していない: --none / 約定した: --filled --qty 数量 --price 価格</span>';
+    }
+    if (stale) {
+      rb.textContent = "● STALE 更新停止"; rb.className = "rk stale";
+      html = "<b>STALE / 更新停止</b>: " + esc(stale) + " (表示は古い可能性があります)<br>" + html;
+      kind = kind === "ng" ? "ng" : "stale";
+    }
+    box.hidden = !html;
+    box.className = "alert" + (kind ? " " + kind : "");
+    set("alert", html);
+  }
   function tickClock() {
     if (document.hidden) return;
     var t = new Date(Date.now() + 9 * 3600000);
     $("clock").textContent = pad2(t.getUTCHours()) + ":" + pad2(t.getUTCMinutes()) + ":" + pad2(t.getUTCSeconds());
+    try { renderBadge(); } catch (e) { /* 次の秒で再試行 */ }
   }
 
   // ───── 監査ログの文言 ─────
@@ -639,6 +687,13 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
       case "learning.param_adjust": return "パラメータ調整 " + (d.strategyId || "") + " " + (d.param || "") + " " + (d.from != null ? d.from + "→" + d.to : "");
       case "learning.param_revert": return "パラメータを元に戻す " + (d.strategyId || "") + " " + (d.param || "");
       case "learning.reflect": return "振り返りを実行";
+      case "order.resolved_by_position": return (d.symbol || "") + " 注文の状態を建玉の確認で解消";
+      case "order.manual_resolve": return (d.symbol || "") + " 注文の状態を手動で解消" + (d.status ? " (" + d.status + ")" : "");
+      case "engine.kill_switch_close": return (d.symbol || "") + " キルスイッチで強制決済";
+      case "engine.account_degraded": return "口座情報の取得が劣化 (一部の口座を取得できません)" + (d.reason ? ": " + d.reason : "");
+      case "engine.learning": return "学習を実行" + (d.reason ? ": " + d.reason : "");
+      case "engine.intel_error": return "情報収集でエラー" + (d.reason ? ": " + d.reason : "");
+      case "reconcile.external_close": return (d.symbol || "") + " 外部で決済された建玉を検出";
       case "engine.start": return "エンジン起動";
       case "engine.stop": return "エンジン停止";
       default: return e.type;
@@ -792,8 +847,11 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
   function loadCandles() {
     if (!chartSel.symbol || cur !== "board") return Promise.resolve();
     var q = "/api/candles?limit=120&symbol=" + encodeURIComponent(chartSel.symbol) + (chartSel.tf ? "&tf=" + encodeURIComponent(chartSel.tf) : "");
+    var reqSym = chartSel.symbol, reqTf = chartSel.tf;
     return fetch(q, { cache: "no-store" }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); }).then(function (res) {
       if (res.j && res.j.timeframes) syncTfs(res.j.timeframes);
+      // 取得中に銘柄・時間足を変えた場合は、古い応答 (成功・エラーとも) で表示を上書きしない
+      if (chartSel.symbol !== reqSym || (reqTf && chartSel.tf !== reqTf)) return;
       if (!res.ok) { $("candles").innerHTML = '<p class="empty">' + esc(res.j && res.j.error || "チャートを取得できません") + "</p>"; set("candleInfo", ""); return; }
       lastCandles = res.j;
       if (!chartSel.tf) chartSel.tf = res.j.tf;
@@ -935,7 +993,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
   var CLOUD = (function () {
     var cv = $("cloud"), ctx = cv.getContext("2d");
     var W = 0, H = 0, cx = 0, cy = 0, R = 0, ex = 0, ey = 0;
-    var running = false, raf = 0, tmr = 0, last = 0, rot = 0, acc = 0, nAmb = 0;
+    var running = false, want = false, vis = true, raf = 0, tmr = 0, last = 0, rot = 0, acc = 0, nAmb = 0;
     var pts = [], links = [], spokes = [], flows = [], outs = [], marks = [], readers = [];
     var data = { count: 0, tone: null, items: [], strategies: [], key: "" };
     var eng = { pulse: 0, color: C.y, msg: "", msgColor: C.y, msgT: 0 };
@@ -1190,19 +1248,36 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     function frame(ts) {
       raf = 0; tmr = 0;
       if (!running) return;
-      if (!W && !layout()) { tmr = setTimeout(loop, 400); return; }
-      var dt = last ? (ts - last) / 1000 : 0.016; last = ts;
-      update(reduce ? Math.min(1.2, dt) : Math.min(0.1, dt));
-      draw(ts);
+      try {
+        if (!W && !layout()) { tmr = setTimeout(loop, 400); return; }
+        var dt = last ? (ts - last) / 1000 : 0.016; last = ts;
+        update(reduce ? Math.min(1.2, dt) : Math.min(0.1, dt));
+        draw(ts);
+      } catch (e) {
+        // 描画の例外で止めない (running のまま 1 秒後に再試行。合成モードなど状態は戻す)
+        if (window.console && console.error) console.error("cloud frame", e);
+        try { ctx.globalCompositeOperation = "source-over"; ctx.globalAlpha = 1; } catch (e2) { /* 無視 */ }
+        if (running) tmr = setTimeout(loop, 1000);
+        return;
+      }
+      if (!running) return;
       if (reduce) tmr = setTimeout(loop, 1000); else loop();
+    }
+    function apply() {
+      var on = want && vis;
+      if (on === running) return;
+      running = on;
+      if (on) { last = 0; if (!raf && !tmr) loop(); }
+      else { if (raf) cancelAnimationFrame(raf); if (tmr) clearTimeout(tmr); raf = 0; tmr = 0; }
+    }
+    // 画面外 (スクロールで見えない) の間は描画を止める
+    if (typeof IntersectionObserver !== "undefined") {
+      try { new IntersectionObserver(function (es) { vis = es[es.length - 1].isIntersecting; apply(); }).observe(cv); } catch (e) { /* 非対応なら常に描画 */ }
     }
     function kick() { if (running && reduce && tmr) { clearTimeout(tmr); tmr = 0; loop(); } }
     return {
       run: function (on) {
-        if (on === running) return;
-        running = on;
-        if (on) { last = 0; if (!raf && !tmr) loop(); }
-        else { if (raf) cancelAnimationFrame(raf); if (tmr) clearTimeout(tmr); raf = 0; tmr = 0; }
+        want = on; apply();
       },
       resize: function () { if (running) layout(); else W = 0; },
       setData: function (s) {
@@ -1369,7 +1444,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
   function renderNtr() {
     var bs = (TR ? TR.byStrategy : []).slice().sort(function (a, b) { return b.netPnl - a.netPnl; }), st = tradeStats();
     set("ntrT", "× " + esc(st.n) + " TRADES · BY STRATEGY");
-    var h = '<div class="xtop"><div class="xbig"><small>×</small>' + esc(num(st.n, 0)) + '</div><div class="xs">TRADES IN VIEW · 直近の取引<br>勝ち <b>' + esc(st.wins) + "</b> / 負け <b>" + esc(st.losses) + '</b><br>損益 <b class="' + cls(st.pnl) + '">' + esc(signed(st.pnl, 0)) + "</b> " + esc(TR ? TR.baseCurrency : "") + "</div></div>";
+    var h = '<div class="xtop"><div class="xbig"><small>×</small>' + esc(num(st.n, 0)) + '</div><div class="xs">TRADES · この mode の全期間 (一覧は直近 ' + esc(TR && TR.trades ? TR.trades.length : 0) + ' 件)<br>勝ち <b>' + esc(st.wins) + "</b> / 負け <b>" + esc(st.losses) + '</b><br>損益 <b class="' + cls(st.pnl) + '">' + esc(signed(st.pnl, 0)) + "</b> " + esc(TR ? TR.baseCurrency : "") + "</div></div>";
     if (!bs.length) { set("ntr", h + '<p class="empty">まだ取引がありません</p>'); return; }
     var mx = 0;
     bs.forEach(function (x) { mx = Math.max(mx, Math.abs(x.netPnl)); });
@@ -1691,25 +1766,30 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     safe("overview", function () { renderOverview(S); });
     safe("market", function () { renderSentiment(S); renderPlan(S); });
     safe("positions", function () { renderPositions(S); });
-    safe("trades", function () { renderTrades(TR); });
-    safe("learning", function () { renderLearning(LE); });
+    if (TR) safe("trades", function () { renderTrades(TR); });
+    if (LE) safe("learning", function () { renderLearning(LE); });
   }
 
   // ───── 監査ログの取得 (差分) ─────
+  function evKey(e) { return e.ts + "|" + e.type + "|" + JSON.stringify(e.data || {}); }
   function loadEvents() {
-    return get("/api/events?limit=30" + (evSince ? "&since=" + evSince : "")).then(function (r) {
-      var evs = r.events || [];
-      if (!evs.length) { if (!evBooted) { evBooted = true; safe("log", renderLog); } return; }
-      evSince = Math.max(evSince, evs[0].ts);
-      EV = evs.concat(EV).slice(0, 80);
+    if (evInflight) return evInflight; // 並行実行しない (同じ記録が二重に入るのを防ぐ)
+    // since と同じミリ秒の記録も返ってくる (取りこぼし防止) ので、evKey で重複を除く
+    evInflight = get("/api/events?limit=30" + (evSince ? "&since=" + evSince : "")).then(function (r) {
+      var evs = r.events || [], fresh = evs.filter(function (e) { return !evSeen[evKey(e)]; });
+      if (evs.length) evSince = Math.max(evSince, evs[0].ts);
+      if (!fresh.length) { if (!evBooted) { evBooted = true; safe("log", renderLog); } return; }
+      EV = fresh.concat(EV).slice(0, 80);
+      evSeen = {}; EV.forEach(function (e) { evSeen[evKey(e)] = 1; });
       safe("log", renderLog);
       safe("stack", renderStack);
       safe("marquee", renderMarquee);
       safe("mini", renderMini);
       // 初回は最新の数件だけ動かす (古い記録を一度に流さない)
-      (evBooted ? evs : evs.slice(0, 3)).slice().reverse().forEach(function (e, i) { setTimeout(function () { CLOUD.event(e); }, 400 + i * 1500); });
+      (evBooted ? fresh : fresh.slice(0, 3)).slice().reverse().forEach(function (e, i) { setTimeout(function () { CLOUD.event(e); }, 400 + i * 1500); });
       evBooted = true;
-    });
+    }).then(function () { evInflight = null; }, function (e) { evInflight = null; throw e; });
+    return evInflight;
   }
 
   // ───── タブの切り替え (選んだタブはこの端末に記憶する) ─────
@@ -1760,20 +1840,36 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
       return r.json();
     });
   }
+  // 1 回の更新: status / trades / learning / events / chart を個別に取得し、1 つの失敗で他を止めない
   function refresh() {
-    Promise.all([get("/api/status"), get("/api/trades?limit=100"), get("/api/learning")]).then(function (res) {
-      S = res[0]; TR = res[1]; LE = res[2];
-      $("error").textContent = "";
-      renderAll();
-      loadEvents().catch(function () { /* 記録だけ失敗しても他の表示は続ける */ });
+    var errs = [], now = Date.now();
+    var learnEvery = cur === "learning" ? LEARN_TAB_MS : LEARN_MS;
+    var tasks = [
+      get("/api/status").then(function (r) { S = r; POLL.fails = 0; POLL.lastOk = Date.now(); }, function (e) { POLL.fails++; errs.push("status"); }),
+      get("/api/trades?limit=100" + (S && S.mode ? "&mode=" + encodeURIComponent(S.mode) : "")).then(function (r) { TR = r; }, function () { errs.push("trades"); }),
+      loadEvents().catch(function () { errs.push("events"); }),
+    ];
+    if (!LE || now - POLL.lastLearn >= learnEvery) {
+      POLL.lastLearn = now;
+      tasks.push(get("/api/learning").then(function (r) { LE = r; }, function () { POLL.lastLearn = 0; errs.push("learning"); }));
+    }
+    return Promise.all(tasks).then(function () {
+      $("error").textContent = errs.length ? "更新に失敗: " + errs.join(", ") : "";
+      if (S) { renderAll(); if (!errs.length || errs.indexOf("status") < 0) $("updated").textContent = new Date().toLocaleTimeString("ja-JP"); }
       loadCandles().catch(function () { /* チャートだけ失敗しても他の表示は続ける */ });
-      $("updated").textContent = new Date().toLocaleTimeString("ja-JP");
-    }).catch(function (e) {
-      $("error").textContent = "更新に失敗: " + e.message;
     });
   }
-  refresh();
-  setInterval(refresh, 5000);
+  // 実行中は重ねず、終了後に次を予約する。タブが隠れている間は止め、戻ったら即時に取得する
+  function pollCycle() {
+    clearTimeout(POLL.timer);
+    if (document.hidden || POLL.busy) return;
+    POLL.busy = true;
+    var done = function () { POLL.busy = false; clearTimeout(POLL.timer); POLL.timer = setTimeout(pollCycle, POLL_MS); };
+    try { refresh().then(done, function (e) { if (window.console && console.error) console.error("refresh", e); done(); }); }
+    catch (e) { if (window.console && console.error) console.error("refresh", e); done(); }
+  }
+  document.addEventListener("visibilitychange", function () { if (!document.hidden) pollCycle(); });
+  pollCycle();
 })();
 </script>
 </body>

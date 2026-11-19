@@ -103,6 +103,9 @@ export interface ShadowTrackerDeps {
   onError?: (where: string, e: unknown) => void;
 }
 
+/** MFE/MAE だけが変わった場合の kv 保存の最短間隔 */
+export const SHADOW_SAVE_INTERVAL_MS = 45_000;
+
 export class ShadowTracker {
   readonly opts: ShadowOptions;
   readonly mode: TradingMode;
@@ -116,6 +119,9 @@ export class ShadowTracker {
   private counters: ShadowCounters;
   private dirty = false;
   private countersDirty = false;
+  /** 決済・新規追加・監視解除など、間引かずに保存したい変化があった */
+  private urgent = false;
+  private lastSaveTs = -Infinity;
 
   constructor(deps: ShadowTrackerDeps) {
     this.store = deps.store;
@@ -213,6 +219,7 @@ export class ShadowTracker {
     this.recent.push(now);
     this.counters.created++;
     this.dirty = true;
+    this.urgent = true;
     this.countersDirty = true;
     return true;
   }
@@ -236,6 +243,7 @@ export class ShadowTracker {
         this.counters.unwatched++;
         this.keys.delete(dedupeKey(o.symbol, o.strategyId, o.direction));
         this.dirty = true;
+        this.urgent = true;
         this.countersDirty = true;
         continue;
       }
@@ -250,19 +258,22 @@ export class ShadowTracker {
       } catch (e) {
         this.onError?.("shadow.range", e);
       }
+      const before = `${o.mfeR}|${o.maeR}|${o.lastCandleTs ?? ""}`;
       const res = this.step(o, q, now, range);
-      this.dirty = true;
       if (!res) {
+        if (before !== `${o.mfeR}|${o.maeR}|${o.lastCandleTs ?? ""}`) this.dirty = true;
         keep.push(o);
         continue;
       }
+      this.dirty = true;
+      this.urgent = true;
       this.keys.delete(dedupeKey(o.symbol, o.strategyId, o.direction));
       this.counters.closed++;
       this.countersDirty = true;
       closed.push(res);
     }
     this.open = keep;
-    this.flush();
+    this.flush(now, false);
     for (const t of closed) {
       try {
         this.onClosed?.(t);
@@ -314,13 +325,20 @@ export class ShadowTracker {
     return { ...base, exitTs: now, exitPrice, exitReason: reason, ...r, mfeR, maeR };
   }
 
-  /** 変化があれば kv に保存する */
-  flush(): void {
-    if (this.dirty) {
+  /**
+   * 変化があれば kv に保存する。引数なし (終了処理など) は間引かず即保存。
+   * update 内 (force=false) では、決済・新規追加・監視解除以外 (MFE/MAE 更新のみ) は SHADOW_SAVE_INTERVAL_MS 間隔に間引く
+   */
+  flush(now?: number, force = true): void {
+    const ts = now ?? Date.now();
+    const due = force || this.urgent || ts - this.lastSaveTs >= SHADOW_SAVE_INTERVAL_MS;
+    if (this.dirty && due) {
       this.dirty = false;
+      this.urgent = false;
+      this.lastSaveTs = ts;
       this.store.kvSet(shadowOpenKey(this.mode), this.open);
     }
-    if (this.countersDirty) {
+    if (this.countersDirty && due) {
       this.countersDirty = false;
       this.store.kvSet(shadowCountersKey(this.mode), this.counters);
     }

@@ -691,6 +691,14 @@ export interface TradeFilter {
 }
 
 /** 永続化インターフェース。同期 API (node:sqlite / メモリ) */
+export interface OperationalCutoffs {
+  audit?: number;
+  intel?: number;
+  briefs?: number;
+  plans?: number;
+  equity?: number;
+}
+
 export interface Store {
   saveTrade(t: TradeRecord): void;
   updateTrade(id: string, patch: Partial<TradeRecord>): void;
@@ -713,7 +721,8 @@ export interface Store {
   listLessons(opts?: { status?: Lesson["status"]; scope?: string; limit?: number }): Lesson[];
 
   saveAdjustment(a: ParamAdjustment): void;
-  listAdjustments(opts?: { strategyId?: string; status?: ParamAdjustment["status"] }): ParamAdjustment[];
+  /** createdAt の昇順。limit を渡すと最新 N 件 (昇順) だけを返す */
+  listAdjustments(opts?: { strategyId?: string; status?: ParamAdjustment["status"]; limit?: number }): ParamAdjustment[];
 
   saveEquity(p: EquityPoint): void;
   listEquity(opts?: { since?: number; mode?: TradingMode }): EquityPoint[];
@@ -729,6 +738,13 @@ export interface Store {
   listForecastOutcomes(f?: ForecastOutcomeFilter): ForecastOutcomeRecord[];
   /** judgedAt < before の記録を消す。消した件数を返す */
   pruneForecastOutcomes(before: number): number;
+
+  /**
+   * 運用ログ系の表の古い行を消す (各 cutoff より古いもの)。消した件数を返す。
+   * 対象は audit / intel (fetchedAt) / briefs / plans (最新 1 件は残す) / equity のみ。
+   * 学習データ (trades, attributions, lessons, adjustments, shadow_trades, forecast_outcomes, kv) は消さない。
+   */
+  pruneOperational(cutoffs: OperationalCutoffs): Record<keyof OperationalCutoffs, number>;
 
   audit(e: AuditEvent): void;
   listAudit(opts?: { since?: number; type?: string; limit?: number }): AuditEvent[];
