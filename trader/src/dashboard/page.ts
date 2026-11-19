@@ -54,7 +54,11 @@ svg { width: 100%; height: 220px; display: block; }
 .tone { display: inline-block; min-width: 64px; text-align: center; padding: 0 6px; border-radius: 6px; font-size: 12px; font-weight: 600; background: var(--chip); }
 .tone.bull { color: var(--pos); } .tone.bear { color: var(--neg); }
 .scale { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); }
-@media (max-width: 600px) { main { padding: 8px; gap: 8px; } .big { font-size: 22px; } th, td { padding: 4px; } }
+nav#tabs { display: flex; gap: 4px; padding: 6px 8px; background: var(--card); border-bottom: 1px solid var(--line); position: sticky; top: var(--hdr, 49px); z-index: 1; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+nav#tabs button { flex: 1 0 auto; padding: 8px 12px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); font: inherit; font-weight: 600; cursor: pointer; }
+nav#tabs button[aria-selected="true"] { background: var(--chip); color: var(--accent); }
+section[hidden] { display: none; }
+@media (max-width: 600px) { .dbar { min-width: 56px; } .tone { min-width: 0; } main { padding: 8px; gap: 8px; } .big { font-size: 22px; } th, td { padding: 4px; } }
 </style>
 </head>
 <body>
@@ -65,57 +69,64 @@ svg { width: 100%; height: 220px; display: block; }
   <span class="muted">更新: <span id="updated">-</span></span>
   <span id="error" class="err"></span>
 </header>
+<nav id="tabs" role="tablist">
+  <button type="button" data-tab="overview">概要</button>
+  <button type="button" data-tab="market">強気・弱気</button>
+  <button type="button" data-tab="positions">ポジション</button>
+  <button type="button" data-tab="trades">取引</button>
+  <button type="button" data-tab="learning">学習</button>
+</nav>
 <main>
-  <section>
+  <section data-tab="overview">
     <h2>評価額</h2>
     <div id="equity" class="big">-</div>
     <div id="equitySub" class="muted"></div>
   </section>
-  <section>
+  <section data-tab="overview">
     <h2>リスク状態</h2>
     <div id="risk" class="kv"></div>
   </section>
-  <section class="wide">
+  <section class="wide" data-tab="market">
     <h2>相場の強気・弱気</h2>
     <div id="sentiment"></div>
   </section>
-  <section>
+  <section data-tab="market">
     <h2>計画・情報</h2>
     <div id="plan"></div>
   </section>
-  <section class="wide">
+  <section class="wide" data-tab="overview">
     <h2>評価額の推移</h2>
     <div id="chart"></div>
   </section>
-  <section class="wide">
+  <section class="wide" data-tab="positions">
     <h2>保有ポジション</h2>
     <div id="positions" class="scroll"></div>
   </section>
-  <section class="wide">
+  <section class="wide" data-tab="trades">
     <h2>直近のトレードと損益要因</h2>
     <div id="trades" class="scroll"></div>
   </section>
-  <section>
+  <section data-tab="trades">
     <h2>戦略別の成績</h2>
     <div id="byStrategy" class="scroll"></div>
   </section>
-  <section>
+  <section data-tab="learning">
     <h2>損益要因の集計</h2>
     <div id="causes"></div>
   </section>
-  <section>
+  <section data-tab="learning">
     <h2>教訓</h2>
     <div id="lessons"></div>
   </section>
-  <section class="wide">
+  <section class="wide" data-tab="learning">
     <h2>パラメータ調整</h2>
     <div id="adjustments" class="scroll"></div>
   </section>
-  <section>
+  <section data-tab="learning">
     <h2>情報源の信頼度</h2>
     <div id="sources" class="scroll"></div>
   </section>
-  <section class="wide">
+  <section class="wide" data-tab="learning">
     <h2>腕の成績 (戦略×レジーム×資産クラス)</h2>
     <div id="arms" class="scroll"></div>
   </section>
@@ -315,6 +326,29 @@ svg { width: 100%; height: 220px; display: block; }
         a.disabled ? '<span class="neg">停止</span>' : "有効"];
     }), [false, true, true, true, true, false]));
   }
+
+  // タブの切り替え (選んだタブはこの端末に記憶する)
+  var TAB_KEY = "dashboard.tab";
+  function showTab(name) {
+    var btns = document.querySelectorAll("nav#tabs button");
+    var ok = false;
+    for (var i = 0; i < btns.length; i++) if (btns[i].getAttribute("data-tab") === name) ok = true;
+    if (!ok) name = "overview";
+    for (var j = 0; j < btns.length; j++) btns[j].setAttribute("aria-selected", btns[j].getAttribute("data-tab") === name ? "true" : "false");
+    var secs = document.querySelectorAll("main section[data-tab]");
+    for (var k = 0; k < secs.length; k++) secs[k].hidden = secs[k].getAttribute("data-tab") !== name;
+    try { localStorage.setItem(TAB_KEY, name); } catch (e) { /* 保存できなくても表示は続ける */ }
+  }
+  document.getElementById("tabs").addEventListener("click", function (ev) {
+    var t = ev.target && ev.target.closest ? ev.target.closest("button[data-tab]") : null;
+    if (t) { showTab(t.getAttribute("data-tab")); window.scrollTo(0, 0); }
+  });
+  function fitHeader() { document.documentElement.style.setProperty("--hdr", document.querySelector("header").offsetHeight + "px"); }
+  window.addEventListener("resize", fitHeader);
+  fitHeader();
+  var saved = null;
+  try { saved = localStorage.getItem(TAB_KEY); } catch (e) { saved = null; }
+  showTab(saved || "overview");
 
   function get(path) {
     return fetch(path, { cache: "no-store" }).then(function (r) {
