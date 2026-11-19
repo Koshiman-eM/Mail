@@ -367,7 +367,7 @@ async function cmdBacktest(flags: ParsedArgs["flags"], io: Io): Promise<number> 
     io.out(`ccxt (${config.env.CCXT_EXCHANGE}) から履歴を取得します...`);
     feed = CcxtFeed.create(config.env.CCXT_EXCHANGE);
   }
-  const symbol = a.symbol ?? (a.source === "ccxt" ? (config.env.CCXT_EXCHANGE === "bitflyer" ? "BTC/JPY" : "BTC/USDT") : "SYN/USDT");
+  const symbol = a.symbol ?? (a.source === "ccxt" ? (["bitflyer", "bitbank", "coincheck", "zaif"].includes(config.env.CCXT_EXCHANGE) ? "BTC/JPY" : "BTC/USDT") : "SYN/USDT");
   const rows = await runBacktestCommand({
     ...a,
     symbol,

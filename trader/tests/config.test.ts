@@ -27,3 +27,45 @@ describe("decimal ヘルパー", () => {
     expect(D(0.1).plus(0.2).toString()).toBe("0.3");
   });
 });
+
+describe("リスク値の範囲検証", () => {
+  it("既定値は範囲内で、そのまま読み込める", () => {
+    const r = loadConfig({}).risk;
+    expect(r.riskPerTrade).toBe(0.005);
+    expect(r.maxDailyLoss).toBe(0.03);
+    expect(r.maxDrawdown).toBe(0.15);
+    expect(r.maxPositionPct).toBe(0.2);
+    expect(r.maxExposureByClass).toEqual({ crypto: 0.6, meme: 0.05, fx: 0.6, stock: 0.6 });
+    expect(r.maxOpenPositions).toBe(8);
+    expect(r.maxOrdersPerMinute).toBe(30);
+  });
+  it("上限ちょうどは通る", () => {
+    const r = loadConfig({ RISK_PER_TRADE: "0.05", MAX_DAILY_LOSS: "0.2", MAX_DRAWDOWN: "0.5", MAX_EXPOSURE_CRYPTO: "1", MAX_POSITION_PCT: "1" }).risk;
+    expect(r.riskPerTrade).toBe(0.05);
+  });
+  it("単位の取り違え (0.5 = 50%) は分かりやすいエラーで止まる", () => {
+    expect(() => loadConfig({ RISK_PER_TRADE: "0.5" })).toThrow(/0\.5 は 50% の意味です.*0\.5% なら 0\.005/);
+  });
+  it("パーセント表記の数字 (3 = 300%) も止まる", () => {
+    expect(() => loadConfig({ MAX_DAILY_LOSS: "3" })).toThrow(/MAX_DAILY_LOSS=3 は 300% の意味です.*0\.03/);
+  });
+  it.each([
+    ["RISK_PER_TRADE", "0.06"],
+    ["RISK_PER_TRADE", "0"],
+    ["RISK_PER_TRADE", "-0.01"],
+    ["MAX_DAILY_LOSS", "0.25"],
+    ["MAX_DRAWDOWN", "0.6"],
+    ["MAX_POSITION_PCT", "1.5"],
+    ["MAX_EXPOSURE_CRYPTO", "2"],
+    ["MAX_EXPOSURE_MEME", "0"],
+    ["MAX_EXPOSURE_FX", "1.01"],
+    ["MAX_EXPOSURE_STOCK", "-1"],
+    ["MAX_OPEN_POSITIONS", "0"],
+    ["MAX_OPEN_POSITIONS", "2.5"],
+  ])("%s=%s は範囲外で起動を止める", (k, v) => {
+    expect(() => loadConfig({ [k]: v })).toThrow(new RegExp(`設定が不正です[\\s\\S]*${k}`));
+  });
+  it("数値でない値も止まる", () => {
+    expect(() => loadConfig({ MAX_DRAWDOWN: "abc" })).toThrow(/MAX_DRAWDOWN/);
+  });
+});
