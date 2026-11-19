@@ -6,8 +6,8 @@ import { defaultFetchText, intelId, stripHtml, type FetchTextFn, type IntelSourc
 export const DEFAULT_RSS_FEEDS = [
   "https://www.coindesk.com/arc/outboundfeeds/rss/",
   "https://cointelegraph.com/rss",
-  "https://www.fxstreet.com/rss/news",
-  "https://finance.yahoo.com/news/rssindex",
+  "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+  "https://feeds.bbci.co.uk/news/business/rss.xml",
 ];
 
 const MAX_ITEMS_PER_FEED = 50;
