@@ -12,6 +12,7 @@ import type {
   TradeRecord,
   TradingMode,
 } from "../core/types";
+import { isLearningExcludedTrade } from "../core/types";
 import { attributeTrade, CAUSE_LABEL, fmtNum, pct } from "./attribution";
 import { buildReflectionPrompt, REFLECTION_SYSTEM } from "./prompts";
 import type { ParamProposal, StrategyParamInfo } from "./tuner";
@@ -193,7 +194,7 @@ export function computeReflectionStats(opts: ReflectOptions): ReflectionStats {
   const from = now - windowMs;
   const trades = store
     .listTrades({ since: from, until: now, ...(opts.mode ? { mode: opts.mode } : {}) })
-    .filter((t) => !t.estimated && !t.simulatedShort);
+    .filter((t) => !t.estimated && !t.simulatedShort && !isLearningExcludedTrade(t));
   const atts = new Map<string, TradeAttribution>();
   for (const t of trades) {
     atts.set(t.id, store.getAttribution(t.id) ?? attributeTrade(t, { strategyRegimes: opts.strategyRegimes }));

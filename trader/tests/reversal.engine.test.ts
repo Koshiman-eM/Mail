@@ -98,7 +98,8 @@ describe("エンジン (paper): 転換で決済", () => {
   }, 60_000);
 
   it("買い・含み損で損切りの手前: 押し安値割れで reversal (損切り 97 より上)", async () => {
-    const w = await runtime(scenarioBars(LONG_LOSS, [99.3, 99.0, 98.5, 98.0]), probe());
+    // エントリーした足を 99.4 まで下げておく (その安値 99.35 が最初のスイングロー。フォールバックより先に押し安値ができる)
+    const w = await runtime(scenarioBars([99.4, ...LONG_LOSS.slice(1)], [99.3, 99.0, 98.5, 98.0]), probe());
     const p = await opened(w);
     await run(w, H + 1, H + LONG_LOSS_BREAK);
     expect(w.rt.engine.positions.list()).toHaveLength(1);
@@ -108,7 +109,24 @@ describe("エンジン (paper): 転換で決済", () => {
     expect(t.exitPrice).toBeLessThan(p.entryPrice);
     expect(t.exitPrice).toBeGreaterThan(p.initialStop);
     expect(t.netPnl).toBeLessThan(0);
-    expect(w.store.listAudit({ type: "position.reversal_exit" })[0].data).toMatchObject({ level: LONG_LOSS_LEVEL, close: 99.4, pivotTs: barTs(H + 5) });
+    const a = w.store.listAudit({ type: "position.reversal_exit" })[0].data;
+    expect(a).toMatchObject({ level: LONG_LOSS_LEVEL, close: 99.4, pivotTs: barTs(H + 5) });
+    expect(a.fallback).toBeUndefined();
+    await close(w);
+  }, 60_000);
+
+  it("REVERSAL_EXIT_FALLBACK=true: エントリー後にスイングが確定していなければ、エントリーした足の安値を割った終値で reversal (監査ログに fallback: true)", async () => {
+    // LONG_LOSS: エントリーした足 (100 → 100) の安値 99.95。r5 の終値 99.6 が割る (r5 のスイングローの確定 (r8) より前)
+    const w = await runtime(scenarioBars(LONG_LOSS, [99.3, 99.0, 98.5, 98.0]), probe(), { REVERSAL_EXIT_FALLBACK: "true" });
+    const p = await opened(w);
+    await run(w, H + 1, H + 5);
+    expect(w.rt.engine.positions.list()).toHaveLength(1);
+    await w.tickTo(barTs(H + 6) + 1_000);
+    expect(w.rt.engine.positions.list()).toHaveLength(0);
+    expect(w.store.listTrades()[0]).toMatchObject({ exitReason: "reversal" });
+    expect(w.store.listAudit({ type: "position.reversal_exit" })[0].data).toMatchObject({
+      tradeId: p.id, timeframe: "1m", primaryTimeframe: "1m", level: 99.95, pivotTs: barTs(H), fallback: true, close: 99.6, barTs: barTs(H + 5),
+    });
     await close(w);
   }, 60_000);
 
@@ -178,6 +196,37 @@ describe("エンジン (paper): 転換で決済", () => {
     expect(sh).toMatchObject({ reason: "observe_only", exitReason: "reversal", exitTs: barTs(H + LONG_PROFIT_BREAK + 1) + 1_000 });
     expect(w.rt.engine.shadow!.size).toBe(0);
     await close(w);
+  }, 60_000);
+
+  it("REVERSAL_EXIT_TF=lower (既定): 5m の戦略の建玉を 1m 足の押し安値割れで決済する。仮想トレードも 1m で判定する。same なら 5m", async () => {
+    const p5 = (): Strategy => ({ ...probe(), primaryTimeframe: "5m", timeframes: ["5m"] });
+    // 実際の建玉 (lower)
+    const w = await runtime(scenarioBars(LONG_PROFIT, TAIL), p5());
+    const p = await opened(w);
+    await run(w, H + 1, H + LONG_PROFIT_BREAK);
+    expect(w.rt.engine.positions.list()).toHaveLength(1);
+    await w.tickTo(barTs(H + LONG_PROFIT_BREAK + 1) + 1_000);
+    expect(w.rt.engine.positions.list()).toHaveLength(0);
+    expect(w.store.listTrades()[0]).toMatchObject({ exitReason: "reversal", exitTs: barTs(H + LONG_PROFIT_BREAK + 1) + 1_000 });
+    expect(w.store.listAudit({ type: "position.reversal_exit" })[0].data).toMatchObject({
+      tradeId: p.id, timeframe: "1m", primaryTimeframe: "5m", level: LONG_PROFIT_LEVEL, close: 102.4, barTs: barTs(H + LONG_PROFIT_BREAK),
+    });
+    await close(w);
+    // same: 5m 足で判定する (1m の押し安値割れでは決済しない)
+    const ws = await runtime(scenarioBars(LONG_PROFIT, TAIL), p5(), { REVERSAL_EXIT_TF: "same" });
+    await opened(ws);
+    await run(ws, H + 1, H + LONG_PROFIT_BREAK + 1);
+    const evs = ws.store.listAudit({ type: "position.reversal_exit" });
+    expect(evs.every((e) => e.data.timeframe === "5m")).toBe(true);
+    expect(ws.store.listTrades().some((t) => t.exitTs === barTs(H + LONG_PROFIT_BREAK + 1) + 1_000)).toBe(false);
+    await close(ws);
+    // 観測専用の仮想トレードも同じ 1m で判定する (記録の reversalTf = 1m)
+    const wo = await runtime(scenarioBars(LONG_PROFIT, TAIL), p5(), { OBSERVE_ONLY_STRATEGIES: "rev_probe" });
+    await wo.tickTo(barTs(H) + 1_000);
+    expect(wo.rt.engine.shadow!.list()).toMatchObject([{ reason: "observe_only", reversalTf: "1m" }]);
+    for (let k = H + 1; k <= H + LONG_PROFIT_BREAK + 1; k++) await wo.tickTo(barTs(k) + 1_000);
+    expect(wo.store.listShadowTrades()[0]).toMatchObject({ exitReason: "reversal", exitTs: barTs(H + LONG_PROFIT_BREAK + 1) + 1_000 });
+    await close(wo);
   }, 60_000);
 
   it("バックテストと一致: 同じ足で、エントリーの足・決済の足・理由が同じ (バックテストは次の足の始値で決済)", async () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_OBSERVE_ONLY_STRATEGIES, LIVE_CONFIRM_PHRASE, loadConfig, resolveMode } from "../src/core/config";
+import { DEFAULT_OBSERVE_ONLY_STRATEGIES, LIVE_CONFIRM_PHRASE, loadConfig, observeOnlyConfigWarnings, resolveMode } from "../src/core/config";
 import { D, floorToStep } from "../src/core/decimal";
 import { effectiveLimitTakeProfit, limitOrdersFromEnv } from "../src/engine/limitOrders";
 
@@ -72,13 +72,22 @@ describe("リスク値の範囲検証", () => {
 });
 
 describe("OBSERVE_ONLY_STRATEGIES (観測専用の戦略)", () => {
-  it("未設定なら既定値 scalp_rebound", () => {
-    expect(loadConfig({}).env.OBSERVE_ONLY_STRATEGIES).toEqual(["scalp_rebound"]);
-    expect(DEFAULT_OBSERVE_ONLY_STRATEGIES).toBe("scalp_rebound");
+  it("未設定なら既定値 scalp_rebound,mid_trend_follow,long_momentum (中長期の新規エントリーはしない)", () => {
+    expect(loadConfig({}).env.OBSERVE_ONLY_STRATEGIES).toEqual(["scalp_rebound", "mid_trend_follow", "long_momentum"]);
+    expect(DEFAULT_OBSERVE_ONLY_STRATEGIES).toBe("scalp_rebound,mid_trend_follow,long_momentum");
   });
   it("空文字 (空白だけも) なら観測専用なし", () => {
     expect(loadConfig({ OBSERVE_ONLY_STRATEGIES: "" }).env.OBSERVE_ONLY_STRATEGIES).toEqual([]);
     expect(loadConfig({ OBSERVE_ONLY_STRATEGIES: "  " }).env.OBSERVE_ONLY_STRATEGIES).toEqual([]);
+  });
+  it("明示的な設定が中長期の戦略 (mid_trend_follow / long_momentum) を含まなければ警告する (古い .env では新しい既定が効かない)", () => {
+    expect(observeOnlyConfigWarnings(loadConfig({}).env.OBSERVE_ONLY_STRATEGIES)).toEqual([]);
+    expect(observeOnlyConfigWarnings(loadConfig({ OBSERVE_ONLY_STRATEGIES: "long_momentum,mid_trend_follow" }).env.OBSERVE_ONLY_STRATEGIES)).toEqual([]);
+    const [w] = observeOnlyConfigWarnings(loadConfig({ OBSERVE_ONLY_STRATEGIES: "scalp_rebound" }).env.OBSERVE_ONLY_STRATEGIES);
+    expect(w).toMatch(/^中長期戦略 \(mid_trend_follow \/ long_momentum\) が新規エントリー可能です。既定は観測専用です/);
+    expect(observeOnlyConfigWarnings(["scalp_rebound", "mid_trend_follow"])[0]).toMatch(/^中長期戦略 \(long_momentum\) が新規エントリー可能です/);
+    expect(observeOnlyConfigWarnings([])).toHaveLength(1);
+    expect(observeOnlyConfigWarnings(undefined)).toEqual([]);
   });
   it("カンマ区切り。前後の空白・空要素・重複を除く", () => {
     expect(loadConfig({ OBSERVE_ONLY_STRATEGIES: " scalp_rebound , scalp_micro,,scalp_rebound " }).env.OBSERVE_ONLY_STRATEGIES).toEqual(["scalp_rebound", "scalp_micro"]);

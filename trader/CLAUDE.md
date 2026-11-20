@@ -19,6 +19,8 @@
 - `npm run trader -- resume`: キルスイッチ・日次停止を解除 (監査ログに記録。動作中のエンジンにも次のティックで反映)
 - `npm run trader -- orders` (`orders list`): 保留中・状態不明の注文を一覧
 - `npm run trader -- regime --symbol BTC/JPY --hours 3 [--tf 1m,15m,1h,4h] [--step <分>]`: 各時刻の相場の状態 (レジーム) を運用と同じ detectRegime で表示 (確定足だけ。スプレッドは 0 扱い。VENUES に gmo があれば GMOコインの足)。目線・押し安値/戻り高値・choppiness も表示
+- `npm run trader -- paper reset --equity <円> [--confirm]`: paper の口座 (ペーパーウォレット) を指定の評価額で作り直す。学習データ (取引の履歴・腕・要因分析・パラメータ調整・振り返り・仮想トレード・予想・ニュースの答え合わせ・情報源の信頼度・リスク設定の上書き `risk:limits:paper`・指値の約定率) は残す。`--confirm` なしは確認だけ (dry run、何も書かない)。TRADING_MODE=live では拒否、paper のエンジンが動作中 (kv `engine:lock:paper` の heartbeat が 60 秒以内) なら拒否する (`sudo systemctl stop trader` で止めてから)。実行中は `engine:lock:paper` を取得するので、その間に起動したエンジンは起動しない (`cmdRun` は状態を読み込む前にロックを取る)。保有中の建玉は最後の価格 (無ければ建値) で決済理由 `wallet_reset` (表示「リセットで決済」)・`learningExcluded: true` として記帳上だけ閉じ、腕・要因分析・ParamTuner・振り返り・情報源の信頼度・テンポ・report / ダッシュボードの成績には使わない (`isLearningExcludedTrade`)。書き換えるのは `journal:open:paper` / `positions:exitPlans:paper` / `orders:pending:paper` / `orders:restingTp:paper` / `orders:resolveRequests:paper` / `paper:snapshot` (新しい評価額・建玉なし) / `risk:state:paper` (日初・最高 = 新しい評価額、キルスイッチ・日次停止なし) / `paper:resets` (履歴に追記) だけで、1 トランザクション (SQLite は BEGIN IMMEDIATE) で行う。監査ログ `paper.wallet_reset`。status の当初評価額は最新のリセットの金額。実装は `src/paper/walletReset.ts`
+- `npm run report [-- --all]`: paper の評価額・成績は最新の口座リセット以降 (`--all` で全期間)。ダッシュボードの成績も同じ (戦略パネルのボタン / `/api/trades?scope=all` で全期間)
 - `npm run trader -- gmo check`: GMOコインの API の応答の形を確かめる (公開 API と、`GMO_API_KEY` があれば読み取り専用の非公開 API。**注文・取消は呼ばない**。キーは表示しない)。live に切り替える前に必ず実行する
 - `npm run trader -- orders resolve <clientId> --none | --filled --qty <数量> --price <価格>`: 状態不明の注文を手動で確定する。escalated 以外は `--force` 必須。`--none` で取消に失敗したら保留のまま
 
@@ -33,6 +35,7 @@
 4. **シークレットは環境変数のみ** (`.env.local`)。
 5. **先読み禁止**: 戦略に渡すのは確定足だけ。バックテストの約定は次の足の始値で行う。
 6. **リスク管理を迂回しない**: 新規エントリーは必ず `RiskManager.evaluateEntry` を通す。
+   - 純期待値の規則 (コスト比): コスト控除後の期待値を出すシグナル (`edgeIsNet: true`。scalp_micro・scalp_rebound・scalp_pullback・pullback_5m・pullback_15m) は、テンポの有無によらず「期待値 ≥ max(0, `MIN_EDGE_TO_COST` − 1) × コスト かつ 期待値 > 0」(コストを二重に数えない。NaN は拒否)。それ以外は「期待値 ≥ `MIN_EDGE_TO_COST` × コスト」。バックテストのエントリーの判定 (`minEdgeToCostRatio`) も同じ (`netEdgeMinBps`。edgeIsNet の「期待値 > 0」は比率 0 = フィルターなしでも求める)。
    - 日次損失上限 → 当日停止
    - 最大ドローダウン → kill switch (手動の `resume` まで停止)
 7. **学習による変更は検証してから適用**: パラメータ調整は、feed から取った長い履歴 (主時間足 3000 本、scalp は 14 日分) を 5 区間に分けたバックテストで、区間ごとの符号検定 (片側 p < 0.1)・改善幅・取引数の条件をすべて満たすときだけ適用する (`learningHooks.ts` の `createParamValidator`、`tuner.ts`)。hub の短い足では代用しない。
@@ -41,7 +44,7 @@
    - 値動きの予想 (`forecast.ts`) によるエントリーサイズの倍率はパラメータの変更ではない。consensus を除いた基礎モデルで、同じ時刻・同じ資産クラスの予想を 1 観測にまとめ、12 グループの多重検定 (Bonferroni) で補正した有意性 (入る z ≥ 2.638、出る z < 2.138、判定済み 100 件以上) を満たしたときだけ 0.7〜1.2 倍で効く。結果は RiskManager の上限 (`MAX_SIZE_MULTIPLIER` = 1.5) の範囲内に収まる。満たさない間は常に 1.0。リスク判定は迂回しない。
 8. **学習状態は mode 別キー**: 腕・パラメータ・調整履歴・情報源の信頼度・ニュースの答え合わせ・予想・仮想トレードの kv は `<名前空間>:<mode>:...` (信頼度は `intel:sourceReliability:<mode>`)。paper の学習を live に持ち込まない。旧キー (mode なし) は paper にだけ初回起動時に引き継ぐ (`migration.ts`)。live は初期状態から始める。
 9. **仮想トレードの重みと停止中の扱い**: 見送ったシグナルの結果は腕の配分に重み 0.25 (腕を止める判定には使わず、止まった腕の回復判定にだけ使う)。ニュースの答え合わせは 1 記事あたり合計 0.3 (時間 × 資産の数で割る)。取引による信頼度の更新は (情報源, 記事) ごとに 1 回。停止中 (`HALT_SHADOW_REASONS`) に記録した仮想トレードは学習に使わない。戦略がコストで見送ったシグナル (`strategy_filter:*`、`StrategyContext.onFiltered`) は観測専用で、保存だけして腕・情報の効き具合には使わない。
-   - 観測専用の戦略 (`OBSERVE_ONLY_STRATEGIES`、既定 `scalp_rebound`、空文字で無効) は新規エントリーを発注せず、仮想トレード (`observe_only`) としてだけ記録する (RiskManager・腕の乱数に触れない。判定は腕・計画の判定より前で、戦略の対象レジームと低流動性の停止は守る)。`observe_only` は通常の見送りと同じく腕の配分に重み 0.25 で入り、腕を止める判定には使わない。
+   - 観測専用の戦略 (`OBSERVE_ONLY_STRATEGIES`、既定 `scalp_rebound,mid_trend_follow,long_momentum` (中長期の新規エントリーはしない方針)、空文字で無効) は新規エントリーを発注せず、仮想トレード (`observe_only`) としてだけ記録する (RiskManager・腕の乱数に触れない。判定は腕・計画の判定より前で、戦略の対象レジームと低流動性の停止は守る)。`observe_only` は通常の見送りと同じく腕の配分に重み 0.25 で入り、腕を止める判定には使わない。観測専用にした戦略の保有中の建玉は従来どおり管理・決済する (持ち主の戦略の決済シグナル・損切り・利確・読みの管理・転換で決済。止めるのは新規だけ)。明示的な設定が mid_trend_follow / long_momentum を含まなければ起動時に警告する (`observeOnlyConfigWarnings`。古い .env の `OBSERVE_ONLY_STRATEGIES=scalp_rebound` では新しい既定が効かないため)。
 10. **腕の停止と回復**: 止めるのは実取引だけの統計で、件数 ≥ 30 かつ「縮小推定の平均 + 2.5·SE < 0」のとき。止まった腕も戦略は評価し、仮想トレード (`arm_disabled`) を記録して、回復の推定が 0 を越えたら戻す (`allocator.ts`)。
 11. **ダッシュボードの書き込みはリスク設定だけ**: `/api/risk-settings` (kv `risk:limits:<mode>`)。CSRF トークン・Origin 確認・ループバック待ち受け (それ以外は `DASHBOARD_WRITE_TOKEN`) が必須。live でリスクを上げる変更は確認語が必要。範囲は `config.ts` の `RISK_SETTING_SPECS` が唯一の定義。
 12. **空売りの再現は paper だけ** (`PAPER_SIMULATE_SHORT`、既定 true。`src/core/short.ts`): `allowShort=false` の銘柄は live では空売りしない (GMOコインのレバレッジ銘柄は `allowShort=true` なので live でも売りから建てられる。13 を参照)。
@@ -65,7 +68,7 @@
    - 確定足だけ (各時間足で直近 300 本)。スイング点は左は厳密・右は `>=` (横ばい対応) で、N 本後に確定する (リペイントしない)。上位足も確定足だけ (MTF: 1m→15m、5m/15m→1h、1h→4h、4h→1d、1d→1w。1w は直近 300 本の 1d から作り、形成中の週は除く)。
    - 弾いたシグナルは観測専用の仮想トレード `strategy_filter:structure_*` (bias / mtf / chop / none / weak / po / stop) だけで、学習には使わない。
    - 構造の損切り (`STRUCTURE_STOP_MODE=structure`) は損切りを押し安値/戻り高値 ± ATR × バッファへ動かすだけ。サイズは RiskManager が決め、期待値は増やさない。新しい損切り幅が元の 0.5 倍未満・3 倍超・0.5 ATR 未満、または利確が不正なら見送る。
-   - 既定の対象: scalp_momentum_burst, scalp_micro, short_ema_trend, short_breakout, mid_trend_follow, long_momentum, meme_momentum (対象外: scalp_obi, scalp_vwap_revert, short_rsi_revert, scalp_rebound, scalp_pullback)。未知の id と、purist での `STRUCTURE_EXIT_ON_WEAKENING` は起動時に警告する。
+   - 既定の対象: scalp_momentum_burst, scalp_micro, short_ema_trend, short_breakout, mid_trend_follow, long_momentum, meme_momentum (対象外: scalp_obi, scalp_vwap_revert, short_rsi_revert, scalp_rebound, scalp_pullback, pullback_5m, pullback_15m。押し目買い・戻り売りの 3 戦略は上位足のトレンドを自前で判定する)。未知の id と、purist での `STRUCTURE_EXIT_ON_WEAKENING` は起動時に警告する。
    - 設定: `STRUCTURE_MODE` / `_STRATEGIES` / `_PIVOT_N` (3〜20、既定 6) / `_BREAK_MODE` / `_BIAS_METHOD` / `_REVERSAL_MODE` / `_USE_MTF` / `_USE_PERFECT_ORDER` / `_STOP_MODE` / `_STOP_ATR_BUFFER` / `_EXIT_ON_REVERSAL` / `_EXIT_ON_WEAKENING` / `_CHOP_M` / `_CHOP_R` (`config.ts`、既定は README)。
    - `STRUCTURE_EXIT_ON_REVERSAL` (既定 false) はラップした戦略だけの「目線の転換」での決済 (戦略の flat シグナル)。建玉に対する押し安値割れ / 戻り高値超えは 18 (`REVERSAL_EXIT`、全戦略) で、両方 true は重複 (起動時に警告)。
 15. **指値 (maker)** (`LIMIT_ENTRY` 既定 true、`src/engine/limitOrders.ts`、`orders.ts`):
@@ -76,7 +79,7 @@
    - PaperBroker は気配が価格を通過したときだけ約定 (触れただけでは約定しない)、maker 手数料。バックテスト (`limitOrders`) は次の足から高値・安値が通過したときだけ約定し、maker 手数料、同じ足では損切り優先。検証・CLI のバックテストも現在の mode と同じ前提にする。約定率は kv `orders:limitStats:<mode>`。
 16. **テンポと最大保有** (`src/engine/tempo.ts`、`TARGET_ENTRIES_PER_HOUR` 既定 0 = 無効、`MAX_HOLD_MINUTES` 既定 0 = 無効):
    - tempo (0〜1) = 不足 (1 − 直近 1 時間のエントリー / 目標) × 待ち (最後のエントリーから 60/目標 分まで 0、その 2 倍で 1)。ティックごとに 1 回計算し、新規エントリーの戦略評価 (`StrategyContext.tempo` / `tempoExplore`) と `RiskManager.evaluateEntry` (`EntryParams`) にだけ渡す。決済・バックテスト・パラメータ検証には渡さない。無効なら何も渡さず従来と同一。
-   - 緩めるのは戦略の costMult (1.5 へ)、scalp_pullback の閾値、MIN_EDGE_TO_COST (`TEMPO_MIN_EDGE_TO_COST` へ。1 未満にしない) だけ。edgeIsNet のシグナルはコストを二重計上しない。クールダウン・損切り幅の制限・最大保有・RiskManager のそのほかの判定は緩めない。
+   - 緩めるのは戦略の costMult (1.5 へ)、押し目買い・戻り売りの 3 戦略 (scalp_pullback・pullback_5m・pullback_15m。判定は共通の `createPullback`) の閾値、MIN_EDGE_TO_COST (`TEMPO_MIN_EDGE_TO_COST` へ。1 未満にしない) だけ。edgeIsNet のシグナルはコストを二重計上しない (下の「純期待値の規則」。テンポは比率を緩めてから同じ規則を使う)。クールダウン・損切り幅の制限・最大保有・RiskManager のそのほかの判定は緩めない。
    - 探索は paper では常に、live では `TEMPO_ALLOW_LIVE_EXPLORE=true` のときだけ。純期待値の下限を tempo × 往復コストだけ下げ (`tempoNetEdgeFloor`。RiskManager も同じ)、純期待値 ≤ 0 のエントリーはサイズ × `TEMPO_EXPLORE_SIZE` (既定 0.5) で `features.tempoExplore=1`。NaN は常に拒否。
    - 上限: 直近 1 時間のエントリーが ceil(目標 × `TEMPO_CAP_MULTIPLIER` (既定 2)) に達したら新規を止め、仮想トレード `tempo_cap`。エントリーは約定して建玉になった時に 1 回数え、再起動時はこの mode の直近 1 時間の取引と建玉から復元する。
    - `MAX_HOLD_MINUTES` (0 = 無効、5〜1440): mid / long は新規を発注せず仮想トレード `hold_limit` (observe_only と同じ扱い、重み 0.25、腕の停止には使わない)。ほかの戦略は maxHold (と expectedMs) を丸める。保有中の建玉は変えない。バックテスト・検証も同じ `maxHoldMinutes` (mid / long は丸めない)。
@@ -93,19 +96,20 @@
    - TradeRecord / ShadowTradeRecord に `thesisExpectedMs` / `thesisDeadlineTs` / `thesisExtendedAt` / `thesisOutcome` (failed_early / timeout / extended / none) / `thesisNetRAtDeadline` / `thesisStopExit` (TradeRecord のみ) (任意。古い記録も読める)。要因分析・ParamTuner は 3 つの理由を time と同じ扱い (`isTimeLikeExit`)。
    - 表示: report / simulate の「読みの答え合わせ」(テンポの表と同じく「うち空売り (paper 再現)」の件数・純損益を注記)、ダッシュボードの保有ポジション (読みの期限・残り分・状態・現在の R)、status の設定と各建玉の期限。ラベルは 読み外れ(途中) / 読み外れ(期限) / 延長の上限。
 18. **転換で決済** (`REVERSAL_EXIT` 既定 true、`src/engine/reversalExit.ts` が純粋な判定。false なら従来と同一):
-   - 建玉に対するダウ理論: 持ち主の戦略の主時間足で、エントリーした足以降に確定したスイングロー (買い) / スイングハイ (売り) のうち最も新しいものを水準にする。確定足の終値がそれを `REVERSAL_EXIT_BUFFER_ATR` (0〜1、既定 0) × ATR(14) より大きく割ったら (越えたら) 成行で決済 (理由 `reversal`。含み益でも含み損でも)。
-   - スイングは `detectPivots` / `confirmedPivots` (N = `REVERSAL_EXIT_PIVOT_N`、2〜10、既定 3。`STRUCTURE_PIVOT_N` とは別)。N 本後に確定してから使う (リペイントしない)。エントリー前のスイングは使わない (エントリーした足は使う)。エントリー後にスイングが無ければ何もしない (損切りが守る)。ヒゲでは決済しない。ATR は最後の 100 本から。
+   - 時間足 (`REVERSAL_EXIT_TF`): `lower` (既定) = 持ち主の戦略の主時間足の 1 つ下 (1m→1m、5m→1m、15m→5m、1h→15m、4h→1h、1d→4h。`reversalTimeframeFor`)、`same` = 主時間足 (従来)。hub は対象の戦略のその時間足も取得する (`hubTimeframesFor` に reversal を渡す。全銘柄で同じ時間足なので建玉のある銘柄でも必ずある)。hub にその足が無ければ主時間足で判定する。
+   - 建玉に対するダウ理論: その時間足で、エントリーした足以降に確定したスイングロー (買い) / スイングハイ (売り) のうち最も新しいものを水準にする。確定足の終値がそれを `REVERSAL_EXIT_BUFFER_ATR` (0〜1、既定 0) × ATR(14) より大きく割ったら (越えたら) 成行で決済 (理由 `reversal`。含み益でも含み損でも)。
+   - スイングは `detectPivots` / `confirmedPivots` (N = `REVERSAL_EXIT_PIVOT_N`、2〜10、既定 3。`STRUCTURE_PIVOT_N` とは別)。N 本後に確定してから使う (リペイントしない)。エントリー前のスイングは使わない (エントリーした足は使う)。エントリー後に確定したスイングが無ければ何もしない (損切りが守る)。`REVERSAL_EXIT_FALLBACK=true` (既定 false) のときだけ、エントリーした足 (確定済み) の安値 (買い) / 高値 (売り) を水準にする (監査ログに `fallback: true`。エントリーした足が形成中なら判定しない)。既定で無効なのは早く発火しすぎるため (simulate でほとんどの取引をエントリー付近で閉じ、転換で決済の勝率は 5% 前後だった)。エンジン・バックテスト・仮想トレードとも同じ設定 (`ReversalSettings.fallback`)。ヒゲでは決済しない。ATR は最後の 100 本から (バッファ 0 なら ATR は使わない)。
    - 対象: `REVERSAL_EXIT_STRATEGIES` (空 = 全戦略。未登録の id は起動時に警告)。読みの管理の建玉・延長中の建玉も対象 (答え合わせは延長前なら「期限前に決着」、延長後なら延長)。
-   - エンジン: 保有中の建玉を、主時間足の新しい確定足ごとに 1 回 (`processSymbol` の持ち主の戦略の評価の後)。損切り・利確・トレーリング・読みの管理 (ティックごと) が先。同じ確定足で戦略の決済シグナルも出たら `signal` を優先 (`signal` の件数は無効のときと同じ)。決済の手続き中 (保留中・状態不明の注文、読みの決済の再試行、一部約定の残り、利確の指値の取消中、拒否後の建玉確認) は重ねない (`PositionManager.exitInProgress`)。決済は signal と同じ通常の `close()`。監査ログ `position.reversal_exit` (水準・終値・スイングの足・ATR・状態)。足がエントリーより新しい建玉は判定せず `position.reversal_no_history` を 1 回 (hub は各時間足を最大 2000 本保持)。新たに保存するものは無い (水準は足から毎回求める)。
-   - バックテスト: 主時間足が確定したバーの終値で判定し、次のバーの始値で決済 (signal と同じ)。`reversal` を backtest・`createParamValidator`・setup・backtest コマンドへ渡す (検証も運用と同じ規則)。
-   - 仮想トレード: 同じ規則。記録時に戦略の主時間足を `reversalTf` に保存し (有効で対象のときだけ。決済の記録には残さない)、engine が渡す hub のその時間足の確定足で判定 (リサンプルしない。足が無ければ判定しない)。損切り・利確・読みの管理が先。古い記録は従来どおり。
+   - エンジン: 保有中の建玉を、判定の時間足の新しい確定足ごとに 1 回 (`processSymbol` の持ち主の戦略の評価の後)。損切り・利確・トレーリング・読みの管理 (ティックごと) が先。同じ確定足で戦略の決済シグナルも出たら `signal` を優先 (`signal` の件数は無効のときと同じ)。決済の手続き中 (保留中・状態不明の注文、読みの決済の再試行、一部約定の残り、利確の指値の取消中、拒否後の建玉確認) は重ねない (`PositionManager.exitInProgress`)。決済は signal と同じ通常の `close()`。監査ログ `position.reversal_exit` (判定の時間足 `timeframe`・主時間足 `primaryTimeframe`・水準・`fallback`・終値・スイングの足・ATR・状態)。足がエントリーより新しい建玉は判定せず `position.reversal_no_history` を 1 回 (hub は各時間足を最大 2000 本保持)。新たに保存するものは無い (水準は足から毎回求める)。
+   - バックテスト: 判定の時間足が確定したバーの終値で判定し、次のバーの始値で決済 (signal と同じ)。主時間足が確定していないバーでは戦略を評価せず転換で決済だけを判定する。基準足が粗くて 1 つ下の時間足を作れなければ same (主時間足) で判定する (`reversalBacktestTimeframe`。例: pullback_5m は基準足 5m なので 5m)。`reversal` を backtest・`createParamValidator`・setup・backtest コマンドへ渡す (検証も運用と同じ規則)。
+   - 仮想トレード: 同じ規則。記録時に実際の建玉と同じ判定の時間足 (`REVERSAL_EXIT_TF`) を `reversalTf` に保存し (有効で対象のときだけ。決済の記録には残さない)、engine が渡す hub のその時間足の確定足で判定 (リサンプルしない。足が無ければ判定しない)。損切り・利確・読みの管理が先。古い記録は従来どおり。
    - 要因分析・ParamTuner は `signal` と同じ扱い (`isSignalLikeExit`。決済後に伸びたら early_exit → tp_raise)。表示名は「転換で決済」(ダッシュボードの取引は 押し安値割れ / 戻り高値超え を添える)。report / simulate の「転換で決済」の表、status の設定。
 
 ## 4. 構成
 - `src/core/`: 型の契約 (`types.ts`)、設定、decimal、HTTP リトライ、Claude 呼び出し (`ai.ts`。構造化出力、拒否時はサーバー側フォールバック、キー未設定時はルールベース)
 - `src/strategies/labels.ts`: 戦略・時間軸・腕のキーの日本語の表示名 (表示専用。id・kv キー・env の値・腕のキーは変えない。long / short は長期 / 短期の意味で売買の向きではない)。画面・レポートはここを通す
 - `src/indicators/`, `src/regime/`: 指標・リサンプル・相場環境の判定
-- `src/strategies/`: 12 戦略 (scalp 6 / short 3 / mid / long / meme)。scalp_rebound は 15m の下降トレンド中の 1m の反発を買う (買いのみ・crypto。既定で観測専用)。scalp_pullback は 15m EMA20 の傾きで方向を決め、上昇中の 1m の押しを買い・下降中の戻りを売る (crypto。売りは canShort。損切り = 押しの極値 ± stopAtr (0.3) ATR を 0.8〜3.5 ATR に収める (超えたら見送り)、利確 = tpR (2) × 損切り幅、保有 10〜30 分、純期待値 (edgeIsNet)、コスト条件と 5 本のクールダウンあり。構造ラッパーなし・観測専用でない)。パラメータの標準名は stopAtr, tpAtr, trailAtr, entryThreshold, maxHoldBars
+- `src/strategies/`: 14 戦略 (scalp 6 / short 5 / mid / long / meme)。mid_trend_follow・long_momentum は既定で観測専用 (保有中の建玉は管理する)。scalp_rebound は 15m の下降トレンド中の 1m の反発を買う (買いのみ・crypto。既定で観測専用)。scalp_pullback は 15m EMA20 の傾きで方向を決め、上昇中の 1m の押しを買い・下降中の戻りを売る (crypto。売りは canShort。損切り = 押しの極値 ± stopAtr (0.3) ATR を 0.8〜3.5 ATR に収める (超えたら見送り)、利確 = tpR (2) × 損切り幅、保有 10〜30 分、純期待値 (edgeIsNet)、コスト条件と 5 本のクールダウンあり。構造ラッパーなし・観測専用でない)。pullback_5m (5m / 上位足 1h、保有 6〜24 本 = 30 分〜2 時間) と pullback_15m (15m / 上位足 4h、保有 4〜16 本 = 1〜4 時間) は scalp_pullback と同じ判定 (`createPullback`) の短期版 (horizon short、純期待値、構造ラッパーなし・観測専用でない。warmup は上位足 28 本ぶん)。パラメータの標準名は stopAtr, tpAtr, trailAtr, entryThreshold, maxHoldBars
 - `src/structure/`: 相場構造 (pivots・machine・perfectOrder・mtf・wrap・settings)。`src/engine/structureCompare.ts` は `--structure-compare`
 - `src/engine/tempo.ts`: テンポ・上限・探索。`thesis.ts`: 読みの管理の純粋な判定 (期限・純 R・延長後の保護ストップ・決済理由)。`reversalExit.ts`: 転換で決済の純粋な判定 (エントリー後の押し安値・戻り高値と終値の比較、設定)。`limitOrders.ts`: 指値エントリー / 待機の利確の管理。`orders.ts`: 保留中・状態不明の注文の管理 (指値の取消確認・約定率の統計を含む)
 - `src/backtest/`: イベント駆動バックテスト、`evaluateParams`、`walkForward`、合成データ

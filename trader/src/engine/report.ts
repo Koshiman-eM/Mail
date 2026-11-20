@@ -24,6 +24,7 @@ export const EXIT_REASON_LABEL: Record<ExitReason, string> = {
   thesis_timeout: "読み外れ(期限)",
   thesis_cap: "延長の上限",
   reversal: REVERSAL_EXIT_LABEL,
+  wallet_reset: "リセットで決済",
 };
 
 /** 決済理由の表示名。転換で決済は方向が分かれば中身 (買い: 押し安値割れ / 売り: 戻り高値超え) を添える */

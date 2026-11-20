@@ -222,10 +222,18 @@ export class SqliteStore implements Store {
     return this.tx(fn);
   }
 
+  /**
+   * 書き込みのロックを最初に取るトランザクション (BEGIN IMMEDIATE)。読んでから書く処理で、途中の書き込みが
+   * 別の接続との競合で SQLITE_BUSY になるのを防ぐ (ロック待ちは busy_timeout まで)。入れ子は外側に参加する
+   */
+  immediateTransaction<T>(fn: () => T): T {
+    return this.tx(fn, "BEGIN IMMEDIATE");
+  }
+
   /** トランザクション (入れ子はそのまま外側に参加) */
-  private tx<T>(fn: () => T): T {
+  private tx<T>(fn: () => T, begin = "BEGIN"): T {
     if (this.db.isTransaction) return fn();
-    this.db.exec("BEGIN");
+    this.db.exec(begin);
     try {
       const r = fn();
       this.db.exec("COMMIT");

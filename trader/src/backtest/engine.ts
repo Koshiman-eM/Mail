@@ -24,7 +24,8 @@ import { clampMaxHoldMs } from "../engine/tempo";
 import {
   activeThesisMs, advancePeak, decideThesis, initialRiskPerUnit, THESIS_DISABLED, thesisGrossR, thesisNetR, thesisOutcomeOf, thesisTrailStop, type ThesisPricing,
 } from "../engine/thesis";
-import { checkReversal, entryBarIndex, REVERSAL_ATR_WINDOW, reversalAppliesTo } from "../engine/reversalExit";
+import { checkReversal, entryBarIndex, REVERSAL_ATR_WINDOW, reversalAppliesTo, reversalBacktestTimeframe } from "../engine/reversalExit";
+import { netEdgeMinBps } from "../risk/manager";
 import type { BacktestOptions, BacktestResult, BacktestStats, IntelSource, Sizer } from "./types";
 
 /**
@@ -57,10 +58,13 @@ import type { BacktestOptions, BacktestResult, BacktestStats, IntelSource, Sizer
  *   - 延長した建玉の保護ストップ (建値・トレーリング) はバー i+1 から効く。極値は延長から測り (判定した終値の決済できる価格から始め、
  *     バー i+1 以降の高値・安値 ∓ 半スプレッドで進める)、前バーまでの値を使う (先読みしない)。理由は trailing (thesisStopExit)。
  * 転換で決済 (opts.reversal。省略・無効・戦略が対象外なら従来どおり。ライブの REVERSAL_* と同じ src/engine/reversalExit.ts の規則):
- *   - 主時間足が確定したバー i の終値で、エントリー後に確定した押し安値 (売りは戻り高値) を終値が越えたかを判定し、
+ *   - 判定の時間足 (REVERSAL_EXIT_TF。lower = 主時間足の 1 つ下、same = 主時間足) が確定したバー i の終値で、
+ *     エントリー後に確定した押し安値 (売りは戻り高値。REVERSAL_EXIT_FALLBACK なら無いときエントリーした足の安値・高値) を終値が越えたかを判定し、
  *     バー i+1 の始値の成行で決済する (理由 reversal。戦略の決済シグナルと同じタイミング・同じ約定)。
- *   - 同じバーで戦略の決済シグナル (flat・逆方向) も出たら signal を優先する (ライブと同じ)。
- *   - 足は主時間足の確定足 (その時点で見えている分) をエントリーした足の N 本前から渡す (戦略へ渡す historyBars の制限は受けない)。
+ *     基準足 (baseTimeframe) から lower の時間足が作れない (基準足の方が粗い) ときは same (主時間足) に戻す。
+ *   - 同じバーで戦略の決済シグナル (flat・逆方向) も出たら signal を優先する (ライブと同じ)。主時間足が確定していないバーでは
+ *     戦略を評価せず (evaluateEveryBar を除く)、転換で決済だけを判定する。
+ *   - 足は判定の時間足の確定足 (その時点で見えている分) をエントリーした足の N 本前から渡す (戦略へ渡す historyBars の制限は受けない)。
  */
 
 /** 資産クラス別の既定スプレッド (bps, 全幅) とスリッページ (bps, 片道) */
@@ -166,6 +170,10 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
     const ms = TIMEFRAME_MS[tf];
     if (ms < baseMs || ms % baseMs !== 0) throw new Error(`基準足 ${baseTf} から ${tf} は作れません`);
   }
+  // 転換で決済の判定の時間足 (戦略へ渡す view には入れない。基準足から作れなければ主時間足)
+  const revTf = opts.reversal ? reversalBacktestTimeframe(opts.reversal, primary, baseTf) : primary;
+  const revMs = TIMEFRAME_MS[revTf];
+  const seriesTfs = tfs.includes(revTf) ? tfs : [...tfs, revTf];
 
   const costs = defaultCosts(instrument.assetClass);
   const spreadBps = opts.spreadBps ?? costs.spreadBps;
@@ -211,7 +219,7 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
   // 上位足は全期間を一度だけ集約し、各バーでは「その時点で確定している本数」だけ見せる
   const series = {} as Record<Timeframe, Candle[]>;
   const visible = {} as Record<Timeframe, number>;
-  for (const tf of tfs) {
+  for (const tf of seriesTfs) {
     series[tf] = tf === baseTf ? candles : resample(candles, baseTf, tf);
     visible[tf] = 0;
   }
@@ -240,6 +248,22 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
       entryFeePerUnit: units > 0 ? p.entryFee.toNumber() / units : 0,
       takerFeeRate: instrument.takerFeeRate,
     };
+  };
+  /**
+   * 転換で決済: 判定の時間足の確定足 (今見えている分) を、エントリーした足の N 本前 (ATR の分も含む) から渡して判定する。
+   * 決済するなら次のバーの始値で決済する pending を返す
+   */
+  const reversalPending = (p: OpenPos, close: number): Pending | null => {
+    if (!reversal) return null;
+    const ps = series[revTf];
+    const end = visible[revTf];
+    const e = entryBarIndex(ps, p.entryTs, revMs);
+    if (!(e >= 0 && e < end)) return null;
+    const from = Math.max(0, Math.min(e - reversal.pivotN, end - REVERSAL_ATR_WINDOW));
+    const r = checkReversal(ps.slice(from, end), p.entryTs, p.dir === 1 ? "long" : "short", {
+      pivotN: reversal.pivotN, bufferAtr: reversal.bufferAtr, tfMs: revMs, fallback: reversal.fallback,
+    });
+    return r.exit ? { kind: "exit", intended: close, reason: "reversal" } : null;
   };
   /** 読みの管理を使う建玉なら期限 (ms) */
   const thesisMsOf = (p: OpenPos) => activeThesisMs(thesis, p.expectedMs, p.maxHoldMs, initialRiskPerUnit(p.entryPrice, p.initialStop));
@@ -540,16 +564,25 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
 
     // 7. 確定足の更新と戦略判定
     let primaryClosed = false;
-    for (const tf of tfs) {
+    let revClosed = false;
+    for (const tf of seriesTfs) {
       const s = series[tf];
       const ms = TIMEFRAME_MS[tf];
       let v = visible[tf];
       while (v < s.length && s[v].ts + ms <= now) v++;
       if (tf === primary && v > visible[tf]) primaryClosed = true;
+      if (tf === revTf && v > visible[tf]) revClosed = true;
       visible[tf] = v;
     }
     if (!trading || i >= n - 1) continue;
-    if (!primaryClosed && !opts.evaluateEveryBar) continue;
+    if (!primaryClosed && !opts.evaluateEveryBar) {
+      // 主時間足は未確定でも、判定の時間足 (lower) が確定したら転換で決済だけを判定する
+      if (pos && reversal && revClosed) {
+        const pd = reversalPending(pos, bar.close);
+        if (pd) pending = pd;
+      }
+      continue;
+    }
     if (visible[primary] < strategy.warmup) continue;
 
     const quote: Quote = { ts: now, bid: bar.close * (1 - hs), ask: bar.close * (1 + hs), last: bar.close };
@@ -584,18 +617,9 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
       const p: OpenPos = pos;
       const opposite = signal !== null && ((signal.direction === "long" && p.dir === -1) || (signal.direction === "short" && p.dir === 1));
       if (signal && (signal.direction === "flat" || opposite)) pending = { kind: "exit", intended: bar.close, reason: "signal" };
-      else if (reversal && primaryClosed) {
-        // 転換で決済: 主時間足の確定足 (今見えている分) を、エントリーした足の N 本前 (ATR の分も含む) から渡す
-        const ps = series[primary];
-        const end = visible[primary];
-        const e = entryBarIndex(ps, p.entryTs, primaryMs);
-        if (e >= 0 && e < end) {
-          const from = Math.max(0, Math.min(e - reversal.pivotN, end - REVERSAL_ATR_WINDOW));
-          const r = checkReversal(ps.slice(from, end), p.entryTs, p.dir === 1 ? "long" : "short", {
-            pivotN: reversal.pivotN, bufferAtr: reversal.bufferAtr, tfMs: primaryMs,
-          });
-          if (r.exit) pending = { kind: "exit", intended: bar.close, reason: "reversal" };
-        }
+      else if (reversal && revClosed) {
+        const pd = reversalPending(p, bar.close);
+        if (pd) pending = pd;
       }
       continue;
     }
@@ -615,9 +639,18 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
       skip("short");
       continue;
     }
-    if (minEdgeRatio > 0 && signal.expectedEdgeBps < minEdgeRatio * costBps) {
-      skip("edge");
-      continue;
+    // 期待値 / コストの比 (ライブの RiskManager と同じ規則)。コスト控除後の期待値 (edgeIsNet) のシグナルは
+    // 「期待値 ≥ max(0, 比率 − 1) × コスト かつ 期待値 > 0」(コストを二重に数えない)。「期待値 > 0」は比率が 0 (フィルターなし) でも求める
+    // (NaN も通さない)。それ以外のシグナルは比率 > 0 のときだけ「期待値 ≥ 比率 × コスト」
+    {
+      const edge = signal.expectedEdgeBps;
+      const edgeOk = signal.edgeIsNet === true
+        ? edge > 0 && (minEdgeRatio > 0 ? edge >= netEdgeMinBps(minEdgeRatio, costBps) : true)
+        : !(minEdgeRatio > 0) || edge >= minEdgeRatio * costBps;
+      if (!edgeOk) {
+        skip("edge");
+        continue;
+      }
     }
     // 指値にするか (limitOrders があるときだけ): シグナルの指値 (価格あり) → 戦略の entryOrder → limitOrders.entry
     const signalLimit = signal.entry.type === "limit" && signal.entry.price !== undefined && signal.entry.price > 0;

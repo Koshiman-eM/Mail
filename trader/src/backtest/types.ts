@@ -69,7 +69,11 @@ export interface BacktestOptions {
   marketExtras?: (bar: Candle, now: number) => MarketExtras | undefined;
   /** レジーム判定の設定上書き */
   regime?: Partial<RegimeOptions>;
-  /** expectedEdgeBps がコストの何倍未満なら見送るか (既定 0 = フィルターなし) */
+  /**
+   * expectedEdgeBps がコストの何倍未満なら見送るか (既定 0 = フィルターなし)。
+   * コスト控除後の期待値 (signal.edgeIsNet) は「期待値 ≥ max(0, 比率 − 1) × コスト かつ 期待値 > 0」で判定する (ライブの RiskManager と同じ)。
+   * edgeIsNet の「期待値 > 0」は比率 0 (既定) でも常に求める
+   */
   minEdgeToCostRatio?: number;
   /** エグジット後の値動きを測る本数 (主時間足, 既定 10) */
   postExitBars?: number;

@@ -3,7 +3,7 @@ import { createLogger } from "../core/logger";
 import type {
   AssetClass, CauseCode, ParamAdjustment, Params, RegimeLabel, Store, TradeAttribution, TradeRecord, TradingMode,
 } from "../core/types";
-import { isTimeLikeExit } from "../core/types";
+import { isLearningExcludedTrade, isTimeLikeExit } from "../core/types";
 import { attributeTrade, pct, tradeOutcome } from "./attribution";
 import { proportionGreaterPValue, sampleStats, signTestPValue, welchLessPValue, type SampleStats } from "./stats";
 
@@ -277,12 +277,12 @@ export const paramsKey = (mode: TradingMode, strategyId: string, assetClass: Ass
 /** 適用した調整の評価用メタ情報の kv キー (mode 別) */
 export const adjustmentMetaKey = (mode: TradingMode, id: string) => `adjmeta:${mode}:${id}`;
 /**
- * パラメータ調整に使える取引 (推定約定 estimated と、paper で再現した空売り simulatedShort を除く)。
+ * パラメータ調整に使える取引 (推定約定 estimated と、paper で再現した空売り simulatedShort と、口座のリセットで閉じた取引 learningExcluded を除く)。
  * パラメータは買い・売り共通 (戦略×資産クラス) で、live に持ち込む調整の判断材料にするため、live で実行できない
  * 再現の空売りは集計・事後評価 (Welch の差し戻し) から外す (空売りは方向別の腕 …|short でだけ学習する)。
  * 区間検証のバックテストも mode を渡さないので現物の空売りは含まない (同じ基準)
  */
-export const learnableTrades = (ts: TradeRecord[]) => ts.filter((t) => !t.estimated && !t.simulatedShort);
+export const learnableTrades = (ts: TradeRecord[]) => ts.filter((t) => !t.estimated && !t.simulatedShort && !isLearningExcludedTrade(t));
 const rOf = (t: TradeRecord) => (Number.isFinite(t.rMultiple) ? t.rMultiple : 0);
 const round6 = (x: number) => Number(x.toPrecision(6));
 const fmtP = (p: number) => (p < 0.001 ? "<0.001" : p.toFixed(3));

@@ -298,15 +298,25 @@ describe("RiskManager.evaluateEntry: テンポのモード (EntryParams.tempo)",
   const net = (edge: number) => sig({ expectedEdgeBps: edge, edgeIsNet: true });
   const reasonOf = (d: ReturnType<RiskManager["evaluateEntry"]>) => (d.ok ? "" : d.reason);
 
-  it("tempo を渡さなければ従来の判定そのまま (edgeIsNet でも比率 × コスト)", () => {
+  it("tempo を渡さなくても edgeIsNet はコストを二重に数えない (純 ≥ (比率 − 1) × コスト かつ > 0)。控除前の期待値は従来どおり", () => {
     const rm = new RiskManager(limits);
-    const old = rm.evaluateEntry(params({ signal: net(40) }));
-    expect(old.ok).toBe(false);
+    // edgeIsNet: (2 − 1) × 22 = 22bps 以上
+    const ok = rm.evaluateEntry(params({ signal: net(23) }));
+    expect(ok.ok && ok.notes[0]).toBe(`edge 23.0bps (net) / cost ${COST.toFixed(1)}bps`);
+    const low = rm.evaluateEntry(params({ signal: net(21) }));
+    expect(reasonOf(low)).toBe(`期待値 (コスト控除後) 21.0bps < コスト ${COST.toFixed(1)}bps × (2 - 1)`);
+    for (const e of [0, -5, NaN]) expect(reasonOf(rm.evaluateEntry(params({ signal: net(e) }))), String(e)).toMatch(/コスト控除後.*0 以下/);
+    // tempo 0 と同じ結果 (テンポの有無によらない)
+    for (const e of [21, 23, 40]) expect(rm.evaluateEntry(params({ signal: net(e) })).ok, String(e)).toBe(rm.evaluateEntry(params({ signal: net(e), tempo: 0 })).ok);
+    // 控除前の期待値 (edgeIsNet なし) は従来どおり 比率 × コスト
+    const old = rm.evaluateEntry(params({ signal: sig({ expectedEdgeBps: 40 }) }));
     expect(reasonOf(old)).toBe(`期待値幅 40.0bps < コスト ${COST.toFixed(1)}bps × 2`);
-    const ok = rm.evaluateEntry(params({ signal: net(44.5) }));
-    expect(ok.ok && ok.notes[0]).toBe(`edge 44.5bps / cost ${COST.toFixed(1)}bps`);
-    // edgeIsNet の有無で結果は変わらない
-    expect(rm.evaluateEntry(params({ signal: sig({ expectedEdgeBps: 40 }) }))).toEqual(old);
+    const ok2 = rm.evaluateEntry(params({ signal: sig({ expectedEdgeBps: 44.5 }) }));
+    expect(ok2.ok && ok2.notes[0]).toBe(`edge 44.5bps / cost ${COST.toFixed(1)}bps`);
+    // 比率が 1 以下なら edgeIsNet は > 0 だけ
+    const loose = new RiskManager({ ...limits, minEdgeToCostRatio: 0.8 });
+    expect(loose.evaluateEntry(params({ signal: net(0.1) })).ok).toBe(true);
+    expect(loose.evaluateEntry(params({ signal: net(0) })).ok).toBe(false);
   });
 
   it("tempo 0: edgeIsNet はコストを二重に数えない (比率 - 1)。控除前の期待値は従来どおり", () => {

@@ -1,13 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { D, type Decimal } from "../core/decimal";
-import type {
-  AssetClass,
-  EntryContext,
-  ExitReason,
-  Horizon,
-  Store,
-  TradeRecord,
-  TradingMode,
+import {
+  isLearningExcludedTrade,
+  type AssetClass,
+  type EntryContext,
+  type ExitReason,
+  type Horizon,
+  type Store,
+  type TradeRecord,
+  type TradingMode,
 } from "../core/types";
 
 /** エントリー情報 */
@@ -102,6 +103,8 @@ export interface CloseTradeInput {
   exitOrderType?: "market" | "limit";
   /** 読みの管理の記録 (TradeRecord にそのまま付ける。読みの管理を使った建玉だけ) */
   thesis?: TradeThesisFields;
+  /** 学習・成績の集計から除く (paper の口座のリセット wallet_reset。TradeRecord.learningExcluded) */
+  learningExcluded?: boolean;
 }
 
 /** TradeRecord の読みの管理の項目 */
@@ -330,6 +333,7 @@ export function buildTradeRecord(p: OpenTrade, c: CloseTradeInput): TradeRecord 
         }
       : {}),
     ...thesisFields(c.thesis),
+    ...(c.learningExcluded ? { learningExcluded: true } : {}),
   };
 }
 
@@ -375,6 +379,8 @@ export function fillPostExitMoves(
   const updated: TradeRecord[] = [];
   for (const t of store.listTrades({ since: opts.since, until: opts.now })) {
     if (t.postExitMovePct !== undefined && t.postExitMovePct !== null) continue;
+    // 口座のリセットで記帳上だけ閉じた取引は要因分析・情報源の信頼度の補正に使わない
+    if (isLearningExcludedTrade(t)) continue;
     const h = horizons[t.horizon];
     if (!(h > 0) || !(t.exitPrice > 0)) continue;
     const at = t.exitTs + h;

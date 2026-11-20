@@ -143,7 +143,7 @@ describe("simulate / status", () => {
       expect(report.reversal!.summary.total.trades).toBe(rev);
       if (!on) expect(rev).toBe(0);
       const text = formatSimulationReport(report);
-      expect(text).toContain(on ? "■ 転換で決済 (有効 (戦略の主時間足のスイング 左右 3 本" : "■ 転換で決済 (無効 (従来どおり))");
+      expect(text).toContain(on ? "■ 転換で決済 (有効 (戦略の主時間足の 1 つ下の時間足のスイング 左右 3 本" : "■ 転換で決済 (無効 (従来どおり))");
     }
   }, 120_000);
 
@@ -152,7 +152,7 @@ describe("simulate / status", () => {
     const dbPath = join(dir, "t.db");
     // VENUES=synthetic (既定) では合成データ用の DB (<ベース名>-synthetic.db) を読む
     new SqliteStore(join(dir, "t-synthetic.db")).close();
-    const keys = ["DB_PATH", "TRADING_MODE", "VENUES", "REVERSAL_EXIT", "REVERSAL_EXIT_PIVOT_N", "REVERSAL_EXIT_BUFFER_ATR", "REVERSAL_EXIT_STRATEGIES"];
+    const keys = ["DB_PATH", "TRADING_MODE", "VENUES", "REVERSAL_EXIT", "REVERSAL_EXIT_PIVOT_N", "REVERSAL_EXIT_BUFFER_ATR", "REVERSAL_EXIT_STRATEGIES", "REVERSAL_EXIT_TF"];
     const old = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
     process.env.DB_PATH = dbPath;
     delete process.env.TRADING_MODE;
@@ -161,6 +161,7 @@ describe("simulate / status", () => {
     process.env.REVERSAL_EXIT_PIVOT_N = "4";
     process.env.REVERSAL_EXIT_BUFFER_ATR = "0.2";
     process.env.REVERSAL_EXIT_STRATEGIES = "scalp_pullback";
+    delete process.env.REVERSAL_EXIT_TF;
     const out: string[] = [];
     const err: string[] = [];
     try {
@@ -176,7 +177,7 @@ describe("simulate / status", () => {
     }
     const text = out.join("\n");
     expect(text).toContain(
-      "転換で決済 (REVERSAL_EXIT): 有効 (戦略の主時間足のスイング 左右 4 本 / 終値が水準を 0.2 ATR より大きく越えたら決済 / 対象 scalp_pullback)" +
+      "転換で決済 (REVERSAL_EXIT): 有効 (戦略の主時間足の 1 つ下の時間足のスイング 左右 4 本 / 終値が水準を 0.2 ATR より大きく越えたら決済 / 対象 scalp_pullback)" +
         " — REVERSAL_EXIT=true / REVERSAL_EXIT_PIVOT_N=4 / REVERSAL_EXIT_BUFFER_ATR=0.2 / REVERSAL_EXIT_STRATEGIES=scalp_pullback",
     );
   });

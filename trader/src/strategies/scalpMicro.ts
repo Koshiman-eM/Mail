@@ -31,9 +31,9 @@ import { relaxToward, TEMPO_COST_MULT_FLOOR, tempoNetEdgeFloor } from "../engine
  *   - p = p0 + winEdgeMax × s。s = (confidence - 0.5) / 0.5 (0〜1) はシグナルの強さ。
  *     confidence をそのまま勝率とみなさず、「ランダムウォーク + 最大 winEdgeMax (既定 10%pt) の上乗せ」に抑える。
  *     winEdgeMax は学習で上げられないよう paramBounds に入れない (期待値を自己申告で膨らませない)。
- *   - 既存戦略の expectedEdgeBps (利確幅 × confidence、手数料控除前) とは定義が違う。RiskManager は
- *     expectedEdgeBps ≥ MIN_EDGE_TO_COST × コストで判定するため、この戦略では実質「控除前の期待値 ≥ (1 + 比率) × コスト」
- *     となり、より厳しい側 (安全側) に働く。シグナルには edgeIsNet: true を付ける (テンポのモードの RiskManager は比率から 1 を引く)。
+ *   - 既存戦略の expectedEdgeBps (利確幅 × confidence、手数料控除前) とは定義が違う (コスト控除後)。シグナルには edgeIsNet: true を付け、
+ *     RiskManager とバックテストはテンポの有無によらず「期待値 (純) ≥ max(0, MIN_EDGE_TO_COST − 1) × コスト かつ 期待値 > 0」で判定する
+ *     (= 控除前に直すと「控除前の期待値 ≥ 比率 × コスト」。コストを二重に数えない。テンポのモードは比率を緩めてから同じ規則)。
  *   - テンポ (ctx.tempo、0〜1) で緩めるのは costMult だけ (TEMPO_COST_MULT_FLOOR まで)。期待値 > minNetEdgeBps は緩めない。
  *     例外は探索 (ctx.tempoExplore が true のときだけ): 期待値の下限を tempoNetEdgeFloor (minNetEdgeBps - tempo × 往復コスト) に下げる。
  *     tempoExplore が無い・false なら従来どおり。

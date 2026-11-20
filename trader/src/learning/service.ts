@@ -16,6 +16,7 @@ import type {
   TradeRecord,
   TradingMode,
 } from "../core/types";
+import { isLearningExcludedTrade } from "../core/types";
 import { armKey, StrategyAllocator, type AllocatorOptions, type ArmSnapshot, type ArmUpdate, type Rng } from "./allocator";
 import { attributeTrade } from "./attribution";
 import { DEFAULT_POST_EXIT_HORIZON_MS, fillPostExitMoves, type PriceAt } from "./journal";
@@ -169,6 +170,8 @@ export class LearningService {
     if (existing) return existing;
     // 推定約定の取引は学習に使わない (呼び出し側でも除外しているが念のため)
     if (trade.estimated) return this.attribute(trade);
+    // 口座のリセット (wallet_reset) で記帳上だけ閉じた取引は学習しない (腕・要因分析・信頼度を更新しない)
+    if (isLearningExcludedTrade(trade)) return this.attribute(trade);
     const att = this.attribute(trade);
     this.store.saveAttribution(att);
     const arm = this.allocator.update(trade);
@@ -312,7 +315,7 @@ export class LearningService {
           this.store.saveAttribution(this.attribute(t, prev?.createdAt));
           res.reattributed++;
           // 情報源の信頼度: 決済時の更新をエグジット後の値動きで差分だけ直す (決済時の記録が無ければ何もしない = 二重に数えない)
-          if (!t.estimated && !t.simulatedShort && (t.mode === undefined || t.mode === this.mode)) {
+          if (!t.estimated && !t.simulatedShort && !isLearningExcludedTrade(t) && (t.mode === undefined || t.mode === this.mode)) {
             try {
               if (this.reliability.reviseWithPostExit(t, now).length > 0) res.reliabilityRevised = (res.reliabilityRevised ?? 0) + 1;
             } catch (e) {

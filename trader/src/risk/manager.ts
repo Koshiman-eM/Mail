@@ -47,7 +47,8 @@ export interface EntryParams {
   /** クオート通貨 -> 口座通貨 (既定 1) */
   toAccount?: (ccy: string) => number;
   /**
-   * テンポ (0〜1。`src/engine/tempo.ts`)。省略時は従来のコスト比の判定そのまま。
+   * テンポ (0〜1。`src/engine/tempo.ts`)。省略時は従来のコスト比の判定そのまま
+   * (控除前の期待値: 期待値 ≥ 比率 × コスト。コスト控除後 (edgeIsNet): 期待値 ≥ max(0, 比率 − 1) × コスト かつ > 0)。
    * 渡すとテンポのモードになり、コスト比の判定だけを変える (tempoEdgeRequirement)。ほかの判定は変えない
    */
   tempo?: number;
@@ -57,6 +58,14 @@ export interface EntryParams {
    * 控除前の期待値のシグナル (edgeIsNet なし) には影響しない。tempo が無ければ無視する
    */
   tempoExplore?: boolean;
+}
+
+/**
+ * コスト控除後の期待値 (edgeIsNet) のシグナルに求める期待値の下限: max(0, 比率 − 1) × コスト (bps)。
+ * これに加えて「純 > 0」も求める。テンポの有無によらず同じ規則 (RiskManager とバックテストのエントリーの判定で共通)
+ */
+export function netEdgeMinBps(ratio: number, cost: number): number {
+  return Math.max(0, ratio - 1) * cost;
 }
 
 /** テンポのモードで minEdgeToCostRatio を緩める下限の既定値 (RiskLimits.tempoMinEdgeToCost) */
@@ -83,7 +92,7 @@ export function tempoEdgeRequirement(
   const floor = t !== undefined && Number.isFinite(t) ? Math.max(DEFAULT_TEMPO_MIN_EDGE_TO_COST, t) : DEFAULT_TEMPO_MIN_EDGE_TO_COST;
   const ratio = relaxToward(limits.minEdgeToCostRatio, floor, tempo);
   if (edgeIsNet) {
-    const base = Math.max(0, ratio - 1) * cost;
+    const base = netEdgeMinBps(ratio, cost);
     if (explore) return { ratio, minEdgeBps: base - clampTempo(tempo) * cost, requirePositive: false };
     return { ratio, minEdgeBps: base, requirePositive: true };
   }
@@ -407,10 +416,22 @@ export class RiskManager {
     // コスト比
     const cost = costBps(inst, quote);
     if (p.tempo === undefined) {
-      if (signal.expectedEdgeBps < L.minEdgeToCostRatio * cost) {
-        return { ok: false, reason: `期待値幅 ${signal.expectedEdgeBps.toFixed(1)}bps < コスト ${cost.toFixed(1)}bps × ${L.minEdgeToCostRatio}` };
+      if (signal.edgeIsNet === true) {
+        // コスト控除後の期待値のシグナル: テンポの有無によらず「純 ≥ max(0, 比率 − 1) × コスト かつ 純 > 0」
+        // (控除前に直すと「控除前 ≥ 比率 × コスト」。コストを二重に数えない。NaN は通さない)
+        const edge = signal.expectedEdgeBps;
+        const min = netEdgeMinBps(L.minEdgeToCostRatio, cost);
+        if (!(edge > 0)) return { ok: false, reason: `期待値 (コスト控除後) ${edge.toFixed(1)}bps が 0 以下` };
+        if (!(edge >= min)) {
+          return { ok: false, reason: `期待値 (コスト控除後) ${edge.toFixed(1)}bps < コスト ${cost.toFixed(1)}bps × (${L.minEdgeToCostRatio} - 1)` };
+        }
+        notes.push(`edge ${edge.toFixed(1)}bps (net) / cost ${cost.toFixed(1)}bps`);
+      } else {
+        if (signal.expectedEdgeBps < L.minEdgeToCostRatio * cost) {
+          return { ok: false, reason: `期待値幅 ${signal.expectedEdgeBps.toFixed(1)}bps < コスト ${cost.toFixed(1)}bps × ${L.minEdgeToCostRatio}` };
+        }
+        notes.push(`edge ${signal.expectedEdgeBps.toFixed(1)}bps / cost ${cost.toFixed(1)}bps`);
       }
-      notes.push(`edge ${signal.expectedEdgeBps.toFixed(1)}bps / cost ${cost.toFixed(1)}bps`);
     } else {
       // テンポのモード: 比率を下限まで緩める。コスト控除後の期待値のシグナルはコストを二重に数えない (比率 - 1)。
       // NaN の期待値は通さない (fail-closed)

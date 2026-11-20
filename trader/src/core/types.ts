@@ -281,7 +281,8 @@ export interface Signal {
   expectedEdgeBps: number;
   /**
    * expectedEdgeBps がコスト控除後 (往復コストを引いた期待値) なら true。
-   * テンポのモードの RiskManager は、このときコストを二重に数えないよう比率から 1 を引いて判定する
+   * RiskManager とバックテストのエントリーの判定は、テンポの有無によらず、コストを二重に数えないよう
+   * 「期待値 ≥ max(0, MIN_EDGE_TO_COST − 1) × コスト かつ 期待値 > 0」で判定する (テンポのモードは比率を緩めてから同じ規則)
    */
   edgeIsNet?: boolean;
   entry: { type: "market" | "limit"; price?: number };
@@ -506,7 +507,16 @@ export interface RiskState {
  */
 export type ExitReason =
   | "stop" | "take_profit" | "trailing" | "signal" | "time" | "kill_switch" | "manual"
-  | "thesis_failed" | "thesis_timeout" | "thesis_cap" | "reversal";
+  | "thesis_failed" | "thesis_timeout" | "thesis_cap" | "reversal"
+  /** paper の口座のリセット (`paper reset`) で、保有中の建玉を最後の価格で記帳上だけ閉じた。学習・成績の集計には使わない */
+  | "wallet_reset";
+
+/**
+ * 学習・成績の集計から除く取引 (paper の口座のリセットで閉じた建玉など)。
+ * 腕・要因分析・ParamTuner・振り返り・情報源の信頼度・report / ダッシュボードの成績はこれを除く
+ */
+export const isLearningExcludedTrade = (t: Pick<TradeRecord, "learningExcluded" | "exitReason">): boolean =>
+  t.learningExcluded === true || t.exitReason === "wallet_reset";
 
 /** 時間に関する決済理由 (従来の時間切れ time と読みの管理の 3 つ)。要因分析・パラメータ調整で time と同じ扱いにする */
 export const TIME_LIKE_EXIT_REASONS: readonly string[] = ["time", "thesis_failed", "thesis_timeout", "thesis_cap"];
@@ -604,6 +614,11 @@ export interface TradeRecord {
   thesisOutcome?: "failed_early" | "timeout" | "extended" | "none";
   thesisNetRAtDeadline?: number;
   thesisStopExit?: boolean;
+  /**
+   * 学習・成績の集計から除く (paper の口座のリセット `wallet_reset` で記帳上だけ閉じた建玉)。
+   * 判定は isLearningExcludedTrade を使う
+   */
+  learningExcluded?: boolean;
 }
 
 export type CauseCode =

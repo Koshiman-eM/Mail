@@ -542,7 +542,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
 (function () {
   "use strict";
   var EXIT = { stop: "損切り", take_profit: "利確", trailing: "トレーリング", signal: "シグナル", time: "時間切れ", kill_switch: "キルスイッチ", manual: "手動",
-    thesis_failed: "読み外れ(途中)", thesis_timeout: "読み外れ(期限)", thesis_cap: "延長の上限", reversal: "転換で決済" };
+    thesis_failed: "読み外れ(途中)", thesis_timeout: "読み外れ(期限)", thesis_cap: "延長の上限", reversal: "転換で決済", wallet_reset: "リセットで決済" };
   /** 決済理由の表示名。転換で決済は方向で中身を添える (買い: 押し安値割れ / 売り: 戻り高値超え) */
   function exitLabel(reason, direction) {
     var b = EXIT[reason] || reason || "";
@@ -630,6 +630,8 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
   function toneOf(x) { return x >= 0.3 ? ["強気", "bull"] : x >= 0.1 ? ["やや強気", "bull"] : x <= -0.3 ? ["弱気", "bear"] : x <= -0.1 ? ["やや弱気", "bear"] : ["中立", ""]; }
 
   // ───── 状態 ─────
+  // TR_ALL: 取引・成績を全期間で表示する (paper の口座リセットより前と、リセットで決済した取引を含む)
+  var TR_ALL = false;
   var S = null, TR = null, LE = null, EV = [], evSince = 0, evBooted = false, evSeen = {}, evInflight = null, cur = "board";
   // ポーリングの状態 (status の連続失敗数・最後に status を取れた時刻・learning の最終取得)
   var POLL = { busy: false, timer: 0, fails: 0, lastOk: 0, lastLearn: 0 };
@@ -1757,7 +1759,11 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
       return [esc(x.label), esc(x.trades), esc(pct(x.winRate, 1)), '<span class="' + cls(x.netPnl) + '">' + esc(signed(x.netPnl, 0)) + '</span>', esc(num(x.avgR, 2))];
     }), [false, true, true, true, true]) + '<p class="note">live で実際にできる成績 (' + esc(SIM_SHORT) + 'を除く。現物は買いのみ): ' + esc(live.n) + ' 件 / 勝率 ' + esc(pct(live.n ? live.w / live.n : 0, 1)) + ' / 損益 ' + esc(signed(live.pnl, 0)) + '</p>' +
       (hasSim ? '<p class="note">' + esc(SIM_SHORT) + ' = 取引所では空売りできない現物を paper でだけ売り建てた取引 (借入コストは手数料に含む)。live では空売りしません。戦略別は全方向の合計です。</p>' : '') : '';
-    set("byStrategy", sideHtml + table(["戦略", "取引", "勝率", "損益(" + ccy + ")", "平均R"], t.byStrategy.map(function (s) {
+    // paper の口座のリセット以降の成績 (リセットで決済した取引は集計から除外)
+    var resetNote = t.walletReset ? '<p class="note">' + (t.scope === "all" ? "全期間の成績" : "口座リセット (" + esc(time(t.walletReset.at)) + "、" + esc(num(t.walletReset.toEquity, 0)) + " " + esc(ccy) + ") 以降の成績") +
+      (t.excludedTrades ? " · リセットで決済 " + esc(t.excludedTrades) + " 件は集計から除外" : "") +
+      ' <button type="button" id="trScope">' + (t.scope === "all" ? "リセット以降を表示" : "全期間を表示") + "</button></p>" : "";
+    set("byStrategy", resetNote + sideHtml + table(["戦略", "取引", "勝率", "損益(" + ccy + ")", "平均R"], t.byStrategy.map(function (s) {
       return [shtml(s.strategyId), esc(s.trades), esc(pct(s.winRate, 1)), '<span class="' + cls(s.netPnl) + '">' + esc(signed(s.netPnl, 0)) + "</span>", esc(num(s.avgR, 2))];
     }), [false, true, true, true, true]));
   }
@@ -2168,6 +2174,14 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     if (name === "risk") loadRisk();
     try { localStorage.setItem(TAB_KEY, name); } catch (e) { /* 保存できなくても表示は続ける */ }
   }
+  // 成績の期間の切り替え (口座リセット以降 / 全期間)
+  $("byStrategy").addEventListener("click", function (ev) {
+    var b = ev.target;
+    if (!b || b.id !== "trScope") return;
+    TR_ALL = !TR_ALL;
+    b.disabled = true;
+    refresh();
+  });
   $("tabs").addEventListener("click", function (ev) {
     var t = ev.target && ev.target.closest ? ev.target.closest("button[data-tab]") : null;
     if (t) { showTab(t.getAttribute("data-tab")); window.scrollTo(0, 0); }
@@ -2199,7 +2213,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     var learnEvery = cur === "learning" ? LEARN_TAB_MS : LEARN_MS;
     var tasks = [
       get("/api/status").then(function (r) { S = r; POLL.fails = 0; POLL.lastOk = Date.now(); }, function (e) { POLL.fails++; errs.push("status"); }),
-      get("/api/trades?limit=100" + (S && S.mode ? "&mode=" + encodeURIComponent(S.mode) : "")).then(function (r) { TR = r; }, function () { errs.push("trades"); }),
+      get("/api/trades?limit=100" + (S && S.mode ? "&mode=" + encodeURIComponent(S.mode) : "") + (TR_ALL ? "&scope=all" : "")).then(function (r) { TR = r; }, function () { errs.push("trades"); }),
       loadEvents().catch(function () { errs.push("events"); }),
     ];
     if (!LE || now - POLL.lastLearn >= learnEvery) {

@@ -1,5 +1,6 @@
 import type { AiOptions } from "../core/ai";
 import { DEFAULT_OBSERVE_ONLY_STRATEGIES, type AppConfig } from "../core/config";
+import { equitySinceReset, latestPaperReset } from "../paper/walletReset";
 import { D, Decimal } from "../core/decimal";
 import { redactSecrets } from "../core/http";
 import { createLogger, type Logger } from "../core/logger";
@@ -7,7 +8,7 @@ import { DEFAULT_SHORT_BORROW_RATE_DAILY, isSimulatedShort } from "../core/short
 import {
   systemClock, type Balance, type Broker, type BrokerPosition, type Clock, type EntryContext, type Instrument, type IntelBias, type MarketBrief,
   type IntelItem, type MarketView, type OrderRequest, type Params, type Quote, type RegimeFeatures, type Signal, type Store, type Strategy,
-  type ShadowTradeRecord, type StrategyContext, type StrategyPlan, type Timeframe, type TradeRecord, TIMEFRAME_MS,
+  type ShadowTradeRecord, type StrategyContext, type StrategyPlan, type Timeframe, type TradeRecord, TIMEFRAME_MS, isLearningExcludedTrade,
 } from "../core/types";
 import type { BrokerSet } from "../execution/router";
 import type { PaperSnapshot } from "../execution/paper";
@@ -42,7 +43,9 @@ import {
 import { DEFAULT_ORDER_POLICY, PositionManager, type EntryResult, type OrderPolicy, type SyncResult, type ThesisView } from "./positions";
 import { clampMaxHoldMs, isHoldLimitedHorizon, TempoController, tempoSeedTimestamps, tempoStatusView, type TempoStatusView } from "./tempo";
 import { thesisSettingsFromEnv, type ThesisSettings } from "./thesis";
-import { checkReversal, reversalAppliesTo, reversalDetailLabel, reversalSettingsFromEnv, type ReversalSettings } from "./reversalExit";
+import {
+  checkReversal, reversalAppliesTo, reversalDetailLabel, reversalSettingsFromEnv, reversalTimeframeFor, type ReversalSettings,
+} from "./reversalExit";
 import { effectiveLimitTakeProfit } from "./limitOrders";
 
 export const PAPER_SNAPSHOT_KEY = "paper:snapshot";
@@ -746,7 +749,8 @@ export class TradingEngine {
     const tc = this.tempo;
     if (!tc) return;
     try {
-      const closed = this.store.listTrades({ since: now - tc.windowMs, mode: this.mode }).map((t) => t.entryTs);
+      // 口座リセットで記帳上だけ閉じた取引など、学習・成績から除く取引は数えない
+      const closed = this.store.listTrades({ since: now - tc.windowMs, mode: this.mode }).filter((t) => !isLearningExcludedTrade(t)).map((t) => t.entryTs);
       const ts = tempoSeedTimestamps(closed, this.positions.list().map((p) => p.entryTs), now, tc.windowMs);
       tc.seed(ts);
       if (ts.length) this.log.info("テンポ: 直近のエントリーを復元しました", { entries: ts.length, target: tc.targetPerHour });
@@ -1195,7 +1199,8 @@ export class TradingEngine {
       if (!this.shadow || !sh || !inst) continue;
       try {
         const sim = isSimulatedShort(inst, this.mode, sh.signal.direction);
-        const tf = (this.strategies.find((x) => x.id === sh.signal.strategyId) ?? ALL_STRATEGIES.find((x) => x.id === sh.signal.strategyId))?.primaryTimeframe;
+        const ptf = (this.strategies.find((x) => x.id === sh.signal.strategyId) ?? ALL_STRATEGIES.find((x) => x.id === sh.signal.strategyId))?.primaryTimeframe;
+        const tf = ptf ? reversalTimeframeFor(this.reversal, ptf) : undefined;
         this.shadow.record({
           instrument: inst, quote: sh.quote, signal: sh.signal, regime: sh.regime, reason: "limit_unfilled", now: sh.signalTs,
           ...(sim ? { simulatedShort: true, borrowRateDaily: this.shortBorrowRateDaily() } : {}),
@@ -1431,8 +1436,8 @@ export class TradingEngine {
       const created = this.shadow.record({
         instrument: inst, quote: view.quote, signal: { ...signal, horizon: signal.horizon ?? s.horizon }, regime: regime.label, reason: key, now,
         ...(sim ? { simulatedShort: true, borrowRateDaily: this.shortBorrowRateDaily() } : {}),
-        // 転換で決済は実際の建玉と同じく戦略の主時間足で判定する
-        exitTimeframe: s.primaryTimeframe,
+        // 転換で決済は実際の建玉と同じ時間足 (REVERSAL_EXIT_TF。lower = 主時間足の 1 つ下) で判定する
+        exitTimeframe: reversalTimeframeFor(this.reversal, s.primaryTimeframe),
       });
       if (created && key === "direction_bias" && typeof intelSentiment === "number" && Number.isFinite(intelSentiment)) {
         const m = this.shadowIntelMap();
@@ -1567,7 +1572,7 @@ export class TradingEngine {
       this.shadow.update(now, (sym) => quotes.get(sym) ?? this.hub.latestQuote(sym), {
         isWatched: (sym) => watched.has(sym),
         rangeOf: (sym, since) => this.candleRange(sym, since, now, views),
-        // 転換で決済: hub の確定足をそのまま渡す (hub は全戦略の時間足を持つ)
+        // 転換で決済: hub の確定足をそのまま渡す (hub は全戦略の時間足と転換で決済の時間足を持つ)
         candlesOf: (sym, tf) => viewOf(sym)?.candles[tf],
       });
     } catch (e) {
@@ -1991,7 +1996,9 @@ export class TradingEngine {
   }
 
   /**
-   * 転換で決済 (REVERSAL_EXIT。src/engine/reversalExit.ts)。保有中の建玉を、持ち主の戦略の主時間足の新しい確定足ごとに 1 回判定する。
+   * 転換で決済 (REVERSAL_EXIT。src/engine/reversalExit.ts)。保有中の建玉を、REVERSAL_EXIT_TF の時間足
+   * (lower (既定) = 持ち主の戦略の主時間足の 1 つ下、same = 主時間足。hub がその足を持たなければ主時間足) の新しい確定足ごとに 1 回判定する。
+   * エントリー後に確定したスイングが無ければ、REVERSAL_EXIT_FALLBACK=true のときだけエントリーした足の安値 (買い) / 高値 (売り) を水準にする (監査ログに fallback: true)。
    * 買いはエントリー後にできた押し安値 (確定したスイングロー) を確定足の終値が割ったら、売りは戻り高値を越えたら、
    * 利確・損切りの手前でも成行で決済する (理由 "reversal")。含み益でも含み損でも同じ。
    * - 損切り・利確・トレーリング・読みの管理はティックごとに manageExits で先に判定している (そちらが先)。
@@ -2009,7 +2016,9 @@ export class TradingEngine {
     if (!reversalAppliesTo(this.reversal, pos.strategyId)) return;
     const s = this.strategies.find((x) => x.id === pos.strategyId) ?? ALL_STRATEGIES.find((x) => x.id === pos.strategyId);
     if (!s) return;
-    const tf = s.primaryTimeframe;
+    // 判定の時間足 (REVERSAL_EXIT_TF。lower = 主時間足の 1 つ下)。hub がその足を持たなければ主時間足で判定する
+    const want = reversalTimeframeFor(this.reversal, s.primaryTimeframe);
+    const tf = view.candles[want]?.length ? want : s.primaryTimeframe;
     const tfMs = TIMEFRAME_MS[tf];
     const c = view.candles[tf];
     const lastBar = c && c.length ? c[c.length - 1] : undefined;
@@ -2027,7 +2036,9 @@ export class TradingEngine {
     }
     if (this.positions.exitInProgress(inst.symbol)) return;
     this.reversalEvalAt.set(pos.id, lastBar.ts);
-    const r = checkReversal(c, pos.entryTs, pos.direction, { pivotN: this.reversal.pivotN, bufferAtr: this.reversal.bufferAtr, tfMs });
+    const r = checkReversal(c, pos.entryTs, pos.direction, {
+      pivotN: this.reversal.pivotN, bufferAtr: this.reversal.bufferAtr, tfMs, fallback: this.reversal.fallback,
+    });
     if (r.skip === "no_history" && !this.reversalNoHistory.has(pos.id)) {
       this.reversalNoHistory.add(pos.id);
       const data = { tradeId: pos.id, symbol: inst.symbol, strategyId: pos.strategyId, timeframe: tf, entryTs: pos.entryTs, firstBarTs: c[0].ts };
@@ -2039,7 +2050,8 @@ export class TradingEngine {
     const risk = Math.abs(pos.entryPrice - pos.initialStop);
     const data = {
       tradeId: pos.id, symbol: inst.symbol, strategyId: pos.strategyId, direction: pos.direction, detail: reversalDetailLabel(pos.direction),
-      timeframe: tf, pivotN: this.reversal.pivotN, bufferAtr: this.reversal.bufferAtr, level: r.level, pivotTs: r.pivotTs, close: r.close, barTs: r.barTs,
+      timeframe: tf, primaryTimeframe: s.primaryTimeframe, pivotN: this.reversal.pivotN, bufferAtr: this.reversal.bufferAtr,
+      level: r.level, pivotTs: r.pivotTs, ...(r.fallback ? { fallback: true } : {}), close: r.close, barTs: r.barTs,
       ...(Number.isFinite(r.atr) ? { atr: r.atr } : {}), threshold: r.threshold, entryPrice: pos.entryPrice, entryTs: pos.entryTs,
       initialStop: pos.initialStop, ...(pos.takeProfit !== undefined ? { takeProfit: pos.takeProfit } : {}), intendedPrice: intended,
       // 判定した終値での値動きの R (手数料を含めない。含み益なら正)
@@ -2575,7 +2587,9 @@ export class TradingEngine {
     });
     const plan = this.store.latestPlan();
     const brief = this.store.latestBrief();
-    const eq = this.store.listEquity({ since: now - 7 * 86_400_000, mode: this.mode });
+    // paper の口座リセット (paper reset) 以降だけを成績・推移に使う (当初の評価額もリセット後の評価額)
+    const paperReset = this.mode === "paper" ? latestPaperReset(this.store) : undefined;
+    const eq = equitySinceReset(this.store.listEquity({ since: now - 7 * 86_400_000, mode: this.mode }), paperReset);
     return {
       now,
       mode: this.mode,
@@ -2596,7 +2610,7 @@ export class TradingEngine {
       })),
       equity: {
         current: acct.equity,
-        initial: this.mode === "paper" ? this.config.env.PAPER_INITIAL_EQUITY : (eq[0]?.equity ?? acct.equity),
+        initial: this.mode === "paper" ? (paperReset?.toEquity ?? this.config.env.PAPER_INITIAL_EQUITY) : (eq[0]?.equity ?? acct.equity),
         available: acct.available,
         ...(paperM ? { cash: paperM.cash, realized: paperM.realized, unrealized: paperM.unrealized } : {}),
       },

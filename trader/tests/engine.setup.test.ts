@@ -5,6 +5,7 @@ import type { Candle } from "../src/core/types";
 import { createParamValidator, createPriceAt } from "../src/engine/learningHooks";
 import { brokerVenues, buildRuntime, hubTimeframesFor, parseVenues, parseWatchlist, resolveDbPath, syntheticDbPath } from "../src/engine/setup";
 import { assertSimulationDb } from "../src/engine/simulate";
+import { DEFAULT_REVERSAL_SETTINGS, REVERSAL_DISABLED } from "../src/engine/reversalExit";
 import { ClosedCandleCacheFeed } from "../src/engine/feedCache";
 import { CcxtFeed, PRECISION, type CcxtLike } from "../src/market/feeds/ccxt";
 import { PaperBroker } from "../src/execution/paper";
@@ -40,6 +41,20 @@ describe("設定の解析", () => {
     expect(hubTimeframesFor([{ assetClass: "meme" }], ALL_STRATEGIES)).toEqual(["1m", "5m"]);
     expect(hubTimeframesFor([{ assetClass: "fx" }], ALL_STRATEGIES)).toEqual(["1m", "15m", "1h", "4h", "1d"]);
     expect(hubTimeframesFor([{ assetClass: "crypto" }, { assetClass: "meme" }], ALL_STRATEGIES)).toEqual(["1m", "5m", "15m", "1h", "4h", "1d"]);
+  });
+
+  it("転換で決済 (REVERSAL_EXIT_TF=lower) の判定用に、対象の戦略の主時間足の 1 つ下の時間足も取得する", () => {
+    const only = (id: string) => ALL_STRATEGIES.filter((s) => s.id === id);
+    const lower = { ...DEFAULT_REVERSAL_SETTINGS };
+    // long_momentum (1d) → 4h、mid_trend_follow (4h) → 1h
+    expect(hubTimeframesFor([{ assetClass: "crypto" }], only("long_momentum"), lower)).toEqual(["1m", "4h", "1d"]);
+    expect(hubTimeframesFor([{ assetClass: "crypto" }], only("mid_trend_follow"), lower)).toEqual(["1m", "1h", "4h"]);
+    // fx: 15m の戦略 → 5m も加わる
+    expect(hubTimeframesFor([{ assetClass: "fx" }], ALL_STRATEGIES, lower)).toEqual(["1m", "5m", "15m", "1h", "4h", "1d"]);
+    // same・無効・対象外なら従来どおり
+    expect(hubTimeframesFor([{ assetClass: "crypto" }], only("long_momentum"), { ...lower, timeframe: "same" })).toEqual(["1m", "1d"]);
+    expect(hubTimeframesFor([{ assetClass: "crypto" }], only("long_momentum"), REVERSAL_DISABLED)).toEqual(["1m", "1d"]);
+    expect(hubTimeframesFor([{ assetClass: "crypto" }], only("long_momentum"), { ...lower, strategies: ["other"] })).toEqual(["1m", "1d"]);
   });
 });
 

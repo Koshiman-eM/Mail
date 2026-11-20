@@ -8,8 +8,11 @@
  *     (押し安値割れ) とみなして決済する。
  *   - 売り: 逆。エントリー後のスイングハイ (戻り高値) を、確定足の終値が上回ったら決済する (戻り高値超え)。
  *   - 含み益でも含み損でも同じ (利確・損切りの手前で、トレンドがはっきり転換したら決済する)。
- *   - エントリー後にまだスイングが確定していなければ判定しない (当初の損切りが守る)。エントリーした足より前のスイングは使わない
- *     (エントリーした足そのもののスイングは使う)。
+ *   - エントリー後にまだスイングが確定していなければ判定しない (当初の損切りが守る)。REVERSAL_EXIT_FALLBACK=true (既定 false) のときだけ、
+ *     エントリーした足の安値 (買い) / 高値 (売り) を水準にする (フォールバック。監査ログに fallback: true。早く発火しすぎるので既定は無効)。
+ *     エントリーした足より前のスイングは使わない (エントリーした足そのもののスイングは使う)。
+ *   - 時間足は REVERSAL_EXIT_TF: lower (既定) = 戦略の主時間足の 1 つ下 (1m→1m, 5m→1m, 15m→5m, 1h→15m, 4h→1h, 1d→4h)、
+ *     same = 戦略の主時間足。
  *   - ヒゲ (安値・高値) だけが水準を越えても決済しない (終値で判定する)。
  * スイングは src/structure/pivots.ts の detectPivots (左右 N 本。左は厳密・右は >= で横ばい対応) と同じ規則で、
  * N 本後の足が確定してから使う (confirmedAt ≤ 最後の確定足。リペイントしない)。N は REVERSAL_EXIT_PIVOT_N (既定 3。
@@ -19,7 +22,7 @@
  * 価格は統計値なので number で計算する (会計値ではない)。
  */
 import type { Env } from "../core/config";
-import type { Candle } from "../core/types";
+import { TIMEFRAME_MS, type Candle, type Timeframe } from "../core/types";
 import { atrLast } from "../indicators/series";
 import { confirmedPivots, detectPivots, normalizePivotN } from "../structure/pivots";
 
@@ -32,9 +35,49 @@ export interface ReversalSettings {
   bufferAtr: number;
   /** 対象の戦略 id (REVERSAL_EXIT_STRATEGIES)。空ならすべての戦略 */
   strategies: readonly string[];
+  /**
+   * 判定に使う時間足 (REVERSAL_EXIT_TF)。lower (既定) = 戦略の主時間足の 1 つ下 (reversalLowerTimeframe)、
+   * same = 戦略の主時間足 (従来どおり)
+   */
+  timeframe: ReversalTfMode;
+  /**
+   * エントリー後に確定したスイングが無いとき、エントリーした足の安値 (買い) / 高値 (売り) を水準にする (REVERSAL_EXIT_FALLBACK。既定 false)。
+   * 既定で無効なのは早く発火しすぎるため (simulate でほとんどの取引をエントリー付近で閉じ、勝率は 5% 前後だった)
+   */
+  fallback: boolean;
 }
 
-export const DEFAULT_REVERSAL_SETTINGS: Readonly<ReversalSettings> = { enabled: true, pivotN: 3, bufferAtr: 0, strategies: [] };
+/** 転換で決済の時間足のモード (REVERSAL_EXIT_TF) */
+export type ReversalTfMode = "lower" | "same";
+export const REVERSAL_TF_MODES = ["lower", "same"] as const;
+
+export const DEFAULT_REVERSAL_SETTINGS: Readonly<ReversalSettings> = { enabled: true, pivotN: 3, bufferAtr: 0, strategies: [], timeframe: "lower", fallback: false };
+
+/**
+ * 主時間足の 1 つ下の時間足 (REVERSAL_EXIT_TF=lower で使う)。
+ * 1m→1m, 5m→1m, 15m→5m, 1h→15m, 4h→1h, 1d→4h (1s→1s, 1w→1d)
+ */
+const LOWER_TF: Record<Timeframe, Timeframe> = {
+  "1s": "1s", "1m": "1m", "5m": "1m", "15m": "5m", "1h": "15m", "4h": "1h", "1d": "4h", "1w": "1d",
+};
+export function reversalLowerTimeframe(primary: Timeframe): Timeframe {
+  return LOWER_TF[primary] ?? primary;
+}
+
+/** 転換で決済に使う時間足 (設定が無い・same なら主時間足、lower なら 1 つ下) */
+export function reversalTimeframeFor(s: Pick<ReversalSettings, "timeframe"> | undefined, primary: Timeframe): Timeframe {
+  return s?.timeframe === "same" ? primary : reversalLowerTimeframe(primary);
+}
+
+/**
+ * バックテスト用: 基準足 baseTf から作れる時間足か (基準足の整数倍)。作れなければ主時間足に戻す (same 扱い)
+ */
+export function reversalBacktestTimeframe(s: Pick<ReversalSettings, "timeframe"> | undefined, primary: Timeframe, baseTf: Timeframe): Timeframe {
+  const tf = reversalTimeframeFor(s, primary);
+  const ms = TIMEFRAME_MS[tf];
+  const baseMs = TIMEFRAME_MS[baseTf];
+  return ms >= baseMs && ms % baseMs === 0 ? tf : primary;
+}
 
 /** 無効 (従来どおり)。バックテスト・仮想トレードで設定を渡さないときの既定 */
 export const REVERSAL_DISABLED: Readonly<ReversalSettings> = { ...DEFAULT_REVERSAL_SETTINGS, enabled: false };
@@ -47,7 +90,7 @@ export const REVERSAL_ATR_WINDOW = 100;
 export const REVERSAL_EXIT_LABEL = "転換で決済";
 export const reversalDetailLabel = (direction: "long" | "short"): string => (direction === "long" ? "押し安値割れ" : "戻り高値超え");
 
-type ReversalEnv = Partial<Pick<Env, "REVERSAL_EXIT" | "REVERSAL_EXIT_PIVOT_N" | "REVERSAL_EXIT_BUFFER_ATR" | "REVERSAL_EXIT_STRATEGIES">>;
+type ReversalEnv = Partial<Pick<Env, "REVERSAL_EXIT" | "REVERSAL_EXIT_PIVOT_N" | "REVERSAL_EXIT_BUFFER_ATR" | "REVERSAL_EXIT_STRATEGIES" | "REVERSAL_EXIT_TF" | "REVERSAL_EXIT_FALLBACK">>;
 
 const finite = (x: unknown): x is number => typeof x === "number" && Number.isFinite(x);
 
@@ -59,6 +102,8 @@ export function reversalSettingsFromEnv(env: ReversalEnv): ReversalSettings {
     pivotN: finite(env.REVERSAL_EXIT_PIVOT_N) ? env.REVERSAL_EXIT_PIVOT_N : d.pivotN,
     bufferAtr: finite(env.REVERSAL_EXIT_BUFFER_ATR) && env.REVERSAL_EXIT_BUFFER_ATR >= 0 ? env.REVERSAL_EXIT_BUFFER_ATR : d.bufferAtr,
     strategies: Array.isArray(env.REVERSAL_EXIT_STRATEGIES) ? [...env.REVERSAL_EXIT_STRATEGIES] : [...d.strategies],
+    timeframe: env.REVERSAL_EXIT_TF === "same" || env.REVERSAL_EXIT_TF === "lower" ? env.REVERSAL_EXIT_TF : d.timeframe,
+    fallback: env.REVERSAL_EXIT_FALLBACK ?? d.fallback,
   };
 }
 
@@ -72,7 +117,8 @@ export function reversalAppliesTo(s: ReversalSettings | undefined, strategyId: s
 export function formatReversalSettings(s: ReversalSettings): string {
   if (!s.enabled) return "無効 (従来どおり)";
   return (
-    `有効 (戦略の主時間足のスイング 左右 ${s.pivotN} 本 / 終値が水準を${s.bufferAtr > 0 ? ` ${s.bufferAtr} ATR より大きく` : ""}越えたら決済` +
+    `有効 (${s.timeframe === "same" ? "戦略の主時間足" : "戦略の主時間足の 1 つ下の時間足"}のスイング 左右 ${s.pivotN} 本` +
+    `${s.fallback ? " (無ければエントリーした足の安値・高値)" : ""} / 終値が水準を${s.bufferAtr > 0 ? ` ${s.bufferAtr} ATR より大きく` : ""}越えたら決済` +
     ` / 対象 ${s.strategies.length ? s.strategies.join(", ") : "すべての戦略"})`
   );
 }
@@ -133,16 +179,20 @@ export interface ReversalLevel {
   level: number;
   /** スイングの足の開始時刻 */
   pivotTs: number;
-  /** スイングが確定した足 (N 本後) の開始時刻 */
+  /** スイングが確定した足 (N 本後) の開始時刻 (フォールバックはエントリーした足の開始時刻) */
   confirmedTs: number;
+  /** エントリー後に確定したスイングが無く、エントリーした足の安値 (買い) / 高値 (売り) を使った */
+  fallback?: boolean;
 }
 
 /**
  * 守るべき水準: エントリーした足以降の、確定したスイングロー (買い) / スイングハイ (売り) のうち最も新しいもの。
- * 無ければ undefined (エントリー後にまだスイングが確定していない・履歴が足りない)
+ * 無ければ undefined (エントリー後にまだスイングが確定していない・履歴が足りない)。
+ * fallback が true なら、スイングが無いときにエントリーした足 (確定済み) の安値 (買い) / 高値 (売り) を返す (fallback: true)。
+ * エントリーした足が無い・まだ確定していない (形成中) なら fallback でも undefined
  */
 export function reversalLevel(
-  candles: readonly Candle[], entryTs: number, direction: "long" | "short", N: number, tfMs?: number,
+  candles: readonly Candle[], entryTs: number, direction: "long" | "short", N: number, tfMs?: number, fallback = false,
 ): ReversalLevel | undefined {
   const n = normalizePivotN(N);
   const e = entryBarIndex(candles, entryTs, tfMs);
@@ -153,7 +203,11 @@ export function reversalLevel(
   const type = direction === "long" ? "SL" : "SH";
   const ps = confirmedPivots(detectPivots(win, n), win.length - 1).filter((p) => p.type === type && p.idx + from >= e);
   const p = ps[ps.length - 1];
-  if (!p) return undefined;
+  if (!p) {
+    if (!fallback) return undefined;
+    const eb = candles[e];
+    return { level: direction === "long" ? eb.low : eb.high, pivotTs: eb.ts, confirmedTs: eb.ts, fallback: true };
+  }
   return { level: p.price, pivotTs: p.ts, confirmedTs: win[p.confirmedAt].ts };
 }
 
@@ -164,6 +218,8 @@ export interface ReversalCheckOptions {
   bufferAtr?: number;
   /** 足の長さ (ms)。省略時は足の間隔から推定 */
   tfMs?: number;
+  /** スイングが無ければエントリーした足の安値・高値を水準にする (REVERSAL_EXIT_FALLBACK。省略時 false) */
+  fallback?: boolean;
 }
 
 export interface ReversalCheck {
@@ -171,8 +227,10 @@ export interface ReversalCheck {
   exit: boolean;
   /** 守るべき水準 (無ければ undefined) */
   level?: number;
-  /** 水準のスイングの足の開始時刻 */
+  /** 水準のスイングの足の開始時刻 (フォールバックはエントリーした足) */
   pivotTs?: number;
+  /** 水準がフォールバック (エントリー後に確定したスイングが無く、エントリーした足の安値・高値) */
+  fallback?: boolean;
   /** 判定した確定足 (最後の足) の終値と開始時刻 */
   close: number;
   barTs?: number;
@@ -182,7 +240,7 @@ export interface ReversalCheck {
   threshold?: number;
   /**
    * 判定しなかった理由: no_bars = 足が無い / no_history = 足がエントリーより後からしか無い /
-   * no_swing = エントリー後に確定したスイングが無い / no_atr = バッファがあるのに ATR が求まらない (決済しない)
+   * no_swing = エントリー後に確定したスイングが無い (フォールバック有効ならエントリーした足がまだ確定していない) / no_atr = バッファがあるのに ATR が求まらない (決済しない)
    */
   skip?: "no_bars" | "no_history" | "no_swing" | "no_atr";
 }
@@ -200,12 +258,13 @@ export function checkReversal(
   if (!last) return { exit: false, close, atr, skip: "no_bars" };
   const base = { close, barTs: last.ts, atr };
   if (entryBarIndex(candles, entryTs, opts.tfMs) < 0) return { exit: false, ...base, skip: "no_history" };
-  const lv = reversalLevel(candles, entryTs, direction, opts.pivotN, opts.tfMs);
+  const lv = reversalLevel(candles, entryTs, direction, opts.pivotN, opts.tfMs, opts.fallback === true);
   if (!lv) return { exit: false, ...base, skip: "no_swing" };
   const buf = finite(opts.bufferAtr) && opts.bufferAtr > 0 ? opts.bufferAtr : 0;
-  const found = { ...base, level: lv.level, pivotTs: lv.pivotTs };
+  const found = { ...base, level: lv.level, pivotTs: lv.pivotTs, ...(lv.fallback ? { fallback: true } : {}) };
   if (buf > 0 && !(finite(atr) && atr > 0)) return { exit: false, ...found, skip: "no_atr" };
-  const threshold = direction === "long" ? lv.level - buf * atr : lv.level + buf * atr;
+  // バッファ 0 なら ATR を使わない (足が少なく ATR が求まらなくても 0 × NaN にしない)
+  const threshold = buf === 0 ? lv.level : direction === "long" ? lv.level - buf * atr : lv.level + buf * atr;
   const exit = finite(close) && (direction === "long" ? close < threshold : close > threshold);
   return { exit, ...found, threshold };
 }

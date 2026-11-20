@@ -119,8 +119,29 @@ const str = (def = "") =>
 const idList = (def: string) =>
   str(def).transform((v) => [...new Set(v.split(",").map((x) => x.trim()).filter(Boolean))]);
 
-/** 観測専用 (発注せず仮想トレードだけ記録する) 戦略の既定値 */
-export const DEFAULT_OBSERVE_ONLY_STRATEGIES = "scalp_rebound";
+/**
+ * 観測専用 (発注せず仮想トレードだけ記録する) 戦略の既定値。
+ * scalp_rebound (効果の測定中) と、中長期の mid_trend_follow・long_momentum (中長期の新規エントリーはしない方針)。
+ * 観測専用でも保有中の建玉は従来どおり管理・決済する (止めるのは新規エントリーだけ)
+ */
+export const DEFAULT_OBSERVE_ONLY_STRATEGIES = "scalp_rebound,mid_trend_follow,long_momentum";
+
+/** 既定で観測専用にしている中長期の戦略 (新規エントリーはしない方針) */
+export const MID_LONG_OBSERVE_ONLY_IDS: readonly string[] = ["mid_trend_follow", "long_momentum"];
+
+/**
+ * OBSERVE_ONLY_STRATEGIES の警告 (起動時にログへ出す)。既定は中長期の戦略を含むので、含まない = 明示的に設定している。
+ * 古い .env (.env.example から写した OBSERVE_ONLY_STRATEGIES=scalp_rebound など) では新しい既定が効かないため知らせる
+ */
+export function observeOnlyConfigWarnings(observeOnly: readonly string[] | undefined): string[] {
+  if (observeOnly === undefined) return [];
+  const missing = MID_LONG_OBSERVE_ONLY_IDS.filter((id) => !observeOnly.includes(id));
+  if (missing.length === 0) return [];
+  return [
+    `中長期戦略 (${missing.join(" / ")}) が新規エントリー可能です。既定は観測専用です ` +
+      `(OBSERVE_ONLY_STRATEGIES=${observeOnly.join(",")}。新規を止めるなら ${DEFAULT_OBSERVE_ONLY_STRATEGIES} のように含めてください)`,
+  ];
+}
 
 /**
  * 相場構造 (ダウ理論) のフィルターを掛ける戦略の既定値 (トレンド・ブレイク系だけ)。
@@ -248,7 +269,8 @@ const EnvSchema = z.object({
   MEME_MIN_LIQUIDITY_USD: num(250_000),
   /**
    * 観測専用の戦略 id (カンマ区切り)。評価とシグナルの生成は通常どおり行うが、新規エントリーは発注せず
-   * 仮想トレード (reason "observe_only") としてだけ記録する。既定は scalp_rebound。空文字なら観測専用なし
+   * 仮想トレード (reason "observe_only") としてだけ記録する。既定は scalp_rebound,mid_trend_follow,long_momentum。
+   * 保有中の建玉は従来どおり管理・決済する。空文字なら観測専用なし
    */
   OBSERVE_ONLY_STRATEGIES: idList(DEFAULT_OBSERVE_ONLY_STRATEGIES),
 
@@ -347,7 +369,7 @@ const EnvSchema = z.object({
 
   // 転換で決済 (src/engine/reversalExit.ts)
   /**
-   * 転換で決済を使う (既定 true)。保有中の建玉について、戦略の主時間足でエントリー後にできた押し安値 (買い) / 戻り高値 (売り) を、
+   * 転換で決済を使う (既定 true)。保有中の建玉について、REVERSAL_EXIT_TF の時間足 (既定は戦略の主時間足の 1 つ下) でエントリー後にできた押し安値 (買い) / 戻り高値 (売り) を、
    * 確定足の終値が割ったら (越えたら) 利確・損切りの手前でも成行で決済する (決済理由 reversal)。全戦略が対象。
    * false なら従来と同一
    */
@@ -364,6 +386,16 @@ const EnvSchema = z.object({
   ),
   /** 転換で決済を掛ける戦略 id (カンマ区切り)。空 (既定) ならすべての戦略。未登録の id は起動時に警告する */
   REVERSAL_EXIT_STRATEGIES: idList(""),
+  /**
+   * 転換で決済を判定する時間足。lower (既定) = 戦略の主時間足の 1 つ下 (1m→1m, 5m→1m, 15m→5m, 1h→15m, 4h→1h, 1d→4h)、
+   * same = 戦略の主時間足 (従来どおり)。lower は短い保有でも押し安値割れ・戻り高値超えを拾いやすい
+   */
+  REVERSAL_EXIT_TF: choice("REVERSAL_EXIT_TF", ["lower", "same"] as const, "lower"),
+  /**
+   * 転換で決済のフォールバック (既定 false)。true なら、エントリー後に確定したスイングが無いとき、エントリーした足の安値 (買い) /
+   * 高値 (売り) を水準にする。早く発火しすぎるので既定は無効 (simulate でほとんどの取引をエントリー付近で閉じ、勝率は 5% 前後だった)
+   */
+  REVERSAL_EXIT_FALLBACK: bool("REVERSAL_EXIT_FALLBACK", false),
 
   // 相場構造 (ダウ理論) のフィルター・損切り (src/structure/)
   /** off: ラップしない (従来と同じ) / filter: 対象の戦略をラップする (既定) */

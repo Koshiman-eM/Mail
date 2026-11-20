@@ -204,6 +204,29 @@ describe("決済ロジック", () => {
     expect(r.trades.length).toBe(0);
     expect(r.stats.skipped.edge).toBe(1);
   });
+
+  it("edgeIsNet のシグナルは比率 0 (フィルターなし) でも期待値 > 0 が必要 (ライブの RiskManager と同じ)。それ以外は比率 0 なら判定しない", () => {
+    const run = (extra: Partial<Signal>, minEdgeToCostRatio?: number) => {
+      const s = scripted((ctx) => (ctx.market.now === closeOf(10) ? entrySignal("long", 99, 101, extra) : null));
+      return runBacktest({
+        strategy: s, instrument: inst, candles: bars(flatRows(20)), spreadBps: 2, slippageBps: 1,
+        ...(minEdgeToCostRatio !== undefined ? { minEdgeToCostRatio } : {}),
+      });
+    };
+    for (const edge of [0, -3, NaN]) {
+      const r = run({ expectedEdgeBps: edge, edgeIsNet: true });
+      expect(r.trades.length, String(edge)).toBe(0);
+      expect(r.stats.skipped.edge, String(edge)).toBe(1);
+      expect(run({ expectedEdgeBps: edge, edgeIsNet: true }, 0).stats.skipped.edge, String(edge)).toBe(1);
+    }
+    // 純期待値が正なら比率 0 では通る。edgeIsNet でないシグナルは比率 0 なら期待値によらず通る
+    expect(run({ expectedEdgeBps: 0.5, edgeIsNet: true }).trades.length).toBe(1);
+    expect(run({ expectedEdgeBps: -3 }).trades.length).toBe(1);
+    // 比率 2 (コスト 4bps = スプレッド 2 + 滑り 2): edgeIsNet は (2 − 1) × 4 = 4bps 以上、それ以外は 8bps 以上
+    expect(run({ expectedEdgeBps: 5, edgeIsNet: true }, 2).trades.length).toBe(1);
+    expect(run({ expectedEdgeBps: 3, edgeIsNet: true }, 2).trades.length).toBe(0);
+    expect(run({ expectedEdgeBps: 5 }, 2).trades.length).toBe(0);
+  });
 });
 
 describe("会計・サイズ", () => {

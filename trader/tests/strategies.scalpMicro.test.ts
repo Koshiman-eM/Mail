@@ -313,8 +313,18 @@ describe("scalp_micro: バックテスト (合成データ)", () => {
   const candles = generateCandles({ seed: 2, bars: 3 * 1440, timeframe: "1m", vol: 0.003, startTs: START });
 
   it("保有はすべて 10 分以内 (最大 maxHoldBars 本)。決済後に繰り返しエントリーし、ロング・ショート両方が出る", () => {
-    // 合成データには優位性がないため、期待値の条件だけ外して動き (保有時間・繰り返し) を確かめる
-    const s = createScalpMicro({ minNetEdgeBps: -Infinity });
+    // 合成データには優位性がないため、期待値の条件だけ外して動き (保有時間・繰り返し) を確かめる。
+    // バックテストは edgeIsNet のシグナルに常に「純期待値 > 0」を求めるので、このテストでは edgeIsNet を外して期待値の判定を通さない
+    const inner = createScalpMicro({ minNetEdgeBps: -Infinity });
+    const s = {
+      ...inner,
+      evaluate: (ctx: Parameters<typeof inner.evaluate>[0]) => {
+        const sig = inner.evaluate(ctx);
+        if (!sig?.edgeIsNet) return sig;
+        const { edgeIsNet: _net, ...rest } = sig;
+        return rest;
+      },
+    };
     const r = runBacktest({ strategy: s, instrument: syntheticInstrument({ takerFeeRate: BITBANK_TAKER }), candles, baseTimeframe: "1m" });
     expect(r.trades.length).toBeGreaterThan(20);
     let prevExit = -Infinity;

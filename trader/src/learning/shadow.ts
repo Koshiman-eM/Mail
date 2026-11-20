@@ -24,10 +24,11 @@
  *   途中で読み外れは値動きだけの R (方向 × (仲値 − エントリー価格) / 1R) で判定する (コストだけでは切らない)。
  *   thesisExpectedMs は読みの管理が有効なときだけ記録する。
  *   thesisExpectedMs の無い古い記録は従来どおり。
- * - 転換で決済 (options.reversal が有効で、戦略が対象): 実際の建玉と同じ src/engine/reversalExit.ts の規則で、戦略の主時間足
- *   (記録時に reversalTf として保存) の新しい確定足ごとに 1 回、エントリー後にできた押し安値 (売りは戻り高値) を終値が越えたら
+ * - 転換で決済 (options.reversal が有効で、戦略が対象): 実際の建玉と同じ src/engine/reversalExit.ts の規則で、実際の建玉と同じ時間足
+ *   (REVERSAL_EXIT_TF。lower = 戦略の主時間足の 1 つ下、same = 主時間足。呼び出し側が exitTimeframe で渡し、記録時に reversalTf として保存)
+ *   の新しい確定足ごとに 1 回、エントリー後にできた押し安値 (売りは戻り高値。REVERSAL_EXIT_FALLBACK なら無いときエントリーした足の安値・高値) を終値が越えたら
  *   決済する (理由 reversal、約定は時間切れと同じ 決済側の気配 ∓ 約定ずれ)。足は呼び出し側 (engine) が hub の確定足をそのまま渡す
- *   (hub は全戦略の時間足を持つので、1m 以外もリサンプルしない)。その時間足の足が無い・エントリーより新しい足しか無いときは判定しない。
+ *   (hub は全戦略の時間足と転換で決済の時間足を持つので、1m 以外もリサンプルしない)。その時間足の足が無い・エントリーより新しい足しか無いときは判定しない。
  *   損切り・利確・読みの管理 (ティックごと) が先。reversalTf の無い古い記録・無効のときは従来どおり。
  */
 import { randomUUID } from "node:crypto";
@@ -113,7 +114,7 @@ export interface ShadowRecordInput {
    */
   simulatedShort?: boolean;
   borrowRateDaily?: number;
-  /** 戦略の主時間足 (転換で決済の判定に使う。省略時は転換で決済を判定しない) */
+  /** 転換で決済の判定に使う時間足 (REVERSAL_EXIT_TF で決めた時間足。省略時は転換で決済を判定しない) */
   exitTimeframe?: Timeframe;
 }
 
@@ -542,7 +543,9 @@ export class ShadowTracker {
       const last = revCandles[revCandles.length - 1];
       if (last.ts + tfMs > o.entryTs && o.reversalBarTs !== last.ts) {
         o.reversalBarTs = last.ts;
-        const r = checkReversal(revCandles, o.entryTs, o.direction, { pivotN: this.opts.reversal.pivotN, bufferAtr: this.opts.reversal.bufferAtr, tfMs });
+        const r = checkReversal(revCandles, o.entryTs, o.direction, {
+          pivotN: this.opts.reversal.pivotN, bufferAtr: this.opts.reversal.bufferAtr, tfMs, fallback: this.opts.reversal.fallback === true,
+        });
         if (r.exit) {
           reason = "reversal";
           exit = timeExit;

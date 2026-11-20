@@ -1,7 +1,7 @@
 /** 設定 (VENUES / WATCHLIST) から実行に必要な部品一式を組み立てる */
 import { basename, dirname, extname, join } from "node:path";
 import type { AiOptions } from "../core/ai";
-import type { AppConfig } from "../core/config";
+import { observeOnlyConfigWarnings, type AppConfig } from "../core/config";
 import { createLogger, type Logger } from "../core/logger";
 import { withSimulatedShort } from "../core/short";
 import {
@@ -29,7 +29,9 @@ import { createFxConverter, type FxConverter } from "./fx";
 import { createParamValidator, createPriceAt, type ValidatorOptions } from "./learningHooks";
 import { limitOrdersFromEnv } from "./limitOrders";
 import { thesisSettingsFromEnv } from "./thesis";
-import { reversalConfigWarnings, reversalSettingsFromEnv } from "./reversalExit";
+import {
+  reversalAppliesTo, reversalConfigWarnings, reversalSettingsFromEnv, reversalTimeframeFor, type ReversalSettings,
+} from "./reversalExit";
 
 const ASSET_CLASSES: AssetClass[] = ["crypto", "meme", "fx", "stock"];
 export const KNOWN_VENUES = ["synthetic", "ccxt", "gmo", "oanda", "alpaca", "dex"] as const;
@@ -69,13 +71,20 @@ export function parseVenues(s: string): string[] {
   return list;
 }
 
-/** 監視銘柄の資産クラスに合う戦略の時間足の和集合 + 1m (短い順) */
-export function hubTimeframesFor(instruments: Pick<Instrument, "assetClass">[], strategies: readonly Strategy[]): Timeframe[] {
+/**
+ * 監視銘柄の資産クラスに合う戦略の時間足の和集合 + 1m (短い順)。
+ * reversal (転換で決済) を渡すと、対象の戦略の判定用の時間足 (REVERSAL_EXIT_TF=lower なら主時間足の 1 つ下) も加える
+ * (保有中の建玉の判定に使う。hub は監視銘柄すべてで同じ時間足を取得するので、建玉のある銘柄でも必ず手に入る)
+ */
+export function hubTimeframesFor(
+  instruments: Pick<Instrument, "assetClass">[], strategies: readonly Strategy[], reversal?: ReversalSettings,
+): Timeframe[] {
   const classes = new Set(instruments.map((i) => i.assetClass));
   const tfs = new Set<Timeframe>(["1m"]);
   for (const s of strategies) {
     if (!s.assetClasses.some((c) => classes.has(c))) continue;
     for (const tf of [...s.timeframes, s.primaryTimeframe]) tfs.add(tf);
+    if (reversalAppliesTo(reversal, s.id)) tfs.add(reversalTimeframeFor(reversal, s.primaryTimeframe));
   }
   return [...tfs].sort((a, b) => TIMEFRAME_MS[a] - TIMEFRAME_MS[b]);
 }
@@ -170,6 +179,8 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
   const reversalSettings = reversalSettingsFromEnv(env);
   const knownIds = [...new Set([...ALL_STRATEGIES.map((x) => x.id), ...(opts.strategies ?? []).map((x) => x.id)])];
   for (const w of reversalConfigWarnings(reversalSettings, knownIds, env.STRUCTURE_EXIT_ON_REVERSAL === true)) log.warn(w);
+  // 観測専用 (OBSERVE_ONLY_STRATEGIES): 明示的な設定が中長期の戦略を含まない (古い .env では新しい既定が効かない) と警告する
+  for (const w of observeOnlyConfigWarnings(env.OBSERVE_ONLY_STRATEGIES)) log.warn(w);
   const strategies = opts.strategies ?? configuredStrategies(structureSettings);
   const venues = parseVenues(env.VENUES);
   const watch = parseWatchlist(env.WATCHLIST);
@@ -303,7 +314,7 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
   const instruments = pairs.map((p) => p.inst);
   if (instruments.length === 0) throw new Error("監視銘柄がありません (VENUES / WATCHLIST を確認してください)");
 
-  const timeframes = hubTimeframesFor(instruments, strategies);
+  const timeframes = hubTimeframesFor(instruments, strategies, reversalSettings);
   const hub = new MarketHub({ feeds, clock, timeframes, historyLimit: 300 });
   for (const p of pairs) hub.watch(p.inst, p.feed);
 

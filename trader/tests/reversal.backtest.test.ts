@@ -8,7 +8,7 @@ import { TIMEFRAME_MS, type Candle, type Signal, type Strategy, type StrategyCon
 import { createParamValidator, HistoryCache } from "../src/engine/learningHooks";
 import { DEFAULT_REVERSAL_SETTINGS, REVERSAL_DISABLED, type ReversalSettings } from "../src/engine/reversalExit";
 import {
-  barTs, H, INST, LONG_PROFIT, LONG_PROFIT_BREAK, M, probe, scenarioBars,
+  barTs, H, INST, LONG_LOSS, LONG_LOSS_BREAK, LONG_PROFIT, LONG_PROFIT_BREAK, M, probe, scenarioBars,
 } from "./helpers/reversalScenario";
 
 const ON: ReversalSettings = { ...DEFAULT_REVERSAL_SETTINGS, strategies: [] };
@@ -90,7 +90,7 @@ describe("バックテスト: 転換で決済", () => {
     expect(runBacktest({ ...opts, reversal: { ...ON, strategies: ["periodic"] } }).trades).toEqual(on.trades);
   });
 
-  it("主時間足 (5m) が基準足 (1m) と違っても、主時間足の確定足で判定する", () => {
+  it("REVERSAL_EXIT_TF=same: 主時間足 (5m) が基準足 (1m) と違っても、主時間足の確定足で判定する。lower なら 1m 足で判定する", () => {
     // 5m 足の台本 (LONG_PROFIT) を 1m 足 5 本ずつに分ける (5m に集約すると元の足に戻る)
     const five = scenarioBars(LONG_PROFIT, TAIL).map((b, i) => ({ ...b, ts: barTs(0) + i * 5 * M }));
     const ones: Candle[] = [];
@@ -102,12 +102,54 @@ describe("バックテスト: 転換で決済", () => {
       ones.push({ ts: b.ts + 4 * M, open: b.open, high: Math.max(b.open, b.close), low: Math.min(b.open, b.close), close: b.close, volume: 20 });
     }
     const p5: Strategy = { ...probe({ at: barTs(0) + H * 5 * M }), primaryTimeframe: "5m", timeframes: ["5m"] };
-    const r = runBacktest({ strategy: p5, instrument: INST, candles: ones, baseTimeframe: "1m", ...COSTS, reversal: ON });
+    const SAME: ReversalSettings = { ...ON, timeframe: "same" };
+    const r = runBacktest({ strategy: p5, instrument: INST, candles: ones, baseTimeframe: "1m", ...COSTS, reversal: SAME });
     expect(r.trades[0]).toMatchObject({ exitReason: "reversal", entryTs: barTs(0) + H * 5 * M, exitTs: barTs(0) + (H + LONG_PROFIT_BREAK + 1) * 5 * M });
     // 1m 足のスイングでは判定しない (1m の主時間足なら別の足で決済する)
     const p1 = probe({ at: barTs(0) + H * 5 * M });
-    const r1 = runBacktest({ strategy: p1, instrument: INST, candles: ones, baseTimeframe: "1m", ...COSTS, reversal: ON });
+    const r1 = runBacktest({ strategy: p1, instrument: INST, candles: ones, baseTimeframe: "1m", ...COSTS, reversal: SAME });
     expect(r1.trades[0].exitTs).not.toBe(r.trades[0].exitTs);
+    // lower (既定): 5m の戦略も 1m 足 (主時間足の 1 つ下) で判定する = 1m の戦略と同じ足・同じ理由で決済する
+    // (probe は 1 回だけエントリーするので、実行ごとに作り直す)
+    const p5b: Strategy = { ...probe({ at: barTs(0) + H * 5 * M }), primaryTimeframe: "5m", timeframes: ["5m"] };
+    const lo = runBacktest({ strategy: p5b, instrument: INST, candles: ones, baseTimeframe: "1m", ...COSTS, reversal: ON });
+    expect(lo.trades[0]).toMatchObject({ entryTs: r.trades[0].entryTs, exitTs: r1.trades[0].exitTs, exitReason: r1.trades[0].exitReason });
+  });
+
+  it("REVERSAL_EXIT_TF=lower: 5m の戦略の建玉を 1m 足の押し安値割れで決済する (5m の確定を待たない)", () => {
+    const candles = scenarioBars(LONG_PROFIT, TAIL);
+    const p5 = (): Strategy => ({ ...probe({ at: barTs(H) }), primaryTimeframe: "5m", timeframes: ["5m"] });
+    const lo = runBacktest({ strategy: p5(), instrument: INST, candles, baseTimeframe: "1m", ...COSTS, reversal: ON });
+    // 1m の r12 の終値 102.4 が 1m の押し安値 102.55 を割る → 次の 1m 足 (5m の途中) の始値で決済
+    expect(lo.trades[0]).toMatchObject({ entryTs: barTs(H), exitReason: "reversal", exitTs: barTs(H + LONG_PROFIT_BREAK + 1), intendedExitPrice: 102.4 });
+    expect((lo.trades[0].exitTs - barTs(0)) % (5 * M)).not.toBe(0);
+    expect(lo.stats.reversalExits).toBe(1);
+    // same なら 5m 足で判定する (別の時刻・別の理由)
+    const same = runBacktest({ strategy: p5(), instrument: INST, candles, baseTimeframe: "1m", ...COSTS, reversal: { ...ON, timeframe: "same" } });
+    expect(same.trades[0].exitTs).not.toBe(lo.trades[0].exitTs);
+  });
+
+  it("lower でも基準足が粗くて 1 つ下の時間足を作れなければ same (主時間足) で判定する", () => {
+    const five = scenarioBars(LONG_PROFIT, TAIL).map((b, i) => ({ ...b, ts: barTs(0) + i * 5 * M }));
+    // probe は 1 回だけエントリーするので、実行ごとに作り直す
+    const p5 = (): Strategy => ({ ...probe({ at: barTs(0) + H * 5 * M }), primaryTimeframe: "5m", timeframes: ["5m"] });
+    const opts = { instrument: INST, candles: five, baseTimeframe: "5m" as const, ...COSTS };
+    const lo = runBacktest({ ...opts, strategy: p5(), reversal: ON });
+    const same = runBacktest({ ...opts, strategy: p5(), reversal: { ...ON, timeframe: "same" } });
+    expect(lo.trades[0]).toMatchObject({ exitReason: "reversal", exitTs: barTs(0) + (H + LONG_PROFIT_BREAK + 1) * 5 * M });
+    expect(lo.trades).toEqual(same.trades);
+  });
+});
+
+describe("バックテスト: フォールバック (REVERSAL_EXIT_FALLBACK)", () => {
+  it("既定 (false) はスイングの確定を待ち、true ならエントリーした足の安値割れで決済する", () => {
+    const candles = scenarioBars(LONG_LOSS, [99.3, 99.0, 98.5, 98.0]);
+    const run = (fallback: boolean) =>
+      runBacktest({ strategy: probe({ at: barTs(H) }), instrument: INST, candles, baseTimeframe: "1m", ...COSTS, reversal: { ...ON, fallback } });
+    // 既定: r5 のスイングロー 99.55 を r10 の終値 99.4 が割る → r11 の始値で決済
+    expect(run(false).trades[0]).toMatchObject({ exitReason: "reversal", exitTs: barTs(H + LONG_LOSS_BREAK + 1) });
+    // フォールバック: エントリーした足の安値 99.95 を r5 の終値 99.6 が割る → r6 の始値で決済
+    expect(run(true).trades[0]).toMatchObject({ exitReason: "reversal", exitTs: barTs(H + 6) });
   });
 });
 

@@ -24,6 +24,8 @@ import { exitFxRates, exitReasonCounts, summarizeBySide, summarizeByStrategy, tr
 import { CAUSE_LABEL } from "../learning/attribution";
 import type { LearningService } from "../learning/service";
 import { DASHBOARD_HTML } from "./page";
+import { isLearningExcludedTrade } from "../core/types";
+import { latestPaperReset, performanceTrades } from "../paper/walletReset";
 
 export interface DashboardDeps {
   /** 状態 (TradingEngine.status) */
@@ -98,10 +100,15 @@ export function parseLimit(v: string | null, def = 50, max = 500): number {
 }
 
 /** トレード一覧 (新しい順) と要因分析 */
-export function tradesPayload(deps: DashboardDeps, limit: number, mode?: TradingMode) {
+export function tradesPayload(deps: DashboardDeps, limit: number, mode?: TradingMode, opts: { allTime?: boolean } = {}) {
   // mode 指定時はその mode だけ (paper と live を混ぜない)。集計 (byStrategy) は mode の全期間、一覧は直近 limit 件
-  const allInMode = mode ? deps.store.listTrades({ mode }).filter((t) => t.mode === mode) : deps.store.listTrades();
-  const trades = allInMode.slice(-limit).reverse();
+  const listed = mode ? deps.store.listTrades({ mode }).filter((t) => t.mode === mode) : deps.store.listTrades();
+  // paper の口座のリセット (paper reset) があれば、paper の取引は最新のリセット以降 (scope=all で全期間)。
+  // リセットで記帳上だけ閉じた取引 (wallet_reset) は集計に入れない (一覧は全期間のときだけ表示する)
+  const reset = mode === "live" ? undefined : latestPaperReset(deps.store);
+  const allInMode = performanceTrades(listed, reset, opts);
+  const shown = opts.allTime ? listed : allInMode;
+  const trades = shown.slice(-limit).reverse();
   const quoteOf = (sym: string) => deps.quoteCurrencyOf?.(sym) ?? quoteCurrencyOfSymbol(sym);
   const toAccount = deps.toAccount;
   // 決済時点の為替 (エンジンの監査ログ)。無ければ現在のレート
@@ -109,8 +116,12 @@ export function tradesPayload(deps: DashboardDeps, limit: number, mode?: Trading
   return {
     baseCurrency: deps.baseCurrency ?? "",
     ...(mode ? { mode } : {}),
-    /** byStrategy の集計対象 (mode の全期間) の件数。trades は直近 limit 件だけ */
+    /** byStrategy の集計対象 (mode の全期間。paper はリセット以降) の件数。trades は直近 limit 件だけ */
     totalTrades: allInMode.length,
+    scope: opts.allTime ? ("all" as const) : ("since_reset" as const),
+    ...(reset ? { walletReset: { at: reset.at, toEquity: reset.toEquity, ...(reset.fromEquity !== undefined ? { fromEquity: reset.fromEquity } : {}) } } : {}),
+    /** リセットで決済した取引の件数 (集計から除外。scope と同じ期間: 既定は最新のリセット以降) */
+    excludedTrades: listed.filter((t) => isLearningExcludedTrade(t) && (opts.allTime || !reset || t.exitTs >= reset.at)).length,
     trades: trades.map((t) => {
       const att = deps.store.getAttribution(t.id);
       const pnl = toAccount ? tradePnlAccount(t, toAccount, quoteOf(t.symbol), rates.get(t.id)) : undefined;
@@ -143,6 +154,8 @@ export function tradesPayload(deps: DashboardDeps, limit: number, mode?: Trading
         ...(t.estimated ? { estimated: true } : {}),
         // paper で再現した空売り (live では実行できない取引)
         ...(t.simulatedShort ? { simulatedShort: true } : {}),
+        // 口座のリセットで記帳上だけ閉じた取引 (学習・成績の集計には使っていない)
+        ...(isLearningExcludedTrade(t) ? { learningExcluded: true } : {}),
         attribution: att
           ? {
               outcome: att.outcome,
@@ -391,7 +404,7 @@ export async function routeDashboard(deps: DashboardDeps, method: string, rawUrl
             if (m === "paper" || m === "live") mode = m;
           } catch { /* 絞り込みなしで返す */ }
         }
-        return json(200, tradesPayload(deps, parseLimit(url.searchParams.get("limit")), mode));
+        return json(200, tradesPayload(deps, parseLimit(url.searchParams.get("limit")), mode, { allTime: url.searchParams.get("scope") === "all" }));
       }
       case "/api/candles": {
         const symbol = url.searchParams.get("symbol") ?? "";

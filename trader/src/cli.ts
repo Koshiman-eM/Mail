@@ -26,7 +26,7 @@ import {
   peekResolveRequests, PendingOrders, readLimitStats, requestResolve, RestingTakeProfits, type PendingOrder, type ResolveRequest,
 } from "./engine/orders";
 import { acquireEngineLock, releaseEngineLock, startEngineLockHeartbeat, type LockOwner } from "./engine/lock";
-import { buildRuntime, parseVenues, resolveDbPath } from "./engine/setup";
+import { buildRuntime, parseVenues, resolveDbPath, type Runtime } from "./engine/setup";
 import { effectiveLimitTakeProfit, limitOrdersFromEnv } from "./engine/limitOrders";
 import { formatSimulationReport, runSimulation } from "./engine/simulate";
 import { formatTempoLine, TempoController, tempoSeedTimestamps, tempoStatusView } from "./engine/tempo";
@@ -47,6 +47,11 @@ import { structureSettingsFromEnv } from "./structure/settings";
 import { unifiedToGmo } from "./market/gmo/client";
 import { TIMEFRAME_MS, type ExitReason, type Timeframe } from "./core/types";
 import { horizonLabel, strategyLabel, strategyLabelWithId } from "./strategies/labels";
+import {
+  assertPaperOnly, equitySinceReset, executeWalletReset, formatWalletResetPlan, isDbBusyError, latestPaperReset, paperEngineRunning, performanceTrades,
+  planWalletReset, validateResetEquity, WalletResetError,
+} from "./paper/walletReset";
+import { isLearningExcludedTrade } from "./core/types";
 
 // ───────── 引数解析 ─────────
 
@@ -225,7 +230,8 @@ export const HELP = `自己学習型マルチアセット自動売買ツール
   regime --symbol SYM [--hours 3] [--tf 1m,15m,1h,4h] [--step 5]
                               各時刻の相場の状態 (レジーム) を運用と同じ判定で表示 (ccxt の履歴。先読みなし)
   intel                       情報収集を 1 回実行してブリーフを表示
-  report                      評価額・戦略別成績・学習の状態を表示 (DB_PATH)
+  report [--all]              評価額・戦略別成績・学習の状態を表示 (DB_PATH)。paper は最新の口座リセット以降の成績
+                              (--all でリセット前を含む全期間)
   resume                      キルスイッチ・日次停止を解除 (監査ログに記録)
   status                      設定と現在の状態を表示
   orders                      保留中の注文 (受付済み・未約定、状態不明) を一覧
@@ -236,6 +242,10 @@ export const HELP = `自己学習型マルチアセット自動売買ツール
                               動作中のエンジンは次のティックで、停止中なら次回の起動時に適用します (監査ログに記録)
                               状態不明 (escalated) でない注文には --force が必要です。
                               --none で取消に失敗した場合は確定せず、建玉の照会で確定させます
+  paper reset --equity <円> [--confirm]
+                              paper の口座を指定の評価額で作り直す (学習データは残す)。--confirm なしは確認だけ (dry run)。
+                              保有中の建玉は「リセットで決済」として記帳上だけ閉じ、学習・成績には使いません。
+                              エンジンの停止が必要です (sudo systemctl stop trader)。TRADING_MODE=live では実行できません
   gmo check                   GMOコインの API の応答の形を確かめる (公開 API と、キーがあれば読み取り専用の非公開 API。
                               注文・取消は呼びません。キーは表示しません)
 
@@ -293,33 +303,46 @@ export function acquireRunLock(store: Store, mode: "paper" | "live", io: Io, now
   return { pid: r.lock.pid, hostname: r.lock.hostname, startedAt: r.lock.startedAt };
 }
 
-async function cmdRun(io: Io): Promise<number> {
-  const config = loadConfig();
-  const m = modeLines(config);
-  m.out.forEach((l) => io.out(l));
-  m.warn.forEach((l) => io.err(l));
-  io.out(venuesLine(config));
-  const rt = await buildRuntime(config);
-  io.out(`銘柄: ${rt.instruments.map((i) => `${i.symbol} (${i.assetClass}, ${i.venue})`).join(", ")}`);
-  io.out(`時間足: ${rt.timeframes.join(", ")} / 口座通貨: ${config.env.BASE_CURRENCY} / DB: ${resolveDbPath(config)}`);
-  riskLines(config).forEach((l) => io.out(l));
-  riskOverrideLines(rt.store, rt.engine.mode, config.risk, fmtTime).forEach((l) => io.out(l));
-  io.out(`AI: ${rt.ai ? `有効 (${rt.ai.model})` : "無効 (ルールベース)"}`);
-
-  // 同じ mode のエンジンの二重起動防止 (同じ DB の kv にロックを書き、15 秒ごとに heartbeat を更新する)
-  const mode = rt.engine.mode;
-  const owner = acquireRunLock(rt.store, mode, io);
-  if (!owner) {
+/**
+ * run 用: 二重起動防止のロックを取ってから (heartbeat も開始してから) ランタイムを組み立てる。
+ * buildRuntime は kv の状態 (risk:state・journal:open・決済計画・paper:snapshot) をメモリに読み込むので、
+ * ロックより後に読む (ロックの前に読むと、その間に `paper reset` などが書き換えた状態を古い値で書き戻してしまう)。
+ * ロックが取れなければ undefined (store は閉じる)。組み立ての失敗・組み立て中にロックを失った場合は後始末して例外 / undefined
+ */
+export async function prepareRunRuntime(
+  config: AppConfig,
+  io: Io,
+  deps: {
+    build?: (config: AppConfig, opts: { store: Store }) => Promise<Runtime>;
+    openStore?: (path: string) => Store;
+    now?: () => number;
+  } = {},
+): Promise<{ rt: Runtime; mode: "paper" | "live"; owner: LockOwner; heartbeat: { stop(): void; beat(): void }; lockLost: () => string | undefined; onLost: (fn: (reason: string) => void) => void; releaseLock: () => void } | undefined> {
+  const now = deps.now ?? (() => Date.now());
+  const store = (deps.openStore ?? createStore)(resolveDbPath(config));
+  const mode = config.mode;
+  const closeStore = () => {
     try {
-      rt.close();
+      store.close();
     } catch {
       /* 既に閉じている */
     }
-    return 1;
+  };
+  let owner: LockOwner | undefined;
+  try {
+    owner = acquireRunLock(store, mode, io, now());
+  } catch (e) {
+    closeStore();
+    throw e;
   }
+  if (!owner) {
+    closeStore();
+    return undefined;
+  }
+  const lockOwner = owner;
   const releaseLock = () => {
     try {
-      releaseEngineLock(rt.store, mode, owner);
+      releaseEngineLock(store, mode, lockOwner);
     } catch (e) {
       io.err(`警告: エンジンのロックの削除に失敗しました (${e instanceof Error ? e.message : String(e)})`);
     }
@@ -327,14 +350,68 @@ async function cmdRun(io: Io): Promise<number> {
   // 起動中 (シグナル待ちに入る前) にロックを失った場合も、待ちに入った時点で停止する
   let lockLostReason: string | undefined;
   let onLockLost: (reason: string) => void = () => undefined;
-  const heartbeat = startEngineLockHeartbeat(rt.store, mode, owner, {
-    now: () => Date.now(),
+  const heartbeat = startEngineLockHeartbeat(store, mode, lockOwner, {
+    now,
     onLost: (reason) => {
       lockLostReason = reason;
       onLockLost(reason);
     },
     onError: (msg, failures) => io.err(`警告: エンジンのロックの heartbeat の更新に失敗しました (${failures} 回目): ${msg}`),
   });
+  let rt: Runtime;
+  try {
+    rt = await (deps.build ?? buildRuntime)(config, { store });
+  } catch (e) {
+    heartbeat.stop();
+    releaseLock();
+    closeStore();
+    throw e;
+  }
+  if (rt.engine.mode !== mode) {
+    heartbeat.stop();
+    releaseLock();
+    closeStore();
+    throw new Error(`エンジンの mode (${rt.engine.mode}) が設定 (${mode}) と違います`);
+  }
+  return {
+    rt, mode, owner: lockOwner, heartbeat, releaseLock,
+    lockLost: () => lockLostReason,
+    onLost: (fn) => {
+      onLockLost = fn;
+    },
+  };
+}
+
+async function cmdRun(io: Io): Promise<number> {
+  const config = loadConfig();
+  const m = modeLines(config);
+  m.out.forEach((l) => io.out(l));
+  m.warn.forEach((l) => io.err(l));
+  io.out(venuesLine(config));
+  // 同じ mode のエンジンの二重起動防止 (同じ DB の kv にロックを書き、15 秒ごとに heartbeat を更新する)。
+  // 状態を読み込む前にロックを取る (paper reset との競合防止)
+  const prepared = await prepareRunRuntime(config, io);
+  if (!prepared) return 1;
+  const { rt, mode, heartbeat, releaseLock } = prepared;
+  io.out(`銘柄: ${rt.instruments.map((i) => `${i.symbol} (${i.assetClass}, ${i.venue})`).join(", ")}`);
+  io.out(`時間足: ${rt.timeframes.join(", ")} / 口座通貨: ${config.env.BASE_CURRENCY} / DB: ${resolveDbPath(config)}`);
+  riskLines(config).forEach((l) => io.out(l));
+  riskOverrideLines(rt.store, rt.engine.mode, config.risk, fmtTime).forEach((l) => io.out(l));
+  io.out(`AI: ${rt.ai ? `有効 (${rt.ai.model})` : "無効 (ルールベース)"}`);
+
+  // 組み立て中にロックを失った (別のプロセスが奪取した) なら、エンジンを起動しない
+  const lostEarly = prepared.lockLost();
+  if (lostEarly !== undefined) {
+    io.err(`エラー: エンジンのロックを失いました (${lostEarly})。二重に動作しないよう起動しません`);
+    heartbeat.stop();
+    releaseLock();
+    try {
+      rt.close();
+    } catch {
+      /* 既に閉じている */
+    }
+    return 1;
+  }
 
   let dash: DashboardServer | undefined;
   try {
@@ -402,11 +479,13 @@ async function cmdRun(io: Io): Promise<number> {
         done(code);
       }
     };
-    onLockLost = (reason) => {
+    const onLockLost = (reason: string) => {
       io.err(`エラー: エンジンのロックを失いました (${reason})。二重に動作しないよう停止します`);
       void onSignal("LOCK_LOST", 1);
     };
-    if (lockLostReason !== undefined) onLockLost(lockLostReason);
+    prepared.onLost(onLockLost);
+    const lost = prepared.lockLost();
+    if (lost !== undefined) onLockLost(lost);
     process.once("SIGINT", () => void onSignal("SIGINT"));
     process.once("SIGTERM", () => void onSignal("SIGTERM"));
   });
@@ -546,25 +625,38 @@ async function cmdIntel(io: Io): Promise<number> {
 }
 
 /** DB からの成績・学習レポート */
-export function buildReportText(config: AppConfig, store: Store, now: number = Date.now()): string {
+export function buildReportText(config: AppConfig, store: Store, now: number = Date.now(), opts: { allTime?: boolean } = {}): string {
   const ccy = config.env.BASE_CURRENCY;
   const lines: string[] = [];
   lines.push(`=== レポート (${fmtTime(now)}, DB: ${resolveDbPath(config)}) ===`);
+  // paper の口座のリセット (paper reset) があれば、paper の評価額・成績は最新のリセット以降 (--all で全期間)
+  const reset = latestPaperReset(store);
+  if (reset) {
+    lines.push(
+      opts.allTime
+        ? `paper の口座のリセット: 最新 ${fmtTime(reset.at)} (${fmtNum(reset.toEquity, 0)} ${ccy})。全期間 (--all) を表示します`
+        : `paper の評価額・成績は最新の口座リセット (${fmtTime(reset.at)}, ${fmtNum(reset.toEquity, 0)} ${ccy}) 以降です (全期間は report --all)`,
+    );
+  }
   for (const mode of ["paper", "live"] as const) {
-    const st = equityStats(store.listEquity({ mode }));
+    const st = equityStats(equitySinceReset(store.listEquity({ mode }), reset, opts));
     if (!st) continue;
     lines.push(
       `評価額 (${mode}): ${fmtNum(st.first, 0)} → ${fmtNum(st.last, 0)} ${ccy} (${fmtSigned(st.last - st.first)} / ${fmtPct(st.first ? st.last / st.first - 1 : 0)})` +
         `  最高 ${fmtNum(st.max, 0)} / 最低 ${fmtNum(st.min, 0)} / 最大DD ${fmtPct(st.maxDrawdown)}  期間 ${fmtTime(st.from)} 〜 ${fmtTime(st.to)}`,
     );
   }
-  const trades = store.listTrades();
+  const allTrades = store.listTrades();
+  // 口座のリセットで記帳上だけ閉じた取引 (wallet_reset) は成績に入れない
+  const trades = performanceTrades(allTrades, reset, opts);
+  const resetClosed = allTrades.filter((t) => isLearningExcludedTrade(t) && (opts.allTime || !reset || t.exitTs >= reset.at)).length;
   // 保存済みの気配が無いので為替は概算表で換算する
   const fx = createFxConverter({ baseCurrency: ccy, getQuote: () => undefined });
   const wins = trades.filter((t) => t.netPnl > 0).length;
   lines.push(`取引数: ${trades.length} (勝率 ${fmtPct(trades.length ? wins / trades.length : 0, 1)})`);
   const reasons = Object.entries(exitReasonCounts(trades)).map(([k, v]) => `${EXIT_REASON_LABEL[k as ExitReason] ?? k} ${v}`);
   if (reasons.length) lines.push(`決済理由: ${reasons.join(" / ")}`);
+  if (resetClosed) lines.push(`リセットで決済: ${resetClosed} 件 (成績・学習の集計から除外)`);
   const toAcct = (c: string) => fx.toAccount(c);
   const quoteOf = (t: TradeRecord) => quoteCurrencyOfSymbol(t.symbol);
   const rates = exitFxRates(store);
@@ -602,11 +694,12 @@ export function buildReportText(config: AppConfig, store: Store, now: number = D
   return lines.join("\n");
 }
 
-function cmdReport(io: Io): number {
+function cmdReport(flags: ParsedArgs["flags"], io: Io): number {
+  if (flags.all !== undefined && flags.all !== true) throw new CliError("--all は値を取りません");
   const config = loadConfig();
   const store = openExistingStore(resolveDbPath(config));
   try {
-    io.out(buildReportText(config, store));
+    io.out(buildReportText(config, store, Date.now(), { allTime: flags.all === true }));
     return 0;
   } finally {
     store.close();
@@ -816,7 +909,8 @@ export function tempoStatusLine(config: AppConfig, store: Pick<Store, "listTrade
   const env = config.env;
   const target = env.TARGET_ENTRIES_PER_HOUR ?? 0;
   const tc = target > 0 ? new TempoController({ targetPerHour: target, capMultiplier: env.TEMPO_CAP_MULTIPLIER ?? 2 }) : undefined;
-  if (tc) tc.seed(tempoSeedTimestamps(store.listTrades({ since: now - tc.windowMs, mode }).map((t) => t.entryTs), openEntryTs, now, tc.windowMs));
+  // 口座のリセットで記帳上だけ閉じた取引 (wallet_reset) はエントリーの数に入れない (エントリー自体はリセット前の口座のもの)
+  if (tc) tc.seed(tempoSeedTimestamps(store.listTrades({ since: now - tc.windowMs, mode }).filter((t) => !isLearningExcludedTrade(t)).map((t) => t.entryTs), openEntryTs, now, tc.windowMs));
   const explore = mode === "paper" || env.TEMPO_ALLOW_LIVE_EXPLORE === true;
   return formatTempoLine(tempoStatusView(tc, now, explore), env.MAX_HOLD_MINUTES ?? 0);
 }
@@ -835,6 +929,16 @@ export function strategyStatusLines(config: AppConfig): string[] {
     out.push(`  ${strategyLabelWithId(s.id)} / ${horizonLabel(s.horizon)}${tags.length ? ` / ${tags.join("・")}` : ""}`);
   }
   return out;
+}
+
+/**
+ * status の「決済済みトレード」の行。口座のリセットで記帳上だけ閉じた取引 (wallet_reset) は数えない。
+ * paper はリセットがあれば最新のリセット以降の件数 (live の取引はすべて数える)
+ */
+export function settledTradesLine(store: Pick<Store, "listTrades" | "kvGet">, mode: "paper" | "live"): string {
+  const reset = mode === "paper" ? latestPaperReset(store) : undefined;
+  const n = performanceTrades(store.listTrades(), reset).length;
+  return `決済済みトレード: ${n} 件${reset ? ` (paper はリセット ${fmtTime(reset.at)} 以降)` : ""}`;
 }
 
 function cmdStatus(io: Io): number {
@@ -899,8 +1003,86 @@ function cmdStatus(io: Io): number {
     io.out(`最新の計画: ${plan ? `${fmtTime(plan.generatedAt)} (有効期限 ${fmtTime(plan.validUntil)})` : "(なし)"}`);
     const brief = store.latestBrief();
     io.out(`最新のブリーフ: ${brief ? `${fmtTime(brief.generatedAt)} リスクオン ${brief.riskOn.toFixed(2)}` : "(なし)"}`);
-    io.out(`決済済みトレード: ${store.listTrades().length} 件`);
+    io.out(settledTradesLine(store, mode));
     return 0;
+  } finally {
+    store.close();
+  }
+}
+
+export interface PaperResetArgs {
+  equity: number;
+  confirm: boolean;
+}
+
+/** `paper reset` の引数解析 (--equity <円> 必須、--confirm は値を取らない) */
+export function parsePaperResetArgs(positionals: string[], flags: ParsedArgs["flags"]): PaperResetArgs {
+  if (positionals[0] !== "reset" || positionals.length > 1) {
+    throw new CliError(`使い方: npm run trader -- paper reset --equity <円> [--confirm] (指定: paper ${positionals.join(" ") || "(なし)"})`);
+  }
+  const unknown = Object.keys(flags).filter((k) => k !== "equity" && k !== "confirm");
+  if (unknown.length) throw new CliError(`paper reset に未知のオプションがあります: ${unknown.map((k) => `--${k}`).join(" ")}`);
+  if (flags.confirm !== undefined && flags.confirm !== true) throw new CliError("--confirm は値を取りません (--confirm だけを付けてください)");
+  if (flags.equity === undefined || flags.equity === true) throw new CliError("--equity <新しい評価額 (円)> を指定してください (例: --equity 100000)");
+  let equity: number;
+  try {
+    equity = validateResetEquity(flags.equity);
+  } catch (e) {
+    throw new CliError(e instanceof Error ? e.message : String(e));
+  }
+  return { equity, confirm: flags.confirm === true };
+}
+
+/**
+ * `paper reset`: paper の口座を作り直す (学習データは残す)。confirm が無ければ dry run (書き込まない)。
+ * live (TRADING_MODE=live) とエンジンの動作中は拒否する。終了コードを返す
+ */
+export function paperResetCommand(config: AppConfig, store: Store, a: PaperResetArgs, io: Io, now: number = Date.now(), by = "cli"): number {
+  try {
+    assertPaperOnly({ tradingModeEnv: config.env.TRADING_MODE, mode: config.mode });
+  } catch (e) {
+    io.err(`エラー: ${e instanceof Error ? e.message : String(e)}`);
+    return 2;
+  }
+  const running = paperEngineRunning(store, now);
+  if (running.running) {
+    io.err(`エラー: ${running.message}`);
+    return 1;
+  }
+  if (!a.confirm) {
+    const plan = planWalletReset(store, { equity: a.equity, now });
+    io.out("=== paper の口座のリセット (確認のみ・まだ何も変更していません) ===");
+    formatWalletResetPlan(plan).forEach((l) => io.out(l));
+    io.out("");
+    io.out(`実行するには: npm run trader -- paper reset --equity ${a.equity} --confirm`);
+    return 0;
+  }
+  try {
+    const r = executeWalletReset(store, { equity: a.equity, now, by });
+    io.out("=== paper の口座をリセットしました ===");
+    formatWalletResetPlan(r.plan).forEach((l) => io.out(l));
+    io.out("");
+    io.out(`監査ログ paper.wallet_reset と kv paper:resets に記録しました。エンジンを起動すると ${fmtNum(a.equity, 0)} ${config.env.BASE_CURRENCY} から再開します (sudo systemctl start trader)。`);
+    return 0;
+  } catch (e) {
+    if (e instanceof WalletResetError) {
+      io.err(`エラー: ${e.message}`);
+      return 1;
+    }
+    if (isDbBusyError(e)) {
+      io.err("エラー: DB が別のプロセスに使われていて書き込めませんでした (何も変更していません)。エンジン・ダッシュボードなどが止まっていることを確認して、もう一度実行してください");
+      return 1;
+    }
+    throw e;
+  }
+}
+
+function cmdPaper(positionals: string[], flags: ParsedArgs["flags"], io: Io): number {
+  const a = parsePaperResetArgs(positionals, flags);
+  const config = loadConfig();
+  const store = openExistingStore(resolveDbPath(config));
+  try {
+    return paperResetCommand(config, store, a, io);
   } finally {
     store.close();
   }
@@ -925,7 +1107,7 @@ export async function main(argv: string[] = process.argv.slice(2), io: Io = cons
       io.out(HELP);
       return 0;
     }
-    if (args.command !== "orders" && args.command !== "gmo" && args.positionals.length > 0) {
+    if (args.command !== "orders" && args.command !== "gmo" && args.command !== "paper" && args.positionals.length > 0) {
       throw new CliError(`余分な引数があります: ${args.positionals.join(" ")} (${args.command} は位置引数を取りません)`);
     }
     switch (args.command) {
@@ -940,7 +1122,7 @@ export async function main(argv: string[] = process.argv.slice(2), io: Io = cons
       case "intel":
         return await cmdIntel(io);
       case "report":
-        return cmdReport(io);
+        return cmdReport(args.flags, io);
       case "resume":
         return cmdResume(io);
       case "status":
@@ -949,6 +1131,8 @@ export async function main(argv: string[] = process.argv.slice(2), io: Io = cons
         return cmdOrders(args.positionals, args.flags, io);
       case "gmo":
         return await cmdGmo(args.positionals, io);
+      case "paper":
+        return cmdPaper(args.positionals, args.flags, io);
       default:
         io.err(`未知のコマンド: ${args.command}\n`);
         io.out(HELP);

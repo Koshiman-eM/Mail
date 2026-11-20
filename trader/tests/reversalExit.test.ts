@@ -4,7 +4,7 @@ import { loadConfig } from "../src/core/config";
 import type { Candle } from "../src/core/types";
 import {
   checkReversal, DEFAULT_REVERSAL_SETTINGS, entryBarIndex, formatReversalSettings, REVERSAL_ATR_WINDOW, reversalAppliesTo, reversalConfigWarnings,
-  reversalLevel, reversalSettingsFromEnv,
+  reversalBacktestTimeframe, reversalLevel, reversalLowerTimeframe, reversalSettingsFromEnv, reversalTimeframeFor,
 } from "../src/engine/reversalExit";
 
 const M = 60_000;
@@ -71,12 +71,37 @@ describe("reversalLevel / checkReversal", () => {
     expect(checkReversal(series(LONG_PROFIT), ENTRY_TS, "short", { pivotN: 3, tfMs: M }).exit).toBe(false);
   });
 
-  it("エントリー後にスイングが無ければ決済しない (損切りが守る)", () => {
+  it("エントリー後にスイングが無ければ決済しない (損切りが守る。REVERSAL_EXIT_FALLBACK の既定 false)", () => {
     // 一方的に下げ続ける (エントリー後にスイングローができない)
     const c = series([100, 99.5, 99, 98.5, 98, 97.5, 97]);
+    expect(reversalLevel(c, ENTRY_TS, "long", 3, M)).toBeUndefined();
     const r = checkReversal(c, ENTRY_TS, "long", { pivotN: 3, tfMs: M });
     expect(r).toMatchObject({ exit: false, skip: "no_swing" });
     expect(r.level).toBeUndefined();
+    expect(checkReversal(c, ENTRY_TS, "long", { pivotN: 3, tfMs: M, fallback: false })).toMatchObject({ exit: false, skip: "no_swing" });
+  });
+
+  it("フォールバック (fallback: true): スイングが無ければエントリーした足の安値 (買い) / 高値 (売り) を水準にする", () => {
+    // エントリーした足 (100 → 100) の安値 99.95
+    const c = series([100, 99.5, 99, 98.5, 98, 97.5, 97]);
+    expect(reversalLevel(c, ENTRY_TS, "long", 3, M, true)).toEqual({ level: 99.95, pivotTs: T0 + E * M, confirmedTs: T0 + E * M, fallback: true });
+    const r = checkReversal(c, ENTRY_TS, "long", { pivotN: 3, tfMs: M, fallback: true });
+    expect(r).toMatchObject({ exit: true, level: 99.95, pivotTs: T0 + E * M, fallback: true, close: 97 });
+    expect(r.skip).toBeUndefined();
+    // エントリーした足だけ (後の確定足が無い): 終値は安値を下回れないので決済しない
+    expect(checkReversal(c.slice(0, E + 1), ENTRY_TS, "long", { pivotN: 3, tfMs: M, fallback: true })).toMatchObject({ exit: false, level: 99.95, fallback: true });
+    // 売り: 一方的に上げ続ける → エントリーした足の高値 100.05 を終値が越えたら決済
+    const up = series([100, 100.5, 101, 101.5, 102, 102.5, 103]);
+    expect(checkReversal(up, ENTRY_TS, "short", { pivotN: 3, tfMs: M, fallback: true })).toMatchObject({ exit: true, level: 100.05, fallback: true });
+    // スイングが確定していれば fallback は付かない
+    expect(checkReversal(series(LONG_PROFIT), ENTRY_TS, "long", { pivotN: 3, tfMs: M, fallback: true })).toMatchObject({ exit: true, level: 102.55 });
+    expect(checkReversal(series(LONG_PROFIT), ENTRY_TS, "long", { pivotN: 3, tfMs: M, fallback: true }).fallback).toBeUndefined();
+    // エントリーした足がまだ形成中なら水準なし (no_swing)
+    expect(checkReversal(c.slice(0, E), ENTRY_TS, "long", { pivotN: 3, tfMs: M, fallback: true })).toMatchObject({ exit: false, skip: "no_swing" });
+    // 確定のラグの間 (スイングの確定前) はフォールバックの水準。エントリー前のスイングは使わない
+    expect(reversalLevel(series(LONG_PROFIT).slice(0, E + 10), ENTRY_TS, "long", 3, M, true)).toMatchObject({ level: 99.95, fallback: true });
+    const pre = [100, 100, 99, 98.5, 98, 99, 99.5, 100, 100, 100];
+    expect(checkReversal(bars([...pre, 100, 99, 97.5]), ENTRY_TS, "long", { pivotN: 3, tfMs: M, fallback: true })).toMatchObject({ exit: true, level: 99.95, fallback: true });
   });
 
   it("エントリーより前のスイングローは使わない", () => {
@@ -153,6 +178,8 @@ describe("reversalLevel / checkReversal", () => {
     expect(checkReversal(c, ENTRY_TS, "long", { pivotN: 3, tfMs: M })).toMatchObject({ exit: true, level: 99.45, close: 99.3 });
     // エントリーが 1 本後の足なら、そのスイングはエントリーより前の足なので使わない
     expect(reversalLevel(c, ENTRY_TS + M, "long", 3, M)).toBeUndefined();
+    // フォールバックなら、エントリーした足 r1 の安値
+    expect(reversalLevel(c, ENTRY_TS + M, "long", 3, M, true)).toMatchObject({ level: 99.45, pivotTs: T0 + (E + 1) * M, fallback: true });
   });
 
   it("最も新しい確定したスイングを使う (押し安値の切り上げに付いていく)", () => {
@@ -170,7 +197,7 @@ describe("reversalLevel / checkReversal", () => {
   it("N を変えると使うスイングが変わる (N=2 なら早く確定する)", () => {
     const c = series(LONG_PROFIT.slice(0, 10));
     expect(reversalLevel(c, ENTRY_TS, "long", 3, M)).toBeUndefined();
-    expect(reversalLevel(c, ENTRY_TS, "long", 2, M)).toMatchObject({ level: 102.55, confirmedTs: T0 + (E + 9) * M });
+    expect(reversalLevel(c, ENTRY_TS, "long", 2, M)).toEqual({ level: 102.55, pivotTs: T0 + (E + 7) * M, confirmedTs: T0 + (E + 9) * M });
   });
 });
 
@@ -181,14 +208,23 @@ describe("設定 (REVERSAL_*)", () => {
     expect(env.REVERSAL_EXIT_PIVOT_N).toBe(3);
     expect(env.REVERSAL_EXIT_BUFFER_ATR).toBe(0);
     expect(env.REVERSAL_EXIT_STRATEGIES).toEqual([]);
+    expect(env.REVERSAL_EXIT_TF).toBe("lower");
+    expect(env.REVERSAL_EXIT_FALLBACK).toBe(false);
+    expect(DEFAULT_REVERSAL_SETTINGS.fallback).toBe(false);
+    expect(DEFAULT_REVERSAL_SETTINGS.timeframe).toBe("lower");
     expect(reversalSettingsFromEnv(env)).toEqual({ ...DEFAULT_REVERSAL_SETTINGS, strategies: [] });
     // 手組みの設定 (項目なし) も既定と同じ
     expect(reversalSettingsFromEnv({})).toEqual({ ...DEFAULT_REVERSAL_SETTINGS, strategies: [] });
   });
 
   it("値の読み込みと範囲外の日本語のエラー", () => {
-    const env = loadConfig({ REVERSAL_EXIT: "off", REVERSAL_EXIT_PIVOT_N: "5", REVERSAL_EXIT_BUFFER_ATR: "0.25", REVERSAL_EXIT_STRATEGIES: " a, b ,a" }).env;
-    expect(reversalSettingsFromEnv(env)).toEqual({ enabled: false, pivotN: 5, bufferAtr: 0.25, strategies: ["a", "b"] });
+    const env = loadConfig({
+      REVERSAL_EXIT: "off", REVERSAL_EXIT_PIVOT_N: "5", REVERSAL_EXIT_BUFFER_ATR: "0.25", REVERSAL_EXIT_STRATEGIES: " a, b ,a", REVERSAL_EXIT_TF: "same",
+      REVERSAL_EXIT_FALLBACK: "true",
+    }).env;
+    expect(reversalSettingsFromEnv(env)).toEqual({ enabled: false, pivotN: 5, bufferAtr: 0.25, strategies: ["a", "b"], timeframe: "same", fallback: true });
+    expect(() => loadConfig({ REVERSAL_EXIT_FALLBACK: "maybe" })).toThrow(/REVERSAL_EXIT_FALLBACK/);
+    expect(() => loadConfig({ REVERSAL_EXIT_TF: "higher" })).toThrow(/REVERSAL_EXIT_TF/);
     expect(() => loadConfig({ REVERSAL_EXIT_PIVOT_N: "1" })).toThrow(/REVERSAL_EXIT_PIVOT_N=1 は不正です。2 以上 10 以下の整数/);
     expect(() => loadConfig({ REVERSAL_EXIT_PIVOT_N: "11" })).toThrow(/REVERSAL_EXIT_PIVOT_N/);
     expect(() => loadConfig({ REVERSAL_EXIT_PIVOT_N: "2.5" })).toThrow(/整数/);
@@ -209,8 +245,34 @@ describe("設定 (REVERSAL_*)", () => {
     ]);
     expect(reversalConfigWarnings(all, ["a"], true)[0]).toMatch(/STRUCTURE_EXIT_ON_REVERSAL=true と REVERSAL_EXIT=true を併用/);
     expect(reversalConfigWarnings({ ...all, enabled: false, strategies: ["zzz"] }, ["a"], true)).toEqual([]);
-    expect(formatReversalSettings(all)).toBe("有効 (戦略の主時間足のスイング 左右 3 本 / 終値が水準を越えたら決済 / 対象 すべての戦略)");
+    expect(formatReversalSettings(all)).toBe(
+      "有効 (戦略の主時間足の 1 つ下の時間足のスイング 左右 3 本 / 終値が水準を越えたら決済 / 対象 すべての戦略)",
+    );
+    expect(formatReversalSettings({ ...all, fallback: true })).toContain("左右 3 本 (無ければエントリーした足の安値・高値) /");
+    expect(formatReversalSettings({ ...all, timeframe: "same" })).toMatch(/^有効 \(戦略の主時間足のスイング 左右 3 本/);
     expect(formatReversalSettings({ ...all, bufferAtr: 0.2, strategies: ["a"] })).toContain("0.2 ATR より大きく越えたら決済 / 対象 a");
     expect(formatReversalSettings({ ...all, enabled: false })).toBe("無効 (従来どおり)");
+  });
+});
+
+describe("判定の時間足 (REVERSAL_EXIT_TF)", () => {
+  it("lower: 主時間足の 1 つ下 (1m→1m, 5m→1m, 15m→5m, 1h→15m, 4h→1h, 1d→4h)。same: 主時間足", () => {
+    const map = { "1m": "1m", "5m": "1m", "15m": "5m", "1h": "15m", "4h": "1h", "1d": "4h" } as const;
+    for (const [p, lower] of Object.entries(map)) {
+      expect(reversalLowerTimeframe(p as keyof typeof map)).toBe(lower);
+      expect(reversalTimeframeFor({ timeframe: "lower" }, p as keyof typeof map)).toBe(lower);
+      expect(reversalTimeframeFor({ timeframe: "same" }, p as keyof typeof map)).toBe(p);
+    }
+    // 設定が無ければ既定 (lower)
+    expect(reversalTimeframeFor(undefined, "15m")).toBe("5m");
+  });
+
+  it("バックテスト: 基準足から lower の時間足が作れなければ same (主時間足) に戻す", () => {
+    expect(reversalBacktestTimeframe({ timeframe: "lower" }, "15m", "1m")).toBe("5m");
+    expect(reversalBacktestTimeframe({ timeframe: "lower" }, "15m", "5m")).toBe("5m");
+    expect(reversalBacktestTimeframe({ timeframe: "lower" }, "15m", "15m")).toBe("15m");
+    expect(reversalBacktestTimeframe({ timeframe: "lower" }, "1h", "5m")).toBe("15m");
+    expect(reversalBacktestTimeframe({ timeframe: "lower" }, "1d", "1h")).toBe("4h");
+    expect(reversalBacktestTimeframe({ timeframe: "same" }, "1h", "1m")).toBe("1h");
   });
 });
