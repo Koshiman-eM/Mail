@@ -6,14 +6,9 @@ import type { Bias, StructureOptions, StructureRegime } from "../structure/types
 import { STRUCTURE_WINDOW_BARS } from "../structure/wrap";
 import { fetchCandlesPaged } from "./backtestCommand";
 import { fmtTime, formatTable } from "./report";
+import { REGIME_LABEL_JA } from "../strategies/labels";
 
-export const REGIME_LABEL_JA: Record<RegimeLabel, string> = {
-  trend_up: "上昇トレンド",
-  trend_down: "下降トレンド",
-  range: "レンジ",
-  high_vol: "荒い値動き",
-  low_liquidity: "流動性が低い",
-};
+export { REGIME_LABEL_JA };
 const LABEL_ORDER: RegimeLabel[] = ["trend_up", "trend_down", "range", "high_vol", "low_liquidity"];
 export const DEFAULT_REGIME_TIMEFRAMES: Timeframe[] = ["1m", "15m", "1h", "4h"];
 

@@ -41,10 +41,11 @@ import { requestResume } from "./risk/resumeRequest";
 import { riskOverrideLines } from "./risk/settings";
 import { createStore } from "./storage";
 import { ReadOnlyOverlayStore } from "./storage/readonly";
-import { configuredStrategies, getStrategy } from "./strategies/registry";
+import { ALL_STRATEGIES, configuredStrategies, getStrategy } from "./strategies/registry";
 import { structureSettingsFromEnv } from "./structure/settings";
 import { unifiedToGmo } from "./market/gmo/client";
 import { TIMEFRAME_MS, type ExitReason, type Timeframe } from "./core/types";
+import { horizonLabel, strategyLabel, strategyLabelWithId } from "./strategies/labels";
 
 // ───────── 引数解析 ─────────
 
@@ -813,6 +814,22 @@ export function tempoStatusLine(config: AppConfig, store: Pick<Store, "listTrade
   return formatTempoLine(tempoStatusView(tc, now, explore), env.MAX_HOLD_MINUTES ?? 0);
 }
 
+/**
+ * status 用の戦略一覧。表示名に id を [] で添える (OBSERVE_ONLY_STRATEGIES / STRUCTURE_STRATEGIES は id で指定するため)。
+ * 観測専用・相場構造フィルターの対象かどうかも付ける
+ */
+export function strategyStatusLines(config: AppConfig): string[] {
+  const observe = new Set(config.env.OBSERVE_ONLY_STRATEGIES ?? []);
+  const structure = structureSettingsFromEnv(config.env);
+  const filtering = structure.mode === "filter" ? new Set(structure.strategies) : new Set<string>();
+  const out = [`戦略 (${ALL_STRATEGIES.length} 本。環境変数では [ ] の id で指定):`];
+  for (const s of ALL_STRATEGIES) {
+    const tags = [observe.has(s.id) ? "観測専用" : "", filtering.has(s.id) ? "構造フィルター対象" : ""].filter(Boolean);
+    out.push(`  ${strategyLabelWithId(s.id)} / ${horizonLabel(s.horizon)}${tags.length ? ` / ${tags.join("・")}` : ""}`);
+  }
+  return out;
+}
+
 function cmdStatus(io: Io): number {
   const config = loadConfig();
   const m = modeLines(config);
@@ -820,6 +837,7 @@ function cmdStatus(io: Io): number {
   m.warn.forEach((l) => io.err(l));
   io.out(venuesLine(config));
   io.out(`監視銘柄 (WATCHLIST): ${config.env.WATCHLIST || "(既定)"}`);
+  strategyStatusLines(config).forEach((l) => io.out(l));
   const dbPath = resolveDbPath(config);
   io.out(`口座通貨: ${config.env.BASE_CURRENCY} / DB: ${dbPath} / AI: ${config.ai.enabled ? config.ai.model : "無効"}`);
   riskLines(config).forEach((l) => io.out(l));
@@ -847,7 +865,7 @@ function cmdStatus(io: Io): number {
         : plan?.thesis?.extendedAt !== undefined
           ? ` / 読みの期限 ${fmtTime(p.entryTs + ms)} → 延長中 (上限 ${fmtTime(p.entryTs + ms * Math.max(1, thesis.extendMult))})`
           : ` / 読みの期限 ${fmtTime(p.entryTs + ms)} (監視中)`;
-      io.out(`  ${p.symbol} ${p.direction === "long" ? "買い" : "売り"} ${p.qty} @ ${p.entryPrice} (${p.strategyId}, ${fmtTime(p.entryTs)})${th}`);
+      io.out(`  ${p.symbol} ${p.direction === "long" ? "買い" : "売り"} ${p.qty} @ ${p.entryPrice} (${strategyLabel(p.strategyId)}, ${fmtTime(p.entryTs)})${th}`);
     }
     const pending = new PendingOrders({ store, mode }).list();
     if (pending.length) {

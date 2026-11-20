@@ -16,6 +16,7 @@ import { defaultStructureSettings, type StructureSettings } from "../structure/s
 import { isStructureWrapped, withFilterCounter, withStructure, type StructureFilterConfig } from "../structure/wrap";
 import { baseTimeframeOf, createBacktestDataLoader, type BacktestCommandOptions } from "./backtestCommand";
 import { fmtPct, formatTable } from "./report";
+import { strategyLabel } from "../strategies/labels";
 
 export type CompareConditionId = "A" | "B" | "C" | "D" | "E" | "F" | "G";
 
@@ -161,7 +162,7 @@ export function formatCompareRows(rows: readonly CompareRow[]): string {
         .map(([k, v]) => `${REASON_SHORT[k] ?? k} ${v}`)
         .join(" ");
       return [
-        r.strategyId, `${r.condition} ${r.label}`, ...(sweep ? [r.pivotN !== undefined ? String(r.pivotN) : "-"] : []),
+        strategyLabel(r.strategyId), `${r.condition} ${r.label}`, ...(sweep ? [r.pivotN !== undefined ? String(r.pivotN) : "-"] : []),
         m ? m.profitFactor.toFixed(2) : "-", m ? fmtPct(m.maxDrawdown) : "-", m ? m.expectancyR.toFixed(3) : "-", m ? m.trades : "-",
         m ? fmtPct(m.winRate, 1) : "-", m ? fmtHold(m.avgHoldMs) : "-", r.foldTrades.length ? r.foldTrades.join("/") : "-",
         filtered || "-", r.note ?? "",

@@ -7,6 +7,7 @@ import { mergeCandles } from "../market/candles";
 import { ALL_STRATEGIES, getStrategy } from "../strategies/registry";
 import { fmtNum, fmtPct, formatTable } from "./report";
 import { isHoldLimitedHorizon } from "./tempo";
+import { horizonLabel, strategyLabel } from "../strategies/labels";
 
 const DAY = 86_400_000;
 /** 合成データの開始時刻 (再現性のため固定) */
@@ -190,7 +191,6 @@ export async function runBacktestCommand(o: BacktestCommandOptions): Promise<Bac
   return rows;
 }
 
-const HORIZON_LABEL: Record<string, string> = { scalp: "スキャル", short: "短期", mid: "中期", long: "長期" };
 
 export function formatBacktestRows(rows: BacktestRow[]): string {
   return formatTable(
@@ -198,7 +198,7 @@ export function formatBacktestRows(rows: BacktestRow[]): string {
     rows.map((r) => {
       const m = r.metrics;
       return [
-        r.strategyId, HORIZON_LABEL[r.horizon] ?? r.horizon, r.baseTimeframe, r.bars,
+        strategyLabel(r.strategyId), horizonLabel(r.horizon), r.baseTimeframe, r.bars,
         m ? m.trades : "-", m ? fmtPct(m.winRate, 1) : "-", m ? fmtNum(m.netPnl, 0) : "-", m ? fmtPct(m.returnPct) : "-",
         m ? fmtPct(m.maxDrawdown) : "-", m ? m.profitFactor.toFixed(2) : "-", m ? m.expectancyR.toFixed(3) : "-", m ? m.sharpe.toFixed(2) : "-",
         m ? fmtNum(m.fees, 0) : "-", r.note ?? "",

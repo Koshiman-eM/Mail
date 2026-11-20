@@ -1,0 +1,44 @@
+import { describe, expect, it } from "vitest";
+import { ALL_STRATEGIES, configuredStrategies } from "../src/strategies/registry";
+import { armLabel, HORIZON_LABELS, STRATEGY_LABELS, strategyLabel, strategyLabelWithId } from "../src/strategies/labels";
+import { structureSettingsFromEnv } from "../src/structure/settings";
+import { loadConfig } from "../src/core/config";
+
+describe("戦略の表示名 (表示専用。id は変えない)", () => {
+  it("全戦略に表示名があり、long / short / ロング / ショート を含まない", () => {
+    for (const s of ALL_STRATEGIES) {
+      const label = STRATEGY_LABELS[s.id];
+      expect(label, s.id).toBeTruthy();
+      expect(label).not.toMatch(/long|short|ロング|ショート/i);
+    }
+    for (const label of [...Object.values(STRATEGY_LABELS), ...Object.values(HORIZON_LABELS)]) {
+      expect(label).not.toMatch(/long|short|ロング|ショート/i);
+    }
+  });
+
+  it("表示名の先頭は時間軸の表示名 (ミームを除く)", () => {
+    for (const s of ALL_STRATEGIES) {
+      if (s.id.startsWith("meme_")) continue;
+      expect(STRATEGY_LABELS[s.id].startsWith(HORIZON_LABELS[s.horizon]), s.id).toBe(true);
+    }
+  });
+
+  it("相場構造のラッパーを掛けても同じ id (同じ表示名)", () => {
+    const wrapped = configuredStrategies(structureSettingsFromEnv(loadConfig({ STRUCTURE_MODE: "filter" }).env));
+    expect(wrapped.map((s) => s.id)).toEqual(ALL_STRATEGIES.map((s) => s.id));
+    for (const s of wrapped) expect(strategyLabel(s.id)).toBe(STRATEGY_LABELS[s.id]);
+  });
+
+  it("未知の id はそのまま、id 併記は [id] を付ける", () => {
+    expect(strategyLabel("unknown_x")).toBe("unknown_x");
+    expect(strategyLabelWithId("unknown_x")).toBe("unknown_x");
+    expect(strategyLabelWithId("long_momentum")).toBe("長期・モメンタム (日足) [long_momentum]");
+  });
+
+  it("腕のキーを日本語にし、末尾の |short は「空売り (paper 再現)」にする", () => {
+    expect(armLabel("short_breakout|trend_up|crypto")).toBe("短期・ブレイクアウト (1 時間足) / 上昇トレンド / crypto");
+    expect(armLabel("short_breakout|range|crypto|short")).toBe("短期・ブレイクアウト (1 時間足) / レンジ / crypto / 空売り (paper 再現)");
+    expect(armLabel("weird")).toBe("weird");
+    expect(armLabel("a|b|c|d")).toBe("a|b|c|d");
+  });
+});

@@ -9,6 +9,7 @@ import { microReasonLabel, sideLabel, SIMULATED_SHORT_LABEL, type ShadowGroup, t
 import { quoteCurrencyOfSymbol } from "./fx";
 import type { LimitStats } from "./orders";
 import { THESIS_OUTCOME_LABEL, type ThesisOutcome } from "./thesis";
+import { armLabel, strategyLabel } from "../strategies/labels";
 
 export const EXIT_REASON_LABEL: Record<ExitReason, string> = {
   stop: "損切り",
@@ -515,7 +516,7 @@ export function renderStrategyTable(rows: StrategySummary[], ccy: string): strin
   if (rows.length === 0) return "  (トレードなし)";
   return formatTable(
     ["戦略", "取引数", "勝率", `純損益(${ccy})`, `手数料(${ccy})`, "平均R"],
-    rows.map((r) => [r.strategyId, r.trades, fmtPct(r.winRate, 1), fmtSigned(r.netPnl), fmtNum(r.fees, 0), r.avgR.toFixed(2)]),
+    rows.map((r) => [strategyLabel(r.strategyId), r.trades, fmtPct(r.winRate, 1), fmtSigned(r.netPnl), fmtNum(r.fees, 0), r.avgR.toFixed(2)]),
   );
 }
 
@@ -536,10 +537,10 @@ const SHADOW_EXIT_LABEL: Record<string, string> = {
   thesis_failed: "読み外れ(途中)", thesis_timeout: "読み外れ(期限)", thesis_cap: "延長の上限",
 };
 
-function shadowGroupTable(title: string, rows: ShadowGroup[], limit: number): string {
+function shadowGroupTable(title: string, rows: ShadowGroup[], limit: number, keyLabel: (key: string) => string = (k) => k): string {
   return formatTable(
     [title, "件数", "勝率", "平均純R", "純R合計"],
-    rows.slice(0, limit).map((g) => [g.key, g.n, fmtPct(g.winRate, 1), fmtR(g.avgNetR), fmtR(g.sumNetR, 2)]),
+    rows.slice(0, limit).map((g) => [keyLabel(g.key), g.n, fmtPct(g.winRate, 1), fmtR(g.avgNetR), fmtR(g.sumNetR, 2)]),
   );
 }
 
@@ -564,14 +565,14 @@ export function renderShadow(s: ShadowSummary | undefined, opts: { limit?: numbe
   }
   if (s.bySide && s.bySide.some((g) => g.key === SIMULATED_SHORT_LABEL)) out.push(shadowGroupTable("方向", s.bySide, limit), "");
   out.push(shadowGroupTable("見送り理由", s.byReason, limit));
-  out.push("", shadowGroupTable("戦略", s.byStrategy, limit));
+  out.push("", shadowGroupTable("戦略", s.byStrategy, limit, strategyLabel));
   if (s.micro && s.micro.some((g) => g.n > 0)) {
     out.push(
       "",
-      "  超短期 (scalp_micro / scalp_rebound) の答え合わせ",
+      `  ${strategyLabel("scalp_micro")} / ${strategyLabel("scalp_rebound")} の答え合わせ`,
       formatTable(
         ["戦略", "見送り理由", "件数", "利確到達率", "ランダム時の勝率 p0", "平均R (コスト前)", "平均純R"],
-        s.micro.slice(0, 2 * (limit + 1)).map((g) => [g.strategyId ?? "-", microReasonLabel(g.key), g.n, fmtPct(g.tpRate, 1), fmtPct(g.p0, 1), fmtR(g.avgGrossR), fmtR(g.avgNetR)]),
+        s.micro.slice(0, 2 * (limit + 1)).map((g) => [g.strategyId ? strategyLabel(g.strategyId) : "-", microReasonLabel(g.key), g.n, fmtPct(g.tpRate, 1), fmtPct(g.p0, 1), fmtR(g.avgGrossR), fmtR(g.avgNetR)]),
       ),
       "  ※ 利確到達率が p0 を安定して上回るなら、値動きに優位性があります。平均R (コスト前) が正でも平均純R が負なら、手数料が利益を上回っています。どれも発注していない記録です (コストで見送ったものは腕の学習にも使いません)。",
     );
@@ -689,14 +690,14 @@ export function renderLearning(
   const arms = [...s.arms].sort((a, b) => b.n - a.n || (b.shadowN ?? 0) - (a.shadowN ?? 0)).slice(0, opts.arms ?? 15);
   out.push("■ 腕の成績 (戦略×レジーム×資産クラス。仮想 = 見送ったシグナルの仮想トレード、重み 0.25 で反映)");
   if (s.arms.some((a) => a.key.endsWith(SIMULATED_SHORT_ARM_SUFFIX))) {
-    out.push(`  ※ 末尾が ${SIMULATED_SHORT_ARM_SUFFIX} の腕 = ${SIMULATED_SHORT_LABEL}。買いの腕とは別に学習し、live では使いません`);
+    out.push(`  ※ 「${SIMULATED_SHORT_LABEL}」の腕 (内部キーの末尾 ${SIMULATED_SHORT_ARM_SUFFIX}) は買いの腕とは別に学習し、live では使いません`);
   }
   out.push(
     arms.length
       ? formatTable(
           ["腕", "件数", "仮想", "勝率", "期待R", "仮想平均R", "配分倍率", "状態"],
           arms.map((a) => [
-            a.key, a.n, a.shadowN ?? 0, fmtPct(a.winRate, 1), a.meanR.toFixed(3), (a.shadowN ?? 0) > 0 ? (a.shadowMeanR ?? 0).toFixed(3) : "-",
+            armLabel(a.key), a.n, a.shadowN ?? 0, fmtPct(a.winRate, 1), a.meanR.toFixed(3), (a.shadowN ?? 0) > 0 ? (a.shadowMeanR ?? 0).toFixed(3) : "-",
             a.weight.toFixed(2), a.disabled ? "停止" : "有効",
           ]),
         )
@@ -712,7 +713,7 @@ export function renderLearning(
       ? formatTable(
           ["日時", "戦略/資産", "パラメータ", "変更", "状態", "検証 (現行→候補)"],
           adj.map((a) => [
-            fmtTime(a.createdAt), `${a.strategyId}/${a.assetClass}`, a.param, `${a.from} → ${a.to}`, ADJUSTMENT_STATUS_LABEL[a.status] ?? a.status,
+            fmtTime(a.createdAt), `${strategyLabel(a.strategyId)}/${a.assetClass}`, a.param, `${a.from} → ${a.to}`, ADJUSTMENT_STATUS_LABEL[a.status] ?? a.status,
             a.validation ? `${a.validation.baselineScore.toFixed(2)} → ${a.validation.candidateScore.toFixed(2)} (${a.validation.trades}件)` : "-",
           ]),
         )

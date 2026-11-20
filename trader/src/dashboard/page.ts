@@ -3,6 +3,8 @@
  * 既定の「ボード」タブはコックピット風の一覧 (粒子の雲・SIGNAL STACK・チャート・ENGINE LOG など)。常に暗いテーマ。
  * 注意: テンプレート文字列なので、中の JS ではバッククォートとバックスラッシュを使わない。
  */
+import { HORIZON_LABELS, REGIME_LABEL_JA, STRATEGY_LABELS } from "../strategies/labels";
+
 export const DASHBOARD_HTML = `<!doctype html>
 <html lang="ja">
 <head>
@@ -546,7 +548,25 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
   /** paper で再現した空売り (live では実行できない取引・腕) */
   var SIM_SHORT = '空売り (paper 再現)';
   function isSimArm(k) { return String(k).slice(-6) === '|short'; }
-  var STRATS = ["scalp_obi", "scalp_vwap_revert", "scalp_momentum_burst", "short_ema_trend", "short_rsi_revert", "short_breakout", "mid_trend_follow", "long_momentum", "meme_momentum"];
+  /** 戦略 id → 日本語の表示名 / 時間軸の表示名 (サーバーが strategies/labels.ts から埋め込む。id 自体は変えない) */
+  var SLAB = ${JSON.stringify(STRATEGY_LABELS)};
+  var HLAB = ${JSON.stringify(HORIZON_LABELS)};
+  var RLAB = ${JSON.stringify(REGIME_LABEL_JA)};
+  /** 表示名 (未知の id は id のまま) */
+  function slab(id) { return SLAB[id] || String(id == null ? "" : id); }
+  /** 表示名にホバーで id を出す HTML (id は小さく薄い文字ではなく title に置く。表のセル用) */
+  function shtml(id) { return '<span title="' + esc(id) + '">' + esc(slab(id)) + "</span>"; }
+  /** 腕のキー <戦略>|<レジーム>|<資産クラス>[|short] の表示名 (キー自体は変えない) */
+  function alab(key) {
+    var p = String(key).split("|");
+    if (p.length < 3) return String(key);
+    var out = [slab(p[0]), RLAB[p[1]] || p[1], p[2]];
+    if (p[3] === "short") out.push(SIM_SHORT);
+    return out.join(" / ");
+  }
+  function ahtml(key) { return '<span title="' + esc(key) + '">' + esc(alab(key)) + "</span>"; }
+  // 全戦略の id (表示名の対応表 = ALL_STRATEGIES と同じ一覧。戦略を足したらここも自動で増える)
+  var STRATS = Object.keys(SLAB);
   var REG = ["trend_up", "trend_down", "range", "high_vol", "low_liquidity"];
   var REG_L = { trend_up: "UP", trend_down: "DOWN", range: "RANGE", high_vol: "HIVOL", low_liquidity: "LOLIQ" };
   var REG_J = { trend_up: "上昇トレンド", trend_down: "下降トレンド", range: "レンジ", high_vol: "高ボラティリティ", low_liquidity: "低流動性" };
@@ -599,7 +619,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
   }
   function set(id, html) { var el = $(id); if (el.__h !== html) { el.__h = html; el.innerHTML = html; } }
   function baseOf(sym) { return String(sym).split(/[/:|-]/)[0].toUpperCase(); }
-  function horizonOf(id) { return { scalp: "SCALP", short: "SHORT", mid: "MID", long: "LONG", meme: "MEME" }[String(id).split("_")[0]] || "STRAT"; }
+  function horizonOf(id) { var k = String(id).split("_")[0]; return k === "meme" ? "ミーム" : HLAB[k] || "戦略"; }
   function acctPnl(x) { return x.netPnlAccount != null ? x.netPnlAccount : x.netPnl; }
   function toneOf(x) { return x >= 0.3 ? ["強気", "bull"] : x >= 0.1 ? ["やや強気", "bull"] : x <= -0.3 ? ["弱気", "bear"] : x <= -0.1 ? ["やや弱気", "bear"] : ["中立", ""]; }
 
@@ -733,7 +753,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
   function label(e) {
     var d = e.data || {};
     switch (e.type) {
-      case "engine.entry": return (d.symbol || "") + " " + (DIR[d.direction] || "") + "エントリー @" + num(d.price) + " (" + (d.strategyId || "") + ")";
+      case "engine.entry": return (d.symbol || "") + " " + (DIR[d.direction] || "") + "エントリー @" + num(d.price) + " (" + slab(d.strategyId || "") + ")";
       case "engine.exit": return (d.symbol || "") + " 決済 @" + num(d.exitPrice) + " " + (EXIT[d.reason] || d.reason || "") + (typeof d.netPnl === "number" ? " 損益 " + signed(d.netPnl, 0) : "") + (typeof d.rMultiple === "number" ? " (" + num(d.rMultiple, 2) + "R)" : "");
       case "engine.skip_summary": return "見送り: " + (d.reason || "-");
       case "engine.plan": return "計画を更新 (対象 " + (d.active != null ? d.active : "-") + " 銘柄 / リスクオン " + signed(Number(d.riskOn) || 0, 2) + ")";
@@ -747,8 +767,8 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
       case "risk.kill_switch": return "キルスイッチ作動";
       case "risk.resume": return "停止を解除";
       case "risk.limits_changed": return "リスク上限を変更" + (d.action === "reset" ? " (.env の値に戻す)" : "") + (d.raised ? " · 上げる変更" : "");
-      case "learning.param_adjust": return "パラメータ調整 " + (d.strategyId || "") + " " + (d.param || "") + " " + (d.from != null ? d.from + "→" + d.to : "");
-      case "learning.param_revert": return "パラメータを元に戻す " + (d.strategyId || "") + " " + (d.param || "");
+      case "learning.param_adjust": return "パラメータ調整 " + slab(d.strategyId || "") + " " + (d.param || "") + " " + (d.from != null ? d.from + "→" + d.to : "");
+      case "learning.param_revert": return "パラメータを元に戻す " + slab(d.strategyId || "") + " " + (d.param || "");
       case "learning.reflect": return "振り返りを実行";
       case "order.resolved_by_position": return (d.symbol || "") + " 注文の状態を建玉の確認で解消";
       case "order.manual_resolve": return (d.symbol || "") + " 注文の状態を手動で解消" + (d.status ? " (" + d.status + ")" : "");
@@ -968,7 +988,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     var h = "<span></span>" + REG.map(function (rg) { return '<span class="ch" title="' + esc(REG_J[rg]) + '">' + esc(REG_L[rg]) + "</span>"; }).join("");
     var best = null, total = 0, off = 0;
     g.rows.forEach(function (sid) {
-      h += '<span class="rl" title="' + esc(sid) + '">' + esc(sid) + "</span>";
+      h += '<span class="rl" title="' + esc(sid) + '">' + esc(slab(sid)) + "</span>";
       REG.forEach(function (rg) {
         var c = g.by[sid] && g.by[sid][rg], fill = 0, col = "#111a2c", mr = 0, dis = false;
         if (c) {
@@ -978,12 +998,12 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
         }
         var sq = "";
         for (var i = 0; i < 12; i++) sq += i < fill ? '<i style="background:' + col + '"></i>' : "<i></i>";
-        h += '<span class="cell' + (dis ? " off" : "") + '" title="' + esc(sid + " × " + REG_J[rg] + (c ? " / " + c.n + " 件 / 期待R " + num(mr, 3) + (dis ? " / 無効" : "") : " / 未取引")) + '">' + sq + "</span>";
+        h += '<span class="cell' + (dis ? " off" : "") + '" title="' + esc(slab(sid) + " [" + sid + "] × " + REG_J[rg] + (c ? " / " + c.n + " 件 / 期待R " + num(mr, 3) + (dis ? " / 無効" : "") : " / 未取引")) + '">' + sq + "</span>";
       });
     });
     set("heat", h);
     set("heatSide", '<div class="hs"><div class="k">ARMS</div><div class="v">' + esc(arms.length) + '</div></div><div class="hs"><div class="k">TRADES</div><div class="v" style="color:' + C.c + '">' + esc(num(total, 0)) + "</div></div>" +
-      '<div class="hs"><div class="k">BEST R</div><div class="v" style="color:' + C.g + '" title="' + esc(best ? best.sid + " × " + REG_J[best.rg] : "") + '">' + esc(best ? signed(best.r, 2) : "-") + "</div></div>" +
+      '<div class="hs"><div class="k">BEST R</div><div class="v" style="color:' + C.g + '" title="' + esc(best ? slab(best.sid) + " [" + best.sid + "] × " + REG_J[best.rg] : "") + '">' + esc(best ? signed(best.r, 2) : "-") + "</div></div>" +
       '<div class="hs"><div class="k">OFF</div><div class="v" style="color:' + C.r + '">' + esc(off) + "</div></div>");
     set("heatSt", "● " + arms.length + " ARMS");
   }
@@ -1002,7 +1022,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     var mx = Math.max(1.5, rows[0].w * 1.1);
     var h = rows.slice(0, 9).map(function (r, i) {
       var col = i === 0 && rows.length > 1 ? C.y : r.w >= 1 ? C.b : C.p;
-      return '<div class="al"><div><div class="nm' + (i === 0 && rows.length > 1 ? " top" : "") + '" title="' + esc(r.sid) + '">' + esc(r.sid) + '</div><div class="sb">' + esc(r.n + " 件" + (r.wr != null ? " · 勝率 " + pct(r.wr, 0) : "") + (on.length && on.indexOf(r.sid) < 0 ? " · 計画外" : "")) + "</div></div>" +
+      return '<div class="al"><div><div class="nm' + (i === 0 && rows.length > 1 ? " top" : "") + '" title="' + esc(r.sid) + '">' + esc(slab(r.sid)) + '</div><div class="sb">' + esc(r.n + " 件" + (r.wr != null ? " · 勝率 " + pct(r.wr, 0) : "") + (on.length && on.indexOf(r.sid) < 0 ? " · 計画外" : "")) + "</div></div>" +
         '<div class="bar2"><i style="width:' + (100 * clamp(r.w / mx, 0, 1)).toFixed(1) + "%;--bc:" + col + '"></i><span class="one" style="left:' + (100 / mx).toFixed(1) + '%"></span></div>' +
         '<div class="v">×' + esc(num(r.w, 2)) + "</div></div>";
     }).join("");
@@ -1357,7 +1377,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
         }
         var want = strat.slice(0, W && W < 600 ? 1 : 2);
         if (want.join() !== readers.map(function (r) { return r.id; }).join()) {
-          readers = want.map(function (id) { return { id: id, label: String(id).toUpperCase() + " · READING", a: pick(), b: pick(), t: Math.random(), dur: rnd(2.5, 4.5) }; });
+          readers = want.map(function (id) { return { id: id, label: slab(id) + " · READING", a: pick(), b: pick(), t: Math.random(), dur: rnd(2.5, 4.5) }; });
         }
         $("clCount").textContent = (count ? num(count, 0) : "0") + " ITEMS" + (count > target() ? " · 表示 " + target() + " 点" : "");
         set("mhCount", esc(num(count, 0)));
@@ -1398,7 +1418,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     set("run", bs.slice(0, 5).map(function (x, i) {
       var best = x.strategyId === bestId, col = best ? C.y : i % 2 ? C.p : C.b;
       return '<div class="rr' + (best ? " best" : "") + '"><span class="tg2">' + esc(horizonOf(x.strategyId)) + "</span>" +
-        '<div style="min-width:0"><div class="nm" title="' + esc(x.strategyId) + '">' + esc(x.strategyId) + '</div><div class="sb">' + esc(x.trades + " 件 · 勝率 " + pct(x.winRate, 0) + " · 勝ち " + x.wins + " / 負け " + x.losses) + "</div>" +
+        '<div style="min-width:0"><div class="nm" title="' + esc(x.strategyId) + '">' + esc(slab(x.strategyId)) + '</div><div class="sb">' + esc(x.trades + " 件 · 勝率 " + pct(x.winRate, 0) + " · 勝ち " + x.wins + " / 負け " + x.losses) + "</div>" +
         '<div class="db' + (best ? " glow" : "") + '"><i style="width:' + (100 * x.trades / mx).toFixed(1) + "%;--bc:" + col + '"></i></div></div>' +
         '<div class="rv"><b>' + esc(signed(x.avgR, 2)) + 'R</b><span class="' + cls(x.netPnl) + '">' + esc(sbig(x.netPnl)) + "</span></div></div>";
     }).join(""));
@@ -1446,12 +1466,12 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     EV.filter(function (e) { return e.kind === "entry" || e.kind === "exit" || e.kind === "skip"; }).slice(0, 5).forEach(function (e) {
       var d = e.data || {};
       if (e.kind === "entry") {
-        h += '<div class="sc" style="--sc:' + C.y + '"><div class="sq"><span class="tg">ENTRY</span><span class="q">' + esc(hms(e.ts) + " · " + (d.symbol || "") + " · " + (DIR[d.direction] || "") + " · " + (d.strategyId || "")) + "</span></div>" +
+        h += '<div class="sc" style="--sc:' + C.y + '"><div class="sq"><span class="tg">ENTRY</span><span class="q">' + esc(hms(e.ts) + " · " + (d.symbol || "") + " · " + (DIR[d.direction] || "") + " · " + slab(d.strategyId || "")) + "</span></div>" +
           '<div class="sv">' + esc((d.direction === "short" ? "▼ " : "▲ ") + "@" + num(d.price)) + '</div><div class="sf">' + esc("数量 " + num(d.qty) + " · エントリー") + "</div></div>";
       } else if (e.kind === "exit") {
         var p = typeof d.netPnl === "number" ? d.netPnl : null, col = p > 0 ? C.g : p < 0 ? C.r : C.mut;
         h += '<div class="sc" style="--sc:' + col + '"><div class="sq"><span class="tg">EXIT</span><span class="q">' + esc(hms(e.ts) + " · " + (d.symbol || "") + " · " + (EXIT[d.reason] || d.reason || "決済")) + "</span></div>" +
-          '<div class="sv ' + cls(p) + '">' + esc(p == null ? "@" + num(d.exitPrice) : signed(p, 0)) + '</div><div class="sf">' + esc("@" + num(d.exitPrice) + (typeof d.rMultiple === "number" ? " · " + num(d.rMultiple, 2) + "R" : "") + (d.strategyId ? " · " + d.strategyId : "")) + "</div></div>";
+          '<div class="sv ' + cls(p) + '">' + esc(p == null ? "@" + num(d.exitPrice) : signed(p, 0)) + '</div><div class="sf">' + esc("@" + num(d.exitPrice) + (typeof d.rMultiple === "number" ? " · " + num(d.rMultiple, 2) + "R" : "") + (d.strategyId ? " · " + slab(d.strategyId) : "")) + "</div></div>";
       } else {
         h += '<div class="sc" style="--sc:' + C.r + '"><div class="sq"><span class="tg">SKIP</span><span class="q">' + esc(hms(e.ts) + " · 見送り") + '</span></div><div class="sv no">No trade.</div><div class="sf" title="' + esc(d.reason || "") + '">' + esc(d.reason || "-") + "</div></div>";
       }
@@ -1516,7 +1536,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     mx = mx || 1;
     h += bs.slice(0, 6).map(function (x, i) {
       var best = i === 0 && x.netPnl > 0;
-      return '<div class="sr' + (best ? " best" : "") + '"><span class="nm" title="' + esc(x.strategyId) + '">' + esc(x.strategyId) + '</span><span class="pv">' + esc(sbig(x.netPnl)) + '</span><span class="bd' + (x.winRate >= 0.5 ? " g" : "") + '" title="勝率">' + esc(pct(x.winRate, 0)) + "</span>" +
+      return '<div class="sr' + (best ? " best" : "") + '"><span class="nm" title="' + esc(x.strategyId) + '">' + esc(slab(x.strategyId)) + '</span><span class="pv">' + esc(sbig(x.netPnl)) + '</span><span class="bd' + (x.winRate >= 0.5 ? " g" : "") + '" title="勝率">' + esc(pct(x.winRate, 0)) + "</span>" +
         '<div class="hb"><i class="' + (x.netPnl < 0 ? "neg" : "") + '" style="width:' + (100 * Math.abs(x.netPnl) / mx).toFixed(1) + '%"></i></div></div>';
     }).join("");
     set("ntr", h);
@@ -1684,7 +1704,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     if (p) {
       h += '<p class="note">' + esc(p.rationale) + "</p>";
       h += '<div class="scroll">' + table(["銘柄", "有効な戦略", "方向", "倍率"], p.symbols.map(function (x) {
-        return [esc(x.symbol), x.enabledStrategies.length ? x.enabledStrategies.map(function (id) { return '<span class="chip">' + esc(id) + "</span>"; }).join("") : '<span class="muted">' + esc(x.notes || "停止") + "</span>",
+        return [esc(x.symbol), x.enabledStrategies.length ? x.enabledStrategies.map(function (id) { return '<span class="chip" title="' + esc(id) + '">' + esc(slab(id)) + "</span>"; }).join("") : '<span class="muted">' + esc(x.notes || "停止") + "</span>",
           esc(x.directionBias === "both" ? "両方" : DIR[x.directionBias] || x.directionBias), esc(num(x.riskMultiplier, 2))];
       }), [false, false, false, true]) + "</div>";
       if (p.blackouts.length) h += '<p class="err">ブラックアウト: ' + p.blackouts.map(function (x) { return esc(x.reason + " (" + time(x.start) + "〜" + time(x.end) + ")"); }).join(", ") + "</p>";
@@ -1706,7 +1726,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     set("positions", table(["銘柄", "戦略", "方向", "数量", "建値", "現在値", "ストップ", "利確", "含み損益(" + ccy + ")", "建玉時刻", "読みの期限", "残り", "状態", "現在のR"], s.positions.map(function (x) {
       var u = x.unrealizedPnlAccount != null ? x.unrealizedPnlAccount : x.unrealizedPnl;
       var th = x.thesis;
-      return [esc(x.symbol), esc(x.strategyId), esc(DIR[x.direction]), esc(num(x.qty)), esc(num(x.entryPrice)), esc(num(x.lastPrice)), esc(num(x.stop)),
+      return [esc(x.symbol), shtml(x.strategyId), esc(DIR[x.direction]), esc(num(x.qty)), esc(num(x.entryPrice)), esc(num(x.lastPrice)), esc(num(x.stop)),
         esc(x.takeProfit != null ? num(x.takeProfit) : "-"), '<span class="' + cls(u) + '">' + esc(signed(u, 0)) + "</span>", esc(time(x.entryTs)),
         th ? esc(time(th.deadlineTs)) + (th.state === "extended" ? '<br><span class="muted">上限 ' + esc(time(th.capTs)) + "</span>" : "") : "-",
         th ? esc(remain(th.remainingMin)) : "-",
@@ -1721,7 +1741,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
       var causes = x.attribution ? x.attribution.causes.map(function (c) {
         return '<span class="chip ' + esc(x.attribution.outcome) + '" title="' + esc(c.evidence) + '">' + esc(c.label) + " " + esc(num(c.weight, 2)) + "</span>";
       }).join("") : '<span class="muted">未分析</span>';
-      return [esc(time(x.exitTs)), esc(x.symbol) + (x.estimated ? ' <span class="muted" title="約定を確認できず推定した値を含む">(推定)</span>' : ""), esc(x.strategyId), esc(x.simulatedShort ? SIM_SHORT : DIR[x.direction]), esc(EXIT[x.exitReason] || x.exitReason),
+      return [esc(time(x.exitTs)), esc(x.symbol) + (x.estimated ? ' <span class="muted" title="約定を確認できず推定した値を含む">(推定)</span>' : ""), shtml(x.strategyId), esc(x.simulatedShort ? SIM_SHORT : DIR[x.direction]), esc(EXIT[x.exitReason] || x.exitReason),
         '<span class="' + cls(pnl) + '">' + esc(signed(pnl, 0)) + "</span>", '<span class="' + cls(x.rMultiple) + '">' + esc(num(x.rMultiple, 2)) + "</span>", causes];
     }), [false, false, false, false, false, true, true, false]));
     // 方向別 (買い / 売り / 空売り (paper 再現))。live で実際にできる成績は空売り (paper 再現) を除いたもの
@@ -1732,7 +1752,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     }), [false, true, true, true, true]) + '<p class="note">live で実際にできる成績 (' + esc(SIM_SHORT) + 'を除く。現物は買いのみ): ' + esc(live.n) + ' 件 / 勝率 ' + esc(pct(live.n ? live.w / live.n : 0, 1)) + ' / 損益 ' + esc(signed(live.pnl, 0)) + '</p>' +
       (hasSim ? '<p class="note">' + esc(SIM_SHORT) + ' = 取引所では空売りできない現物を paper でだけ売り建てた取引 (借入コストは手数料に含む)。live では空売りしません。戦略別は全方向の合計です。</p>' : '') : '';
     set("byStrategy", sideHtml + table(["戦略", "取引", "勝率", "損益(" + ccy + ")", "平均R"], t.byStrategy.map(function (s) {
-      return [esc(s.strategyId), esc(s.trades), esc(pct(s.winRate, 1)), '<span class="' + cls(s.netPnl) + '">' + esc(signed(s.netPnl, 0)) + "</span>", esc(num(s.avgR, 2))];
+      return [shtml(s.strategyId), esc(s.trades), esc(pct(s.winRate, 1)), '<span class="' + cls(s.netPnl) + '">' + esc(signed(s.netPnl, 0)) + "</span>", esc(num(s.avgR, 2))];
     }), [false, true, true, true, true]));
   }
   function renderLearning(l) {
@@ -1748,7 +1768,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
       return "<li>" + esc(x.text) + ' <span class="muted">[' + esc(x.scope) + " / " + (x.origin === "llm" ? "AI" : "ルール") + "]</span></li>";
     }).join("") + "</ul>" : '<p class="empty">まだありません</p>');
     set("adjustments", table(["日時", "戦略/資産", "パラメータ", "変更", "状態", "検証 (現行→候補)", "理由"], l.adjustments.slice().reverse().map(function (a) {
-      return [esc(time(a.createdAt)), esc(a.strategyId + "/" + a.assetClass), esc(a.param), esc(a.from + " → " + a.to), esc(ADJ[a.status] || a.status),
+      return [esc(time(a.createdAt)), shtml(a.strategyId) + esc("/" + a.assetClass), esc(a.param), esc(a.from + " → " + a.to), esc(ADJ[a.status] || a.status),
         esc(a.validation ? num(a.validation.baselineScore, 2) + " → " + num(a.validation.candidateScore, 2) + " (" + a.validation.trades + "件)" : "-"), '<span class="muted">' + esc(a.reason) + "</span>"];
     })));
     var src = Object.keys(l.sources).map(function (k) { return l.sources[k]; }).sort(function (a, b) { return b.n - a.n; });
@@ -1757,19 +1777,19 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     }), [false, true, true, true, true]) + '<p class="note">件数・的中はトレード由来。ニュースは値動きとの答え合わせ (的中/判定、重み 0.3)。</p>' + '<p class="note">情報の効き具合: ' + Object.keys(l.intelInfluence).map(function (k) { return esc(k + " " + num(l.intelInfluence[k], 2)); }).join(" / ") + "</p>");
     set("arms", table(["腕", "件数", "仮想", "勝率", "期待R", "仮想平均R", "配分倍率", "状態"], l.arms.slice().sort(function (a, b) { return b.n - a.n || (b.shadowN || 0) - (a.shadowN || 0); }).map(function (a) {
       var sn = a.shadowN || 0;
-      return [esc(a.key) + (isSimArm(a.key) ? ' <span class="muted">(' + esc(SIM_SHORT) + ')</span>' : ''), esc(a.n), esc(sn), esc(pct(a.winRate, 1)), '<span class="' + cls(a.meanR) + '">' + esc(num(a.meanR, 3)) + "</span>",
+      return [ahtml(a.key), esc(a.n), esc(sn), esc(pct(a.winRate, 1)), '<span class="' + cls(a.meanR) + '">' + esc(num(a.meanR, 3)) + "</span>",
         sn ? '<span class="' + cls(a.shadowMeanR) + '">' + esc(num(a.shadowMeanR, 3)) + "</span>" : "-", esc(num(a.weight, 2)),
         a.disabled ? '<span class="neg">停止</span>' : "有効"];
-    }), [false, true, true, true, true, true, true, false]) + (l.arms.some(function (a) { return isSimArm(a.key); }) ? '<p class="note">末尾が |short の腕 = ' + esc(SIM_SHORT) + '。買いの腕とは別に学習し、live では使いません。</p>' : ''));
+    }), [false, true, true, true, true, true, true, false]) + (l.arms.some(function (a) { return isSimArm(a.key); }) ? '<p class="note">「' + esc(SIM_SHORT) + '」の腕 (内部キーの末尾 |short) は買いの腕とは別に学習し、live では使いません。表示名にカーソルを置くと内部キーを確認できます。</p>' : ''));
     safe("shadow", function () { renderShadow(l.shadow); });
     safe("newsCheck", function () { renderNewsCheck(l.news); });
     safe("forecast", function () { renderForecast(l.forecast); });
   }
   var SH_EXIT = { stop: "損切り", take_profit: "利確", time: "時間切れ", unwatched: "監視終了", trailing: "トレーリング",
     thesis_failed: "読み外れ(途中)", thesis_timeout: "読み外れ(期限)", thesis_cap: "延長の上限" };
-  function shadowRows(rows) {
+  function shadowRows(rows, keyHtml) {
     return rows.slice(0, 20).map(function (g) {
-      return [esc(g.key), esc(g.n), esc(pct(g.winRate, 1)), '<span class="' + cls(g.avgNetR) + '">' + esc(signed(g.avgNetR, 3)) + "</span>",
+      return [keyHtml ? keyHtml(g.key) : esc(g.key), esc(g.n), esc(pct(g.winRate, 1)), '<span class="' + cls(g.avgNetR) + '">' + esc(signed(g.avgNetR, 3)) + "</span>",
         '<span class="' + cls(g.sumNetR) + '">' + esc(signed(g.sumNetR, 2)) + "</span>"];
     });
   }
@@ -1783,11 +1803,11 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     var heads = ["件数", "勝率", "平均純R", "純R合計"], numc = [false, true, true, true, true];
     if ((sh.bySide || []).some(function (g) { return g.key === SIM_SHORT; })) h += '<h2>BY SIDE · 方向ごと</h2>' + '<div class="scroll">' + table(['方向'].concat(heads), shadowRows(sh.bySide), numc) + '</div>';
     h += "<h2>BY REASON · 見送り理由ごと</h2>" + '<div class="scroll">' + table(["見送り理由"].concat(heads), shadowRows(sh.byReason || []), numc) + "</div>";
-    h += "<h2>BY STRATEGY · 戦略ごと</h2>" + '<div class="scroll">' + table(["戦略"].concat(heads), shadowRows(sh.byStrategy || []), numc) + "</div>";
+    h += "<h2>BY STRATEGY · 戦略ごと</h2>" + '<div class="scroll">' + table(["戦略"].concat(heads), shadowRows(sh.byStrategy || [], shtml), numc) + "</div>";
     if ((sh.micro || []).some(function (g) { return g.n > 0; })) {
       var MICRO_LBL = { 'strategy_filter:cost': 'コストで見送り', 'strategy_filter:spread': 'スプレッドで見送り', 'strategy_filter:edge': '期待値で見送り', 'observe_only': '観測専用', 'hold_limit': '最大保有の対象外', 'tempo_cap': 'テンポの上限' };
-      h += '<h2>MICRO · 超短期 (scalp_micro / scalp_rebound) の答え合わせ</h2><div class="scroll">' + table(['戦略', '見送り理由', '件数', '利確到達率', 'ランダム時の勝率 p0', '平均R (コスト前)', '平均純R'], sh.micro.map(function (g) {
-        return [esc(g.strategyId || '-'), esc(MICRO_LBL[g.key] || g.key), esc(g.n), esc(pct(g.tpRate, 1)), esc(pct(g.p0, 1)),
+      h += '<h2>MICRO · ' + esc(slab('scalp_micro') + ' / ' + slab('scalp_rebound')) + ' の答え合わせ</h2><div class="scroll">' + table(['戦略', '見送り理由', '件数', '利確到達率', 'ランダム時の勝率 p0', '平均R (コスト前)', '平均純R'], sh.micro.map(function (g) {
+        return [g.strategyId ? shtml(g.strategyId) : '-', esc(MICRO_LBL[g.key] || g.key), esc(g.n), esc(pct(g.tpRate, 1)), esc(pct(g.p0, 1)),
           '<span class="' + cls(g.avgGrossR) + '">' + esc(signed(g.avgGrossR, 3)) + '</span>', '<span class="' + cls(g.avgNetR) + '">' + esc(signed(g.avgNetR, 3)) + '</span>'];
       }), [false, false, true, true, true, true, true]) + '</div>';
       h += '<p class="note">利確到達率が p0 を安定して上回るなら、値動きに優位性があります。平均R (コスト前) が正でも平均純R が負なら、手数料が利益を上回っています。どれも発注していない記録です (コストで見送ったものは腕の学習にも使いません)。</p>';
