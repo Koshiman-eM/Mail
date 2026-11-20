@@ -198,7 +198,7 @@ export const TUNER_RULES: readonly Rule[] = [
     },
     pick: (p) => (has(p, "stopAtr") ? { param: "stopAtr", direction: "down" } : undefined),
   },
-  // 利確・シグナル決済の後にさらに伸びた → 利確幅を広げる
+  // 利確・シグナル決済 (転換で決済 reversal も同じ扱い。attribution の early_exit) の後にさらに伸びた → 利確幅を広げる
   {
     id: "tp_raise",
     label: "early_exit (利確後にさらに伸びた)",

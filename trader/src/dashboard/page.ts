@@ -542,7 +542,13 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
 (function () {
   "use strict";
   var EXIT = { stop: "損切り", take_profit: "利確", trailing: "トレーリング", signal: "シグナル", time: "時間切れ", kill_switch: "キルスイッチ", manual: "手動",
-    thesis_failed: "読み外れ(途中)", thesis_timeout: "読み外れ(期限)", thesis_cap: "延長の上限" };
+    thesis_failed: "読み外れ(途中)", thesis_timeout: "読み外れ(期限)", thesis_cap: "延長の上限", reversal: "転換で決済" };
+  /** 決済理由の表示名。転換で決済は方向で中身を添える (買い: 押し安値割れ / 売り: 戻り高値超え) */
+  function exitLabel(reason, direction) {
+    var b = EXIT[reason] || reason || "";
+    if (reason === "reversal" && (direction === "long" || direction === "short")) return b + (direction === "long" ? " (押し安値割れ)" : " (戻り高値超え)");
+    return b;
+  }
   var ADJ = { proposed: "提案のみ", applied: "適用", rejected: "却下", reverted: "差し戻し" };
   var DIR = { long: "買い", short: "売り" };
   /** paper で再現した空売り (live では実行できない取引・腕) */
@@ -754,7 +760,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     var d = e.data || {};
     switch (e.type) {
       case "engine.entry": return (d.symbol || "") + " " + (DIR[d.direction] || "") + "エントリー @" + num(d.price) + " (" + slab(d.strategyId || "") + ")";
-      case "engine.exit": return (d.symbol || "") + " 決済 @" + num(d.exitPrice) + " " + (EXIT[d.reason] || d.reason || "") + (typeof d.netPnl === "number" ? " 損益 " + signed(d.netPnl, 0) : "") + (typeof d.rMultiple === "number" ? " (" + num(d.rMultiple, 2) + "R)" : "");
+      case "engine.exit": return (d.symbol || "") + " 決済 @" + num(d.exitPrice) + " " + exitLabel(d.reason, d.direction) + (typeof d.netPnl === "number" ? " 損益 " + signed(d.netPnl, 0) : "") + (typeof d.rMultiple === "number" ? " (" + num(d.rMultiple, 2) + "R)" : "");
       case "engine.skip_summary": return "見送り: " + (d.reason || "-");
       case "engine.plan": return "計画を更新 (対象 " + (d.active != null ? d.active : "-") + " 銘柄 / リスクオン " + signed(Number(d.riskOn) || 0, 2) + ")";
       case "engine.order_rejected": return (d.symbol || "") + " 注文が拒否されました " + (d.reason || "");
@@ -1470,7 +1476,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
           '<div class="sv">' + esc((d.direction === "short" ? "▼ " : "▲ ") + "@" + num(d.price)) + '</div><div class="sf">' + esc("数量 " + num(d.qty) + " · エントリー") + "</div></div>";
       } else if (e.kind === "exit") {
         var p = typeof d.netPnl === "number" ? d.netPnl : null, col = p > 0 ? C.g : p < 0 ? C.r : C.mut;
-        h += '<div class="sc" style="--sc:' + col + '"><div class="sq"><span class="tg">EXIT</span><span class="q">' + esc(hms(e.ts) + " · " + (d.symbol || "") + " · " + (EXIT[d.reason] || d.reason || "決済")) + "</span></div>" +
+        h += '<div class="sc" style="--sc:' + col + '"><div class="sq"><span class="tg">EXIT</span><span class="q">' + esc(hms(e.ts) + " · " + (d.symbol || "") + " · " + (exitLabel(d.reason, d.direction) || "決済")) + "</span></div>" +
           '<div class="sv ' + cls(p) + '">' + esc(p == null ? "@" + num(d.exitPrice) : signed(p, 0)) + '</div><div class="sf">' + esc("@" + num(d.exitPrice) + (typeof d.rMultiple === "number" ? " · " + num(d.rMultiple, 2) + "R" : "") + (d.strategyId ? " · " + slab(d.strategyId) : "")) + "</div></div>";
       } else {
         h += '<div class="sc" style="--sc:' + C.r + '"><div class="sq"><span class="tg">SKIP</span><span class="q">' + esc(hms(e.ts) + " · 見送り") + '</span></div><div class="sv no">No trade.</div><div class="sf" title="' + esc(d.reason || "") + '">' + esc(d.reason || "-") + "</div></div>";
@@ -1741,7 +1747,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
       var causes = x.attribution ? x.attribution.causes.map(function (c) {
         return '<span class="chip ' + esc(x.attribution.outcome) + '" title="' + esc(c.evidence) + '">' + esc(c.label) + " " + esc(num(c.weight, 2)) + "</span>";
       }).join("") : '<span class="muted">未分析</span>';
-      return [esc(time(x.exitTs)), esc(x.symbol) + (x.estimated ? ' <span class="muted" title="約定を確認できず推定した値を含む">(推定)</span>' : ""), shtml(x.strategyId), esc(x.simulatedShort ? SIM_SHORT : DIR[x.direction]), esc(EXIT[x.exitReason] || x.exitReason),
+      return [esc(time(x.exitTs)), esc(x.symbol) + (x.estimated ? ' <span class="muted" title="約定を確認できず推定した値を含む">(推定)</span>' : ""), shtml(x.strategyId), esc(x.simulatedShort ? SIM_SHORT : DIR[x.direction]), esc(exitLabel(x.exitReason, x.direction)),
         '<span class="' + cls(pnl) + '">' + esc(signed(pnl, 0)) + "</span>", '<span class="' + cls(x.rMultiple) + '">' + esc(num(x.rMultiple, 2)) + "</span>", causes];
     }), [false, false, false, false, false, true, true, false]));
     // 方向別 (買い / 売り / 空売り (paper 再現))。live で実際にできる成績は空売り (paper 再現) を除いたもの
@@ -1786,7 +1792,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     safe("forecast", function () { renderForecast(l.forecast); });
   }
   var SH_EXIT = { stop: "損切り", take_profit: "利確", time: "時間切れ", unwatched: "監視終了", trailing: "トレーリング",
-    thesis_failed: "読み外れ(途中)", thesis_timeout: "読み外れ(期限)", thesis_cap: "延長の上限" };
+    thesis_failed: "読み外れ(途中)", thesis_timeout: "読み外れ(期限)", thesis_cap: "延長の上限", reversal: "転換で決済" };
   function shadowRows(rows, keyHtml) {
     return rows.slice(0, 20).map(function (g) {
       return [keyHtml ? keyHtml(g.key) : esc(g.key), esc(g.n), esc(pct(g.winRate, 1)), '<span class="' + cls(g.avgNetR) + '">' + esc(signed(g.avgNetR, 3)) + "</span>",

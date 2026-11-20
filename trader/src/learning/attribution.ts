@@ -1,4 +1,4 @@
-import { isTimeLikeExit, type Cause, type CauseCode, type RegimeLabel, type TradeAttribution, type TradeRecord } from "../core/types";
+import { isSignalLikeExit, isTimeLikeExit, type Cause, type CauseCode, type RegimeLabel, type TradeAttribution, type TradeRecord } from "../core/types";
 
 /**
  * トレードの損益要因分析 (純粋関数)。比率・リターンはすべて小数 (0.01 = 1%)。
@@ -169,15 +169,12 @@ export function attributeTrade(trade: TradeRecord, opts: AttributionOptions = {}
     }
   }
 
-  // early_exit: 利確・シグナル決済の後、実現リターン以上に伸びた
-  if ((t.exitReason === "take_profit" || t.exitReason === "signal") && post !== undefined && post > 0) {
+  // early_exit: 利確・シグナル決済の後、実現リターン以上に伸びた (転換で決済 reversal もシグナル決済と同じ扱い)
+  if ((t.exitReason === "take_profit" || isSignalLikeExit(t.exitReason)) && post !== undefined && post > 0) {
     const need = Math.max(Math.abs(t.returnPct), costPct, T.earlyExitMinStopFrac * stopWidthPct);
     if (post >= need) {
-      add(
-        "early_exit",
-        need > 0 ? post / need : 2,
-        `${t.exitReason === "take_profit" ? "利確" : "シグナル決済"}後にさらに ${pct(post)} 伸びた (実現リターン ${pct(t.returnPct)})`,
-      );
+      const what = t.exitReason === "take_profit" ? "利確" : t.exitReason === "reversal" ? "転換で決済" : "シグナル決済";
+      add("early_exit", need > 0 ? post / need : 2, `${what}後にさらに ${pct(post)} 伸びた (実現リターン ${pct(t.returnPct)})`);
     }
   }
 

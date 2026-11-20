@@ -97,8 +97,8 @@ function ctxOf(o: CtxOpts): StrategyContext {
 }
 
 describe("scalp_rebound: 登録と既定値", () => {
-  it("registry に scalp・crypto・買いの戦略として登録され、戦略数は 12", () => {
-    expect(ALL_STRATEGIES).toHaveLength(12);
+  it("registry に scalp・crypto・買いの戦略として登録され、戦略数は 14", () => {
+    expect(ALL_STRATEGIES).toHaveLength(14);
     expect(getStrategy("scalp_rebound")).toBe(scalpRebound);
     expect(strategiesFor("crypto", "scalp").map((s) => s.id)).toContain("scalp_rebound");
     expect(strategiesFor("meme").map((s) => s.id)).not.toContain("scalp_rebound");

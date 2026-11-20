@@ -24,6 +24,11 @@
  *   途中で読み外れは値動きだけの R (方向 × (仲値 − エントリー価格) / 1R) で判定する (コストだけでは切らない)。
  *   thesisExpectedMs は読みの管理が有効なときだけ記録する。
  *   thesisExpectedMs の無い古い記録は従来どおり。
+ * - 転換で決済 (options.reversal が有効で、戦略が対象): 実際の建玉と同じ src/engine/reversalExit.ts の規則で、戦略の主時間足
+ *   (記録時に reversalTf として保存) の新しい確定足ごとに 1 回、エントリー後にできた押し安値 (売りは戻り高値) を終値が越えたら
+ *   決済する (理由 reversal、約定は時間切れと同じ 決済側の気配 ∓ 約定ずれ)。足は呼び出し側 (engine) が hub の確定足をそのまま渡す
+ *   (hub は全戦略の時間足を持つので、1m 以外もリサンプルしない)。その時間足の足が無い・エントリーより新しい足しか無いときは判定しない。
+ *   損切り・利確・読みの管理 (ティックごと) が先。reversalTf の無い古い記録・無効のときは従来どおり。
  */
 import { randomUUID } from "node:crypto";
 import { defaultCosts } from "../backtest/engine";
@@ -31,8 +36,10 @@ import { holdingFeeDailyOf, jstCutoffCrossings } from "../core/holdingFee";
 import {
   advancePeak, decideThesis, resolveThesisMs, thesisGrossR, thesisOutcomeOf, thesisTrailStop, tighterStop, type ThesisSettings,
 } from "../engine/thesis";
-import type {
-  AssetClass, Horizon, Instrument, Quote, RegimeLabel, ShadowExitReason, ShadowTradeRecord, Signal, Store, TradingMode,
+import { checkReversal, reversalAppliesTo, type ReversalSettings } from "../engine/reversalExit";
+import {
+  TIMEFRAME_MS, type AssetClass, type Candle, type Horizon, type Instrument, type Quote, type RegimeLabel, type ShadowExitReason, type ShadowTradeRecord,
+  type Signal, type Store, type Timeframe, type TradingMode,
 } from "../core/types";
 
 export interface ShadowOptions {
@@ -49,6 +56,8 @@ export interface ShadowOptions {
   defaultMaxHoldMs: number;
   /** 読みの管理 (省略・無効なら従来どおり maxHoldMs で時間切れ) */
   thesis?: ThesisSettings;
+  /** 転換で決済 (省略・無効なら判定しない = 従来どおり) */
+  reversal?: ReversalSettings;
 }
 
 export const DEFAULT_SHADOW_OPTIONS: ShadowOptions = {
@@ -72,6 +81,10 @@ export interface ShadowOpen extends Omit<ShadowTradeRecord, "exitTs" | "exitPric
   thesisPeak?: number;
   /** 延長後の保護ストップ (きつくなる方へだけ更新する。決済の記録には残さない) */
   thesisStop?: number;
+  /** 転換で決済を判定する時間足 (戦略の主時間足。転換で決済が有効で戦略が対象のときだけ。決済の記録には残さない) */
+  reversalTf?: Timeframe;
+  /** 転換で決済を最後に判定した確定足の開始時刻 (確定足ごとに 1 回。決済の記録には残さない) */
+  reversalBarTs?: number;
 }
 
 /** 件数の記録 (捨てた理由別) */
@@ -100,6 +113,8 @@ export interface ShadowRecordInput {
    */
   simulatedShort?: boolean;
   borrowRateDaily?: number;
+  /** 戦略の主時間足 (転換で決済の判定に使う。省略時は転換で決済を判定しない) */
+  exitTimeframe?: Timeframe;
 }
 
 /** 前回の判定以降の値幅 (1m 確定足の高値・安値。仲値ベース) */
@@ -288,6 +303,8 @@ export class ShadowTracker {
     const tpOk = finite(sig.takeProfit) && (long ? sig.takeProfit > entryPrice : sig.takeProfit < entryPrice);
     // 読みの期限 (シグナルの expectedMs、無ければ最大保有。読みの管理が有効なときだけ)。既定の保有上限 (defaultMaxHoldMs) は読みの期限にしない
     const thesisMs = this.opts.thesis?.enabled === true ? resolveThesisMs(sig.expectedMs, sig.maxHoldMs) : undefined;
+    // 転換で決済の時間足 (有効で戦略が対象のときだけ記録する)
+    const reversalTf = input.exitTimeframe && TIMEFRAME_MS[input.exitTimeframe] && reversalAppliesTo(this.opts.reversal, sig.strategyId) ? input.exitTimeframe : undefined;
     const o: ShadowOpen = {
       id: `sh_${now.toString(36)}_${randomUUID().slice(0, 8)}`,
       mode: this.mode,
@@ -317,6 +334,7 @@ export class ShadowTracker {
         ? { simulatedShort: true, borrowRateDaily: finite(input.borrowRateDaily) ? Math.max(0, input.borrowRateDaily) : 0 }
         : {}),
       ...(holdingFeeDailyOf(inst) !== undefined ? { holdingFeeDaily: holdingFeeDailyOf(inst) } : {}),
+      ...(reversalTf ? { reversalTf } : {}),
     };
     this.open.push(o);
     this.keys.add(key);
@@ -334,12 +352,17 @@ export class ShadowTracker {
    * - 損切りは決済側 (買い: bid / 売り: ask) で判定。同じ判定で損切りと利確の両方に届きうる場合は損切りを先にする
    * - 損切りはストップ価格 (窓開けなら決済側の気配) に約定ずれを不利側に加えて約定。利確は指値。時間切れは決済側の気配 ∓ 約定ずれ
    * - rangeOf の 1m 確定足: エントリーした足も含める (不利側だけ。ファイル冒頭)
+   * - candlesOf: 転換で決済の判定に使う、その時間足の確定足 (昇順。最後が直近の確定足)。省略時は転換で決済を判定しない
    * 決済したものを返す。kv への保存は変化があったときだけ (1 回)
    */
   update(
     now: number,
     quoteOf: (symbol: string) => Pick<Quote, "bid" | "ask"> | undefined,
-    opts: { isWatched?: (symbol: string) => boolean; rangeOf?: (symbol: string, sinceTs: number) => PriceRange | undefined } = {},
+    opts: {
+      isWatched?: (symbol: string) => boolean;
+      rangeOf?: (symbol: string, sinceTs: number) => PriceRange | undefined;
+      candlesOf?: (symbol: string, tf: Timeframe) => readonly Candle[] | undefined;
+    } = {},
   ): ShadowTradeRecord[] {
     const closed: ShadowTradeRecord[] = [];
     const keep: ShadowOpen[] = [];
@@ -378,9 +401,16 @@ export class ShadowTracker {
       } catch (e) {
         this.onError?.("shadow.range", e);
       }
+      // 転換で決済: 戦略の主時間足の確定足 (有効で、記録時に時間足を保存した仮想トレードだけ)
+      let revCandles: readonly Candle[] | undefined;
+      try {
+        if (o.reversalTf && opts.candlesOf && reversalAppliesTo(this.opts.reversal, o.strategyId)) revCandles = opts.candlesOf(o.symbol, o.reversalTf);
+      } catch (e) {
+        this.onError?.("shadow.candles", e);
+      }
       const key = () => `${o.mfeR}|${o.maeR}|${o.lastCandleTs ?? ""}|${o.thesisExtendedAt ?? ""}|${o.thesisPeak ?? ""}|${o.thesisStop ?? ""}`;
       const before = key();
-      const res = this.step(o, q, now, adverse, favorable, thesisFav);
+      const res = this.step(o, q, now, adverse, favorable, thesisFav, revCandles);
       if (!res) {
         if (before !== key()) this.dirty = true;
         keep.push(o);
@@ -408,10 +438,12 @@ export class ShadowTracker {
   /**
    * 1 件の判定 (決済したら記録を返す)。o の MFE / MAE は更新する。
    * adverse: 不利側 (損切り・MAE) に使う足の値幅、favorable: 有利側 (利確・MFE) に使う足の値幅 (どちらも仲値ベース)。
-   * thesisFav: 延長した時刻以降に始まった足の値幅 (延長後の極値と、延長後の保護ストップの判定に使う)
+   * thesisFav: 延長した時刻以降に始まった足の値幅 (延長後の極値と、延長後の保護ストップの判定に使う)。
+   * revCandles: 転換で決済の判定に使う時間足 (o.reversalTf) の確定足 (無ければ判定しない)
    */
   private step(
     o: ShadowOpen, q: Pick<Quote, "bid" | "ask">, now: number, adverse?: PriceRange, favorable?: PriceRange, thesisFav?: PriceRange,
+    revCandles?: readonly Candle[],
   ): ShadowTradeRecord | undefined {
     const long = o.direction === "long";
     const dir = long ? 1 : -1;
@@ -503,6 +535,20 @@ export class ShadowTracker {
       reason = "time";
       exit = timeExit;
     }
+    // 転換で決済 (損切り・利確・読みの管理・時間切れの後。延長した判定と同じ回でも判定する = 実際の建玉と同じ)。
+    // 戦略の主時間足の新しい確定足ごとに 1 回、エントリー後の押し安値 (売りは戻り高値) を終値が越えたら決済側の気配 ∓ 約定ずれで決済
+    if (!reason && o.reversalTf && revCandles && revCandles.length > 0 && this.opts.reversal) {
+      const tfMs = TIMEFRAME_MS[o.reversalTf];
+      const last = revCandles[revCandles.length - 1];
+      if (last.ts + tfMs > o.entryTs && o.reversalBarTs !== last.ts) {
+        o.reversalBarTs = last.ts;
+        const r = checkReversal(revCandles, o.entryTs, o.direction, { pivotN: this.opts.reversal.pivotN, bufferAtr: this.opts.reversal.bufferAtr, tfMs });
+        if (r.exit) {
+          reason = "reversal";
+          exit = timeExit;
+        }
+      }
+    }
     if (!reason || !exit) {
       // 延長後の極値と保護ストップを進める (延長した時刻以降に始まった足と今の気配。次の判定のストップから効く)
       if (thesis && wasExtended) {
@@ -513,7 +559,7 @@ export class ShadowTracker {
       return undefined;
     }
     const r = this.closeR(o, exit, now);
-    const { risk: _risk, lastCandleTs: _l, mfeR, maeR, thesisPeak: _tp, thesisStop: _ts, ...base } = o;
+    const { risk: _risk, lastCandleTs: _l, mfeR, maeR, thesisPeak: _tp, thesisStop: _ts, reversalTf: _rt, reversalBarTs: _rb, ...base } = o;
     return {
       ...base, exitTs: now, exitPrice: exit.fill, exitReason: reason, ...r, mfeR, maeR,
       ...(thesis ? { thesisOutcome: thesisOutcomeOf(reason, o.thesisExtendedAt !== undefined) } : {}),

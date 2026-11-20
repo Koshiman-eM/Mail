@@ -1,0 +1,211 @@
+/**
+ * 転換で決済 (REVERSAL_EXIT)。純粋なモジュール (足・時刻は引数で渡す。I/O・乱数なし)。
+ *
+ * 建玉を持った後の値動きをダウ理論で見る (建玉に対する相対的な判定。全戦略に掛ける)。
+ *   - 買い: エントリーした足以降にできたスイングロー (エントリー後の安値の切り上げ = 押し安値) のうち、
+ *     確定している最も新しいものを「守るべき水準」にする。確定足の終値がその水準を
+ *     REVERSAL_EXIT_BUFFER_ATR × ATR(14) より大きく下回ったら (既定 0 = 終値が下回れば十分)、エントリーからの上昇が崩れた
+ *     (押し安値割れ) とみなして決済する。
+ *   - 売り: 逆。エントリー後のスイングハイ (戻り高値) を、確定足の終値が上回ったら決済する (戻り高値超え)。
+ *   - 含み益でも含み損でも同じ (利確・損切りの手前で、トレンドがはっきり転換したら決済する)。
+ *   - エントリー後にまだスイングが確定していなければ判定しない (当初の損切りが守る)。エントリーした足より前のスイングは使わない
+ *     (エントリーした足そのもののスイングは使う)。
+ *   - ヒゲ (安値・高値) だけが水準を越えても決済しない (終値で判定する)。
+ * スイングは src/structure/pivots.ts の detectPivots (左右 N 本。左は厳密・右は >= で横ばい対応) と同じ規則で、
+ * N 本後の足が確定してから使う (confirmedAt ≤ 最後の確定足。リペイントしない)。N は REVERSAL_EXIT_PIVOT_N (既定 3。
+ * 新規エントリーのフィルターの STRUCTURE_PIVOT_N とは別)。
+ * 足は確定足だけ (昇順) を渡す。最後の足が「いま確定した足」で、その終値で判定する (先読みなし)。
+ * ATR は最後の REVERSAL_ATR_WINDOW 本だけから求める (渡す足の本数によらず同じ値にするため。運用とバックテストで一致させる)。
+ * 価格は統計値なので number で計算する (会計値ではない)。
+ */
+import type { Env } from "../core/config";
+import type { Candle } from "../core/types";
+import { atrLast } from "../indicators/series";
+import { confirmedPivots, detectPivots, normalizePivotN } from "../structure/pivots";
+
+export interface ReversalSettings {
+  /** 転換で決済を使うか (REVERSAL_EXIT。false なら従来と同一) */
+  enabled: boolean;
+  /** スイングの左右の本数 (REVERSAL_EXIT_PIVOT_N。2〜10) */
+  pivotN: number;
+  /** 終値が水準をこの ATR(14) 倍より大きく越えたら決済 (REVERSAL_EXIT_BUFFER_ATR。0〜1。0 = 越えれば十分) */
+  bufferAtr: number;
+  /** 対象の戦略 id (REVERSAL_EXIT_STRATEGIES)。空ならすべての戦略 */
+  strategies: readonly string[];
+}
+
+export const DEFAULT_REVERSAL_SETTINGS: Readonly<ReversalSettings> = { enabled: true, pivotN: 3, bufferAtr: 0, strategies: [] };
+
+/** 無効 (従来どおり)。バックテスト・仮想トレードで設定を渡さないときの既定 */
+export const REVERSAL_DISABLED: Readonly<ReversalSettings> = { ...DEFAULT_REVERSAL_SETTINGS, enabled: false };
+
+/** ATR の期間と、ATR を求める足の本数 (最後の何本か) */
+export const REVERSAL_ATR_PERIOD = 14;
+export const REVERSAL_ATR_WINDOW = 100;
+
+/** 決済理由の表示名と、方向別の中身 (買い: 押し安値割れ / 売り: 戻り高値超え) */
+export const REVERSAL_EXIT_LABEL = "転換で決済";
+export const reversalDetailLabel = (direction: "long" | "short"): string => (direction === "long" ? "押し安値割れ" : "戻り高値超え");
+
+type ReversalEnv = Partial<Pick<Env, "REVERSAL_EXIT" | "REVERSAL_EXIT_PIVOT_N" | "REVERSAL_EXIT_BUFFER_ATR" | "REVERSAL_EXIT_STRATEGIES">>;
+
+const finite = (x: unknown): x is number => typeof x === "number" && Number.isFinite(x);
+
+/** 環境変数から (未設定の項目は config の既定値と同じ) */
+export function reversalSettingsFromEnv(env: ReversalEnv): ReversalSettings {
+  const d = DEFAULT_REVERSAL_SETTINGS;
+  return {
+    enabled: env.REVERSAL_EXIT ?? d.enabled,
+    pivotN: finite(env.REVERSAL_EXIT_PIVOT_N) ? env.REVERSAL_EXIT_PIVOT_N : d.pivotN,
+    bufferAtr: finite(env.REVERSAL_EXIT_BUFFER_ATR) && env.REVERSAL_EXIT_BUFFER_ATR >= 0 ? env.REVERSAL_EXIT_BUFFER_ATR : d.bufferAtr,
+    strategies: Array.isArray(env.REVERSAL_EXIT_STRATEGIES) ? [...env.REVERSAL_EXIT_STRATEGIES] : [...d.strategies],
+  };
+}
+
+/** この戦略の建玉に転換で決済を掛けるか (有効で、対象の一覧が空 = すべて、または一覧に含まれる) */
+export function reversalAppliesTo(s: ReversalSettings | undefined, strategyId: string): boolean {
+  if (!s?.enabled) return false;
+  return s.strategies.length === 0 || s.strategies.includes(strategyId);
+}
+
+/** 設定の 1 行表示 (status / simulate / backtest の見出し用) */
+export function formatReversalSettings(s: ReversalSettings): string {
+  if (!s.enabled) return "無効 (従来どおり)";
+  return (
+    `有効 (戦略の主時間足のスイング 左右 ${s.pivotN} 本 / 終値が水準を${s.bufferAtr > 0 ? ` ${s.bufferAtr} ATR より大きく` : ""}越えたら決済` +
+    ` / 対象 ${s.strategies.length ? s.strategies.join(", ") : "すべての戦略"})`
+  );
+}
+
+/**
+ * 設定の警告 (起動時にログへ出す。害はないが意図どおりに効かない組み合わせ)。
+ * - REVERSAL_EXIT_STRATEGIES に戦略の一覧 (knownIds) に無い id がある (綴り違いなど。その id は何も対象にしない)
+ * - STRUCTURE_EXIT_ON_REVERSAL=true と併用している (ラップした戦略の目線の転換での決済と重なる。どちらか一方で十分)
+ */
+export function reversalConfigWarnings(s: ReversalSettings, knownIds: readonly string[], structureExitOnReversal = false): string[] {
+  const out: string[] = [];
+  if (!s.enabled) return out;
+  const known = new Set(knownIds);
+  const unknown = s.strategies.filter((id) => !known.has(id));
+  if (unknown.length > 0) out.push(`REVERSAL_EXIT_STRATEGIES に未登録の戦略 id があります (無視されます): ${unknown.join(", ")}`);
+  if (structureExitOnReversal) {
+    out.push(
+      "STRUCTURE_EXIT_ON_REVERSAL=true と REVERSAL_EXIT=true を併用しています。どちらも転換で決済するので重複です (REVERSAL_EXIT は全戦略・建玉に対する押し安値割れ / 戻り高値超え)",
+    );
+  }
+  return out;
+}
+
+/** 足の間隔 (最小の正の差)。求まらなければ undefined */
+function inferBarMs(candles: readonly Candle[]): number | undefined {
+  let min = Infinity;
+  for (let i = 1; i < Math.min(candles.length, 500); i++) {
+    const d = candles[i].ts - candles[i - 1].ts;
+    if (d > 0 && d < min) min = d;
+  }
+  return Number.isFinite(min) ? min : undefined;
+}
+
+/**
+ * エントリーした足の添字 (ts ≤ entryTs < ts + 足の長さ)。
+ * - 足がエントリーより後からしか無い (履歴が足りない・建玉が古すぎる) なら -1。
+ * - エントリーした足がまだ確定していない (形成中) なら candles.length。
+ * - 足が欠けていてエントリーした足が無ければ、エントリーの後の最初の足。
+ * tfMs (足の長さ) を省略すると足の間隔から推定する
+ */
+export function entryBarIndex(candles: readonly Candle[], entryTs: number, tfMs?: number): number {
+  if (candles.length === 0 || !finite(entryTs) || candles[0].ts > entryTs) return -1;
+  // ts ≤ entryTs の最後の足 (二分探索)
+  let lo = 0;
+  let hi = candles.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (candles[mid].ts <= entryTs) lo = mid;
+    else hi = mid - 1;
+  }
+  const ms = finite(tfMs) && tfMs > 0 ? tfMs : inferBarMs(candles);
+  if (ms === undefined || entryTs < candles[lo].ts + ms) return lo;
+  return lo + 1;
+}
+
+export interface ReversalLevel {
+  /** 守るべき水準 (買い: 押し安値 = スイングローの安値、売り: 戻り高値 = スイングハイの高値) */
+  level: number;
+  /** スイングの足の開始時刻 */
+  pivotTs: number;
+  /** スイングが確定した足 (N 本後) の開始時刻 */
+  confirmedTs: number;
+}
+
+/**
+ * 守るべき水準: エントリーした足以降の、確定したスイングロー (買い) / スイングハイ (売り) のうち最も新しいもの。
+ * 無ければ undefined (エントリー後にまだスイングが確定していない・履歴が足りない)
+ */
+export function reversalLevel(
+  candles: readonly Candle[], entryTs: number, direction: "long" | "short", N: number, tfMs?: number,
+): ReversalLevel | undefined {
+  const n = normalizePivotN(N);
+  const e = entryBarIndex(candles, entryTs, tfMs);
+  if (e < 0 || e >= candles.length) return undefined;
+  // 足 i のスイングは足 i−N 〜 i+N だけで決まるので、エントリーした足の N 本前から渡せば結果は変わらない
+  const from = Math.max(0, e - n);
+  const win = candles.slice(from);
+  const type = direction === "long" ? "SL" : "SH";
+  const ps = confirmedPivots(detectPivots(win, n), win.length - 1).filter((p) => p.type === type && p.idx + from >= e);
+  const p = ps[ps.length - 1];
+  if (!p) return undefined;
+  return { level: p.price, pivotTs: p.ts, confirmedTs: win[p.confirmedAt].ts };
+}
+
+export interface ReversalCheckOptions {
+  /** スイングの左右の本数 (REVERSAL_EXIT_PIVOT_N) */
+  pivotN: number;
+  /** バッファ (ATR の倍数。省略・0 なら終値が水準を越えれば十分) */
+  bufferAtr?: number;
+  /** 足の長さ (ms)。省略時は足の間隔から推定 */
+  tfMs?: number;
+}
+
+export interface ReversalCheck {
+  /** 決済する (確定足の終値が水準をバッファより大きく越えた) */
+  exit: boolean;
+  /** 守るべき水準 (無ければ undefined) */
+  level?: number;
+  /** 水準のスイングの足の開始時刻 */
+  pivotTs?: number;
+  /** 判定した確定足 (最後の足) の終値と開始時刻 */
+  close: number;
+  barTs?: number;
+  /** ATR(14) (最後の REVERSAL_ATR_WINDOW 本から。求まらなければ NaN) */
+  atr: number;
+  /** 決済の閾値 (買い: 水準 − バッファ × ATR、売り: 水準 + バッファ × ATR) */
+  threshold?: number;
+  /**
+   * 判定しなかった理由: no_bars = 足が無い / no_history = 足がエントリーより後からしか無い /
+   * no_swing = エントリー後に確定したスイングが無い / no_atr = バッファがあるのに ATR が求まらない (決済しない)
+   */
+  skip?: "no_bars" | "no_history" | "no_swing" | "no_atr";
+}
+
+/**
+ * 転換で決済の判定 (最後の確定足の終値で 1 回)。
+ * 買い: 終値 < 押し安値 − バッファ × ATR で exit、売り: 終値 > 戻り高値 + バッファ × ATR で exit (等しいときは決済しない)
+ */
+export function checkReversal(
+  candles: readonly Candle[], entryTs: number, direction: "long" | "short", opts: ReversalCheckOptions,
+): ReversalCheck {
+  const last = candles[candles.length - 1];
+  const close = last ? last.close : NaN;
+  const atr = candles.length ? atrLast(candles.slice(-REVERSAL_ATR_WINDOW), REVERSAL_ATR_PERIOD) : NaN;
+  if (!last) return { exit: false, close, atr, skip: "no_bars" };
+  const base = { close, barTs: last.ts, atr };
+  if (entryBarIndex(candles, entryTs, opts.tfMs) < 0) return { exit: false, ...base, skip: "no_history" };
+  const lv = reversalLevel(candles, entryTs, direction, opts.pivotN, opts.tfMs);
+  if (!lv) return { exit: false, ...base, skip: "no_swing" };
+  const buf = finite(opts.bufferAtr) && opts.bufferAtr > 0 ? opts.bufferAtr : 0;
+  const found = { ...base, level: lv.level, pivotTs: lv.pivotTs };
+  if (buf > 0 && !(finite(atr) && atr > 0)) return { exit: false, ...found, skip: "no_atr" };
+  const threshold = direction === "long" ? lv.level - buf * atr : lv.level + buf * atr;
+  const exit = finite(close) && (direction === "long" ? close < threshold : close > threshold);
+  return { exit, ...found, threshold };
+}

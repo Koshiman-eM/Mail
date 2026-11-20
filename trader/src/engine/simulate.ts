@@ -17,11 +17,13 @@ import { readLimitStats, type LimitStats } from "./orders";
 import { effectiveLimitTakeProfit } from "./limitOrders";
 import {
   equityStats, EXIT_REASON_LABEL, exitFxRates, exitReasonCounts, fmtNum, fmtPct, fmtSigned, fmtTime, renderLearning, renderLimitStats, renderOrderTypeTable,
-  renderSideTable, renderStrategyTable, renderTempoTable, renderThesisTable, summarizeByOrderType, summarizeBySide, summarizeByStrategy, summarizeByTempo,
-  summarizeThesis, type OrderTypeSummary, type SideSummary, type StrategySummary, type TempoSummary, type ThesisSummary,
+  renderReversalTable, renderSideTable, renderStrategyTable, renderTempoTable, renderThesisTable, summarizeByOrderType, summarizeBySide, summarizeByStrategy,
+  summarizeByTempo, summarizeReversal, summarizeThesis, type OrderTypeSummary, type ReversalSummary, type SideSummary, type StrategySummary, type TempoSummary,
+  type ThesisSummary,
 } from "./report";
 import { formatTempoLine, type TempoStatusView } from "./tempo";
 import { formatThesisSettings, thesisSettingsFromEnv, type ThesisSettings } from "./thesis";
+import { formatReversalSettings, reversalSettingsFromEnv, type ReversalSettings } from "./reversalExit";
 
 const HOUR = 3_600_000;
 /** 既定の開始時刻 (再現性のため固定。月曜 00:00 UTC) */
@@ -99,6 +101,8 @@ export interface SimulationReport {
   };
   /** 読みの管理 (THESIS_*): 設定と読みの答え合わせ */
   thesis?: { settings: ThesisSettings; summary: ThesisSummary };
+  /** 転換で決済 (REVERSAL_*): 設定と成績 */
+  reversal?: { settings: ReversalSettings; summary: ReversalSummary };
   exitReasons: Partial<Record<ExitReason, number>>;
   causes: CauseSummary;
   attributedTrades: number;
@@ -275,6 +279,10 @@ export async function runSimulation(o: SimulationOptions = {}): Promise<{ report
       settings: thesisSettingsFromEnv(config.env),
       summary: summarizeThesis(trades, (c) => runtime.fx.toAccount(c), quoteOf, exitFxRates(store, start)),
     },
+    reversal: {
+      settings: reversalSettingsFromEnv(config.env),
+      summary: summarizeReversal(trades, (c) => runtime.fx.toAccount(c), quoteOf, exitFxRates(store, start)),
+    },
     exitReasons: exitReasonCounts(trades),
     causes: snapshot.causes,
     attributedTrades: trades.filter((t) => store.getAttribution(t.id) !== undefined).length,
@@ -352,6 +360,7 @@ export function formatSimulationReport(r: SimulationReport): string {
   }
   if (r.tempo) lines.push("", "■ テンポの探索と通常のエントリー", renderTempoTable(r.tempo.byTempo, ccy));
   if (r.thesis) lines.push("", `■ 読みの答え合わせ (読みの管理 ${formatThesisSettings(r.thesis.settings)})`, renderThesisTable(r.thesis.summary, ccy));
+  if (r.reversal) lines.push("", `■ 転換で決済 (${formatReversalSettings(r.reversal.settings)})`, renderReversalTable(r.reversal.summary, ccy));
   lines.push("", "■ 戦略別の成績 (全方向)", renderStrategyTable(r.byStrategy, ccy));
   lines.push("", `■ 学習の動き (学習ループ ${r.learning.learningRuns} 回 / 計画の更新 ${r.plans} 回)`);
   const applied = r.learning.adjustments.filter((a) => a.status === "applied").length;

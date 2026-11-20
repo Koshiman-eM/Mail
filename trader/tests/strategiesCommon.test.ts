@@ -78,6 +78,8 @@ describe("registry", () => {
       "short_ema_trend",
       "short_rsi_revert",
       "short_breakout",
+      "pullback_5m",
+      "pullback_15m",
       "mid_trend_follow",
       "long_momentum",
       "meme_momentum",
@@ -92,6 +94,8 @@ describe("registry", () => {
     expect(meme).not.toContain("scalp_obi");
     expect(strategiesFor("crypto", "scalp").map((s) => s.id)).toEqual(["scalp_obi", "scalp_vwap_revert", "scalp_momentum_burst", "scalp_micro", "scalp_rebound", "scalp_pullback"]);
     expect(strategiesFor("fx", "short").length).toBe(3);
+    // 押し目買い・戻り売りの 5 分足・15 分足は crypto の短期だけ
+    expect(strategiesFor("crypto", "short").map((s) => s.id)).toEqual(["short_ema_trend", "short_rsi_revert", "short_breakout", "pullback_5m", "pullback_15m"]);
     expect(strategiesFor("crypto").map((s) => s.id)).not.toContain("meme_momentum");
   });
 

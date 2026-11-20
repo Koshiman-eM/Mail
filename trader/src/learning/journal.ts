@@ -87,9 +87,10 @@ export interface CloseTradeInput {
   /** open が返した id */
   id: string;
   exitPrice: number;
-  /** 想定決済価格 (ストップ価格・利確価格・シグナル時点の価格)。省略時は exitPrice */
+  /** 想定決済価格 (ストップ価格・利確価格・シグナル / 転換で決済を判定した時点の価格)。省略時は exitPrice */
   intendedExitPrice?: number;
   exitTs: number;
+  /** 決済理由 (TradeRecord.exitReason にそのまま入る。転換で決済は "reversal") */
   exitReason: ExitReason;
   /** 決済時の手数料 (クオート通貨建て)。open.entryFees と合算して TradeRecord.fees になる */
   fees?: number;

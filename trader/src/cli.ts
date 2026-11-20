@@ -15,11 +15,12 @@ import { DEFAULT_REGIME_TIMEFRAMES, runRegimeCommand } from "./engine/regimeRepo
 import { createFxConverter, quoteCurrencyOfSymbol } from "./engine/fx";
 import {
   equityStats, EXIT_REASON_LABEL, exitFxRates, exitReasonCounts, fmtNum, fmtPct, fmtSigned, fmtTime, isSimulatedShortTrade, liveExecutableTrades,
-  renderLearning, renderLimitStats, renderOrderTypeTable, renderSideTable, renderStrategyTable, renderTempoTable, renderThesisTable, summarizeByOrderType,
-  summarizeBySide, summarizeByStrategy, summarizeByTempo, summarizeThesis,
+  renderLearning, renderLimitStats, renderOrderTypeTable, renderReversalTable, renderSideTable, renderStrategyTable, renderTempoTable, renderThesisTable,
+  summarizeByOrderType, summarizeBySide, summarizeByStrategy, summarizeByTempo, summarizeReversal, summarizeThesis,
 } from "./engine/report";
 import { readExitPlans } from "./engine/positions";
 import { activeThesisMs, formatThesisSettings, initialRiskPerUnit, thesisSettingsFromEnv } from "./engine/thesis";
+import { formatReversalSettings, reversalSettingsFromEnv } from "./engine/reversalExit";
 import { D } from "./core/decimal";
 import {
   peekResolveRequests, PendingOrders, readLimitStats, requestResolve, RestingTakeProfits, type PendingOrder, type ResolveRequest,
@@ -471,13 +472,16 @@ async function cmdBacktest(flags: ParsedArgs["flags"], io: Io): Promise<number> 
   // 運用・パラメータ検証と同じく、STRUCTURE_MODE=filter なら対象の戦略を相場構造のフィルターでラップする
   // 最大保有 (MAX_HOLD_MINUTES) も実運用と同じ前提にする (0 = 無効)。テンポはバックテストに渡さない
   const maxHold = config.env.MAX_HOLD_MINUTES > 0 ? config.env.MAX_HOLD_MINUTES : undefined;
-  // 読みの管理 (THESIS_*) も実運用と同じ規則にする
+  // 読みの管理 (THESIS_*)・転換で決済 (REVERSAL_*) も実運用と同じ規則にする
   const thesis = thesisSettingsFromEnv(config.env);
-  const rows = await runBacktestCommand({ ...common, strategies: configuredStrategies(structure), ...(maxHold !== undefined ? { maxHoldMinutes: maxHold } : {}), thesis });
+  const reversal = reversalSettingsFromEnv(config.env);
+  const rows = await runBacktestCommand({
+    ...common, strategies: configuredStrategies(structure), ...(maxHold !== undefined ? { maxHoldMinutes: maxHold } : {}), thesis, reversal,
+  });
   io.out(
     `バックテスト: ${symbol} / ${a.days} 日 / ${sourceLabel} / 構造フィルター ${structure.mode === "filter" ? "あり" : "なし"}` +
       (maxHold !== undefined ? ` / 最大保有 ${maxHold} 分` : "") +
-      ` / 読みの管理 ${thesis.enabled ? "有効" : "無効"}`,
+      ` / 読みの管理 ${thesis.enabled ? "有効" : "無効"} / 転換で決済 ${reversal.enabled ? "有効" : "無効"}`,
   );
   io.out(formatBacktestRows(rows));
   io.out("※ 損益はクオート通貨建て (初期評価額 1,000,000)。期間の前にウォームアップ用の足を付けています。");
@@ -588,6 +592,9 @@ export function buildReportText(config: AppConfig, store: Store, now: number = D
   // 読みの管理 (THESIS_EXIT): 途中・期限での読み外れ、期限で読み当たり → 延長、期限前に決着 の成績と期限での的中率
   lines.push("", `■ 読みの答え合わせ (読みの管理 ${thesisSettingsFromEnv(config.env).enabled ? "有効" : "無効"})`);
   lines.push(renderThesisTable(summarizeThesis(trades, toAcct, quoteOf, rates), ccy));
+  // 転換で決済 (REVERSAL_EXIT): 件数・勝率・純損益・平均R・含み益で決済した件数・勝ちの取引が取れた利確までの距離の割合
+  lines.push("", `■ 転換で決済 (REVERSAL_EXIT ${reversalSettingsFromEnv(config.env).enabled ? "有効" : "無効"})`);
+  lines.push(renderReversalTable(summarizeReversal(trades, toAcct, quoteOf, rates), ccy));
   // 学習状態は取引 mode (paper / live) 別。report は読み取り専用なので、起動時の移行などの書き込みは DB に反映しない
   const learning = new LearningService({ store: new ReadOnlyOverlayStore(store), mode: config.mode, getStrategy: (id) => getStrategy(id) });
   lines.push("", `学習状態: ${config.mode}`);
@@ -874,6 +881,12 @@ function cmdStatus(io: Io): number {
     }
     io.out(tempoStatusLine(config, store, mode, open.map((p) => p.entryTs), now));
     io.out(`読みの管理 (THESIS_EXIT): ${formatThesisSettings(thesis)}${thesis.enabled && (config.env.MAX_HOLD_MINUTES ?? 0) > 0 ? ` / 読みの期限の上限 ${config.env.MAX_HOLD_MINUTES} 分 (MAX_HOLD_MINUTES)` : ""}`);
+    const rev = reversalSettingsFromEnv(config.env);
+    io.out(
+      `転換で決済 (REVERSAL_EXIT): ${formatReversalSettings(rev)} — REVERSAL_EXIT=${rev.enabled} / REVERSAL_EXIT_PIVOT_N=${rev.pivotN} / ` +
+        `REVERSAL_EXIT_BUFFER_ATR=${rev.bufferAtr} / REVERSAL_EXIT_STRATEGIES=${rev.strategies.length ? rev.strategies.join(",") : "(空 = すべて)"}` +
+        (rev.enabled && config.env.STRUCTURE_EXIT_ON_REVERSAL ? " (STRUCTURE_EXIT_ON_REVERSAL=true と重複)" : ""),
+    );
     io.out(`指値: エントリー ${config.env.LIMIT_ENTRY ? "有効" : "無効"} (期限 ${config.env.LIMIT_ENTRY_TIMEOUT_MS !== undefined ? `${config.env.LIMIT_ENTRY_TIMEOUT_MS}ms` : "主時間足 (20 秒〜15 分)"}) / 利確の板置き ${effectiveLimitTakeProfit(config.env, mode) ? "有効" : config.env.LIMIT_TAKE_PROFIT ? "無効 (live では使わない: LIMIT_TAKE_PROFIT は paper 専用)" : "無効"}`);
     const tps = new RestingTakeProfits({ store, mode }).list();
     if (tps.length) {

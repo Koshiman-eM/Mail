@@ -345,6 +345,26 @@ const EnvSchema = z.object({
     "0.1 以上 3 以下の R で指定してください (延長後、最も有利な価格からこれだけ戻したら決済)",
   ),
 
+  // 転換で決済 (src/engine/reversalExit.ts)
+  /**
+   * 転換で決済を使う (既定 true)。保有中の建玉について、戦略の主時間足でエントリー後にできた押し安値 (買い) / 戻り高値 (売り) を、
+   * 確定足の終値が割ったら (越えたら) 利確・損切りの手前でも成行で決済する (決済理由 reversal)。全戦略が対象。
+   * false なら従来と同一
+   */
+  REVERSAL_EXIT: bool("REVERSAL_EXIT", true),
+  /** 転換で決済のスイングの左右の本数 (2〜10 の整数、既定 3。新規エントリーのフィルターの STRUCTURE_PIVOT_N とは別) */
+  REVERSAL_EXIT_PIVOT_N: checkedNum(
+    "REVERSAL_EXIT_PIVOT_N", 3, (x) => Number.isInteger(x) && x >= 2 && x <= 10,
+    "2 以上 10 以下の整数で指定してください (スイングの左右の本数)",
+  ),
+  /** 終値が押し安値 (戻り高値) をこの ATR(14) 倍より大きく越えたら決済 (0〜1、既定 0 = 終値が越えれば十分) */
+  REVERSAL_EXIT_BUFFER_ATR: checkedNum(
+    "REVERSAL_EXIT_BUFFER_ATR", 0, (x) => x >= 0 && x <= 1,
+    "0 以上 1 以下の ATR の倍数で指定してください (0 なら終値が押し安値・戻り高値を越えれば決済)",
+  ),
+  /** 転換で決済を掛ける戦略 id (カンマ区切り)。空 (既定) ならすべての戦略。未登録の id は起動時に警告する */
+  REVERSAL_EXIT_STRATEGIES: idList(""),
+
   // 相場構造 (ダウ理論) のフィルター・損切り (src/structure/)
   /** off: ラップしない (従来と同じ) / filter: 対象の戦略をラップする (既定) */
   STRUCTURE_MODE: choice("STRUCTURE_MODE", ["off", "filter"] as const, "filter"),

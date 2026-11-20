@@ -501,17 +501,27 @@ export interface RiskState {
 
 /**
  * 決済理由。thesis_failed: 読みの期限の途中で読み外れ / thesis_timeout: 期限で読み外れ / thesis_cap: 読み当たりで延長した上限
- * (読みの管理。src/engine/thesis.ts)
+ * (読みの管理。src/engine/thesis.ts)。
+ * reversal: 転換で決済 (保有後にできた押し安値を確定足の終値が割った / 戻り高値を越えた。src/engine/reversalExit.ts)
  */
 export type ExitReason =
   | "stop" | "take_profit" | "trailing" | "signal" | "time" | "kill_switch" | "manual"
-  | "thesis_failed" | "thesis_timeout" | "thesis_cap";
+  | "thesis_failed" | "thesis_timeout" | "thesis_cap" | "reversal";
 
 /** 時間に関する決済理由 (従来の時間切れ time と読みの管理の 3 つ)。要因分析・パラメータ調整で time と同じ扱いにする */
 export const TIME_LIKE_EXIT_REASONS: readonly string[] = ["time", "thesis_failed", "thesis_timeout", "thesis_cap"];
 
 /** 時間に関する決済理由か (TIME_LIKE_EXIT_REASONS) */
 export const isTimeLikeExit = (reason: string | undefined): boolean => reason !== undefined && TIME_LIKE_EXIT_REASONS.includes(reason);
+
+/**
+ * 確定足で判断して成行で決済する理由 (戦略の決済シグナル signal と 転換で決済 reversal)。
+ * 要因分析 (early_exit)・パラメータ調整では signal と同じ扱いにする
+ */
+export const SIGNAL_LIKE_EXIT_REASONS: readonly string[] = ["signal", "reversal"];
+
+/** 確定足で判断した決済 (signal / reversal) か (SIGNAL_LIKE_EXIT_REASONS) */
+export const isSignalLikeExit = (reason: string | undefined): boolean => reason !== undefined && SIGNAL_LIKE_EXIT_REASONS.includes(reason);
 
 export interface EntryContext {
   regime: RegimeFeatures;
@@ -687,9 +697,10 @@ export interface SourceReliability {
 
 /**
  * 仮想トレードの決済理由。unwatched は監視をやめたため捨てたもの (学習には使わない)。
- * trailing・thesis_* は読みの管理 (延長後の建値・トレーリング、途中・期限での読み外れ、延長の上限)
+ * trailing・thesis_* は読みの管理 (延長後の建値・トレーリング、途中・期限での読み外れ、延長の上限)。reversal は転換で決済
  */
-export type ShadowExitReason = "stop" | "take_profit" | "time" | "unwatched" | "trailing" | "thesis_failed" | "thesis_timeout" | "thesis_cap";
+export type ShadowExitReason =
+  | "stop" | "take_profit" | "time" | "unwatched" | "trailing" | "thesis_failed" | "thesis_timeout" | "thesis_cap" | "reversal";
 
 /**
  * 見送ったシグナルの仮想トレード (決済済み)。R は統計値なので number。

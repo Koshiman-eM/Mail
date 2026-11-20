@@ -29,6 +29,7 @@ import { createFxConverter, type FxConverter } from "./fx";
 import { createParamValidator, createPriceAt, type ValidatorOptions } from "./learningHooks";
 import { limitOrdersFromEnv } from "./limitOrders";
 import { thesisSettingsFromEnv } from "./thesis";
+import { reversalConfigWarnings, reversalSettingsFromEnv } from "./reversalExit";
 
 const ASSET_CLASSES: AssetClass[] = ["crypto", "meme", "fx", "stock"];
 export const KNOWN_VENUES = ["synthetic", "ccxt", "gmo", "oanda", "alpaca", "dex"] as const;
@@ -165,6 +166,10 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
   // opts.strategies を渡したときはそのまま使う (テスト・独自の一覧)
   const structureSettings = structureSettingsFromEnv(env);
   for (const w of structureConfigWarnings(structureSettings, ALL_STRATEGIES.map((x) => x.id))) log.warn(w);
+  // 転換で決済 (REVERSAL_*): 未登録の戦略 id と、STRUCTURE_EXIT_ON_REVERSAL との併用 (重複) を警告する
+  const reversalSettings = reversalSettingsFromEnv(env);
+  const knownIds = [...new Set([...ALL_STRATEGIES.map((x) => x.id), ...(opts.strategies ?? []).map((x) => x.id)])];
+  for (const w of reversalConfigWarnings(reversalSettings, knownIds, env.STRUCTURE_EXIT_ON_REVERSAL === true)) log.warn(w);
   const strategies = opts.strategies ?? configuredStrategies(structureSettings);
   const venues = parseVenues(env.VENUES);
   const watch = parseWatchlist(env.WATCHLIST);
@@ -355,6 +360,8 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
       ...((config.env.MAX_HOLD_MINUTES ?? 0) > 0 ? { maxHoldMinutes: config.env.MAX_HOLD_MINUTES } : {}),
       // 読みの管理 (THESIS_*) も実運用と同じ規則で検証する
       thesis: thesisSettingsFromEnv(config.env),
+      // 転換で決済 (REVERSAL_*) も実運用と同じ規則で検証する
+      reversal: reversalSettings,
       ...(opts.validation ?? {}),
     }),
     priceAt: createPriceAt(hub, clock),

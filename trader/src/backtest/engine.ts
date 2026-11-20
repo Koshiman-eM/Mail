@@ -24,6 +24,7 @@ import { clampMaxHoldMs } from "../engine/tempo";
 import {
   activeThesisMs, advancePeak, decideThesis, initialRiskPerUnit, THESIS_DISABLED, thesisGrossR, thesisNetR, thesisOutcomeOf, thesisTrailStop, type ThesisPricing,
 } from "../engine/thesis";
+import { checkReversal, entryBarIndex, REVERSAL_ATR_WINDOW, reversalAppliesTo } from "../engine/reversalExit";
 import type { BacktestOptions, BacktestResult, BacktestStats, IntelSource, Sizer } from "./types";
 
 /**
@@ -55,6 +56,11 @@ import type { BacktestOptions, BacktestResult, BacktestStats, IntelSource, Sizer
  *     (従来の時間切れと同じタイミング。始値で損切りを越えていれば損切りの理由)。
  *   - 延長した建玉の保護ストップ (建値・トレーリング) はバー i+1 から効く。極値は延長から測り (判定した終値の決済できる価格から始め、
  *     バー i+1 以降の高値・安値 ∓ 半スプレッドで進める)、前バーまでの値を使う (先読みしない)。理由は trailing (thesisStopExit)。
+ * 転換で決済 (opts.reversal。省略・無効・戦略が対象外なら従来どおり。ライブの REVERSAL_* と同じ src/engine/reversalExit.ts の規則):
+ *   - 主時間足が確定したバー i の終値で、エントリー後に確定した押し安値 (売りは戻り高値) を終値が越えたかを判定し、
+ *     バー i+1 の始値の成行で決済する (理由 reversal。戦略の決済シグナルと同じタイミング・同じ約定)。
+ *   - 同じバーで戦略の決済シグナル (flat・逆方向) も出たら signal を優先する (ライブと同じ)。
+ *   - 足は主時間足の確定足 (その時点で見えている分) をエントリーした足の N 本前から渡す (戦略へ渡す historyBars の制限は受けない)。
  */
 
 /** 資産クラス別の既定スプレッド (bps, 全幅) とスリッページ (bps, 片道) */
@@ -129,7 +135,7 @@ interface OpenPos {
 type Pending =
   | { kind: "entry"; signal: Signal; qty: Decimal; intended: number; context: EntryContext }
   | { kind: "limit"; signal: Signal; qty: Decimal; intended: number; price: number; expiresIdx: number; context: EntryContext }
-  | { kind: "exit"; intended: number };
+  | { kind: "exit"; intended: number; reason: "signal" | "reversal" };
 
 export function runBacktest(opts: BacktestOptions): BacktestResult {
   const { strategy, instrument } = opts;
@@ -175,6 +181,9 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
     : undefined;
   const limitTp = limitOpts?.takeProfit === true;
   const thesis = opts.thesis ?? THESIS_DISABLED;
+  // 転換で決済 (有効で、この戦略が対象のときだけ。無ければ従来どおり)
+  const reversal = opts.reversal && reversalAppliesTo(opts.reversal, strategy.id) ? opts.reversal : undefined;
+  if (reversal) stats.reversalExits = 0;
   /** シグナルの読みの期限 (最大保有で丸める。無ければ undefined = maxHoldMs を期限にする) */
   const expectedOf = (sig: Signal): number | undefined =>
     sig.expectedMs !== undefined && Number.isFinite(sig.expectedMs) && sig.expectedMs > 0
@@ -377,8 +386,9 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
       const pd: Pending = pending;
       pending = null;
       if (pd.kind === "exit" && pos) {
-        closePosition(i, marketFill(bar.open, pos.dir === -1), bar.ts, "signal", pd.intended);
-        stats.signalExits++;
+        closePosition(i, marketFill(bar.open, pos.dir === -1), bar.ts, pd.reason, pd.intended);
+        if (pd.reason === "reversal") stats.reversalExits = (stats.reversalExits ?? 0) + 1;
+        else stats.signalExits++;
       } else if (pd.kind === "entry" && !pos) {
         const dir: 1 | -1 = pd.signal.direction === "long" ? 1 : -1;
         const px = marketFill(bar.open, dir === 1);
@@ -569,14 +579,27 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
     const ctx: StrategyContext = { market: view, regime, intel, position, params };
     stats.evaluations++;
     const signal = strategy.evaluate(ctx);
-    if (!signal) continue;
 
     if (pos) {
       const p: OpenPos = pos;
-      const opposite = (signal.direction === "long" && p.dir === -1) || (signal.direction === "short" && p.dir === 1);
-      if (signal.direction === "flat" || opposite) pending = { kind: "exit", intended: bar.close };
+      const opposite = signal !== null && ((signal.direction === "long" && p.dir === -1) || (signal.direction === "short" && p.dir === 1));
+      if (signal && (signal.direction === "flat" || opposite)) pending = { kind: "exit", intended: bar.close, reason: "signal" };
+      else if (reversal && primaryClosed) {
+        // 転換で決済: 主時間足の確定足 (今見えている分) を、エントリーした足の N 本前 (ATR の分も含む) から渡す
+        const ps = series[primary];
+        const end = visible[primary];
+        const e = entryBarIndex(ps, p.entryTs, primaryMs);
+        if (e >= 0 && e < end) {
+          const from = Math.max(0, Math.min(e - reversal.pivotN, end - REVERSAL_ATR_WINDOW));
+          const r = checkReversal(ps.slice(from, end), p.entryTs, p.dir === 1 ? "long" : "short", {
+            pivotN: reversal.pivotN, bufferAtr: reversal.bufferAtr, tfMs: primaryMs,
+          });
+          if (r.exit) pending = { kind: "exit", intended: bar.close, reason: "reversal" };
+        }
+      }
       continue;
     }
+    if (!signal) continue;
     if (signal.direction === "flat") continue;
     if (pending && pending.kind === "limit") {
       // 指値のエントリーを待っている: 逆方向のシグナルなら取り消す (同じ方向なら置いたまま待つ)

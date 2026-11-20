@@ -18,7 +18,7 @@ import { DEX_SOURCE } from "../intel/sources/dexscreener";
 import { atrLast } from "../indicators/series";
 import { armKey } from "../learning/allocator";
 import { ForecastTracker, type ForecastOptions, type ForecastStatusView } from "../learning/forecast";
-import type { PriceAt } from "../learning/journal";
+import type { OpenTrade, PriceAt } from "../learning/journal";
 import type { NewsMarketInfo } from "../learning/newsCheck";
 import { ShadowTracker, type PriceRange, type ShadowOptions } from "../learning/shadow";
 import { TradeJournal } from "../learning/journal";
@@ -42,6 +42,7 @@ import {
 import { DEFAULT_ORDER_POLICY, PositionManager, type EntryResult, type OrderPolicy, type SyncResult, type ThesisView } from "./positions";
 import { clampMaxHoldMs, isHoldLimitedHorizon, TempoController, tempoSeedTimestamps, tempoStatusView, type TempoStatusView } from "./tempo";
 import { thesisSettingsFromEnv, type ThesisSettings } from "./thesis";
+import { checkReversal, reversalAppliesTo, reversalDetailLabel, reversalSettingsFromEnv, type ReversalSettings } from "./reversalExit";
 import { effectiveLimitTakeProfit } from "./limitOrders";
 
 export const PAPER_SNAPSHOT_KEY = "paper:snapshot";
@@ -289,6 +290,8 @@ export interface EngineStatus {
   maxHoldMinutes?: number;
   /** 読みの管理の設定 (THESIS_*) */
   thesis?: ThesisSettings;
+  /** 転換で決済の設定 (REVERSAL_*) */
+  reversal?: ReversalSettings;
   /** 指値 (maker) の利用状況: 設定・約定率の集計・待っている指値のエントリー・板に置いた利確の指値 */
   limitOrders?: {
     limitEntry: boolean;
@@ -409,6 +412,12 @@ export class TradingEngine {
   private readonly maxHoldMs?: number;
   /** 読みの管理 (THESIS_*。手組みの設定 (テスト) で未設定の項目は config の既定値) */
   readonly thesis: ThesisSettings;
+  /** 転換で決済 (REVERSAL_*。手組みの設定 (テスト) で未設定の項目は config の既定値) */
+  readonly reversal: ReversalSettings;
+  /** 建玉 (trade id) ごとに、転換で決済を最後に判定した確定足の開始時刻 (確定足ごとに 1 回だけ判定する。メモリのみ) */
+  private readonly reversalEvalAt = new Map<string, number>();
+  /** 足がエントリーより新しくて転換で決済を判定できなかった建玉 (監査ログを 1 回だけ残す) */
+  private readonly reversalNoHistory = new Set<string>();
   private readonly opt: Required<Omit<EngineOptions, "tickMs" | "intelEveryMs" | "learnEveryMs" | "shadow" | "newsEvalEveryMs" | "forecast">> & {
     tickMs: number;
     intelEveryMs: number;
@@ -476,6 +485,7 @@ export class TradingEngine {
     const mh = env.MAX_HOLD_MINUTES ?? 0;
     if (Number.isFinite(mh) && mh > 0) this.maxHoldMs = Math.round(mh * 60_000);
     this.thesis = thesisSettingsFromEnv(env);
+    this.reversal = reversalSettingsFromEnv(env);
     const o = deps.options ?? {};
     this.opt = {
       equityEveryMs: o.equityEveryMs ?? 60_000,
@@ -526,8 +536,8 @@ export class TradingEngine {
       this.shadow = new ShadowTracker({
         store: deps.store,
         mode: deps.brokerSet.mode,
-        // 仮想トレードも実際の建玉と同じ読みの管理で決済する (腕の学習をそろえるため)
-        options: { thesis: this.thesis, ...shadowOpts },
+        // 仮想トレードも実際の建玉と同じ読みの管理・転換で決済で決済する (腕の学習をそろえるため)
+        options: { thesis: this.thesis, reversal: this.reversal, ...shadowOpts },
         onClosed: (t) => this.onShadowClosed(t),
         onError: (where, e) => this.warnThrottled(where, this.clock.now(), "仮想トレードの処理に失敗 (取引は継続)", { error: errMsg(e) }),
       });
@@ -1185,9 +1195,11 @@ export class TradingEngine {
       if (!this.shadow || !sh || !inst) continue;
       try {
         const sim = isSimulatedShort(inst, this.mode, sh.signal.direction);
+        const tf = (this.strategies.find((x) => x.id === sh.signal.strategyId) ?? ALL_STRATEGIES.find((x) => x.id === sh.signal.strategyId))?.primaryTimeframe;
         this.shadow.record({
           instrument: inst, quote: sh.quote, signal: sh.signal, regime: sh.regime, reason: "limit_unfilled", now: sh.signalTs,
           ...(sim ? { simulatedShort: true, borrowRateDaily: this.shortBorrowRateDaily() } : {}),
+          ...(tf ? { exitTimeframe: tf } : {}),
         });
       } catch (e) {
         this.warnThrottled("shadow.record", now, "仮想トレードの記録に失敗 (取引は継続)", { error: errMsg(e) });
@@ -1419,6 +1431,8 @@ export class TradingEngine {
       const created = this.shadow.record({
         instrument: inst, quote: view.quote, signal: { ...signal, horizon: signal.horizon ?? s.horizon }, regime: regime.label, reason: key, now,
         ...(sim ? { simulatedShort: true, borrowRateDaily: this.shortBorrowRateDaily() } : {}),
+        // 転換で決済は実際の建玉と同じく戦略の主時間足で判定する
+        exitTimeframe: s.primaryTimeframe,
       });
       if (created && key === "direction_bias" && typeof intelSentiment === "number" && Number.isFinite(intelSentiment)) {
         const m = this.shadowIntelMap();
@@ -1540,15 +1554,21 @@ export class TradingEngine {
     return lastTs === undefined ? undefined : { high, low, lastCandleTs: lastTs };
   }
 
-  /** 毎ティック: 仮想トレードの損切り・利確・時間切れの判定。監視をやめた銘柄の分は捨てる */
+  /** 毎ティック: 仮想トレードの損切り・利確・時間切れ・転換で決済の判定。監視をやめた銘柄の分は捨てる */
   private shadowUpdate(quotes: Map<string, Quote>, now: number): void {
     if (!this.shadow || this.shadow.size === 0) return;
     try {
       const watched = new Set(this.hub.watched().map((i) => i.symbol));
       const views = new Map<string, MarketView | undefined>();
+      const viewOf = (sym: string) => {
+        if (!views.has(sym)) views.set(sym, this.hub.getView(sym, now));
+        return views.get(sym);
+      };
       this.shadow.update(now, (sym) => quotes.get(sym) ?? this.hub.latestQuote(sym), {
         isWatched: (sym) => watched.has(sym),
         rangeOf: (sym, since) => this.candleRange(sym, since, now, views),
+        // 転換で決済: hub の確定足をそのまま渡す (hub は全戦略の時間足を持つ)
+        candlesOf: (sym, tf) => viewOf(sym)?.candles[tf],
       });
     } catch (e) {
       this.warnThrottled("shadow.update", now, "仮想トレードの判定に失敗 (取引は継続)", { error: errMsg(e) });
@@ -1798,6 +1818,8 @@ export class TradingEngine {
       }
     }
     const candidates: Candidate[] = [];
+    /** このティックで持ち主の戦略の決済シグナル (flat・逆方向) で決済を試みたか (転換で決済を重ねない) */
+    let signalExitTried = false;
     for (const s of this.strategies) {
       if (!s.assetClasses.includes(inst.assetClass)) continue;
       // 評価タイミング: 板が必須の戦略は毎ティック、それ以外は主時間足の新しい確定足が出たときだけ
@@ -1899,6 +1921,7 @@ export class TradingEngine {
       if (owner) {
         const opposite = (signal.direction === "long" && owner.direction === "short") || (signal.direction === "short" && owner.direction === "long");
         if (signal.direction === "flat" || opposite) {
+          signalExitTried = true;
           const intended = owner.direction === "long" ? view.quote.bid : view.quote.ask;
           const res = await this.positions.close(sym, "signal", intended, ctx.now);
           if (res.status === "closed" || res.status === "reduced") {
@@ -1943,7 +1966,13 @@ export class TradingEngine {
         score: signal.confidence * armWeight * signal.expectedEdgeBps,
       });
     }
-    if (pos || candidates.length === 0) return;
+    if (pos) {
+      // 転換で決済 (REVERSAL_EXIT): 戦略の決済シグナルと同じく確定足で判断する (同じ確定足で両方なら signal を優先)
+      const cur = this.positions.get(sym);
+      if (cur && cur.id === pos.id) await this.reversalExit(inst, view, cur, ctx, signalExitTried);
+      return;
+    }
+    if (candidates.length === 0) return;
     // 同じ銘柄で複数の戦略がシグナルを出したら confidence × 腕の重み × 期待値幅 が最大のもの
     const best = candidates.reduce((a, b) => (b.score > a.score ? b : a));
     if (candidates.length > 1) {
@@ -1959,6 +1988,72 @@ export class TradingEngine {
       return;
     }
     await this.enter(inst, view, best, ctx);
+  }
+
+  /**
+   * 転換で決済 (REVERSAL_EXIT。src/engine/reversalExit.ts)。保有中の建玉を、持ち主の戦略の主時間足の新しい確定足ごとに 1 回判定する。
+   * 買いはエントリー後にできた押し安値 (確定したスイングロー) を確定足の終値が割ったら、売りは戻り高値を越えたら、
+   * 利確・損切りの手前でも成行で決済する (理由 "reversal")。含み益でも含み損でも同じ。
+   * - 損切り・利確・トレーリング・読みの管理はティックごとに manageExits で先に判定している (そちらが先)。
+   * - 戦略の決済シグナル (flat・逆方向) と同じ確定足で両方が出たら signal を優先する (signalTried のときは判定済みとして見送る)。
+   *   したがって signal の件数は REVERSAL_EXIT=false のときと変わらず、reversal は「シグナルでは決済しなかった」転換だけ。
+   * - 決済の手続きが進んでいる建玉 (保留中・状態不明の注文、読みの決済の再試行、一部約定の残り、利確の指値の取消中) には重ねない
+   *   (PositionManager.exitInProgress。進んでいる間は判定せず、終われば同じ確定足で判定する)。
+   * - 決済はシグナルと同じ通常の close() (利確の指値の取消確認・reduceOnly・状態不明の扱いはそのまま)。
+   *   発注レートの上限・再試行待ち (throttled) なら次のティックで判定し直す。
+   * - 読みの管理の建玉・延長中の建玉も対象 (読みの決済が決まっていれば上書きしない)。
+   * - 足がエントリーより新しい (履歴が足りない) 建玉は判定しない (監査ログ position.reversal_no_history を 1 回だけ)。
+   * 判定の根拠は監査ログ position.reversal_exit (水準・終値・スイングの足の時刻など) に残す。
+   */
+  private async reversalExit(inst: Instrument, view: MarketView, pos: OpenTrade, ctx: TickCtx, signalTried: boolean): Promise<void> {
+    if (!reversalAppliesTo(this.reversal, pos.strategyId)) return;
+    const s = this.strategies.find((x) => x.id === pos.strategyId) ?? ALL_STRATEGIES.find((x) => x.id === pos.strategyId);
+    if (!s) return;
+    const tf = s.primaryTimeframe;
+    const tfMs = TIMEFRAME_MS[tf];
+    const c = view.candles[tf];
+    const lastBar = c && c.length ? c[c.length - 1] : undefined;
+    // エントリーした後に確定した足がまだ無ければ何もしない
+    if (!c || !lastBar || lastBar.ts + tfMs <= pos.entryTs) return;
+    if (this.reversalEvalAt.get(pos.id) === lastBar.ts) return;
+    if (this.reversalEvalAt.size > 256) {
+      const open = new Set(this.positions.list().map((p) => p.id));
+      for (const id of [...this.reversalEvalAt.keys()]) if (!open.has(id)) this.reversalEvalAt.delete(id);
+      for (const id of [...this.reversalNoHistory]) if (!open.has(id)) this.reversalNoHistory.delete(id);
+    }
+    if (signalTried) {
+      this.reversalEvalAt.set(pos.id, lastBar.ts);
+      return;
+    }
+    if (this.positions.exitInProgress(inst.symbol)) return;
+    this.reversalEvalAt.set(pos.id, lastBar.ts);
+    const r = checkReversal(c, pos.entryTs, pos.direction, { pivotN: this.reversal.pivotN, bufferAtr: this.reversal.bufferAtr, tfMs });
+    if (r.skip === "no_history" && !this.reversalNoHistory.has(pos.id)) {
+      this.reversalNoHistory.add(pos.id);
+      const data = { tradeId: pos.id, symbol: inst.symbol, strategyId: pos.strategyId, timeframe: tf, entryTs: pos.entryTs, firstBarTs: c[0].ts };
+      this.store.audit({ ts: ctx.now, type: "position.reversal_no_history", data });
+      this.log.warn("足がエントリーより新しいため、この建玉は転換で決済を判定できません (損切り・利確などは従来どおり)", data);
+    }
+    if (!r.exit) return;
+    const intended = pos.direction === "long" ? view.quote.bid : view.quote.ask;
+    const risk = Math.abs(pos.entryPrice - pos.initialStop);
+    const data = {
+      tradeId: pos.id, symbol: inst.symbol, strategyId: pos.strategyId, direction: pos.direction, detail: reversalDetailLabel(pos.direction),
+      timeframe: tf, pivotN: this.reversal.pivotN, bufferAtr: this.reversal.bufferAtr, level: r.level, pivotTs: r.pivotTs, close: r.close, barTs: r.barTs,
+      ...(Number.isFinite(r.atr) ? { atr: r.atr } : {}), threshold: r.threshold, entryPrice: pos.entryPrice, entryTs: pos.entryTs,
+      initialStop: pos.initialStop, ...(pos.takeProfit !== undefined ? { takeProfit: pos.takeProfit } : {}), intendedPrice: intended,
+      // 判定した終値での値動きの R (手数料を含めない。含み益なら正)
+      ...(risk > 0 ? { grossR: Number((((pos.direction === "long" ? 1 : -1) * (r.close - pos.entryPrice)) / risk).toFixed(4)) } : {}),
+    };
+    this.log.info(`転換で決済します (${data.detail})`, data);
+    const res = await this.positions.close(inst.symbol, "reversal", intended, ctx.now);
+    this.store.audit({ ts: ctx.now, type: "position.reversal_exit", data: { ...data, status: res.status, ...(res.reason ? { result: res.reason } : {}) } });
+    // 発注レートの上限・決済の再試行待ちは発注していないので、次のティックで判定し直す
+    if (res.status === "throttled") this.reversalEvalAt.delete(pos.id);
+    if (res.status === "closed" || res.status === "reduced") {
+      ctx.exits++;
+      ctx.account = await this.account(ctx.now, true);
+    }
   }
 
   private async enter(inst: Instrument, view: MarketView, c: Candidate, ctx: TickCtx): Promise<void> {
@@ -2585,6 +2680,7 @@ export class TradingEngine {
       tempo: this.tempoStatus(now),
       maxHoldMinutes: this.maxHoldMs !== undefined ? this.maxHoldMs / 60_000 : 0,
       thesis: { ...this.thesis },
+      reversal: { ...this.reversal, strategies: [...this.reversal.strategies] },
       limitOrders: {
         limitEntry: this.config.env.LIMIT_ENTRY ?? true,
         limitTakeProfit: effectiveLimitTakeProfit(this.config.env, this.mode),

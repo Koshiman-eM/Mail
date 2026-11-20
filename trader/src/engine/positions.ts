@@ -298,7 +298,7 @@ interface VerifyItem {
  * 保有ポジションの管理。1 銘柄 1 ポジション (PaperBroker が銘柄単位でネッティングするため)。
  * - 毎ティック: 価格を journal に反映し、損切り → 利確 → トレーリング → 時間切れ の順で決済を判定する。
  *   読みの管理 (deps.thesis) が有効なら、時間切れの代わりに読みの期限で答え合わせをする (途中・期限で読み外れ / 延長 / 延長の上限。src/engine/thesis.ts)。
- * - 戦略の flat シグナル・kill switch でも決済する。
+ * - 戦略の flat シグナル・転換で決済 (engine が確定足ごとに判定して close を呼ぶ。exitInProgress のときは重ねない)・kill switch でも決済する。
  * - 発注は成行。結果が確定 (filled / canceled / rejected) したら約定数量で journal に反映する。
  *   受付済み・未約定 (open / partially_filled) や例外で状態不明の注文は「保留中」(PendingOrders) として記録し、
  *   syncPending で照会して確定させる。保留中の注文がある銘柄には新たな注文を出さない (再送しない)。
@@ -889,6 +889,29 @@ export class PositionManager {
     } finally {
       this.closing.delete(p.id);
     }
+  }
+
+  /**
+   * 決済の手続きが進んでいる建玉か。進んでいれば理由を返す (無ければ undefined)。
+   * 確定足で判断する追加の決済 (転換で決済) を重ねないためのガード。どれも close() の前に確かめる:
+   * - 保留中・状態不明の注文がある (決済の約定待ち・照会中)
+   * - 決済中 (close の途中)
+   * - 決済が拒否された後の建玉の確認待ち (建玉が残っているか分からない)
+   * - 決めた読みの決済 (読み外れ・延長の上限) を約定するまで再試行中 (読みの決済を上書きしない)
+   * - 一部約定の残り (retryExit) を同じ理由で決済中
+   * - 決済のために板の利確の指値を取消中
+   */
+  exitInProgress(symbol: string): string | undefined {
+    const p = this.get(symbol);
+    if (!p) return "ポジションがありません";
+    if (this.hasPending(symbol)) return "保留中の注文があります";
+    if (this.closing.has(p.id)) return "決済中";
+    if (this.verifyQueue.has(p.id)) return "決済の拒否後の建玉の確認待ち";
+    const plan = this.plans[p.id];
+    if (plan?.thesis?.exit) return `読みの決済 (${plan.thesis.exit.reason}) を再試行中`;
+    if (plan?.retryExit) return `一部約定の残りを決済中 (${plan.retryExit.reason})`;
+    if (this.tps.get(p.id)?.exit) return "決済のため利確の指値を取消中";
+    return undefined;
   }
 
   /** 全ポジションを決済 (kill switch 等)。保留中の注文がある銘柄は pending を返す。venue ごとに並列 */

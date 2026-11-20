@@ -13,6 +13,7 @@ import type {
 } from "../core/types";
 import type { RegimeOptions } from "../regime/detect";
 import type { ThesisSettings } from "../engine/thesis";
+import type { ReversalSettings } from "../engine/reversalExit";
 
 export interface SizerArgs {
   /** 現在の評価額 (クオート通貨) */
@@ -108,6 +109,12 @@ export interface BacktestOptions {
    * 判定はバーの終値 (∓ 半スプレッド、手数料の見積り込みの純 R) で行い、決済は次のバーの始値。延長後の保護ストップは次のバーから効く
    */
   thesis?: ThesisSettings;
+  /**
+   * 転換で決済 (ライブの REVERSAL_* と同じ src/engine/reversalExit.ts の規則。省略・無効・戦略が対象外なら従来どおり)。
+   * 主時間足が確定したバーの終値で判定し (エントリー後の押し安値 / 戻り高値を終値が越えたか)、決済は次のバーの始値の成行
+   * (理由 reversal。戦略の決済シグナルと同じタイミング。同じバーで決済シグナルも出たら signal を優先)
+   */
+  reversal?: ReversalSettings;
 }
 
 export interface BacktestMetrics {
@@ -140,6 +147,8 @@ export interface BacktestStats {
   entries: number;
   /** 反転 (flat) シグナルによる決済数 */
   signalExits: number;
+  /** 転換で決済 (reversal) による決済数 */
+  reversalExits?: number;
   /** 見送り理由ごとの件数 (size / edge / short / equity) */
   skipped: Record<string, number>;
   /** 指値のエントリー (limitOrders.entry のとき): 置いた / 約定 / 期限切れ / 逆シグナルで取消 */

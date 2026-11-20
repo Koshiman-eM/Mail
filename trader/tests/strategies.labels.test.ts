@@ -29,6 +29,18 @@ describe("戦略の表示名 (表示専用。id は変えない)", () => {
     for (const s of wrapped) expect(strategyLabel(s.id)).toBe(STRATEGY_LABELS[s.id]);
   });
 
+  it("押し目買い・戻り売りの 3 つ (1 分足・5 分足・15 分足) は時間足で区別する。表示名は重複しない", () => {
+    expect(strategyLabel("scalp_pullback")).toBe("超短期・押し目買い / 戻り売り (1 分足)");
+    expect(strategyLabel("pullback_5m")).toBe("短期・押し目買い / 戻り売り (5 分足)");
+    expect(strategyLabel("pullback_15m")).toBe("短期・押し目買い / 戻り売り (15 分足)");
+    expect(strategyLabelWithId("pullback_5m")).toBe("短期・押し目買い / 戻り売り (5 分足) [pullback_5m]");
+    expect(armLabel("pullback_15m|trend_down|crypto|short")).toBe("短期・押し目買い / 戻り売り (15 分足) / 下降トレンド / crypto / 空売り (paper 再現)");
+    const ids = ALL_STRATEGIES.map((s) => s.id);
+    for (const id of ["scalp_pullback", "pullback_5m", "pullback_15m"]) expect(ids).toContain(id);
+    const labels = ALL_STRATEGIES.map((s) => STRATEGY_LABELS[s.id]);
+    expect(new Set(labels).size).toBe(labels.length);
+  });
+
   it("未知の id はそのまま、id 併記は [id] を付ける", () => {
     expect(strategyLabel("unknown_x")).toBe("unknown_x");
     expect(strategyLabelWithId("unknown_x")).toBe("unknown_x");

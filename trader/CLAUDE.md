@@ -9,13 +9,13 @@
 
 ## 2. コマンド
 - `npm install` / `npm test` / `npm run typecheck`
-- `npm run simulate -- --days 1`: 合成データで高速にペーパー運転する (ネット不要)。構造フィルターの理由別の見送り数・エントリー/時・平均保有・テンポ・見送り件数・読みの答え合わせも表示
+- `npm run simulate -- --days 1`: 合成データで高速にペーパー運転する (ネット不要)。構造フィルターの理由別の見送り数・エントリー/時・平均保有・テンポ・見送り件数・読みの答え合わせ・転換で決済の成績も表示
 - `npm run backtest -- --strategy all [--source synthetic|ccxt|gmo]`
 - `npm run backtest -- --structure-compare [--strategy <id>|all] [--pivot-sweep] [--folds 5] [--days N] [--source ...]`: 相場構造フィルターの比較 (A: ラッパーなし 〜 G: conservative を evaluateParams の区間で比べる)。30 取引未満の区間は「回数不足」。`--pivot-sweep` (N=4/6/10) は頑健性の確認だけで、N を調整し続けない
 - `npm start`: 実時間で起動する。既定は paper
-- `npm run report`: 成績と学習状態 (現在の mode のもの) を表示。注文種別ごとの成績・maker/taker 手数料の内訳・指値の約定率・探索/通常 (テンポ) の表・読みの答え合わせ (途中/期限で読み外れ・延長・期限前に決着、期限での的中率) も出す
+- `npm run report`: 成績と学習状態 (現在の mode のもの) を表示。注文種別ごとの成績・maker/taker 手数料の内訳・指値の約定率・探索/通常 (テンポ) の表・読みの答え合わせ (途中/期限で読み外れ・延長・期限前に決着、期限での的中率)・転換で決済 (件数・勝率・純損益・平均R・含み益で決済した件数・勝ちの取引が取れた利確までの距離の割合) も出す
 - `npm run trader -- intel`: 情報収集を 1 回実行してブリーフを表示
-- `npm run status`: 設定と現在の状態を表示 (指値の設定と約定率、テンポ・最大保有、読みの管理の設定と各建玉の読みの期限も)
+- `npm run status`: 設定と現在の状態を表示 (指値の設定と約定率、テンポ・最大保有、読みの管理の設定と各建玉の読みの期限、転換で決済の設定 REVERSAL_* も)
 - `npm run trader -- resume`: キルスイッチ・日次停止を解除 (監査ログに記録。動作中のエンジンにも次のティックで反映)
 - `npm run trader -- orders` (`orders list`): 保留中・状態不明の注文を一覧
 - `npm run trader -- regime --symbol BTC/JPY --hours 3 [--tf 1m,15m,1h,4h] [--step <分>]`: 各時刻の相場の状態 (レジーム) を運用と同じ detectRegime で表示 (確定足だけ。スプレッドは 0 扱い。VENUES に gmo があれば GMOコインの足)。目線・押し安値/戻り高値・choppiness も表示
@@ -67,6 +67,7 @@
    - 構造の損切り (`STRUCTURE_STOP_MODE=structure`) は損切りを押し安値/戻り高値 ± ATR × バッファへ動かすだけ。サイズは RiskManager が決め、期待値は増やさない。新しい損切り幅が元の 0.5 倍未満・3 倍超・0.5 ATR 未満、または利確が不正なら見送る。
    - 既定の対象: scalp_momentum_burst, scalp_micro, short_ema_trend, short_breakout, mid_trend_follow, long_momentum, meme_momentum (対象外: scalp_obi, scalp_vwap_revert, short_rsi_revert, scalp_rebound, scalp_pullback)。未知の id と、purist での `STRUCTURE_EXIT_ON_WEAKENING` は起動時に警告する。
    - 設定: `STRUCTURE_MODE` / `_STRATEGIES` / `_PIVOT_N` (3〜20、既定 6) / `_BREAK_MODE` / `_BIAS_METHOD` / `_REVERSAL_MODE` / `_USE_MTF` / `_USE_PERFECT_ORDER` / `_STOP_MODE` / `_STOP_ATR_BUFFER` / `_EXIT_ON_REVERSAL` / `_EXIT_ON_WEAKENING` / `_CHOP_M` / `_CHOP_R` (`config.ts`、既定は README)。
+   - `STRUCTURE_EXIT_ON_REVERSAL` (既定 false) はラップした戦略だけの「目線の転換」での決済 (戦略の flat シグナル)。建玉に対する押し安値割れ / 戻り高値超えは 18 (`REVERSAL_EXIT`、全戦略) で、両方 true は重複 (起動時に警告)。
 15. **指値 (maker)** (`LIMIT_ENTRY` 既定 true、`src/engine/limitOrders.ts`、`orders.ts`):
    - 新規は買いが最良の買い気配、売りが最良の売り気配への指値。優先順位は シグナル自身の指値価格 > 戦略の `entryOrder` > 設定。`scalp_micro` は成行。post-only は `capabilities.postOnly` のある取引先だけ (PaperBroker は可、GMO は不可。GMO の SOK は現物のみ (要確認) なので、レバレッジの指値は通常の LIMIT)。
    - RiskManager は発注前に、指値価格でサイズを決めて評価する。待機中は kv `orders:pending:<mode>` に保存し、その銘柄の新規を止める。期限・反対シグナル・損切り価格の通過・新規を止める条件 (停止・日次停止・kill switch・状態不明の注文・口座取得不可・気配の古さ) で取り消す。
@@ -91,6 +92,14 @@
    - 仮想トレードも同じ規則。`thesisExpectedMs` は読みの管理が有効なときだけ記録 (無い古い記録は従来どおり)。極値と延長後の保護ストップの判定は、延長した時刻以降に始まった 1m 足と気配だけ (当初の損切りは従来どおりの範囲)。
    - TradeRecord / ShadowTradeRecord に `thesisExpectedMs` / `thesisDeadlineTs` / `thesisExtendedAt` / `thesisOutcome` (failed_early / timeout / extended / none) / `thesisNetRAtDeadline` / `thesisStopExit` (TradeRecord のみ) (任意。古い記録も読める)。要因分析・ParamTuner は 3 つの理由を time と同じ扱い (`isTimeLikeExit`)。
    - 表示: report / simulate の「読みの答え合わせ」(テンポの表と同じく「うち空売り (paper 再現)」の件数・純損益を注記)、ダッシュボードの保有ポジション (読みの期限・残り分・状態・現在の R)、status の設定と各建玉の期限。ラベルは 読み外れ(途中) / 読み外れ(期限) / 延長の上限。
+18. **転換で決済** (`REVERSAL_EXIT` 既定 true、`src/engine/reversalExit.ts` が純粋な判定。false なら従来と同一):
+   - 建玉に対するダウ理論: 持ち主の戦略の主時間足で、エントリーした足以降に確定したスイングロー (買い) / スイングハイ (売り) のうち最も新しいものを水準にする。確定足の終値がそれを `REVERSAL_EXIT_BUFFER_ATR` (0〜1、既定 0) × ATR(14) より大きく割ったら (越えたら) 成行で決済 (理由 `reversal`。含み益でも含み損でも)。
+   - スイングは `detectPivots` / `confirmedPivots` (N = `REVERSAL_EXIT_PIVOT_N`、2〜10、既定 3。`STRUCTURE_PIVOT_N` とは別)。N 本後に確定してから使う (リペイントしない)。エントリー前のスイングは使わない (エントリーした足は使う)。エントリー後にスイングが無ければ何もしない (損切りが守る)。ヒゲでは決済しない。ATR は最後の 100 本から。
+   - 対象: `REVERSAL_EXIT_STRATEGIES` (空 = 全戦略。未登録の id は起動時に警告)。読みの管理の建玉・延長中の建玉も対象 (答え合わせは延長前なら「期限前に決着」、延長後なら延長)。
+   - エンジン: 保有中の建玉を、主時間足の新しい確定足ごとに 1 回 (`processSymbol` の持ち主の戦略の評価の後)。損切り・利確・トレーリング・読みの管理 (ティックごと) が先。同じ確定足で戦略の決済シグナルも出たら `signal` を優先 (`signal` の件数は無効のときと同じ)。決済の手続き中 (保留中・状態不明の注文、読みの決済の再試行、一部約定の残り、利確の指値の取消中、拒否後の建玉確認) は重ねない (`PositionManager.exitInProgress`)。決済は signal と同じ通常の `close()`。監査ログ `position.reversal_exit` (水準・終値・スイングの足・ATR・状態)。足がエントリーより新しい建玉は判定せず `position.reversal_no_history` を 1 回 (hub は各時間足を最大 2000 本保持)。新たに保存するものは無い (水準は足から毎回求める)。
+   - バックテスト: 主時間足が確定したバーの終値で判定し、次のバーの始値で決済 (signal と同じ)。`reversal` を backtest・`createParamValidator`・setup・backtest コマンドへ渡す (検証も運用と同じ規則)。
+   - 仮想トレード: 同じ規則。記録時に戦略の主時間足を `reversalTf` に保存し (有効で対象のときだけ。決済の記録には残さない)、engine が渡す hub のその時間足の確定足で判定 (リサンプルしない。足が無ければ判定しない)。損切り・利確・読みの管理が先。古い記録は従来どおり。
+   - 要因分析・ParamTuner は `signal` と同じ扱い (`isSignalLikeExit`。決済後に伸びたら early_exit → tp_raise)。表示名は「転換で決済」(ダッシュボードの取引は 押し安値割れ / 戻り高値超え を添える)。report / simulate の「転換で決済」の表、status の設定。
 
 ## 4. 構成
 - `src/core/`: 型の契約 (`types.ts`)、設定、decimal、HTTP リトライ、Claude 呼び出し (`ai.ts`。構造化出力、拒否時はサーバー側フォールバック、キー未設定時はルールベース)
@@ -98,7 +107,7 @@
 - `src/indicators/`, `src/regime/`: 指標・リサンプル・相場環境の判定
 - `src/strategies/`: 12 戦略 (scalp 6 / short 3 / mid / long / meme)。scalp_rebound は 15m の下降トレンド中の 1m の反発を買う (買いのみ・crypto。既定で観測専用)。scalp_pullback は 15m EMA20 の傾きで方向を決め、上昇中の 1m の押しを買い・下降中の戻りを売る (crypto。売りは canShort。損切り = 押しの極値 ± stopAtr (0.3) ATR を 0.8〜3.5 ATR に収める (超えたら見送り)、利確 = tpR (2) × 損切り幅、保有 10〜30 分、純期待値 (edgeIsNet)、コスト条件と 5 本のクールダウンあり。構造ラッパーなし・観測専用でない)。パラメータの標準名は stopAtr, tpAtr, trailAtr, entryThreshold, maxHoldBars
 - `src/structure/`: 相場構造 (pivots・machine・perfectOrder・mtf・wrap・settings)。`src/engine/structureCompare.ts` は `--structure-compare`
-- `src/engine/tempo.ts`: テンポ・上限・探索。`thesis.ts`: 読みの管理の純粋な判定 (期限・純 R・延長後の保護ストップ・決済理由)。`limitOrders.ts`: 指値エントリー / 待機の利確の管理。`orders.ts`: 保留中・状態不明の注文の管理 (指値の取消確認・約定率の統計を含む)
+- `src/engine/tempo.ts`: テンポ・上限・探索。`thesis.ts`: 読みの管理の純粋な判定 (期限・純 R・延長後の保護ストップ・決済理由)。`reversalExit.ts`: 転換で決済の純粋な判定 (エントリー後の押し安値・戻り高値と終値の比較、設定)。`limitOrders.ts`: 指値エントリー / 待機の利確の管理。`orders.ts`: 保留中・状態不明の注文の管理 (指値の取消確認・約定率の統計を含む)
 - `src/backtest/`: イベント駆動バックテスト、`evaluateParams`、`walkForward`、合成データ
 - `src/market/`: feed (ccxt / GMOコイン / OANDA / Alpaca / DexScreener / synthetic) と MarketHub。GMO は `src/market/gmo/` (client・klines・check) と `feeds/gmo.ts`
 - `src/execution/`: PaperBroker、実口座アダプター (ccxt / GMO `gmoBroker.ts` / OANDA / Alpaca)、router

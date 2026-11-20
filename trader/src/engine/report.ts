@@ -9,6 +9,7 @@ import { microReasonLabel, sideLabel, SIMULATED_SHORT_LABEL, type ShadowGroup, t
 import { quoteCurrencyOfSymbol } from "./fx";
 import type { LimitStats } from "./orders";
 import { THESIS_OUTCOME_LABEL, type ThesisOutcome } from "./thesis";
+import { REVERSAL_EXIT_LABEL, reversalDetailLabel } from "./reversalExit";
 import { armLabel, strategyLabel } from "../strategies/labels";
 
 export const EXIT_REASON_LABEL: Record<ExitReason, string> = {
@@ -22,7 +23,14 @@ export const EXIT_REASON_LABEL: Record<ExitReason, string> = {
   thesis_failed: "読み外れ(途中)",
   thesis_timeout: "読み外れ(期限)",
   thesis_cap: "延長の上限",
+  reversal: REVERSAL_EXIT_LABEL,
 };
+
+/** 決済理由の表示名。転換で決済は方向が分かれば中身 (買い: 押し安値割れ / 売り: 戻り高値超え) を添える */
+export function exitReasonLabel(reason: string, direction?: "long" | "short"): string {
+  const base = EXIT_REASON_LABEL[reason as ExitReason] ?? reason;
+  return reason === "reversal" && direction ? `${base} (${reversalDetailLabel(direction)})` : base;
+}
 
 export const ADJUSTMENT_STATUS_LABEL: Record<string, string> = {
   proposed: "提案のみ",
@@ -440,6 +448,88 @@ export function renderThesisTable(s: ThesisSummary | undefined, ccy: string): st
   return lines.join("\n");
 }
 
+// ───────── 転換で決済 (REVERSAL_EXIT) ─────────
+
+export interface ReversalRow extends Omit<StrategySummary, "strategyId" | "losses" | "fees"> {
+  /** long: 押し安値割れ (買い) / short: 戻り高値超え (売り) / total: 合計 */
+  key: "long" | "short" | "total";
+  label: string;
+  /** 決済時に値動きでプラスだった件数 (手数料前の損益 grossPnl > 0) */
+  inProfit: number;
+  /** 勝ち (純損益 > 0) の取引の、利確までの距離のうち取れた割合の平均 (値動きの R ÷ 計画の利確の R)。対象が無ければ NaN */
+  tpCapture: number;
+  /** tpCapture の対象 (利確のある勝ちの取引) の件数 */
+  tpCaptureN: number;
+}
+
+export interface ReversalSummary {
+  /** 方向別 (件数のある方向だけ) と合計 (最後の行) */
+  rows: ReversalRow[];
+  /** 合計 (rows の最後の行と同じ。転換で決済が 0 件なら件数 0 の行) */
+  total: ReversalRow;
+  /** うち空売り (paper 再現。live では実行できない) の件数・純損益 (口座通貨) */
+  simShortTrades: number;
+  simShortNetPnl: number;
+}
+
+/**
+ * 利確までの距離のうち取れた割合 = 値動きの R ÷ 計画の利確の R = 方向 × (決済価格 − 建値) / |利確価格 − 建値|
+ * (どちらも当初の損切り幅で割った R なので、損切り幅は約分される。手数料を含めない)。利確が無い・距離が 0 なら NaN
+ */
+export function tpCaptureOf(t: Pick<TradeRecord, "direction" | "entryPrice" | "exitPrice" | "takeProfit">): number {
+  if (t.takeProfit === undefined || !Number.isFinite(t.takeProfit)) return NaN;
+  const dist = Math.abs(t.takeProfit - t.entryPrice);
+  if (!(dist > 0) || !Number.isFinite(t.exitPrice)) return NaN;
+  return ((t.direction === "long" ? 1 : -1) * (t.exitPrice - t.entryPrice)) / dist;
+}
+
+/** 転換で決済 (exitReason === "reversal") の取引の集計 (方向別と合計) */
+export function summarizeReversal(
+  trades: TradeRecord[],
+  toAccount: (ccy: string) => number,
+  quoteOf?: (t: TradeRecord) => string | undefined,
+  exitRates?: Map<string, number>,
+): ReversalSummary {
+  const rev = trades.filter((t) => t.exitReason === "reversal");
+  const rowOf = (key: ReversalRow["key"], label: string, list: TradeRecord[]): ReversalRow => {
+    const s = summarizeByStrategy(list.map((t) => ({ ...t, strategyId: key })), toAccount, quoteOf, exitRates)[0];
+    const caps = list.filter((t) => t.netPnl > 0).map(tpCaptureOf).filter((x) => Number.isFinite(x));
+    return {
+      key, label, trades: list.length, wins: s?.wins ?? 0, winRate: s?.winRate ?? 0, netPnl: s?.netPnl ?? 0, avgR: s?.avgR ?? 0,
+      unconverted: s?.unconverted ?? 0, inProfit: list.filter((t) => t.grossPnl > 0).length,
+      tpCapture: caps.length ? caps.reduce((a, b) => a + b, 0) / caps.length : NaN, tpCaptureN: caps.length,
+    };
+  };
+  const rows: ReversalRow[] = [];
+  for (const dir of ["long", "short"] as const) {
+    const list = rev.filter((t) => t.direction === dir);
+    if (list.length) rows.push(rowOf(dir, `${reversalDetailLabel(dir)} (${dir === "long" ? "買い" : "売り"})`, list));
+  }
+  const total = rowOf("total", "合計", rev);
+  rows.push(total);
+  const sim = simShortByKey(rev, () => "reversal", toAccount, quoteOf, exitRates).get("reversal");
+  return { rows, total, simShortTrades: sim?.trades ?? 0, simShortNetPnl: sim?.netPnl ?? 0 };
+}
+
+/** 転換で決済の表 (report / simulate 共通) */
+export function renderReversalTable(s: ReversalSummary | undefined, ccy: string): string {
+  if (!s || s.total.trades === 0) return "  (転換で決済した取引はまだありません)";
+  const lines = [
+    formatTable(
+      ["区分", "取引数", "勝率", `純損益(${ccy})`, "平均R", "含み益で決済", "利確までの距離のうち取れた割合 (勝ち)"],
+      s.rows.map((r) => [
+        r.label, r.trades, fmtPct(r.winRate, 1), fmtSigned(r.netPnl), r.avgR.toFixed(2), `${r.inProfit} 件`,
+        r.tpCaptureN ? `${fmtPct(r.tpCapture, 1)} (${r.tpCaptureN} 件)` : "-",
+      ]),
+    ),
+    "  ※ 含み益で決済 = 決済時に値動きでプラス (手数料前)。取れた割合 = 値動きの R ÷ 計画の利確の R (利確のある勝ちの取引の平均。100% で利確と同じ)",
+  ];
+  if (s.simShortTrades > 0) {
+    lines.push(`  ※ うち空売り (paper 再現) ${s.simShortTrades} 件 (純損益 ${fmtSigned(s.simShortNetPnl)} ${ccy})。live では空売りしません`);
+  }
+  return lines.join("\n");
+}
+
 export function exitReasonCounts(trades: TradeRecord[]): Partial<Record<ExitReason, number>> {
   const out: Partial<Record<ExitReason, number>> = {};
   for (const t of trades) out[t.exitReason] = (out[t.exitReason] ?? 0) + 1;
@@ -534,7 +624,7 @@ export function renderCauses(c: CauseSummary): string {
 
 const SHADOW_EXIT_LABEL: Record<string, string> = {
   stop: "損切り", take_profit: "利確", time: "時間切れ", unwatched: "監視終了", trailing: "トレーリング",
-  thesis_failed: "読み外れ(途中)", thesis_timeout: "読み外れ(期限)", thesis_cap: "延長の上限",
+  thesis_failed: "読み外れ(途中)", thesis_timeout: "読み外れ(期限)", thesis_cap: "延長の上限", reversal: REVERSAL_EXIT_LABEL,
 };
 
 function shadowGroupTable(title: string, rows: ShadowGroup[], limit: number, keyLabel: (key: string) => string = (k) => k): string {
