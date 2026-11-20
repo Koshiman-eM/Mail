@@ -18,6 +18,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { defaultCosts } from "../backtest/engine";
+import { holdingFeeDailyOf, jstCutoffCrossings } from "../core/holdingFee";
 import type {
   AssetClass, Horizon, Instrument, Quote, RegimeLabel, ShadowExitReason, ShadowTradeRecord, Signal, Store, TradingMode,
 } from "../core/types";
@@ -64,7 +65,8 @@ export interface ShadowCounters {
 }
 
 export interface ShadowRecordInput {
-  instrument: Pick<Instrument, "symbol" | "assetClass" | "takerFeeRate">;
+  /** meta.holdingFeeDaily がある銘柄 (GMO) は持ち越し手数料を PaperBroker と同じ計算で costR / netR に含める */
+  instrument: Pick<Instrument, "symbol" | "assetClass" | "takerFeeRate"> & Partial<Pick<Instrument, "meta">>;
   quote: Pick<Quote, "bid" | "ask">;
   signal: Pick<Signal, "strategyId" | "direction" | "confidence" | "expectedEdgeBps" | "stopLoss" | "takeProfit" | "maxHoldMs"> & { horizon?: Horizon };
   regime: RegimeLabel;
@@ -290,6 +292,7 @@ export class ShadowTracker {
       ...(input.simulatedShort && !long
         ? { simulatedShort: true, borrowRateDaily: finite(input.borrowRateDaily) ? Math.max(0, input.borrowRateDaily) : 0 }
         : {}),
+      ...(holdingFeeDailyOf(inst) !== undefined ? { holdingFeeDaily: holdingFeeDailyOf(inst) } : {}),
     };
     this.open.push(o);
     this.keys.add(key);
@@ -427,6 +430,14 @@ export class ShadowTracker {
       r.netR -= borrow;
       r.costR += borrow;
     }
+    // 持ち越し手数料 (GMO。PaperBroker と同じ: 建玉代金 × 日率 × 日本時間 6:00 をまたいだ回数。1 単位あたりを R に換算)
+    const holding = finite(o.holdingFeeDaily) && o.holdingFeeDaily > 0
+      ? (o.entryMid * o.holdingFeeDaily * jstCutoffCrossings(o.entryTs, now)) / o.risk
+      : 0;
+    if (holding > 0) {
+      r.netR -= holding;
+      r.costR += holding;
+    }
     const { risk: _risk, lastCandleTs: _l, mfeR, maeR, ...base } = o;
     return { ...base, exitTs: now, exitPrice: exit.fill, exitReason: reason, ...r, mfeR, maeR };
   }
@@ -481,13 +492,15 @@ export interface ShadowSummary {
   bySide?: ShadowGroup[];
   exitReasons: Partial<Record<ShadowExitReason, number>>;
   counters: ShadowCounters;
-  /** scalp_micro の決済済み仮想トレードの見送り理由別の答え合わせ (最後の行が "合計")。無ければ省略 */
+  /** 超短期 (MICRO_STRATEGY_IDS) の決済済み仮想トレードの戦略・見送り理由別の答え合わせ (戦略ごとに最後の行が "合計")。無ければ省略 */
   micro?: MicroObservationGroup[];
 }
 
 export interface MicroObservationGroup {
   /** 見送り理由 (合計は "合計") */
   key: string;
+  /** 戦略 (scalp_micro / scalp_rebound) */
+  strategyId?: string;
   n: number;
   /** 利確到達率 (exitReason === "take_profit" の割合) */
   tpRate: number;
@@ -498,16 +511,25 @@ export interface MicroObservationGroup {
 }
 
 export const MICRO_STRATEGY_ID = "scalp_micro";
+/** 答え合わせの表に載せる超短期の戦略 */
+export const MICRO_STRATEGY_IDS: readonly string[] = [MICRO_STRATEGY_ID, "scalp_rebound"];
 export const MICRO_TOTAL_KEY = "合計";
 const MICRO_REASON_LABEL: Record<string, string> = {
   "strategy_filter:cost": "コストで見送り",
   "strategy_filter:spread": "スプレッドで見送り",
   "strategy_filter:edge": "期待値で見送り",
+  observe_only: "観測専用",
 };
 export const microReasonLabel = (reason: string): string => MICRO_REASON_LABEL[reason] ?? reason;
 
 function summarizeMicro(records: readonly ShadowTradeRecord[]): MicroObservationGroup[] {
-  const rs = records.filter((t) => t.strategyId === MICRO_STRATEGY_ID);
+  const out: MicroObservationGroup[] = [];
+  for (const id of MICRO_STRATEGY_IDS) out.push(...summarizeMicroOf(records, id));
+  return out;
+}
+
+function summarizeMicroOf(records: readonly ShadowTradeRecord[], strategyId: string): MicroObservationGroup[] {
+  const rs = records.filter((t) => t.strategyId === strategyId);
   if (rs.length === 0) return [];
   const mk = (key: string, list: ShadowTradeRecord[]): MicroObservationGroup => {
     let tp = 0, g = 0, nn = 0, p0s = 0, p0n = 0;
@@ -526,7 +548,7 @@ function summarizeMicro(records: readonly ShadowTradeRecord[]): MicroObservation
       }
     }
     const n = list.length;
-    return { key, n, tpRate: n ? tp / n : 0, p0: p0n ? p0s / p0n : NaN, avgGrossR: n ? g / n : 0, avgNetR: n ? nn / n : 0 };
+    return { key, strategyId, n, tpRate: n ? tp / n : 0, p0: p0n ? p0s / p0n : NaN, avgGrossR: n ? g / n : 0, avgNetR: n ? nn / n : 0 };
   };
   const by = new Map<string, ShadowTradeRecord[]>();
   for (const t of rs) by.set(t.reason, [...(by.get(t.reason) ?? []), t]);
@@ -580,7 +602,7 @@ export function summarizeShadowTrades(
     bySide: group((t) => sideLabel(t.direction, t.simulatedShort)),
     exitReasons,
     counters: extra.counters ?? emptyCounters(),
-    ...(records.some((t) => t.strategyId === MICRO_STRATEGY_ID) ? { micro: summarizeMicro(records) } : {}),
+    ...(records.some((t) => MICRO_STRATEGY_IDS.includes(t.strategyId)) ? { micro: summarizeMicro(records) } : {}),
   };
 }
 

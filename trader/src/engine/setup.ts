@@ -14,6 +14,8 @@ import { LearningService, type LearningServiceDeps } from "../learning/service";
 import { AlpacaFeed } from "../market/feeds/alpaca";
 import { CcxtFeed } from "../market/feeds/ccxt";
 import { DexScreenerFeed } from "../market/feeds/dexscreener";
+import { GmoFeed } from "../market/feeds/gmo";
+import { gmoToUnified, parseGmoSymbols, unifiedToGmo } from "../market/gmo/client";
 import { OandaFeed } from "../market/feeds/oanda";
 import { SyntheticFeed } from "../market/feeds/synthetic";
 import { MarketHub } from "../market/hub";
@@ -26,7 +28,7 @@ import { createFxConverter, type FxConverter } from "./fx";
 import { createParamValidator, createPriceAt, type ValidatorOptions } from "./learningHooks";
 
 const ASSET_CLASSES: AssetClass[] = ["crypto", "meme", "fx", "stock"];
-export const KNOWN_VENUES = ["synthetic", "ccxt", "oanda", "alpaca", "dex"] as const;
+export const KNOWN_VENUES = ["synthetic", "ccxt", "gmo", "oanda", "alpaca", "dex"] as const;
 /** ccxt で WATCHLIST が空のときに探す既定銘柄 (存在するものを最大 3 つ) */
 export const DEFAULT_CCXT_SYMBOLS = ["BTC/JPY", "ETH/JPY", "BTC/USDT", "ETH/USDT", "SOL/USDT", "DOGE/USDT"];
 export const DEFAULT_OANDA_SYMBOLS = ["USD/JPY", "EUR/USD"];
@@ -35,7 +37,7 @@ export const DEFAULT_ALPACA_SYMBOLS = ["AAPL", "MSFT"];
 export const DEFAULT_SYNTHETIC_HISTORY_MS = 15 * 86_400_000;
 
 export interface WatchEntry {
-  /** synthetic / ccxt / ccxt:<id> / oanda / alpaca / dex */
+  /** synthetic / ccxt / ccxt:<id> / gmo / oanda / alpaca / dex */
   venue: string;
   symbol: string;
   assetClass?: AssetClass;
@@ -116,6 +118,8 @@ export interface RuntimeOptions {
   fetchImpl?: typeof fetch;
   /** テスト用: ccxt の feed 生成 */
   createCcxtFeed?: (exchangeId: string) => MarketDataFeed;
+  /** テスト用: GMO の feed 生成 (symbols は GMO の表記 "BTC_JPY") */
+  createGmoFeed?: (symbols: string[]) => MarketDataFeed;
   /** feed と銘柄を直接指定する (指定時は VENUES / WATCHLIST を使わない。テスト・独自 feed 用) */
   markets?: { feed: MarketDataFeed; instruments: Instrument[] }[];
   strategies?: readonly Strategy[];
@@ -170,6 +174,9 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
     pairs.push({ inst, feed });
   };
   const entriesFor = (pred: (v: string) => boolean) => watch.filter((w) => pred(w.venue));
+  // GMO の feed が使う取引 mode と監査ログの書き込み先 (store は後で作るので、作った後に差し込む)
+  const gmoTradeMode = opts.brokerSet?.mode ?? config.mode;
+  let auditSink: Store["audit"] | undefined;
   let dexFeed: DexScreenerFeed | undefined;
   const allTfs: Timeframe[] = ["1m", "5m", "15m", "1h", "4h", "1d"];
   const getDex = () => (dexFeed ??= new DexScreenerFeed({ clock, timeframes: allTfs, ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}) }));
@@ -208,6 +215,32 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
         }
       } catch (e) {
         log.warn("ccxt の初期化に失敗したためスキップします", { exchange: id, error: e instanceof Error ? e.message : String(e) });
+      }
+    } else if (kind === "gmo") {
+      // GMOコインのレバレッジ銘柄。WATCHLIST に gmo の銘柄があればそれだけ、無ければ GMO_SYMBOLS (ccxt と同じ扱い)
+      const entries = entriesFor((x) => x === "gmo");
+      try {
+        const symbols = entries.length ? parseGmoSymbols(entries.map((e) => unifiedToGmo(e.symbol)).join(",")) : parseGmoSymbols(env.GMO_SYMBOLS);
+        const feed =
+          opts.createGmoFeed?.(symbols) ??
+          new GmoFeed({
+            symbols,
+            holdingFeeDaily: env.GMO_LEVERAGE_FEE_DAILY,
+            clientOptions: opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {},
+            // 現物銘柄の足への切り替え: paper は許可、live は GMO_ALLOW_SPOT_CANDLES=true のときだけ。切り替えたら監査ログに残す
+            allowSpotCandles: gmoTradeMode === "paper" || env.GMO_ALLOW_SPOT_CANDLES,
+            onSpotCandles: (info) => auditSink?.({ ts: clock.now(), type: "gmo.spot_candles", data: { ...info, mode: gmoTradeMode } }),
+          });
+        const list = await feed.listInstruments();
+        for (const g of symbols) {
+          const unified = gmoToUnified(g);
+          const inst = list.find((i) => i.symbol === unified);
+          const entry = entries.find((e) => unifiedToGmo(e.symbol) === g);
+          if (inst) add(withClass(inst, entry?.assetClass), feed);
+          else log.warn("GMO に無い銘柄を無視します", { symbol: g });
+        }
+      } catch (e) {
+        log.warn("GMO の初期化に失敗したためスキップします", { error: e instanceof Error ? e.message : String(e) });
       }
     } else if (kind === "oanda") {
       if (!env.OANDA_API_TOKEN || !env.OANDA_ACCOUNT_ID) throw new Error("oanda: OANDA_API_TOKEN / OANDA_ACCOUNT_ID が必要です");
@@ -276,7 +309,17 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
 
   const store = opts.store ?? createStore(resolveDbPath(config));
   // リスク状態は実際の発注先の mode ごとに分ける (paper の基準で live の kill switch を誤作動させない)
-  const risk = new RiskManager(config.risk, store, { mode: brokerSet.mode });
+  auditSink = (e) => store.audit(e);
+  // GMO の実効レバレッジの基準は GMO 口座の評価額。エンジンが渡す評価額は全発注先の合計なので、live で GMO 以外の
+  // 発注先 (dex・synthetic は発注しないので除く) を併用しているときは GMO の新規エントリーを拒否させる
+  const gmoOtherOrderVenues = brokerVenues(venues, env.CCXT_EXCHANGE)
+    .split(",")
+    .filter((v) => v && v !== "gmo" && !v.startsWith("dex") && v !== "synthetic");
+  const risk = new RiskManager(config.risk, store, {
+    mode: brokerSet.mode,
+    gmoMaxEffectiveLeverage: env.GMO_MAX_EFFECTIVE_LEVERAGE,
+    ...(venues.includes("gmo") && gmoOtherOrderVenues.length ? { gmoOtherOrderVenues } : {}),
+  });
   const ai = opts.ai === null ? undefined : (opts.ai ?? (config.ai.enabled ? { apiKey: config.ai.apiKey, model: config.ai.model } : undefined));
   // 学習状態は実際の発注先の mode ごとに分ける (paper の理想的な約定で学んだ内容を live に持ち込まない)。
   // 初回起動時に旧キー (mode なし) から移行する: paper はコピー、live は初期状態から (src/learning/migration.ts)

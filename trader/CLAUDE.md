@@ -17,6 +17,8 @@
 - `npm run status`: 設定と現在の状態を表示
 - `npm run trader -- resume`: キルスイッチ・日次停止を解除 (監査ログに記録。動作中のエンジンにも次のティックで反映)
 - `npm run trader -- orders` (`orders list`): 保留中・状態不明の注文を一覧
+- `npm run trader -- regime --symbol BTC/JPY --hours 3 [--tf 1m,15m,1h,4h] [--step <分>]`: 各時刻の相場の状態 (レジーム) を運用と同じ detectRegime で表示 (確定足だけ。スプレッドは 0 扱い。VENUES に gmo があれば GMOコインの足)
+- `npm run trader -- gmo check`: GMOコインの API の応答の形を確かめる (公開 API と、`GMO_API_KEY` があれば読み取り専用の非公開 API。**注文・取消は呼ばない**。キーは表示しない)。live に切り替える前に必ず実行する
 - `npm run trader -- orders resolve <clientId> --none | --filled --qty <数量> --price <価格>`: 状態不明の注文を手動で確定する。escalated 以外は `--force` 必須。`--none` で取消に失敗したら保留のまま
 
 ## 3. 安全ガードレール (厳守)
@@ -38,22 +40,32 @@
    - 値動きの予想 (`forecast.ts`) によるエントリーサイズの倍率はパラメータの変更ではない。consensus を除いた基礎モデルで、同じ時刻・同じ資産クラスの予想を 1 観測にまとめ、12 グループの多重検定 (Bonferroni) で補正した有意性 (入る z ≥ 2.638、出る z < 2.138、判定済み 100 件以上) を満たしたときだけ 0.7〜1.2 倍で効く。結果は RiskManager の上限 (`MAX_SIZE_MULTIPLIER` = 1.5) の範囲内に収まる。満たさない間は常に 1.0。リスク判定は迂回しない。
 8. **学習状態は mode 別キー**: 腕・パラメータ・調整履歴・情報源の信頼度・ニュースの答え合わせ・予想・仮想トレードの kv は `<名前空間>:<mode>:...` (信頼度は `intel:sourceReliability:<mode>`)。paper の学習を live に持ち込まない。旧キー (mode なし) は paper にだけ初回起動時に引き継ぐ (`migration.ts`)。live は初期状態から始める。
 9. **仮想トレードの重みと停止中の扱い**: 見送ったシグナルの結果は腕の配分に重み 0.25 (腕を止める判定には使わず、止まった腕の回復判定にだけ使う)。ニュースの答え合わせは 1 記事あたり合計 0.3 (時間 × 資産の数で割る)。取引による信頼度の更新は (情報源, 記事) ごとに 1 回。停止中 (`HALT_SHADOW_REASONS`) に記録した仮想トレードは学習に使わない。戦略がコストで見送ったシグナル (`strategy_filter:*`、`StrategyContext.onFiltered`) は観測専用で、保存だけして腕・情報の効き具合には使わない。
+   - 観測専用の戦略 (`OBSERVE_ONLY_STRATEGIES`、既定 `scalp_rebound`、空文字で無効) は新規エントリーを発注せず、仮想トレード (`observe_only`) としてだけ記録する (RiskManager・腕の乱数に触れない。判定は腕・計画の判定より前で、戦略の対象レジームと低流動性の停止は守る)。`observe_only` は通常の見送りと同じく腕の配分に重み 0.25 で入り、腕を止める判定には使わない。
 10. **腕の停止と回復**: 止めるのは実取引だけの統計で、件数 ≥ 30 かつ「縮小推定の平均 + 2.5·SE < 0」のとき。止まった腕も戦略は評価し、仮想トレード (`arm_disabled`) を記録して、回復の推定が 0 を越えたら戻す (`allocator.ts`)。
 11. **ダッシュボードの書き込みはリスク設定だけ**: `/api/risk-settings` (kv `risk:limits:<mode>`)。CSRF トークン・Origin 確認・ループバック待ち受け (それ以外は `DASHBOARD_WRITE_TOKEN`) が必須。live でリスクを上げる変更は確認語が必要。範囲は `config.ts` の `RISK_SETTING_SPECS` が唯一の定義。
-12. **空売りの再現は paper だけ** (`PAPER_SIMULATE_SHORT`、既定 true。`src/core/short.ts`): live では空売りしない。
+12. **空売りの再現は paper だけ** (`PAPER_SIMULATE_SHORT`、既定 true。`src/core/short.ts`): `allowShort=false` の銘柄は live では空売りしない (GMOコインのレバレッジ銘柄は `allowShort=true` なので live でも売りから建てられる。13 を参照)。
    - `allowShort` (取引所の仕様) は書き換えない。paper かつ有効のとき、`allowShort=false` の `crypto` (meme・DEX は対象外) に `simulatedShort: true` を付ける (`setup.ts`)。
    - 実効の空売り可否は必ず `canShort(inst, mode)` で判定する (戦略 `common.ts` は `ctx.mode`、RiskManager、PaperBroker、planner)。live・バックテスト・mode 不明では `allowShort` だけ。
    - PaperBroker は負の建玉で約定し、建玉代金を余力から拘束、買い戻し時に借入コスト (建玉代金 × `PAPER_SHORT_BORROW_RATE_DAILY` × 日数) を手数料に計上 (decimal)。
    - 取引・仮想トレードは `simulatedShort: true` を付け、腕は `<戦略>|<レジーム>|<資産クラス>|short` で学習する (買いと取引所で可能な売りは従来のキー)。ParamTuner・振り返り・情報源の信頼度・情報の効き具合・予想の applied からは除外。
    - report / simulate / ダッシュボードは「買い」「売り」「空売り (paper 再現)」に分け、live で実際にできる成績 (再現の空売りを除く) を明示する。
 
+13. **GMOコイン** (venue `gmo`。取引所のレバレッジ取引、銘柄 `GMO_SYMBOLS`):
+   - reduceOnly は必ず `/v1/closeBulkOrder` に送る。反対側の建玉があるとき・建玉を照会できないときの新規は送らない (両建て防止)。POST は再試行しない。protectiveStop は付けない。
+   - GMO の建玉の合計 (絶対値の円換算) は評価額 × `GMO_MAX_EFFECTIVE_LEVERAGE` (既定 1、0.1〜2) までに RiskManager が抑える (既存の判定より緩めない)。
+   - paper と仮想トレードでは、建玉代金 × `meta.holdingFeeDaily` (`GMO_LEVERAGE_FEE_DAILY`、既定 0.0004) × 日本時間 6:00 をまたいだ回数を手数料に計上する (`src/core/holdingFee.ts`)。
+   - live で VENUES に GMO 以外の発注先 (dex・synthetic を除く) があるときは、GMO の新規エントリーを拒否する (評価額が全口座の合計で、GMO 単独の上限にならないため)。
+   - 建玉・注文の照会は形が想定と違えば例外。新規の前に positionSummary・openPositions・activeOrders を確認し (反対建玉・反対方向の新規注文があれば送らない)、銘柄ごとに直列化する。POST は `allowPost: true` のクライアント (GmoBroker が assertLive の後に作る) だけ。
+   - レバレッジ銘柄の足が取れないときの現物の足への切り替えは、paper では許可 (監査ログ `gmo.spot_candles`)、live では `GMO_ALLOW_SPOT_CANDLES=true` のときだけ。
+   - API の仕様は公式資料と未照合 (要確認の項目は `gmo check` が表示する)。応答の形が想定と違えば例外 (fail-closed)。
+
 ## 4. 構成
 - `src/core/`: 型の契約 (`types.ts`)、設定、decimal、HTTP リトライ、Claude 呼び出し (`ai.ts`。構造化出力、拒否時はサーバー側フォールバック、キー未設定時はルールベース)
 - `src/indicators/`, `src/regime/`: 指標・リサンプル・相場環境の判定
-- `src/strategies/`: 10 戦略 (scalp 4 / short 3 / mid / long / meme)。パラメータの標準名は stopAtr, tpAtr, trailAtr, entryThreshold, maxHoldBars
+- `src/strategies/`: 11 戦略 (scalp 5 / short 3 / mid / long / meme)。scalp_rebound は 15m の下降トレンド中の 1m の反発を買う (買いのみ・crypto。既定で観測専用)。パラメータの標準名は stopAtr, tpAtr, trailAtr, entryThreshold, maxHoldBars
 - `src/backtest/`: イベント駆動バックテスト、`evaluateParams`、`walkForward`、合成データ
-- `src/market/`: feed (ccxt / OANDA / Alpaca / DexScreener / synthetic) と MarketHub
-- `src/execution/`: PaperBroker、実口座アダプター、router
+- `src/market/`: feed (ccxt / GMOコイン / OANDA / Alpaca / DexScreener / synthetic) と MarketHub。GMO は `src/market/gmo/` (client・klines・check) と `feeds/gmo.ts`
+- `src/execution/`: PaperBroker、実口座アダプター (ccxt / GMO `gmoBroker.ts` / OANDA / Alpaca)、router
 - `src/risk/`: RiskManager (実効の上限 = .env + ダッシュボードの上書き。`settings.ts`)
 - `src/intel/`: 情報源 → 分析 (Claude) → 資産別バイアス → 戦略計画
 - `src/learning/`: 次の部品で構成する
@@ -68,7 +80,7 @@
   - `forecast.ts`: 銘柄ごとの値動きの予想 (15m / 1h / 4h)・答え合わせ・オンライン学習。有意なときだけエントリーサイズの倍率を返す。kv `forecast:*:<mode>`
   - `migration.ts`: 学習状態の mode 分離の移行 (旧キー → `<mode>` 付きキー。paper はコピー、live は初期状態。フラグ kv `migration:learningModeSplit:<mode>`)
 - `src/storage/`: Store (node:sqlite / memory)
-- `src/engine/`, `src/cli.ts`, `src/dashboard/`: 統合・CLI・ダッシュボード (閲覧 + リスク設定)
+- `src/engine/`, `src/cli.ts`, `src/dashboard/`: 統合・CLI・ダッシュボード (閲覧 + リスク設定)。`regimeReport.ts` は regime コマンド
 
 ## 5. 既定モデル
 Claude API は `claude-opus-5-5` (`ANTHROPIC_MODEL` で変更可)。

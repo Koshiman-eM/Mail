@@ -2,6 +2,7 @@ import { D, floorToStep, roundToStep, Decimal } from "../core/decimal";
 import { TerminalMap, isTerminalOrder } from "../core/sweep";
 import { createLogger } from "../core/logger";
 import { canShort, DEFAULT_SHORT_BORROW_RATE_DAILY } from "../core/short";
+import { holdingFeeDailyOf, jstCutoffCrossings } from "../core/holdingFee";
 import {
   systemClock, type Balance, type Broker, type BrokerPosition, type Clock, type Fill, type Instrument, type OrderRequest, type OrderResult, type Quote,
 } from "../core/types";
@@ -25,7 +26,8 @@ export interface PaperBrokerOptions {
   quoteProvider?: (symbol: string) => Quote | undefined;
   /**
    * 空売りを再現する銘柄 (simulatedShort。allowShort=false の現物) の借入コストの日率 (既定 0.0004 = 0.04%/日)。
-   * 建玉代金 (平均建値 × 数量) × 日率 × 経過日数 (日割り) を、買い戻しの約定の手数料に加えて計上する
+   * 建玉代金 (平均建値 × 数量) × 日率 × 経過日数 (日割り) を、買い戻しの約定の手数料に加えて計上する。
+   * meta.holdingFeeDaily がある銘柄 (GMO) は代わりにその日率で、日本時間 6:00 をまたいだ回数分を計上する (src/core/holdingFee.ts)
    */
   shortBorrowRateDaily?: number;
 }
@@ -35,11 +37,14 @@ interface Pos {
   avg: Decimal;
   openedAt: number;
   /**
-   * 再現した空売り (allowShort=false の銘柄の負の建玉) の借入コストの計算の起点 (この時刻までの分は borrowAccrued に積んだ)。
-   * 取引所で空売りできる銘柄 (FX・株) と買いの建玉には付けない (従来の会計のまま)
+   * 建玉の保有コストの計算の起点 (この時刻までの分は borrowAccrued に積んだ)。対象は次の 2 つ:
+   * - 再現した空売り (allowShort=false の銘柄の負の建玉) の借入コスト (日数比例)
+   * - instrument.meta.holdingFeeDaily がある銘柄 (GMOコインのレバレッジ取引) の買い・売り両方の建玉の持ち越し手数料
+   *   (日本時間 6:00 をまたいだ回数 × 建玉代金 × 日率)
+   * それ以外 (取引所で空売りできる FX・株、現物の買い) には付けない (従来の会計のまま)
    */
   borrowFrom?: number;
-  /** borrowFrom までに積んだ未払いの借入コスト (クオート通貨建て) */
+  /** borrowFrom までに積んだ未払いの保有コスト (クオート通貨建て) */
   borrowAccrued?: Decimal;
 }
 
@@ -111,11 +116,18 @@ export class PaperBroker implements Broker {
     return canShort(inst, this.mode);
   }
 
-  /** 再現した空売りの、now までの未払いの借入コスト (クオート通貨建て)。対象外の建玉は 0 */
+  /**
+   * now までの未払いの保有コスト (クオート通貨建て)。対象外の建玉は 0。
+   * - 持ち越し手数料のある銘柄 (meta.holdingFeeDaily): 建玉代金 × 日率 × 日本時間 6:00 をまたいだ回数
+   * - 再現した空売り: 建玉代金 × PAPER_SHORT_BORROW_RATE_DAILY × 経過日数 (日割り)
+   */
   private borrowOwed(p: Pos, inst: Instrument, now: number): Decimal {
     if (p.borrowFrom === undefined) return D(0);
+    const notional = p.avg.mul(p.qty.abs()).mul(this.cs(inst));
+    const holding = holdingFeeDailyOf(inst);
+    if (holding !== undefined) return (p.borrowAccrued ?? D(0)).plus(notional.mul(holding).mul(jstCutoffCrossings(p.borrowFrom, now)));
     const days = D(Math.max(0, now - p.borrowFrom)).div(DAY_MS);
-    return (p.borrowAccrued ?? D(0)).plus(p.avg.mul(p.qty.abs()).mul(this.cs(inst)).mul(this.borrowRate).mul(days));
+    return (p.borrowAccrued ?? D(0)).plus(notional.mul(this.borrowRate).mul(days));
   }
 
   addInstrument(i: Instrument): void {
@@ -329,10 +341,12 @@ export class PaperBroker implements Broker {
     const now = this.clock.now();
     const cs = this.cs(inst);
     let realizedQuote = D(0);
-    /** 再現した空売りの借入コスト (買い戻した分。クオート通貨建て) */
+    /** 保有コスト (決済した分。クオート通貨建て) */
     let borrowFee = D(0);
-    // 取引所で空売りできない銘柄の負の建玉 (= paper で再現した空売り) だけ借入コストを積む
-    const simulated = (q: Decimal) => q.isNegative() && !inst.allowShort;
+    // 保有コストを積む建玉: 持ち越し手数料のある銘柄 (GMO) は買い・売りとも、それ以外は
+    // 取引所で空売りできない銘柄の負の建玉 (= paper で再現した空売り) だけ
+    const holding = holdingFeeDailyOf(inst) !== undefined;
+    const simulated = (q: Decimal) => (holding ? !q.isZero() : q.isNegative() && !inst.allowShort);
 
     if (!pos || cur.isZero() || cur.isPositive() === signed.isPositive()) {
       const newQty = cur.plus(signed);

@@ -10,6 +10,7 @@ import { loadConfig, type AppConfig } from "./core/config";
 import type { Store, TradeRecord } from "./core/types";
 import { isLoopbackHost, startDashboard, type DashboardServer } from "./dashboard/server";
 import { formatBacktestRows, runBacktestCommand } from "./engine/backtestCommand";
+import { DEFAULT_REGIME_TIMEFRAMES, runRegimeCommand } from "./engine/regimeReport";
 import { createFxConverter, quoteCurrencyOfSymbol } from "./engine/fx";
 import {
   equityStats, EXIT_REASON_LABEL, exitFxRates, exitReasonCounts, fmtNum, fmtPct, fmtSigned, fmtTime, isSimulatedShortTrade, liveExecutableTrades,
@@ -18,19 +19,22 @@ import {
 import { D } from "./core/decimal";
 import { peekResolveRequests, PendingOrders, requestResolve, type PendingOrder, type ResolveRequest } from "./engine/orders";
 import { acquireEngineLock, releaseEngineLock, startEngineLockHeartbeat, type LockOwner } from "./engine/lock";
-import { buildRuntime, resolveDbPath } from "./engine/setup";
+import { buildRuntime, parseVenues, resolveDbPath } from "./engine/setup";
 import { formatSimulationReport, runSimulation } from "./engine/simulate";
 import { createDefaultSources, IntelService } from "./intel/service";
 import { TradeJournal } from "./learning/journal";
 import { LearningService } from "./learning/service";
 import { CcxtFeed } from "./market/feeds/ccxt";
+import { GmoFeed } from "./market/feeds/gmo";
+import { runGmoCheck } from "./market/gmo/check";
+import { parseGmoSymbols } from "./market/gmo/client";
 import { RiskManager } from "./risk/manager";
 import { requestResume } from "./risk/resumeRequest";
 import { riskOverrideLines } from "./risk/settings";
 import { createStore } from "./storage";
 import { ReadOnlyOverlayStore } from "./storage/readonly";
 import { getStrategy } from "./strategies/registry";
-import type { ExitReason, Timeframe } from "./core/types";
+import { TIMEFRAME_MS, type ExitReason, type Timeframe } from "./core/types";
 
 // ───────── 引数解析 ─────────
 
@@ -151,6 +155,30 @@ export function parseBacktestArgs(flags: ParsedArgs["flags"]): BacktestArgs {
   };
 }
 
+export interface RegimeArgs {
+  symbol: string;
+  hours: number;
+  timeframes: Timeframe[];
+  stepMin: number;
+}
+
+export function parseRegimeArgs(flags: ParsedArgs["flags"]): RegimeArgs {
+  const symbol = stringFlag(flags, "symbol", "");
+  if (!symbol) throw new CliError("--symbol <銘柄> を指定してください (例: BTC/JPY)");
+  const tfs = stringFlag(flags, "tf", DEFAULT_REGIME_TIMEFRAMES.join(","))
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
+  for (const t of tfs) if (!(t in TIMEFRAME_MS) || t === "1s") throw new CliError(`--tf に未対応の時間足があります: ${t} (${Object.keys(TIMEFRAME_MS).filter((k) => k !== "1s").join(", ")})`);
+  if (tfs.length === 0) throw new CliError("--tf に時間足を指定してください");
+  return {
+    symbol,
+    hours: numberFlag(flags, "hours", 3, { min: 0.1, max: 168 }),
+    timeframes: [...new Set(tfs)] as Timeframe[],
+    stepMin: numberFlag(flags, "step", 5, { min: 1, max: 1440 }),
+  };
+}
+
 // ───────── 出力 ─────────
 
 export interface Io {
@@ -168,6 +196,8 @@ export const HELP = `自己学習型マルチアセット自動売買ツール
                               合成データ + 仮想時計で高速にペーパー運転 (ネット不要)
   backtest --strategy <ID|all> [--symbol SYM] [--days 30] [--source synthetic|ccxt] [--seed 1]
                               バックテスト (ccxt は CCXT_EXCHANGE の履歴を取得)
+  regime --symbol SYM [--hours 3] [--tf 1m,15m,1h,4h] [--step 5]
+                              各時刻の相場の状態 (レジーム) を運用と同じ判定で表示 (ccxt の履歴。先読みなし)
   intel                       情報収集を 1 回実行してブリーフを表示
   report                      評価額・戦略別成績・学習の状態を表示 (DB_PATH)
   resume                      キルスイッチ・日次停止を解除 (監査ログに記録)
@@ -180,6 +210,8 @@ export const HELP = `自己学習型マルチアセット自動売買ツール
                               動作中のエンジンは次のティックで、停止中なら次回の起動時に適用します (監査ログに記録)
                               状態不明 (escalated) でない注文には --force が必要です。
                               --none で取消に失敗した場合は確定せず、建玉の照会で確定させます
+  gmo check                   GMOコインの API の応答の形を確かめる (公開 API と、キーがあれば読み取り専用の非公開 API。
+                              注文・取消は呼びません。キーは表示しません)
 
 実弾 (live) は TRADING_MODE=live と LIVE_TRADING_CONFIRM=I_UNDERSTAND_REAL_MONEY_RISK の両方が必要です。`;
 
@@ -391,6 +423,24 @@ async function cmdBacktest(flags: ParsedArgs["flags"], io: Io): Promise<number> 
   io.out(`バックテスト: ${symbol} / ${a.days} 日 / ${a.source === "synthetic" ? `合成データ (シード ${a.seed})` : `ccxt ${config.env.CCXT_EXCHANGE}`}`);
   io.out(formatBacktestRows(rows));
   io.out("※ 損益はクオート通貨建て (初期評価額 1,000,000)。期間の前にウォームアップ用の足を付けています。");
+  return 0;
+}
+
+async function cmdRegime(flags: ParsedArgs["flags"], io: Io): Promise<number> {
+  const a = parseRegimeArgs(flags);
+  const config = loadConfig();
+  // 運用中と同じ取引所の足で判定する (VENUES に gmo があれば GMOコイン、無ければ ccxt の CCXT_EXCHANGE)
+  let useGmo = false;
+  try {
+    useGmo = parseVenues(config.env.VENUES).includes("gmo");
+  } catch {
+    /* VENUES が不正なら ccxt を使う */
+  }
+  const feed = useGmo
+    ? new GmoFeed({ symbols: parseGmoSymbols(config.env.GMO_SYMBOLS), holdingFeeDaily: config.env.GMO_LEVERAGE_FEE_DAILY, allowSpotCandles: true })
+    : CcxtFeed.create(config.env.CCXT_EXCHANGE);
+  io.out(useGmo ? "GMOコインから履歴を取得します..." : `ccxt (${config.env.CCXT_EXCHANGE}) から履歴を取得します...`);
+  io.out(await runRegimeCommand({ feed, symbol: a.symbol, hours: a.hours, timeframes: a.timeframes, stepMin: a.stepMin }));
   return 0;
 }
 
@@ -716,6 +766,17 @@ function cmdStatus(io: Io): number {
   }
 }
 
+/** `gmo check`: GMOコインの API の応答の形を確かめる (GET だけ。注文・取消は呼ばない) */
+async function cmdGmo(positionals: string[], io: Io): Promise<number> {
+  const [sub, ...rest] = positionals;
+  if (sub !== "check" || rest.length > 0) throw new CliError(`使い方: npm run trader -- gmo check (未知の引数: ${positionals.join(" ") || "(なし)"})`);
+  const config = loadConfig();
+  return runGmoCheck({
+    env: { GMO_API_KEY: config.env.GMO_API_KEY, GMO_API_SECRET: config.env.GMO_API_SECRET, GMO_SYMBOLS: config.env.GMO_SYMBOLS },
+    out: (s) => io.out(s),
+  });
+}
+
 export async function main(argv: string[] = process.argv.slice(2), io: Io = consoleIo): Promise<number> {
   let args: ParsedArgs;
   try {
@@ -724,7 +785,7 @@ export async function main(argv: string[] = process.argv.slice(2), io: Io = cons
       io.out(HELP);
       return 0;
     }
-    if (args.command !== "orders" && args.positionals.length > 0) {
+    if (args.command !== "orders" && args.command !== "gmo" && args.positionals.length > 0) {
       throw new CliError(`余分な引数があります: ${args.positionals.join(" ")} (${args.command} は位置引数を取りません)`);
     }
     switch (args.command) {
@@ -734,6 +795,8 @@ export async function main(argv: string[] = process.argv.slice(2), io: Io = cons
         return await cmdSimulate(args.flags, io);
       case "backtest":
         return await cmdBacktest(args.flags, io);
+      case "regime":
+        return await cmdRegime(args.flags, io);
       case "intel":
         return await cmdIntel(io);
       case "report":
@@ -744,6 +807,8 @@ export async function main(argv: string[] = process.argv.slice(2), io: Io = cons
         return cmdStatus(io);
       case "orders":
         return cmdOrders(args.positionals, args.flags, io);
+      case "gmo":
+        return await cmdGmo(args.positionals, io);
       default:
         io.err(`未知のコマンド: ${args.command}\n`);
         io.out(HELP);

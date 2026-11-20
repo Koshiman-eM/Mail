@@ -25,7 +25,7 @@
                         ↓
  ┌───────────── 売買ループ (5 秒ごと) ──────────────┐
  │ 市場データ → 相場環境 (トレンド/レンジ/高ボラ/低流動性) │
- │ → 戦略 10 種がシグナル → 学習済みの配分倍率を適用  │
+ │ → 戦略 11 種がシグナル → 学習済みの配分倍率を適用  │
  │ → 値動きの予想 (15m/1h/4h) が統計的に有意なときだけ │
  │   エントリーサイズを 0.7〜1.2 倍                  │
  │ → リスク管理 (コスト比・サイズ・上限・停止判定)   │
@@ -57,9 +57,11 @@
 | | `scalp_vwap_revert` | VWAP からの乖離の逆張り (レンジ相場向け) |
 | | `scalp_momentum_burst` | 出来高急増を伴う直近高値・安値のブレイク |
 | | `scalp_micro` | 5〜10 分で利確・損切りする超短期のモメンタム (成行。コストの条件を満たすときだけ) |
+| | `scalp_rebound` | 15 分足が下降トレンドのときの、1 分足の売られ過ぎからの反発を買う (買いのみ。**既定で観測専用**) |
 
 `scalp_micro` がコストの条件 (利確幅・損切り幅・期待値) で見送ったシグナルは、「見るだけ」の仮想トレード (理由 `strategy_filter:cost` / `:spread` / `:edge`) として記録します。発注・リスク判定・腕の学習には使いません。
-`npm run report` の「超短期 (scalp_micro) の答え合わせ」の表は、見送り理由ごとの利確到達率と、値動きがランダムなときの勝率 p0 を並べます。利確到達率が p0 を安定して上回るなら、値動きに優位性があります。
+`scalp_rebound` は既定で観測専用 (`OBSERVE_ONLY_STRATEGIES=scalp_rebound`) です。シグナルは発注せず、仮想トレード (理由 `observe_only`) としてだけ記録します。効果を確かめてから `OBSERVE_ONLY_STRATEGIES=` (空) にすると実際に取引します。
+`npm run report` の「超短期 (scalp_micro / scalp_rebound) の答え合わせ」の表は、戦略・見送り理由ごとの利確到達率と、値動きがランダムなときの勝率 p0 を並べます。利確到達率が p0 を安定して上回るなら、値動きに優位性があります。
 平均R (コスト前) が正でも平均純R が負なら、手数料が利益を上回っています。件数が少ないうちは偶然の影響が大きいので判断しないでください。
 | 短期 (15 分〜1 時間足) | `short_ema_trend` | EMA9/21 + ADX、押し目でエントリー |
 | | `short_rsi_revert` | RSI + ボリンジャーバンドの逆張り |
@@ -203,10 +205,21 @@ npm run trader -- orders resolve <clientId> --filled --qty <数量> --price <価
 | VENUES の値 | 対象 | 必要な設定 |
 |---|---|---|
 | `synthetic` | 合成データ (デモ・動作確認用) | なし |
-| `ccxt` | 暗号資産取引所 (bitFlyer, bitbank, Coincheck, GMO コイン, Binance 等、ccxt 対応の取引所) | `CCXT_EXCHANGE`。発注には `CCXT_API_KEY` / `CCXT_SECRET` |
+| `gmo` | GMOコイン (取引所のレバレッジ取引。価格の取得と発注) | `GMO_SYMBOLS` (既定 `BTC_JPY,ETH_JPY,XRP_JPY`)。発注には `GMO_API_KEY` / `GMO_API_SECRET` |
+| `ccxt` | 暗号資産取引所 (bitFlyer, bitbank, Coincheck, Binance 等、ccxt 対応の取引所) | `CCXT_EXCHANGE`。発注には `CCXT_API_KEY` / `CCXT_SECRET` |
 | `oanda` | FX (OANDA v20) | `OANDA_API_TOKEN`, `OANDA_ACCOUNT_ID`, `OANDA_ENV=practice` |
 | `alpaca` | 米国株 (Alpaca) | `ALPACA_KEY_ID`, `ALPACA_SECRET_KEY`, `ALPACA_PAPER=true` |
 | `dex` | DEX 上のミームコイン (DexScreener)。価格の監視とペーパー売買のみ | `WATCHLIST=dex\|solana:<ペアアドレス>\|meme` |
+
+### GMOコイン (`VENUES=gmo`)
+
+手数料が低く (成行 0.05% 前後、銘柄により異なる。値は API から取得)、レバレッジ取引で live でも売りから建てられます。
+- 設定例: `VENUES=gmo`、`GMO_SYMBOLS=BTC_JPY`。キーは `.env.local` に `GMO_API_KEY` / `GMO_API_SECRET` (live と `gmo check` だけで使用)。
+- `GMO_LEVERAGE_FEE_DAILY` (既定 0.0004 = 0.04%/日): 日本時間 6:00 をまたいで建玉を持つと、paper と仮想トレードでこの率の手数料を計上します。
+- `GMO_MAX_EFFECTIVE_LEVERAGE` (既定 1): 建玉の合計を口座の評価額の何倍までにするか。1 なら借りて大きく張ることはしません (レバレッジは売りから建てるためだけに使う)。
+- 決済は必ず決済専用の注文 (`closeBulkOrder`) で行い、反対側の建玉 (両建て) は作りません。
+- live では、GMOコインと他の発注先 (ccxt・OANDA など) を同時に使うと、GMOコインの新規の取引を止めます (建玉の上限を GMOコインの口座だけで計算できないため)。
+- **live に切り替える前に `npm run trader -- gmo check` を実行してください。** 注文は出さずに API の応答の形を確かめ、想定と違う項目を表示します (この API 対応は公式資料と照合できていない項目があるため)。
 
 ### 取引所 (ccxt) の選び方
 

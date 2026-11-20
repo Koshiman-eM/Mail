@@ -652,6 +652,8 @@ export interface ShadowTradeRecord {
   simulatedShort?: boolean;
   /** 空売りの借入コストの日率 (simulatedShort のときだけ。記録時の PAPER_SHORT_BORROW_RATE_DAILY) */
   borrowRateDaily?: number;
+  /** 建玉の持ち越し手数料の日率 (meta.holdingFeeDaily がある銘柄 = GMO のとき。買い・売りとも。src/core/holdingFee.ts) */
+  holdingFeeDaily?: number;
 }
 
 export interface ShadowTradeFilter {

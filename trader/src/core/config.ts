@@ -115,11 +115,18 @@ const str = (def = "") =>
     .optional()
     .transform((v) => (v === undefined ? def : v.trim()));
 
+/** カンマ区切りの id の一覧 (前後の空白・空要素・重複を除く)。未設定は def、空文字は [] */
+const idList = (def: string) =>
+  str(def).transform((v) => [...new Set(v.split(",").map((x) => x.trim()).filter(Boolean))]);
+
+/** 観測専用 (発注せず仮想トレードだけ記録する) 戦略の既定値 */
+export const DEFAULT_OBSERVE_ONLY_STRATEGIES = "scalp_rebound";
+
 const EnvSchema = z.object({
   NODE_ENV: str("development"),
   TRADING_MODE: str("paper"),
   LIVE_TRADING_CONFIRM: str(),
-  /** 使う取引先 (カンマ区切り): synthetic, ccxt, oanda, alpaca, dex */
+  /** 使う取引先 (カンマ区切り): synthetic, ccxt, gmo, oanda, alpaca, dex */
   VENUES: str("synthetic"),
   /** 監視銘柄 (カンマ区切り、"venue|symbol|assetClass")。空なら既定のデモ銘柄 */
   WATCHLIST: str(),
@@ -147,6 +154,30 @@ const EnvSchema = z.object({
   CCXT_API_KEY: str(),
   CCXT_SECRET: str(),
   CCXT_PASSWORD: str(),
+  // GMOコイン (取引所 レバレッジ取引)。キーは live の発注と `gmo check` の非公開 API (読み取り) だけに使う
+  GMO_API_KEY: str(),
+  GMO_API_SECRET: str(),
+  /** 使うレバレッジ銘柄 (GMO の表記、カンマ区切り)。WATCHLIST に gmo の銘柄があればそちらを優先 */
+  GMO_SYMBOLS: str("BTC_JPY,ETH_JPY,XRP_JPY"),
+  /**
+   * 建玉の持ち越し手数料 (レバレッジ手数料) の日率 (0〜0.01)。既定 0.0004 (0.04%/日、要確認)。
+   * paper で、日本時間 6:00 をまたいで保有した回数 × 建玉代金 × 日率を手数料に計上する
+   */
+  GMO_LEVERAGE_FEE_DAILY: num(0.0004).refine((x) => x >= 0 && x <= 0.01, {
+    message: "GMO_LEVERAGE_FEE_DAILY は 0 以上 0.01 以下の日率で指定してください (0.04%/日なら 0.0004)",
+  }),
+  /**
+   * GMO の建玉の合計 (絶対値の口座通貨換算) の上限 (評価額の倍率、0.1〜2)。既定 1 (レバレッジを掛けない)。
+   * 超える新規エントリーは RiskManager が拒否する (GMO 自体は 2 倍まで建てられる)
+   */
+  GMO_MAX_EFFECTIVE_LEVERAGE: num(1).refine((x) => x >= 0.1 && x <= 2, {
+    message: "GMO_MAX_EFFECTIVE_LEVERAGE は 0.1 以上 2 以下で指定してください (評価額の何倍まで建てるか)",
+  }),
+  /**
+   * レバレッジ銘柄の足が取れないとき、現物銘柄 (BTC など) の足に切り替えてよいか (既定 false)。
+   * paper では常に許可 (警告と監査ログ gmo.spot_candles を残す)。live ではこれが true のときだけ許可し、false なら例外
+   */
+  GMO_ALLOW_SPOT_CANDLES: bool("GMO_ALLOW_SPOT_CANDLES", false),
   // FX (OANDA v20)
   OANDA_API_TOKEN: str(),
   OANDA_ACCOUNT_ID: str(),
@@ -173,6 +204,11 @@ const EnvSchema = z.object({
   MAX_EXPOSURE_FX: riskEnv("maxExposureFx"),
   MAX_EXPOSURE_STOCK: riskEnv("maxExposureStock"),
   MEME_MIN_LIQUIDITY_USD: num(250_000),
+  /**
+   * 観測専用の戦略 id (カンマ区切り)。評価とシグナルの生成は通常どおり行うが、新規エントリーは発注せず
+   * 仮想トレード (reason "observe_only") としてだけ記録する。既定は scalp_rebound。空文字なら観測専用なし
+   */
+  OBSERVE_ONLY_STRATEGIES: idList(DEFAULT_OBSERVE_ONLY_STRATEGIES),
 
   // ループ間隔
   SCALP_LOOP_MS: num(5_000),

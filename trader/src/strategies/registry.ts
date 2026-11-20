@@ -1,6 +1,7 @@
 import type { AssetClass, Horizon, Strategy } from "../core/types";
 import { scalpMomentumBurst, scalpObi, scalpVwapRevert } from "./scalp";
 import { scalpMicro } from "./scalpMicro";
+import { scalpRebound } from "./scalpRebound";
 import { shortBreakout, shortEmaTrend, shortRsiRevert } from "./short";
 import { midTrendFollow } from "./mid";
 import { longMomentum } from "./long";
@@ -12,6 +13,7 @@ export const ALL_STRATEGIES: readonly Strategy[] = [
   scalpVwapRevert,
   scalpMomentumBurst,
   scalpMicro,
+  scalpRebound,
   shortEmaTrend,
   shortRsiRevert,
   shortBreakout,

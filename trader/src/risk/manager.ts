@@ -123,6 +123,11 @@ export function exposureByClass(
  */
 export const MAX_SIZE_MULTIPLIER = 1.5;
 
+/** GMOコインの建玉の合計の上限 (評価額の倍率) の既定値 (GMO_MAX_EFFECTIVE_LEVERAGE の既定と同じ) */
+export const DEFAULT_GMO_MAX_EFFECTIVE_LEVERAGE = 1;
+/** GMOコインの venue 名 (src/market/feeds/gmo.ts の GMO_VENUE と同じ) */
+const GMO_VENUE = "gmo";
+
 /**
  * ダッシュボードの上書き値 (kv `risk:limits:<mode>`) を読み直す間隔 (ms)。
  * 評価のたびに kv を読まないための短いキャッシュ。エンジンは毎ティックの onEquity で必ず読み直すので、
@@ -144,6 +149,13 @@ export class RiskManager {
    */
   readonly tradeMode?: TradingMode;
   private limitsCache?: { at: number; limits: RiskLimits; updatedAt: number };
+  /** GMO の建玉の合計 (絶対値の口座通貨換算) の上限 (評価額の倍率) */
+  private readonly gmoMaxLeverage: number = DEFAULT_GMO_MAX_EFFECTIVE_LEVERAGE;
+  /**
+   * GMO 以外の発注先 (live で併用しているもの)。エンジンが渡す評価額は全発注先の合計で、GMO 口座の評価額 (actualProfitLoss) を
+   * 基準にできないので、空でなければ live の GMO の新規エントリーを拒否する
+   */
+  private readonly gmoOtherOrderVenues: readonly string[] = [];
 
   /**
    * 状態は kv `risk:state:<mode>` に保存する (既定 paper)。paper は旧キー `risk:state` からも引き継ぐ。
@@ -156,10 +168,16 @@ export class RiskManager {
   constructor(
     private readonly envLimits: RiskLimits,
     private readonly store?: Store,
-    keyOrOpts: string | { mode?: TradingMode; overrideCacheMs?: number } = {},
+    keyOrOpts: string | { mode?: TradingMode; overrideCacheMs?: number; gmoMaxEffectiveLeverage?: number; gmoOtherOrderVenues?: readonly string[] } = {},
   ) {
     let saved: InternalState | undefined;
     this.overrideCacheMs = RISK_OVERRIDE_CACHE_MS;
+    if (typeof keyOrOpts === "object") {
+      const lev = keyOrOpts.gmoMaxEffectiveLeverage;
+      // 不正な値 (非有限・0 以下) は既定値 (1 倍) を使う。上限 2 倍は config の検証と同じ
+      if (lev !== undefined && Number.isFinite(lev) && lev > 0) this.gmoMaxLeverage = Math.min(lev, 2);
+      if (keyOrOpts.gmoOtherOrderVenues?.length) this.gmoOtherOrderVenues = [...keyOrOpts.gmoOtherOrderVenues];
+    }
     if (typeof keyOrOpts === "string") {
       this.key = keyOrOpts;
       saved = store?.kvGet<InternalState>(this.key);
@@ -427,6 +445,43 @@ export class RiskManager {
     if (!classRoom.isFinite()) return { ok: false, reason: `${inst.assetClass} のエクスポージャー上限の余地が計算できないため拒否` };
     if (classRoom.lte(0)) return { ok: false, reason: `${inst.assetClass} のエクスポージャー上限に到達` };
     cap(`${inst.assetClass} エクスポージャー上限`, classRoom.div(perUnitNotional));
+
+    // GMOコイン: 建玉の合計 (絶対値の口座通貨換算) が評価額 × GMO_MAX_EFFECTIVE_LEVERAGE を超えないようにする。
+    // 評価額は GMO 口座の評価額 (actualProfitLoss) を前提とする: live は GMO 単独のときだけ通す (上の gmoOtherOrderVenues)。
+    // paper は単一の PaperBroker の評価額 (全銘柄の合計) を使う
+    // (GMO は証拠金の 2 倍まで建てられるが、このツールでは既定 1 倍まで。上の判定に追加で効く = 緩めない)
+    if (inst.venue === GMO_VENUE) {
+      if (this.tradeMode === "live" && this.gmoOtherOrderVenues.length) {
+        return {
+          ok: false,
+          reason: `VENUES に GMO 以外の発注先 (${this.gmoOtherOrderVenues.join(", ")}) があり、GMO 口座の評価額で実効レバレッジを確認できないため拒否 (live の GMO は単独で使ってください)`,
+        };
+      }
+      let gmoExposure = D(0);
+      for (const x of open) {
+        const xi = x.symbol === inst.symbol ? inst : lookup(p.instruments, x.symbol);
+        if (!xi) return { ok: false, reason: `取引先の分からない建玉 (${x.symbol}) があるため GMO の実効レバレッジを確認できず拒否` };
+        if (xi.venue !== GMO_VENUE) continue;
+        const px = x.price ?? p.prices?.[x.symbol] ?? x.avgPrice;
+        let rate = NaN;
+        try {
+          rate = xi.quoteCurrency ? toAcct(xi.quoteCurrency) : 1;
+        } catch {
+          rate = NaN;
+        }
+        const xcs = x.contractSize ?? xi.contractSize ?? 1;
+        if (!finiteNum(x.qty) || !finiteNum(px) || !(px >= 0) || !finiteNum(rate) || !(rate > 0) || !finiteNum(xcs) || !(xcs > 0)) {
+          return { ok: false, reason: `GMO の建玉額が計算できないため拒否 (${x.symbol})` };
+        }
+        gmoExposure = gmoExposure.plus(D(Math.abs(x.qty)).mul(px).mul(xcs).mul(rate));
+      }
+      const levRoom = D(equity).mul(this.gmoMaxLeverage).minus(gmoExposure);
+      if (!levRoom.isFinite()) return { ok: false, reason: "GMO の実効レバレッジの余地が計算できないため拒否" };
+      if (levRoom.lte(0)) {
+        return { ok: false, reason: `GMO の建玉の合計が評価額の ${this.gmoMaxLeverage} 倍 (実効レバレッジの上限) に達しているため拒否` };
+      }
+      cap(`GMO の実効レバレッジ上限 (評価額の ${this.gmoMaxLeverage} 倍)`, levRoom.div(perUnitNotional));
+    }
 
     if (!(available > 0)) return { ok: false, reason: "余力がありません" };
     cap("余力", D(available).div(perUnitNotional));

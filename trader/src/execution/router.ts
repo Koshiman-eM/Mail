@@ -3,6 +3,7 @@ import type { AppConfig } from "../core/config";
 import type { Broker, Clock, Instrument, Quote } from "../core/types";
 import { AlpacaBroker } from "./alpacaBroker";
 import { CcxtBroker, type CcxtTradeLike } from "./ccxtBroker";
+import { GmoBroker } from "./gmoBroker";
 import { OandaBroker } from "./oandaBroker";
 import { PaperBroker, type PaperBrokerOptions } from "./paper";
 
@@ -87,6 +88,18 @@ export function createBrokers(config: AppConfig, instruments: Instrument[], deps
           instruments: instruments.filter((i) => i.venue === v),
           ...(quoteProvider ? { quoteProvider } : {}),
           ...(toAccount ? { toAccount } : {}),
+        }),
+      );
+    } else if (v === "gmo") {
+      if (!env.GMO_API_KEY || !env.GMO_API_SECRET) throw new Error("gmo: GMO_API_KEY / GMO_API_SECRET が未設定です");
+      brokers.set(
+        v,
+        new GmoBroker({
+          ...guard,
+          // POST を許可したクライアントは GmoBroker が assertLive の後に作る (ここでは渡さない)
+          clientOptions: { apiKey: env.GMO_API_KEY, apiSecret: env.GMO_API_SECRET, ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}) },
+          instruments: instruments.filter((i) => i.venue === v),
+          accountCurrency: "JPY",
         }),
       );
     } else if (v === "oanda") {

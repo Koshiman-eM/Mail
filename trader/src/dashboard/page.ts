@@ -1759,12 +1759,12 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     h += "<h2>BY REASON · 見送り理由ごと</h2>" + '<div class="scroll">' + table(["見送り理由"].concat(heads), shadowRows(sh.byReason || []), numc) + "</div>";
     h += "<h2>BY STRATEGY · 戦略ごと</h2>" + '<div class="scroll">' + table(["戦略"].concat(heads), shadowRows(sh.byStrategy || []), numc) + "</div>";
     if ((sh.micro || []).some(function (g) { return g.n > 0; })) {
-      var MICRO_LBL = { 'strategy_filter:cost': 'コストで見送り', 'strategy_filter:spread': 'スプレッドで見送り', 'strategy_filter:edge': '期待値で見送り' };
-      h += '<h2>MICRO · 超短期 (scalp_micro) の答え合わせ</h2><div class="scroll">' + table(['見送り理由', '件数', '利確到達率', 'ランダム時の勝率 p0', '平均R (コスト前)', '平均純R'], sh.micro.map(function (g) {
-        return [esc(MICRO_LBL[g.key] || g.key), esc(g.n), esc(pct(g.tpRate, 1)), esc(pct(g.p0, 1)),
+      var MICRO_LBL = { 'strategy_filter:cost': 'コストで見送り', 'strategy_filter:spread': 'スプレッドで見送り', 'strategy_filter:edge': '期待値で見送り', 'observe_only': '観測専用' };
+      h += '<h2>MICRO · 超短期 (scalp_micro / scalp_rebound) の答え合わせ</h2><div class="scroll">' + table(['戦略', '見送り理由', '件数', '利確到達率', 'ランダム時の勝率 p0', '平均R (コスト前)', '平均純R'], sh.micro.map(function (g) {
+        return [esc(g.strategyId || '-'), esc(MICRO_LBL[g.key] || g.key), esc(g.n), esc(pct(g.tpRate, 1)), esc(pct(g.p0, 1)),
           '<span class="' + cls(g.avgGrossR) + '">' + esc(signed(g.avgGrossR, 3)) + '</span>', '<span class="' + cls(g.avgNetR) + '">' + esc(signed(g.avgNetR, 3)) + '</span>'];
-      }), [false, true, true, true, true, true]) + '</div>';
-      h += '<p class="note">利確到達率が p0 を安定して上回るなら、値動きに優位性があります。平均R (コスト前) が正でも平均純R が負なら、手数料が利益を上回っています。見るだけの記録で、腕の学習・発注には使いません。</p>';
+      }), [false, false, true, true, true, true, true]) + '</div>';
+      h += '<p class="note">利確到達率が p0 を安定して上回るなら、値動きに優位性があります。平均R (コスト前) が正でも平均純R が負なら、手数料が利益を上回っています。どれも発注していない記録です (コストで見送ったものは腕の学習にも使いません)。</p>';
     }
     h += '<p class="note">純R = 往復手数料・スプレッド・約定ずれ (片道 2bps) を差し引いた R。平均純R が正の見送り理由はフィルターが厳しすぎる可能性があります (設定は自動では変えません)。</p>';
     set("shadow", h);

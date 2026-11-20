@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { LIVE_CONFIRM_PHRASE, loadConfig, resolveMode } from "../src/core/config";
+import { DEFAULT_OBSERVE_ONLY_STRATEGIES, LIVE_CONFIRM_PHRASE, loadConfig, resolveMode } from "../src/core/config";
 import { D, floorToStep } from "../src/core/decimal";
 
 describe("安全ガード: 実弾モード", () => {
@@ -67,5 +67,19 @@ describe("リスク値の範囲検証", () => {
   });
   it("数値でない値も止まる", () => {
     expect(() => loadConfig({ MAX_DRAWDOWN: "abc" })).toThrow(/MAX_DRAWDOWN/);
+  });
+});
+
+describe("OBSERVE_ONLY_STRATEGIES (観測専用の戦略)", () => {
+  it("未設定なら既定値 scalp_rebound", () => {
+    expect(loadConfig({}).env.OBSERVE_ONLY_STRATEGIES).toEqual(["scalp_rebound"]);
+    expect(DEFAULT_OBSERVE_ONLY_STRATEGIES).toBe("scalp_rebound");
+  });
+  it("空文字 (空白だけも) なら観測専用なし", () => {
+    expect(loadConfig({ OBSERVE_ONLY_STRATEGIES: "" }).env.OBSERVE_ONLY_STRATEGIES).toEqual([]);
+    expect(loadConfig({ OBSERVE_ONLY_STRATEGIES: "  " }).env.OBSERVE_ONLY_STRATEGIES).toEqual([]);
+  });
+  it("カンマ区切り。前後の空白・空要素・重複を除く", () => {
+    expect(loadConfig({ OBSERVE_ONLY_STRATEGIES: " scalp_rebound , scalp_micro,,scalp_rebound " }).env.OBSERVE_ONLY_STRATEGIES).toEqual(["scalp_rebound", "scalp_micro"]);
   });
 });

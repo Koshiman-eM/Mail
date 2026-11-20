@@ -191,7 +191,13 @@ export function liveEvents(store: Store, opts: { since?: number; limit: number }
       else if (typeof v === "string") data[k] = redactSecrets(v).slice(0, 120);
     }
     if (e.type === "engine.skip_summary" && e.data.reasons && typeof e.data.reasons === "object") {
-      const top = Object.entries(e.data.reasons as Record<string, { count?: number }>).slice(0, 3).map(([k, v]) => `${redactSecrets(k).slice(0, 40)}×${Number(v?.count) || 0}`);
+      // 実例 (数字入りの元の文字列) があればそれを表示する。無い古いログは集計キー (数字が # になっている) のまま
+      const samples = e.data.samples && typeof e.data.samples === "object" ? (e.data.samples as Record<string, unknown>) : {};
+      const top = Object.entries(e.data.reasons as Record<string, { count?: number }>).slice(0, 3).map(([k, v]) => {
+        const sample = samples[k];
+        const text = typeof sample === "string" && sample ? redactSecrets(sample).slice(0, 160) : redactSecrets(k).slice(0, 40);
+        return `${text}×${Number(v?.count) || 0}`;
+      });
       data.reason = top.join(" / ");
     }
     if (e.type === "engine.plan" && Array.isArray(e.data.activeSymbols)) data.active = e.data.activeSymbols.length;

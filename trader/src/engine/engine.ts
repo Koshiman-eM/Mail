@@ -1,5 +1,5 @@
 import type { AiOptions } from "../core/ai";
-import type { AppConfig } from "../core/config";
+import { DEFAULT_OBSERVE_ONLY_STRATEGIES, type AppConfig } from "../core/config";
 import { D, Decimal } from "../core/decimal";
 import { redactSecrets } from "../core/http";
 import { createLogger, type Logger } from "../core/logger";
@@ -335,6 +335,9 @@ const midOf = (q: Quote) => (q.bid + q.ask) / 2;
  * 売買エンジン。依存はすべて注入する。
  * tick(now) は 1 回分の処理で、テスト・シミュレーションから直接呼べる。start()/stop() は実時間のループ。
  */
+/** 見送り理由の実例 (sample) の最大文字数 */
+const SKIP_SAMPLE_MAX = 160;
+
 export class TradingEngine {
   readonly config: AppConfig;
   readonly store: Store;
@@ -363,6 +366,8 @@ export class TradingEngine {
   private readonly rng: () => number;
   private readonly dexFeed?: DexScreenerFeed;
   private readonly timeframes?: Timeframe[];
+  /** 観測専用の戦略 id (OBSERVE_ONLY_STRATEGIES)。新規エントリーは発注せず仮想トレード (reason "observe_only") としてだけ記録する */
+  private readonly observeOnly: ReadonlySet<string>;
   private readonly opt: Required<Omit<EngineOptions, "tickMs" | "intelEveryMs" | "learnEveryMs" | "shadow" | "newsEvalEveryMs" | "forecast">> & {
     tickMs: number;
     intelEveryMs: number;
@@ -418,6 +423,8 @@ export class TradingEngine {
     this.rng = deps.rng ?? Math.random;
     this.dexFeed = deps.dexFeed;
     this.timeframes = deps.timeframes;
+    // 手組みの設定 (テスト) で未設定なら config の既定値と同じ扱い
+    this.observeOnly = new Set(deps.config.env.OBSERVE_ONLY_STRATEGIES ?? DEFAULT_OBSERVE_ONLY_STRATEGIES.split(","));
     const env = deps.config.env;
     const o = deps.options ?? {};
     this.opt = {
@@ -1067,15 +1074,18 @@ export class TradingEngine {
     const s = this.skips.get(key);
     if (s) {
       s.count++;
-      if (sample) s.sample = sample;
-    } else this.skips.set(key, { count: 1, sample: sample ?? key });
+      if (sample) s.sample = sample.slice(0, SKIP_SAMPLE_MAX);
+    } else this.skips.set(key, { count: 1, sample: (sample ?? key).slice(0, SKIP_SAMPLE_MAX) });
   }
 
   /** 見送り理由の要約を監査ログへ */
   private flushSkips(now: number): void {
     if (this.skips.size > 0) {
       const summary = Object.fromEntries([...this.skips].sort((a, b) => b[1].count - a[1].count).map(([k, v]) => [k, v]));
-      this.store.audit({ ts: now, type: "engine.skip_summary", data: { since: this.lastSkipFlush ?? now, reasons: summary } });
+      // reasons は集計キー (数字は #) → { count, sample }。samples は数字入りの直近の実例 (キーと同じものは載せない)
+      const samples: Record<string, string> = {};
+      for (const [k, v] of this.skips) if (v.sample && v.sample !== k) samples[k] = v.sample.slice(0, SKIP_SAMPLE_MAX);
+      this.store.audit({ ts: now, type: "engine.skip_summary", data: { since: this.lastSkipFlush ?? now, reasons: summary, samples } });
       this.skips.clear();
     }
     this.lastSkipFlush = now;
@@ -1152,9 +1162,12 @@ export class TradingEngine {
     return typeof r === "number" && Number.isFinite(r) && r >= 0 ? r : DEFAULT_SHORT_BORROW_RATE_DAILY;
   }
 
-  /** 新規停止中など、戦略を評価しない経路でも仮想トレード用にだけ評価する (腕の乱数・評価回数には触れない) */
-  private shadowEvaluate(s: Strategy, inst: Instrument, view: MarketView, ctx: TickCtx, key: string): void {
-    if (!this.shadow) return;
+  /**
+   * 新規停止中など、戦略を評価しない経路でも仮想トレード用にだけ評価する (腕の乱数・評価回数には触れない)。
+   * 戻り値は戦略が返したシグナル (評価に失敗・仮想トレードが無効なら null)
+   */
+  private shadowEvaluate(s: Strategy, inst: Instrument, view: MarketView, ctx: TickCtx, key: string): Signal | null {
+    if (!this.shadow) return null;
     try {
       const regime = this.regimeFor(view, s.primaryTimeframe, ctx);
       const intel = this.intelFor(inst, ctx);
@@ -1167,8 +1180,10 @@ export class TradingEngine {
       if (signal) this.rememberSignal(inst.symbol, signal, ctx.now);
       if (signal && signal.direction !== "flat") this.shadowRecord(key, inst, view, s, signal, regime, ctx.now);
       for (const f of filtered) if (f.signal.direction !== "flat") this.shadowRecord(`strategy_filter:${f.reason}`, inst, view, s, f.signal, regime, ctx.now);
+      return signal;
     } catch (e) {
       this.warnThrottled("shadow.evaluate", ctx.now, "仮想トレード用の戦略評価に失敗 (取引は継続)", { strategyId: s.id, symbol: inst.symbol, error: errMsg(e) });
+      return null;
     }
   }
 
@@ -1459,6 +1474,19 @@ export class TradingEngine {
         continue;
       }
       const regime = this.regimeFor(view, s.primaryTimeframe, ctx);
+      if (!pos && this.observeOnly.has(s.id)) {
+        // 観測専用 (OBSERVE_ONLY_STRATEGIES): 評価とシグナルの生成は通常どおり行い、新規エントリーは発注せず
+        // 仮想トレード (reason "observe_only") としてだけ記録する。candidates に入れないので発注・RiskManager には届かず、
+        // 腕の乱数 (armWeight) も引かない。
+        // 判定は腕・計画の判定 (gate) より前に置く: gate の後ろだと、腕が止まっているときは arm_disabled として
+        // (回復判定用に) 記録され、AI の計画で外れると plan_disabled で何も記録されず、観測が腕・計画の状態に左右されるため。
+        // 戦略自身の対象レジームと低流動性の停止だけは通常の経路 (ベースライン計画) と同じく守る (有効にしたら入るはずのシグナルだけを測る)。
+        // 保有中 (pos あり) は通常の経路のまま (観測専用にする前に建てた建玉の決済シグナルを止めない)
+        if (regime.label === "low_liquidity" || !s.regimes.includes(regime.label)) continue;
+        const sig = this.shadowEvaluate(s, inst, view, ctx, "observe_only");
+        if (sig && sig.direction !== "flat") this.skip("observe_only", `${sym} ${s.id}: 観測専用のため発注しません`);
+        continue;
+      }
       let gate: Gate | undefined;
       let armWeight = 1;
       // paper で空売りを再現する銘柄か (live では常に false。src/core/short.ts)

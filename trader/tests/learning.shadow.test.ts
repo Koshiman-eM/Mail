@@ -409,7 +409,7 @@ describe("scalp_micro の答え合わせの集計と表示", () => {
     expect(total.p0).toBeCloseTo((1 / 3 + 1 / 2) / 2, 9);
     expect(summarizeShadowTrades([{ ...recs[0], strategyId: "other" }]).micro).toBeUndefined();
     const text = renderShadow(s);
-    expect(text).toContain("超短期 (scalp_micro) の答え合わせ");
+    expect(text).toContain("超短期 (scalp_micro / scalp_rebound) の答え合わせ");
     expect(text).toContain("コストで見送り");
     expect(text).toContain("期待値で見送り");
     expect(text).toContain("合計");
