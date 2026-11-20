@@ -1691,16 +1691,25 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     }
     set("plan", h || '<p class="empty">計画はまだありません</p>');
   }
+  // 残り時間 (分) を「59日3時間」「21時間3分」「12分」の形にする (期限を過ぎたら「期限切れ」)
+  function remain(min) {
+    if (min == null || !isFinite(min)) return "-";
+    if (min <= 0) return "期限切れ";
+    var m = Math.floor(min), d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60), mm = m % 60;
+    if (d > 0) return d + "日" + h + "時間";
+    if (h > 0) return h + "時間" + mm + "分";
+    return Math.max(1, mm) + "分";
+  }
   function renderPositions(s) {
     var ccy = s.baseCurrency;
-    // 読みの管理: 読みの期限 (延長中は上限の時刻も)・残り分 (延長中は上限まで)・状態 (監視中 / 延長中)・現在の純 R
-    set("positions", table(["銘柄", "戦略", "方向", "数量", "建値", "現在値", "ストップ", "利確", "含み損益(" + ccy + ")", "建玉時刻", "読みの期限", "残り分", "状態", "現在のR"], s.positions.map(function (x) {
+    // 読みの管理: 読みの期限 (延長中は上限の時刻も)・残り時間 (延長中は上限まで)・状態 (監視中 / 延長中)・現在の純 R
+    set("positions", table(["銘柄", "戦略", "方向", "数量", "建値", "現在値", "ストップ", "利確", "含み損益(" + ccy + ")", "建玉時刻", "読みの期限", "残り", "状態", "現在のR"], s.positions.map(function (x) {
       var u = x.unrealizedPnlAccount != null ? x.unrealizedPnlAccount : x.unrealizedPnl;
       var th = x.thesis;
       return [esc(x.symbol), esc(x.strategyId), esc(DIR[x.direction]), esc(num(x.qty)), esc(num(x.entryPrice)), esc(num(x.lastPrice)), esc(num(x.stop)),
         esc(x.takeProfit != null ? num(x.takeProfit) : "-"), '<span class="' + cls(u) + '">' + esc(signed(u, 0)) + "</span>", esc(time(x.entryTs)),
         th ? esc(time(th.deadlineTs)) + (th.state === "extended" ? '<br><span class="muted">上限 ' + esc(time(th.capTs)) + "</span>" : "") : "-",
-        th ? esc(num(th.remainingMin, 1)) : "-",
+        th ? esc(remain(th.remainingMin)) : "-",
         th ? (th.state === "extended" ? '<span class="pos">延長中</span>' : "監視中") : "-",
         th && th.netR != null ? '<span class="' + cls(th.netR) + '">' + esc(signed(th.netR, 2)) + "</span>" : "-"];
     }), [false, false, false, true, true, true, true, true, true, false, false, true, false, true]));
