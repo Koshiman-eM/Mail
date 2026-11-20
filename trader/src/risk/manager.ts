@@ -3,6 +3,7 @@ import { createLogger } from "../core/logger";
 import { canShort } from "../core/short";
 import { sweepOld } from "../core/sweep";
 import { normalizeReason } from "../engine/context";
+import { clampTempo, relaxToward } from "../engine/tempo";
 import type { AssetClass, Instrument, PositionView, Quote, RiskDecision, RiskLimits, RiskState, Signal, Store, TradingMode } from "../core/types";
 import { effectiveRiskLimits } from "./settings";
 
@@ -45,6 +46,48 @@ export interface EntryParams {
   prices?: Record<string, number>;
   /** クオート通貨 -> 口座通貨 (既定 1) */
   toAccount?: (ccy: string) => number;
+  /**
+   * テンポ (0〜1。`src/engine/tempo.ts`)。省略時は従来のコスト比の判定そのまま。
+   * 渡すとテンポのモードになり、コスト比の判定だけを変える (tempoEdgeRequirement)。ほかの判定は変えない
+   */
+  tempo?: number;
+  /**
+   * 探索を許すか (テンポのモードのときだけ意味を持つ。paper、または live で TEMPO_ALLOW_LIVE_EXPLORE=true のときエンジンが true にする)。
+   * true なら edgeIsNet のシグナルの「期待値 > 0」を外し、下限を tempo × cost だけ下げる (tempoEdgeRequirement)。
+   * 控除前の期待値のシグナル (edgeIsNet なし) には影響しない。tempo が無ければ無視する
+   */
+  tempoExplore?: boolean;
+}
+
+/** テンポのモードで minEdgeToCostRatio を緩める下限の既定値 (RiskLimits.tempoMinEdgeToCost) */
+export const DEFAULT_TEMPO_MIN_EDGE_TO_COST = 1;
+
+/**
+ * テンポのモードのコスト比の要件。
+ * - 比率 ratioEff = relaxToward(minEdgeToCostRatio, 下限, tempo)。下限 = max(1, tempoMinEdgeToCost (既定 1))。
+ *   設定が下限より低ければ設定のまま。
+ * - edgeIsNet (期待値がコスト控除後) のシグナル: expectedEdgeBps ≥ max(0, ratioEff - 1) × cost かつ > 0
+ *   (控除前に直すと「控除前 ≥ ratioEff × cost」で、コストを二重に数えない)。
+ *   explore (探索を許す) なら expectedEdgeBps ≥ max(0, ratioEff - 1) × cost - clamp(tempo) × cost で、「> 0」は外す
+ *   (戦略の tempoNetEdgeFloor と同じ幅だけ下げる。期待値 0 以下の探索のシグナルを通す。サイズはエンジンが絞る)。
+ * - それ以外: expectedEdgeBps ≥ ratioEff × cost (explore でも同じ。比率の下限 ≥ 1 なので期待値は 0 以上が必要なまま)。
+ */
+export function tempoEdgeRequirement(
+  limits: Pick<RiskLimits, "minEdgeToCostRatio" | "tempoMinEdgeToCost">,
+  tempo: number,
+  cost: number,
+  edgeIsNet: boolean,
+  explore = false,
+): { ratio: number; minEdgeBps: number; requirePositive: boolean } {
+  const t = limits.tempoMinEdgeToCost;
+  const floor = t !== undefined && Number.isFinite(t) ? Math.max(DEFAULT_TEMPO_MIN_EDGE_TO_COST, t) : DEFAULT_TEMPO_MIN_EDGE_TO_COST;
+  const ratio = relaxToward(limits.minEdgeToCostRatio, floor, tempo);
+  if (edgeIsNet) {
+    const base = Math.max(0, ratio - 1) * cost;
+    if (explore) return { ratio, minEdgeBps: base - clampTempo(tempo) * cost, requirePositive: false };
+    return { ratio, minEdgeBps: base, requirePositive: true };
+  }
+  return { ratio, minEdgeBps: ratio * cost, requirePositive: false };
 }
 
 type InternalState = RiskState & { dayKey?: string };
@@ -363,10 +406,38 @@ export class RiskManager {
 
     // コスト比
     const cost = costBps(inst, quote);
-    if (signal.expectedEdgeBps < L.minEdgeToCostRatio * cost) {
-      return { ok: false, reason: `期待値幅 ${signal.expectedEdgeBps.toFixed(1)}bps < コスト ${cost.toFixed(1)}bps × ${L.minEdgeToCostRatio}` };
+    if (p.tempo === undefined) {
+      if (signal.expectedEdgeBps < L.minEdgeToCostRatio * cost) {
+        return { ok: false, reason: `期待値幅 ${signal.expectedEdgeBps.toFixed(1)}bps < コスト ${cost.toFixed(1)}bps × ${L.minEdgeToCostRatio}` };
+      }
+      notes.push(`edge ${signal.expectedEdgeBps.toFixed(1)}bps / cost ${cost.toFixed(1)}bps`);
+    } else {
+      // テンポのモード: 比率を下限まで緩める。コスト控除後の期待値のシグナルはコストを二重に数えない (比率 - 1)。
+      // NaN の期待値は通さない (fail-closed)
+      // 探索 (tempoExplore) はコスト控除後の期待値のシグナルにだけ効き、「> 0」を外して下限を tempo × cost 下げる
+      const t = clampTempo(p.tempo);
+      const net = signal.edgeIsNet === true;
+      const explore = net && p.tempoExplore === true;
+      const req = tempoEdgeRequirement(L, t, cost, net, explore);
+      const edge = signal.expectedEdgeBps;
+      const tag = `テンポ ${t.toFixed(2)}${explore ? " (探索)" : ""}`;
+      if (net) {
+        if (req.requirePositive && !(edge > 0)) {
+          return { ok: false, reason: `${tag}: 期待値 (コスト控除後) ${edge.toFixed(1)}bps が 0 以下` };
+        }
+        if (!(edge >= req.minEdgeBps)) {
+          return {
+            ok: false,
+            reason: explore
+              ? `${tag}: 期待値 (コスト控除後) ${edge.toFixed(1)}bps < コスト ${cost.toFixed(1)}bps × (${req.ratio.toFixed(2)} - 1 - ${t.toFixed(2)})`
+              : `${tag}: 期待値 (コスト控除後) ${edge.toFixed(1)}bps < コスト ${cost.toFixed(1)}bps × (${req.ratio.toFixed(2)} - 1)`,
+          };
+        }
+      } else if (!(edge >= req.minEdgeBps)) {
+        return { ok: false, reason: `${tag}: 期待値幅 ${edge.toFixed(1)}bps < コスト ${cost.toFixed(1)}bps × ${req.ratio.toFixed(2)}` };
+      }
+      notes.push(`edge ${edge.toFixed(1)}bps${net ? " (net)" : ""} / cost ${cost.toFixed(1)}bps / ${tag} (比率 ${req.ratio.toFixed(2)})`);
     }
-    notes.push(`edge ${signal.expectedEdgeBps.toFixed(1)}bps / cost ${cost.toFixed(1)}bps`);
 
     // サイジング
     const entry = signal.entry.type === "limit" && signal.entry.price ? signal.entry.price : isLong ? quote.ask : quote.bid;

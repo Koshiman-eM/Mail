@@ -1,11 +1,12 @@
-/** CLI の backtest コマンド (合成データ or ccxt の履歴で runBacktest) */
+/** CLI の backtest コマンド (合成データ・ccxt・GMOコインの履歴で runBacktest) */
 import { generateCandles, syntheticInstrument } from "../backtest/synthetic";
 import { runBacktest } from "../backtest/engine";
-import type { BacktestMetrics } from "../backtest/types";
+import type { BacktestMetrics, BacktestOptions } from "../backtest/types";
 import { TIMEFRAME_MS, type Candle, type Instrument, type MarketDataFeed, type Strategy, type Timeframe } from "../core/types";
 import { mergeCandles } from "../market/candles";
 import { ALL_STRATEGIES, getStrategy } from "../strategies/registry";
 import { fmtNum, fmtPct, formatTable } from "./report";
+import { isHoldLimitedHorizon } from "./tempo";
 
 const DAY = 86_400_000;
 /** 合成データの開始時刻 (再現性のため固定) */
@@ -16,17 +17,24 @@ export interface BacktestCommandOptions {
   strategy: string;
   symbol?: string;
   days: number;
-  source: "synthetic" | "ccxt";
+  source: BacktestSource;
   seed: number;
   /** 期待値幅 / コストの下限 (実運用の MIN_EDGE_TO_COST に合わせる) */
   minEdgeToCostRatio?: number;
   riskPerTrade?: number;
   maxPositionPct?: number;
-  /** ccxt のときの feed (CcxtFeed.create(CCXT_EXCHANGE) など) */
+  /** ccxt / gmo のときの feed (CcxtFeed.create(CCXT_EXCHANGE)、GmoFeed など) */
   feed?: MarketDataFeed;
   now?: number;
   /** 戦略一覧の差し替え (テスト用) */
   strategies?: readonly Strategy[];
+  /** 指値 (maker) の前提 (実運用の LIMIT_ENTRY / LIMIT_TAKE_PROFIT / LIMIT_ENTRY_TIMEOUT_MS に合わせる。省略時は従来の成行) */
+  limitOrders?: BacktestOptions["limitOrders"];
+  /**
+   * 最大保有 (分。実運用の MAX_HOLD_MINUTES に合わせる。0・省略で無効)。中期・長期以外の戦略はシグナルの最大保有を縮める。
+   * 中期・長期は縮めずに計算し、運用では新規エントリーしない旨を備考に出す
+   */
+  maxHoldMinutes?: number;
 }
 
 export interface BacktestRow {
@@ -72,21 +80,72 @@ export async function fetchCandlesPaged(
   return out;
 }
 
-export async function runBacktestCommand(o: BacktestCommandOptions): Promise<BacktestRow[]> {
-  const all = o.strategies ?? ALL_STRATEGIES;
-  const selected = o.strategy === "all" ? [...all] : [all.find((s) => s.id === o.strategy) ?? getStrategy(o.strategy)].filter((s): s is Strategy => Boolean(s));
-  if (selected.length === 0) throw new Error(`未知の戦略: ${o.strategy} (${all.map((s) => s.id).join(", ")}, all)`);
+/** 足の取得元。synthetic 以外は o.feed (ccxt は CcxtFeed、gmo は GmoFeed) から履歴を取る */
+export type BacktestSource = "synthetic" | "ccxt" | "gmo";
+
+export interface BacktestData {
+  base: Timeframe;
+  candles: Candle[];
+  instrument: Instrument;
+  /** この時刻以降の足からトレードする (それより前はウォームアップ) */
+  tradeFromTs: number;
+}
+
+/** 取得元ごとの共有状態 (同じ基準足の履歴を戦略ごとに取り直さない) */
+export interface BacktestDataLoader {
+  load(s: Strategy, leadBars?: number): Promise<BacktestData>;
+}
+
+/**
+ * バックテスト用の足を用意する。期間 days の前に主時間足で (leadBars ?? warmup + 50) 本分のウォームアップを付ける。
+ * synthetic は固定の開始時刻から生成 (シード固定)、ccxt / gmo は feed から [until - 期間 - ウォームアップ, until) をページングで取得する。
+ */
+export async function createBacktestDataLoader(o: Pick<BacktestCommandOptions, "symbol" | "days" | "source" | "seed" | "feed" | "now">): Promise<BacktestDataLoader> {
   if (!(o.days > 0)) throw new Error("--days は正の数を指定してください");
   const periodMs = o.days * DAY;
   const now = o.now ?? Date.now();
   const cache = new Map<string, Candle[]>();
-  let ccxtInst: Instrument | undefined;
-  if (o.source === "ccxt") {
-    if (!o.feed) throw new Error("ccxt の feed がありません");
-    const sym = o.symbol ?? "BTC/USDT";
-    ccxtInst = (await o.feed.listInstruments()).find((i) => i.symbol === sym);
-    if (!ccxtInst) throw new Error(`取引所に銘柄がありません: ${sym}`);
+  let feedInst: Instrument | undefined;
+  if (o.source !== "synthetic") {
+    if (!o.feed) throw new Error(`${o.source} の feed がありません`);
+    const sym = o.symbol ?? (o.source === "gmo" ? "BTC/JPY" : "BTC/USDT");
+    feedInst = (await o.feed.listInstruments()).find((i) => i.symbol === sym);
+    if (!feedInst) throw new Error(`取引所に銘柄がありません: ${sym}`);
   }
+  return {
+    async load(s: Strategy, leadBars?: number): Promise<BacktestData> {
+      const base = baseTimeframeOf(s);
+      const warmupMs = (leadBars ?? s.warmup + 50) * TIMEFRAME_MS[s.primaryTimeframe];
+      const baseMs = TIMEFRAME_MS[base];
+      if (o.source === "synthetic") {
+        const bars = Math.ceil((warmupMs + periodMs) / baseMs);
+        const key = `syn|${base}|${bars}`;
+        const candles = cache.get(key) ?? generateCandles({ seed: o.seed, bars, timeframe: base, vol: syntheticVolFor(base), startTs: BACKTEST_SYNTHETIC_START });
+        cache.set(key, candles);
+        const cls = s.assetClasses.includes("crypto") ? "crypto" : s.assetClasses[0];
+        const instrument = syntheticInstrument({
+          symbol: o.symbol ?? "SYN/USDT",
+          assetClass: cls,
+          ...(cls === "meme" ? { allowShort: false, meta: { liquidityUsd: 1_000_000 } } : {}),
+        });
+        return { base, candles, instrument, tradeFromTs: BACKTEST_SYNTHETIC_START + warmupMs };
+      }
+      const until = Math.floor(now / baseMs) * baseMs;
+      const from = until - periodMs - warmupMs;
+      const key = `${o.source}|${base}|${from}`;
+      const candles = cache.get(key) ?? (await fetchCandlesPaged(o.feed!, feedInst!.symbol, base, from, until));
+      cache.set(key, candles);
+      return { base, candles, instrument: feedInst!, tradeFromTs: until - periodMs };
+    },
+  };
+}
+
+export async function runBacktestCommand(o: BacktestCommandOptions): Promise<BacktestRow[]> {
+  const all = o.strategies ?? ALL_STRATEGIES;
+  const selected = o.strategy === "all" ? [...all] : [all.find((s) => s.id === o.strategy) ?? getStrategy(o.strategy)].filter((s): s is Strategy => Boolean(s));
+  if (selected.length === 0) throw new Error(`未知の戦略: ${o.strategy} (${all.map((s) => s.id).join(", ")}, all)`);
+  const loader = await createBacktestDataLoader(o);
+  const holdOn = o.maxHoldMinutes !== undefined && Number.isFinite(o.maxHoldMinutes) && o.maxHoldMinutes > 0;
 
   const rows: BacktestRow[] = [];
   for (const s of selected) {
@@ -95,33 +154,7 @@ export async function runBacktestCommand(o: BacktestCommandOptions): Promise<Bac
       rows.push({ strategyId: s.id, horizon: s.horizon, baseTimeframe: base, bars: 0, note: "板情報が必要なため履歴バックテストの対象外" });
       continue;
     }
-    // 主時間足のウォームアップ分を期間の前に付ける
-    const warmupMs = (s.warmup + 50) * TIMEFRAME_MS[s.primaryTimeframe];
-    const baseMs = TIMEFRAME_MS[base];
-    let candles: Candle[];
-    let instrument: Instrument;
-    let tradeFromTs: number;
-    if (o.source === "synthetic") {
-      const bars = Math.ceil((warmupMs + periodMs) / baseMs);
-      const key = `syn|${base}|${bars}`;
-      candles = cache.get(key) ?? generateCandles({ seed: o.seed, bars, timeframe: base, vol: syntheticVolFor(base), startTs: BACKTEST_SYNTHETIC_START });
-      cache.set(key, candles);
-      const cls = s.assetClasses.includes("crypto") ? "crypto" : s.assetClasses[0];
-      instrument = syntheticInstrument({
-        symbol: o.symbol ?? "SYN/USDT",
-        assetClass: cls,
-        ...(cls === "meme" ? { allowShort: false, meta: { liquidityUsd: 1_000_000 } } : {}),
-      });
-      tradeFromTs = BACKTEST_SYNTHETIC_START + warmupMs;
-    } else {
-      const until = Math.floor(now / baseMs) * baseMs;
-      const from = until - periodMs - warmupMs;
-      const key = `ccxt|${base}`;
-      candles = cache.get(key) ?? (await fetchCandlesPaged(o.feed!, ccxtInst!.symbol, base, from, until));
-      cache.set(key, candles);
-      instrument = ccxtInst!;
-      tradeFromTs = until - periodMs;
-    }
+    const { candles, instrument, tradeFromTs } = await loader.load(s);
     if (candles.length === 0) {
       rows.push({ strategyId: s.id, horizon: s.horizon, baseTimeframe: base, bars: 0, note: "足を取得できませんでした" });
       continue;
@@ -135,14 +168,20 @@ export async function runBacktestCommand(o: BacktestCommandOptions): Promise<Bac
       ...(o.minEdgeToCostRatio !== undefined ? { minEdgeToCostRatio: o.minEdgeToCostRatio } : {}),
       ...(o.riskPerTrade !== undefined ? { riskPerTrade: o.riskPerTrade } : {}),
       ...(o.maxPositionPct !== undefined ? { maxPositionPct: o.maxPositionPct } : {}),
+      ...(o.limitOrders ? { limitOrders: o.limitOrders } : {}),
+      ...(holdOn && !isHoldLimitedHorizon(s.horizon) ? { maxHoldMinutes: o.maxHoldMinutes } : {}),
     });
+    const notes = [
+      ...(r.metrics.trades === 0 ? [r.stats.evaluations === 0 ? "ウォームアップ不足" : "シグナルなし"] : []),
+      ...(holdOn && isHoldLimitedHorizon(s.horizon) ? [`最大保有 ${o.maxHoldMinutes} 分のため運用では発注しない (仮想トレードのみ)`] : []),
+    ];
     rows.push({
       strategyId: s.id,
       horizon: s.horizon,
       baseTimeframe: base,
       bars: candles.length,
       metrics: r.metrics,
-      ...(r.metrics.trades === 0 ? { note: r.stats.evaluations === 0 ? "ウォームアップ不足" : "シグナルなし" } : {}),
+      ...(notes.length ? { note: notes.join(" / ") } : {}),
     });
   }
   return rows;

@@ -202,6 +202,8 @@ export class LearningService {
    * - 新規停止中 (halted / kill switch / 日次停止 / 状態不明の注文による一時停止) に記録したもの (isHaltShadowReason)
    * - 別の mode の仮想トレード
    * - 戦略がコストで見送ったシグナル (strategy_filter:*。測定専用, isObserveOnlyShadowReason)
+   * 観測専用の戦略 (observe_only)・最大保有の対象外の中期・長期 (hold_limit)・テンポの上限 (tempo_cap) は、
+   * 通常の見送り (lower_score など) と同じく腕を重み shadowWeight で更新する (腕を止める判定には使わない)。
    * 有効な腕では配分倍率にだけ効き、無効化中の腕では回復の判定にも使う (allocator)。
    * 計画の片側バイアスで止めたもの (reason "direction_bias") は、エントリー時の情報バイアス
    * (opts.intelSentiment。エンジンが記録時に覚えておく) があれば、情報の効き具合にも重み influenceShadowWeight で入れる

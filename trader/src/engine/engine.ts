@@ -35,8 +35,13 @@ import {
 import { runGrouped, withDeadline } from "./deadline";
 import { createFxConverter, fxApproxReason, normalizeCurrency, type FxConverter } from "./fx";
 import { createPriceAt, priceFromCandles } from "./learningHooks";
-import { peekResolveRequests, removeResolveRequests, type PendingEntry, type PendingOrder, type PendingStatus } from "./orders";
-import { DEFAULT_ORDER_POLICY, PositionManager, type EntryResult, type OrderPolicy } from "./positions";
+import {
+  peekResolveRequests, readLimitStats, removeResolveRequests, type LimitCancelReason, type LimitStats, type PendingEntry, type PendingLimit, type PendingOrder,
+  type PendingStatus,
+} from "./orders";
+import { DEFAULT_ORDER_POLICY, PositionManager, type EntryResult, type OrderPolicy, type SyncResult } from "./positions";
+import { clampMaxHoldMs, isHoldLimitedHorizon, TempoController, tempoSeedTimestamps, tempoStatusView, type TempoStatusView } from "./tempo";
+import { effectiveLimitTakeProfit } from "./limitOrders";
 
 export const PAPER_SNAPSHOT_KEY = "paper:snapshot";
 export const AUTO_MEME_KEY = "engine:autoMemeWatch";
@@ -196,6 +201,11 @@ interface TickCtx {
   entries: number;
   exits: number;
   evaluations: number;
+  /**
+   * テンポ (TARGET_ENTRIES_PER_HOUR > 0 のときだけ。ティックの初めに 1 回計算する)。
+   * level: 0〜1、explore: 探索を許すか (paper、または TEMPO_ALLOW_LIVE_EXPLORE)。無効なら undefined (従来どおり)
+   */
+  tempo?: { level: number; explore: boolean };
 }
 
 export interface PositionStatus {
@@ -266,6 +276,22 @@ export interface EngineStatus {
    * degradedReason: 取得の失敗が続いている (新規エントリー停止) / fxApprox: live で概算レート・古い為替を使っている通貨
    */
   account: { incomplete?: boolean; missing?: string[]; degradedReason?: string; fxApprox?: string[] };
+  /**
+   * エントリー頻度の目標 (テンポ)。enabled: TARGET_ENTRIES_PER_HOUR > 0 / target: 目標 (回/時) /
+   * entriesInWindow: 直近 1 時間のエントリー数 / tempo: 0〜1 / capped: 上限に到達して新規を止めている /
+   * minutesSinceLastEntry: 最後のエントリーからの経過 (分。無ければ null) / exploreAllowed: 探索を許すか
+   */
+  tempo?: TempoStatusView;
+  /** 新規エントリーの最大保有時間 (分。0 = 無効。MAX_HOLD_MINUTES) */
+  maxHoldMinutes?: number;
+  /** 指値 (maker) の利用状況: 設定・約定率の集計・待っている指値のエントリー・板に置いた利確の指値 */
+  limitOrders?: {
+    limitEntry: boolean;
+    limitTakeProfit: boolean;
+    stats: LimitStats;
+    pendingEntries: { symbol: string; clientId: string; price: number; expiresAt: number; cancelReason?: LimitCancelReason }[];
+    restingTakeProfits: { symbol: string; tradeId: string; price: number; qty: string; filledQty: string; status: string; exiting?: string }[];
+  };
 }
 
 /** ダッシュボード用: 直近の情報 (ブリーフの集計対象期間) の件数と見出し */
@@ -368,6 +394,14 @@ export class TradingEngine {
   private readonly timeframes?: Timeframe[];
   /** 観測専用の戦略 id (OBSERVE_ONLY_STRATEGIES)。新規エントリーは発注せず仮想トレード (reason "observe_only") としてだけ記録する */
   private readonly observeOnly: ReadonlySet<string>;
+  /** エントリー頻度の目標 (TARGET_ENTRIES_PER_HOUR > 0 のときだけ)。無ければテンポのモードではない (従来どおり) */
+  readonly tempo?: TempoController;
+  /** 探索を許すか (paper、または live で TEMPO_ALLOW_LIVE_EXPLORE=true)。テンポのモードのときだけ意味を持つ */
+  private readonly tempoExploreAllowed: boolean;
+  /** 探索のエントリーのサイズの倍率 (TEMPO_EXPLORE_SIZE) */
+  private readonly tempoExploreSize: number;
+  /** 新規エントリーの最大保有時間 (ms。MAX_HOLD_MINUTES > 0 のときだけ) */
+  private readonly maxHoldMs?: number;
   private readonly opt: Required<Omit<EngineOptions, "tickMs" | "intelEveryMs" | "learnEveryMs" | "shadow" | "newsEvalEveryMs" | "forecast">> & {
     tickMs: number;
     intelEveryMs: number;
@@ -426,6 +460,14 @@ export class TradingEngine {
     // 手組みの設定 (テスト) で未設定なら config の既定値と同じ扱い
     this.observeOnly = new Set(deps.config.env.OBSERVE_ONLY_STRATEGIES ?? DEFAULT_OBSERVE_ONLY_STRATEGIES.split(","));
     const env = deps.config.env;
+    // テンポと最大保有 (手組みの設定 (テスト) で未設定なら無効 = 従来どおり)
+    const target = env.TARGET_ENTRIES_PER_HOUR ?? 0;
+    if (Number.isFinite(target) && target > 0) this.tempo = new TempoController({ targetPerHour: target, capMultiplier: env.TEMPO_CAP_MULTIPLIER ?? 2 });
+    this.tempoExploreAllowed = deps.brokerSet.mode === "paper" || env.TEMPO_ALLOW_LIVE_EXPLORE === true;
+    const ex = env.TEMPO_EXPLORE_SIZE;
+    this.tempoExploreSize = ex !== undefined && Number.isFinite(ex) && ex > 0 && ex <= 1 ? ex : 0.5;
+    const mh = env.MAX_HOLD_MINUTES ?? 0;
+    if (Number.isFinite(mh) && mh > 0) this.maxHoldMs = Math.round(mh * 60_000);
     const o = deps.options ?? {};
     this.opt = {
       equityEveryMs: o.equityEveryMs ?? 60_000,
@@ -453,6 +495,8 @@ export class TradingEngine {
       brokerFor: (s) => this.brokerFor(s),
       onTradeClosed: (t) => this.onTradeClosed(t),
       onOrder: (now) => this.risk.recordOrder(now),
+      // 新しいポジションの登録はすべてここに来る (成行・指値の約定、一部約定、照会・手動の確定)。テンポのエントリーとして数える
+      onOpened: (_p, now) => this.tempo?.recordEntry(now),
       store: deps.store,
       logger: this.log,
       toAccount: (ccy) => this.fx.toAccount(ccy),
@@ -463,6 +507,9 @@ export class TradingEngine {
       onAnomaly: (reason, now) => this.onAnomaly(reason, now),
       onEscalated: (o, now) => this.onOrderEscalated(o, now),
       orderPolicy: { ...this.opt.orderPolicy, brokerTimeoutMs: this.opt.brokerTimeoutMs },
+      // 利確の指値の板置きは paper 専用 (live では LIMIT_TAKE_PROFIT=true でも置かない。起動時に警告する)。
+      // 手組みの設定 (テスト) で未設定なら config の既定値 (false) と同じ扱い
+      limitTakeProfit: effectiveLimitTakeProfit(env, deps.brokerSet.mode),
     });
     const { enabled: shadowEnabled, ...shadowOpts } = o.shadow ?? {};
     if (shadowEnabled !== false) {
@@ -603,9 +650,20 @@ export class TradingEngine {
         this.log.warn("ペーパー口座の復元に失敗", { error: errMsg(e) });
       }
     }
+    if (this.mode === "live" && this.config.env.LIMIT_TAKE_PROFIT === true) {
+      // 利確の指値の板置きは paper 専用。live では設定を無視する (起動ごとに 1 回だけ警告し、監査ログに残す)
+      this.log.warn("LIMIT_TAKE_PROFIT=true は live では無視します (利確の指値は板に置かず、エンジン側の成行で利確します)。paper 専用の設定です");
+      this.store.audit({ ts: now, type: "limit.tp_live_ignored", data: { mode: this.mode, LIMIT_TAKE_PROFIT: true } });
+    }
     if (this.config.env.AUTO_MEME_WATCH && this.dexFeed) await this.restoreAutoMeme();
     // エンジン停止中に書かれた解消の要求 (CLI `orders resolve`) を適用する
     await this.applyResolveRequests(now);
+    // 板に置いた利確の指値の約定を先に反映する (建玉の突き合わせで外部の決済と誤認しない)
+    try {
+      await this.positions.pollAllTakeProfits(now);
+    } catch (e) {
+      this.log.warn("利確の指値の照会に失敗", { error: errMsg(e) });
+    }
     try {
       const brokerPositions = await this.brokerPositions();
       const r = this.positions.reconcile(brokerPositions, now, { priceOf: (s) => this.priceOf(s), phase: "startup", confirmations: this.reconcileConfirmations() });
@@ -619,15 +677,42 @@ export class TradingEngine {
     } catch (e) {
       this.log.warn("建玉の突き合わせに失敗", { error: errMsg(e) });
     }
+    // 追跡していない建玉の利確の指値 (孤児) を取り消す
+    try {
+      const n = await this.positions.sweepTakeProfits(now);
+      if (n > 0) this.log.warn("追跡していない建玉の利確の指値を取り消しました", { count: n });
+    } catch (e) {
+      this.log.warn("利確の指値の整理に失敗", { error: errMsg(e) });
+    }
+    const tps = this.positions.restingTakeProfits();
+    if (tps.length) this.log.info("板に置いた利確の指値を引き継ぎます", { orders: tps.map((t) => `${t.symbol} ${t.price} ${t.clientId}`) });
     this.lastReconcileAt = now;
     const pending = this.positions.pendingOrders();
     if (pending.length) this.log.warn("保留中の注文があります。照会して確定させます", { orders: pending.map((o) => `${o.symbol} ${o.kind} ${o.clientId}`) });
     this.entryPause(now);
+    this.seedTempo(now);
     this.store.audit({
       ts: now,
       type: "engine.start",
       data: { mode: this.mode, watched: this.hub.watched().map((i) => i.symbol), openPositions: this.journal.list().length, pendingOrders: pending.length },
     });
+  }
+
+  /**
+   * テンポの復元: この mode の取引のうち直近の窓 (1 時間) にエントリーしたものと、保有中のポジションのエントリー時刻を取り込む
+   * (再起動で直近のエントリー数を忘れて、上限を超えて入ったり、テンポを上げすぎたりしない)
+   */
+  private seedTempo(now: number): void {
+    const tc = this.tempo;
+    if (!tc) return;
+    try {
+      const closed = this.store.listTrades({ since: now - tc.windowMs, mode: this.mode }).map((t) => t.entryTs);
+      const ts = tempoSeedTimestamps(closed, this.positions.list().map((p) => p.entryTs), now, tc.windowMs);
+      tc.seed(ts);
+      if (ts.length) this.log.info("テンポ: 直近のエントリーを復元しました", { entries: ts.length, target: tc.targetPerHour });
+    } catch (e) {
+      this.log.warn("テンポの復元に失敗 (直近のエントリー 0 件として続行)", { error: errMsg(e) });
+    }
   }
 
   private uniqueBrokers(): Broker[] {
@@ -866,6 +951,16 @@ export class TradingEngine {
 
     // 2. ポジション管理 (損切り・利確・トレーリング・時間切れ)。口座照会より前に、直近の気配で銘柄ごとに分離して判定する
     let exits = await this.manageExits(quotes, now);
+    // 2a. 追跡していない建玉の利確の指値 (孤児) を取り消す。待っている指値のエントリーで、気配が損切り価格を越えたものは取消を依頼する
+    if (this.positions.tps.size > 0) {
+      try {
+        await this.positions.sweepTakeProfits(now);
+      } catch (e) {
+        this.log.warn("利確の指値の整理に失敗", { error: errMsg(e) });
+      }
+    }
+    // 気配が古い銘柄は判定しない (古い気配による取消は 7 の前に、新規を止める理由として行う)
+    this.positions.checkLimitEntries((s) => quotes.get(s) ?? this.hub.latestQuote(s), now, { maxQuoteAgeMs: this.opt.maxQuoteAgeMs });
     // 2b. 見送ったシグナルの仮想トレードの判定 (実際の建玉には影響しない。失敗しても続ける)
     this.shadowUpdate(quotes, now);
 
@@ -877,6 +972,7 @@ export class TradingEngine {
       const sync = await this.positions.syncPending(now);
       entries += sync.opened.length;
       exits += sync.closed.length + sync.reduced;
+      await this.afterLimitSync(sync, quotes, now);
       if (sync.opened.length || sync.closed.length || sync.reduced || sync.resolved || sync.reconciled) {
         this.saveSnapshot();
         this.acctCache = undefined;
@@ -923,6 +1019,23 @@ export class TradingEngine {
     }
     const killed = Boolean(this.risk.state().killSwitch);
     const killSwitchTripped = killed && !killedBefore;
+    // 停止中 (kill switch・日次停止) は待っている指値のエントリーを取り消す (一部約定の分は建玉になり、kill switch なら下で決済する)
+    if (killed || this.risk.isHalted(now).halted) {
+      const lim = this.positions.pendingOrders().some((o) => o.kind === "entry" && o.limit);
+      if (lim) {
+        try {
+          const r = await this.positions.cancelLimitEntries(() => true, "halted", now);
+          await this.afterLimitSync(r, quotes, now);
+          entries += r.opened.length;
+          if (r.opened.length || r.rejected) {
+            this.saveSnapshot();
+            this.acctCache = undefined;
+          }
+        } catch (e) {
+          this.log.error("停止による指値のエントリーの取消に失敗", { error: errMsg(e) });
+        }
+      }
+    }
     // kill switch 作動中は残っている建玉の決済を試み続ける (初回は即時、以後 killSwitchRetryMs ごと)
     if (killed) exits += await this.killSwitchClose(now, quotes, killSwitchTripped, drawdownPct);
 
@@ -938,6 +1051,8 @@ export class TradingEngine {
         ? { key: "account_unavailable", sample: account.degradedReason }
         : undefined;
     this.entryPause(now);
+    // テンポはティックの初めに 1 回だけ計算する (無効なら渡さない = 従来どおり)
+    const tempo = this.tempo ? { level: this.tempo.level(now), explore: this.tempoExploreAllowed } : undefined;
     const ctx: TickCtx = {
       now,
       brief: this.store.latestBrief(),
@@ -952,7 +1067,11 @@ export class TradingEngine {
       entries,
       exits,
       evaluations: 0,
+      ...(tempo ? { tempo } : {}),
     };
+    // 7a. 新規エントリーを止める理由 (状態不明の注文・口座情報・気配の古さ・取得の失敗・停止) がある銘柄の、待っている指値のエントリーを取り消す
+    //     (テンポの上限は置いた指値を取り消す理由にしない)
+    await this.cancelBlockedLimitEntries(ctx, quotes);
     for (const inst of insts) {
       const view = this.hub.getView(inst.symbol, now);
       if (!view) continue;
@@ -1002,6 +1121,158 @@ export class TradingEngine {
     return exits;
   }
 
+  // ───────── 指値 (maker) のエントリー ─────────
+
+  /**
+   * 照会・取消で確定した指値のエントリーの後処理: 約定した建玉には利確の指値を置き、
+   * 期限切れで約定しなかったシグナルは仮想トレード (limit_unfilled) として記録する
+   */
+  private async afterLimitSync(sync: SyncResult, quotes: Map<string, Quote>, now: number): Promise<void> {
+    for (const p of sync.opened) {
+      try {
+        await this.positions.placeTakeProfit(p, quotes.get(p.symbol) ?? this.hub.latestQuote(p.symbol), now);
+      } catch (e) {
+        this.log.warn("利確の指値の発注に失敗 (次のティックで再試行)", { symbol: p.symbol, error: errMsg(e) });
+      }
+    }
+    this.recordLimitUnfilled(sync.limitUnfilled, now);
+  }
+
+  /**
+   * 期限切れで約定しなかった指値のエントリーを仮想トレード (reason "limit_unfilled") として記録する
+   * (シグナル時点の気配で成行に入っていたらどうなったか = 指値にしたせいで逃した取引の測定。腕の配分に重み 0.25)。
+   * 逆方向のシグナル・損切りの越え・停止・拒否で取り消したものは記録しない
+   */
+  private recordLimitUnfilled(items: SyncResult["limitUnfilled"], now: number): void {
+    for (const { order, cause } of items) {
+      if (cause !== "expired") {
+        this.skip(`limit_canceled:${cause}`, `${order.symbol}: 指値のエントリーを取り消しました (${cause})`);
+        continue;
+      }
+      this.skip("limit_unfilled", `${order.symbol}: 指値のエントリーが期限内に約定しませんでした`);
+      const sh = order.limit?.shadow;
+      const inst = this.hub.instrument(order.symbol);
+      if (!this.shadow || !sh || !inst) continue;
+      try {
+        const sim = isSimulatedShort(inst, this.mode, sh.signal.direction);
+        this.shadow.record({
+          instrument: inst, quote: sh.quote, signal: sh.signal, regime: sh.regime, reason: "limit_unfilled", now: sh.signalTs,
+          ...(sim ? { simulatedShort: true, borrowRateDaily: this.shortBorrowRateDaily() } : {}),
+        });
+      } catch (e) {
+        this.warnThrottled("shadow.record", now, "仮想トレードの記録に失敗 (取引は継続)", { error: errMsg(e) });
+      }
+    }
+  }
+
+  /**
+   * 指値のエントリーを待っている銘柄: 発注した戦略を通常と同じタイミング (新しい確定足、板が必須なら毎ティック) で評価し、
+   * 逆方向のシグナルなら取り消す (取消 → 照会で確定。一部約定ならその数量で建玉になる)
+   */
+  private async watchLimitEntry(inst: Instrument, view: MarketView, pl: PendingOrder, ctx: TickCtx): Promise<void> {
+    const lim = pl.limit;
+    const sid = pl.entry?.input.strategyId;
+    if (!lim || lim.cancelReason !== undefined || !sid) return;
+    const s = this.strategies.find((x) => x.id === sid);
+    if (!s || !s.assetClasses.includes(inst.assetClass)) return;
+    if (s.requiresBook) {
+      if (!view.book) return;
+    } else {
+      const c = view.candles[s.primaryTimeframe];
+      const last = c && c.length ? c[c.length - 1].ts : undefined;
+      if (last === undefined) return;
+      const k = `${inst.symbol}|${s.id}`;
+      if (this.lastEval.get(k) === last) return;
+      this.lastEval.set(k, last);
+    }
+    let signal: Signal | null;
+    try {
+      const regime = this.regimeFor(view, s.primaryTimeframe, ctx);
+      const intel = this.intelFor(inst, ctx);
+      signal = s.evaluate({ market: view, regime, ...(intel ? { intel } : {}), params: this.paramsFor(s, inst), mode: this.mode });
+    } catch (e) {
+      this.warnThrottled(`limit.watch|${s.id}`, ctx.now, "指値の待機中の戦略の評価に失敗", { symbol: inst.symbol, error: errMsg(e) });
+      return;
+    }
+    if (!signal || (signal.direction !== "long" && signal.direction !== "short") || signal.direction === lim.direction) return;
+    this.log.info("指値のエントリーを待っている間に逆方向のシグナルが出たため取り消します", { symbol: inst.symbol, strategyId: s.id, direction: signal.direction });
+    const r = await this.positions.cancelLimitEntries((o) => o.clientId === pl.clientId, "opposite_signal", ctx.now);
+    await this.afterLimitSync(r, new Map(), ctx.now);
+    if (r.opened.length) {
+      ctx.entries += r.opened.length;
+      this.saveSnapshot();
+      ctx.account = await this.account(ctx.now, true);
+    }
+  }
+
+  /**
+   * 新規エントリーを止める理由がある間は、待っている指値のエントリーも取り消す (取消 → 照会で確定。一部約定ならその数量で建玉)。
+   * 理由: 状態不明の注文 (order_unknown) / 口座情報を取得できない (account_unavailable) / 気配が古い・取得の失敗・時間切れ (market_data) /
+   * 停止 (halted。kill switch・日次停止は 5 で先に取り消している)。テンポの上限 (tempo_cap) と追跡外の建玉 (live の untracked_position。
+   * 待っている指値の約定で照会前に建玉が見えることがある) は、置いた指値を取り消す理由にしない
+   */
+  private async cancelBlockedLimitEntries(ctx: TickCtx, quotes: Map<string, Quote>): Promise<void> {
+    const waiting = this.positions.pendingOrders().filter((o) => o.kind === "entry" && o.limit && o.limit.cancelReason === undefined);
+    if (waiting.length === 0) return;
+    const paused = this.positions.escalatedOrders().length > 0;
+    const reasonOf = (o: PendingOrder): LimitCancelReason | undefined => {
+      if (o.limit?.cancelReason !== undefined) return undefined;
+      if (ctx.halted) return "halted";
+      if (paused) return "order_unknown";
+      if (ctx.entryBlock) return "account_unavailable";
+      const q = quotes.get(o.symbol) ?? this.hub.latestQuote(o.symbol);
+      if (this.hub.lastError(o.symbol) || ctx.timedOut.has(o.symbol) || !q || !(ctx.now - q.ts <= this.opt.maxQuoteAgeMs)) return "market_data";
+      return undefined;
+    };
+    const reasons = new Map<string, LimitCancelReason>();
+    for (const o of waiting) {
+      const why = reasonOf(o);
+      if (why) reasons.set(o.clientId, why);
+    }
+    if (reasons.size === 0) return;
+    this.log.warn("新規エントリーを止める理由があるため、待っている指値のエントリーを取り消します", {
+      orders: waiting.filter((o) => reasons.has(o.clientId)).map((o) => `${o.symbol} ${o.clientId} (${reasons.get(o.clientId)})`),
+    });
+    try {
+      const r = await this.positions.cancelLimitEntriesBy((o) => reasons.get(o.clientId), ctx.now);
+      await this.afterLimitSync(r, quotes, ctx.now);
+      ctx.entries += r.opened.length;
+      if (r.opened.length || r.rejected) {
+        this.saveSnapshot();
+        ctx.account = await this.account(ctx.now, true);
+      }
+    } catch (e) {
+      this.log.error("新規を止める理由による指値のエントリーの取消に失敗", { error: errMsg(e) });
+    }
+  }
+
+  /** 新規エントリーの注文の種類: シグナルの指値 (価格あり) → 戦略の entryOrder → 設定 LIMIT_ENTRY (既定 true) */
+  private entryOrderFor(s: Strategy, sig: Signal): "market" | "limit" {
+    if (sig.entry.type === "limit" && sig.entry.price !== undefined && sig.entry.price > 0) return "limit";
+    if (s.entryOrder) return s.entryOrder;
+    return (this.config.env.LIMIT_ENTRY ?? true) ? "limit" : "market";
+  }
+
+  /** 指値のエントリーの有効期限: LIMIT_ENTRY_TIMEOUT_MS、未設定なら主時間足の長さ (20 秒〜15 分) */
+  private limitTimeoutMs(s: Strategy): number {
+    const t = this.config.env.LIMIT_ENTRY_TIMEOUT_MS;
+    if (t !== undefined && Number.isFinite(t) && t > 0) return t;
+    return Math.min(15 * 60_000, Math.max(20_000, TIMEFRAME_MS[s.primaryTimeframe] ?? 60_000));
+  }
+
+  /**
+   * 指値の価格: シグナルの価格、無ければ買いは最良の買い気配・売りは最良の売り気配 (板に置く側)。
+   * 価格の刻みにそろえる (買いは切り捨て、売りは切り上げ = 置いた瞬間に約定する側へ寄せない)
+   */
+  private limitPriceFor(inst: Instrument, sig: Signal, q: Quote): number | undefined {
+    const raw = sig.entry.type === "limit" && sig.entry.price !== undefined && sig.entry.price > 0 ? sig.entry.price : sig.direction === "long" ? q.bid : q.ask;
+    if (!(raw > 0) || !Number.isFinite(raw)) return undefined;
+    if (!(inst.tickSize > 0)) return raw;
+    const units = D(raw).div(inst.tickSize);
+    const px = (sig.direction === "long" ? units.floor() : units.ceil()).mul(inst.tickSize).toNumber();
+    return px > 0 ? px : undefined;
+  }
+
   /** kill switch 作動中の全決済。保留中の注文がある銘柄は照会の結果を待つ */
   private async killSwitchClose(now: number, quotes: Map<string, Quote>, isNew: boolean, drawdownPct?: number): Promise<number> {
     if (this.positions.list().length === 0) return 0;
@@ -1034,7 +1305,17 @@ export class TradingEngine {
   private async maybeReconcile(now: number): Promise<boolean> {
     if (this.lastReconcileAt !== undefined && now - this.lastReconcileAt < this.opt.reconcileEveryMs) return false;
     this.lastReconcileAt = now;
-    if (this.positions.list().length === 0) return false;
+    // 追跡中の建玉も、待っている指値のエントリーも無ければ照会しない
+    // (指値のエントリーを待っている銘柄は、取引所の建玉が説明できる範囲を超えていないかを確かめる)
+    const limitPending = this.positions.pendingOrders().some((o) => o.kind === "entry" && o.limit);
+    if (this.positions.list().length === 0 && !limitPending) return false;
+    // 板に置いた利確の指値の約定を先に反映する (照会までの間の約定を外部の決済と誤認しない)
+    try {
+      await this.positions.pollAllTakeProfits(now);
+    } catch (e) {
+      this.log.warn("利確の指値の照会に失敗", { error: errMsg(e) });
+    }
+    if (this.positions.list().length === 0 && !limitPending) return true;
     let bp: BrokerPosition[];
     try {
       bp = await this.brokerPositions();
@@ -1055,6 +1336,8 @@ export class TradingEngine {
   private entryBlock(inst: Instrument, ctx: TickCtx): { key: string; sample: string } | undefined {
     const sym = inst.symbol;
     if (this.positions.hasPending(sym)) return { key: "pending_order", sample: `${sym}: 保留中の注文の確定待ち` };
+    // 決済済みの建玉の利確の指値 (孤児) の取消を確かめるまでは入らない (reduceOnly の指値が新しい建玉を決済しないように)
+    if (this.positions.hasOrphanTakeProfit(sym)) return { key: "orphan_tp", sample: `${sym}: 決済済みの建玉の利確の指値の取消待ち` };
     // 状態不明の注文がある間はエンジン全体の新規エントリーを止める (確定すれば自動で再開)
     const paused = this.entryPause(ctx.now);
     if (paused) return paused;
@@ -1173,18 +1456,40 @@ export class TradingEngine {
       const intel = this.intelFor(inst, ctx);
       // 戦略自身が見送ったシグナルも観測用に集める (停止中でも新規エントリーの評価なので渡す)
       const filtered: { signal: Signal; reason: string }[] = [];
+      // テンポ (有効なときだけ) も新規エントリーの評価と同じく渡す (入っていたら同じシグナルになるように)
       const signal = s.evaluate({
-        market: view, regime, ...(intel ? { intel } : {}), params: this.paramsFor(s, inst), mode: this.mode,
+        market: view, regime, ...(intel ? { intel } : {}), params: this.paramsFor(s, inst), mode: this.mode, ...this.tempoCtx(ctx),
         onFiltered: (fs, reason) => { filtered.push({ signal: fs, reason }); },
       });
       if (signal) this.rememberSignal(inst.symbol, signal, ctx.now);
-      if (signal && signal.direction !== "flat") this.shadowRecord(key, inst, view, s, signal, regime, ctx.now);
+      // 最大保有 (MAX_HOLD_MINUTES) も実際のエントリーと同じく縮める (hold_limit の中期・長期は戦略のまま)
+      if (signal && signal.direction !== "flat") this.shadowRecord(key, inst, view, s, this.holdLimited(s) ? signal : this.clampHold(signal), regime, ctx.now);
       for (const f of filtered) if (f.signal.direction !== "flat") this.shadowRecord(`strategy_filter:${f.reason}`, inst, view, s, f.signal, regime, ctx.now);
       return signal;
     } catch (e) {
       this.warnThrottled("shadow.evaluate", ctx.now, "仮想トレード用の戦略評価に失敗 (取引は継続)", { strategyId: s.id, symbol: inst.symbol, error: errMsg(e) });
       return null;
     }
+  }
+
+  /** 新規エントリーの評価に渡すテンポ (テンポのモードでなければ空 = 従来どおり) */
+  private tempoCtx(ctx: TickCtx): Pick<StrategyContext, "tempo" | "tempoExplore"> {
+    return ctx.tempo ? { tempo: ctx.tempo.level, tempoExplore: ctx.tempo.explore } : {};
+  }
+
+  /** MAX_HOLD_MINUTES が有効なとき、中期・長期の戦略は新規エントリーしない (仮想トレード hold_limit としてだけ記録する) */
+  private holdLimited(s: Strategy): boolean {
+    return this.maxHoldMs !== undefined && isHoldLimitedHorizon(s.horizon);
+  }
+
+  /**
+   * MAX_HOLD_MINUTES: シグナルの最大保有を上限までに縮める (0・非有限 = 時間切れ無しも上限にする)。
+   * 無効・flat ならそのまま (同じオブジェクト)
+   */
+  private clampHold(sig: Signal): Signal {
+    if (this.maxHoldMs === undefined || sig.direction === "flat") return sig;
+    const next = clampMaxHoldMs(sig.maxHoldMs, this.maxHoldMs);
+    return next === sig.maxHoldMs ? sig : { ...sig, maxHoldMs: next };
   }
 
   /** 前回の判定以降の 1m 確定足の高値・安値 */
@@ -1446,10 +1751,19 @@ export class TradingEngine {
 
   private async processSymbol(inst: Instrument, view: MarketView, ctx: TickCtx): Promise<void> {
     const sym = inst.symbol;
-    const pos = this.positions.get(sym);
+    let pos = this.positions.get(sym);
     if (!pos) {
-      const block = this.entryBlock(inst, ctx);
-      if (block) return this.skip(block.key, block.sample);
+      // 指値のエントリーを待っている間は、その戦略が逆方向のシグナルを出したら取り消す
+      const pl = this.positions.pendingLimitEntry(sym);
+      if (pl) {
+        await this.watchLimitEntry(inst, view, pl, ctx);
+        // 取消の照会で一部約定が分かると建玉になる: 以降は保有中として扱う (古い pos のまま新規の評価をしない)
+        pos = this.positions.get(sym);
+      }
+      if (!pos) {
+        const block = this.entryBlock(inst, ctx);
+        if (block) return this.skip(block.key, block.sample);
+      }
     }
     const candidates: Candidate[] = [];
     for (const s of this.strategies) {
@@ -1485,6 +1799,17 @@ export class TradingEngine {
         if (regime.label === "low_liquidity" || !s.regimes.includes(regime.label)) continue;
         const sig = this.shadowEvaluate(s, inst, view, ctx, "observe_only");
         if (sig && sig.direction !== "flat") this.skip("observe_only", `${sym} ${s.id}: 観測専用のため発注しません`);
+        continue;
+      }
+      if (!pos && this.holdLimited(s)) {
+        // 最大保有 (MAX_HOLD_MINUTES): 中期・長期の戦略は保有の上限に収まらないので、観測専用と同じ扱いにする
+        // (腕・計画の判定より前、対象レジームと低流動性の停止は守る。仮想トレード "hold_limit" は observe_only と同じく
+        // 腕の配分に重み 0.25 で入り、腕を止める判定には使わない)。保有中の建玉の決済シグナルは通常の経路のまま
+        if (regime.label === "low_liquidity" || !s.regimes.includes(regime.label)) continue;
+        const sig = this.shadowEvaluate(s, inst, view, ctx, "hold_limit");
+        if (sig && sig.direction !== "flat") {
+          this.skip("hold_limit", `${sym} ${s.id}: 最大保有 ${Math.round(this.maxHoldMs! / 60_000)} 分に収まらない時間軸 (${s.horizon}) のため発注しません`);
+        }
         continue;
       }
       let gate: Gate | undefined;
@@ -1524,6 +1849,8 @@ export class TradingEngine {
         mode: this.mode,
         // 新規エントリーの評価のときだけ、戦略が自分で見送ったシグナルを観測用に集める (記録だけ。発注・腕の学習には使わない)
         ...(owner ? {} : { onFiltered: (fs: Signal, reason: string) => { filtered.push({ signal: fs, reason }); } }),
+        // テンポも新規エントリーの評価のときだけ渡す (保有中の決済判定は従来どおり)
+        ...(owner ? {} : this.tempoCtx(ctx)),
       };
       ctx.evaluations++;
       let signal: Signal | null;
@@ -1550,6 +1877,8 @@ export class TradingEngine {
         continue;
       }
       if (signal.direction === "flat") continue;
+      // 最大保有 (MAX_HOLD_MINUTES): シグナルの最大保有を上限までに縮める (無効ならそのまま)
+      signal = this.clampHold(signal);
       if (simShortInst && signal.direction === "short") {
         // paper で再現した空売り: 配分倍率・停止は空売りの腕 (…|short) で決める (買いの腕の成績と混ぜない)
         if (shortOnly) {
@@ -1589,6 +1918,14 @@ export class TradingEngine {
       this.skip("lower_score", `${sym}: ${candidates.length} 件中 ${best.strategy.id} を採用`);
       for (const c of candidates) if (c !== best) this.shadowRecord("lower_score", inst, view, c.strategy, c.signal, c.regime, ctx.now);
     }
+    // テンポの上限: 直近 1 時間のエントリーが 目標 × TEMPO_CAP_MULTIPLIER (切り上げ) に達したら新規エントリーを止める
+    // (このティックで先に入った分も数える)。見送ったシグナルは通常の仮想トレードとして記録する
+    if (this.tempo?.capped(ctx.now)) {
+      const snap = this.tempo.snapshot(ctx.now);
+      this.skip("tempo_cap", `${sym}: 直近 1 時間のエントリー ${snap.entriesInWindow} 回が上限 ${snap.capAt} 回に到達 (目標 ${snap.target} 回/時)`);
+      this.shadowRecord("tempo_cap", inst, view, best.strategy, best.signal, best.regime, ctx.now);
+      return;
+    }
     await this.enter(inst, view, best, ctx);
   }
 
@@ -1623,9 +1960,16 @@ export class TradingEngine {
     // 上限は計画と同じ MAX_RISK_MULTIPLIER のまま。RiskManager の判定 (上限・停止) はそのまま通す
     const fm = this.forecastMultiplier(sym, sig, sig.horizon ?? c.strategy.horizon, now);
     const forecastApplied = fm !== undefined && fm.mult !== 1 && Number.isFinite(fm.mult) && fm.mult > 0;
-    const riskMultiplier = forecastApplied ? Math.min(MAX_RISK_MULTIPLIER, c.riskMultiplier * fm!.mult) : c.riskMultiplier;
+    const forecastRiskMultiplier = forecastApplied ? Math.min(MAX_RISK_MULTIPLIER, c.riskMultiplier * fm!.mult) : c.riskMultiplier;
+    // テンポの探索: コスト控除後の期待値が 0 以下のシグナル (テンポで下限を下げて通ったもの) はサイズを TEMPO_EXPLORE_SIZE 倍に絞り、
+    // 取引に印 (features.tempoExplore = 1) を付ける。テンポのモードでなければ従来どおり
+    const tempoExplore = ctx.tempo !== undefined && sig.edgeIsNet === true && sig.expectedEdgeBps <= 0;
+    const riskMultiplier = tempoExplore ? forecastRiskMultiplier * this.tempoExploreSize : forecastRiskMultiplier;
+    // 注文の種類 (指値なら価格を決め、RiskManager のサイズの計算にもその価格を使う)
+    const limitPrice = this.entryOrderFor(c.strategy, sig) === "limit" ? this.limitPriceFor(inst, sig, q) : undefined;
+    const riskSignal: Signal = limitPrice !== undefined ? { ...sig, entry: { type: "limit", price: limitPrice } } : sig;
     const decision = this.risk.evaluateEntry({
-      signal: sig,
+      signal: riskSignal,
       instrument: inst,
       quote: q,
       equity: acct.equity,
@@ -1637,6 +1981,8 @@ export class TradingEngine {
       instruments: new Map(this.hub.watched().map((i) => [i.symbol, i])),
       prices: acct.prices,
       toAccount: (ccy) => this.fx.toAccount(ccy),
+      // テンポのモードのときだけ渡す (コスト比の判定だけが変わる。無ければ従来どおり)
+      ...(ctx.tempo ? { tempo: ctx.tempo.level, tempoExplore: ctx.tempo.explore } : {}),
     });
     if (!decision.ok) {
       const key = `risk: ${normalizeReason(decision.reason)}`;
@@ -1654,20 +2000,50 @@ export class TradingEngine {
       expectedEdgeBps: sig.expectedEdgeBps,
       costBps: cost,
       params: { ...c.params },
-      features: { ...sig.features },
+      // テンポのモードでは、エントリー時のテンポ (tempoLevel) と探索の印 (tempoExplore = 1) を残す (report で分けて集計する)
+      features: { ...sig.features, ...(ctx.tempo ? { tempoLevel: ctx.tempo.level, ...(tempoExplore ? { tempoExplore: 1 } : {}) } : {}) },
       riskMultiplier,
       reason: sig.reason,
     };
-    const req: OrderRequest = {
-      clientId: this.positions.newClientId("e", now),
-      symbol: sym,
-      side,
-      type: "market",
-      qty: decision.qty,
-      strategyId: c.strategy.id,
-      // 取引所側の保護ストップ (対応するアダプターだけが付ける。プロセス停止時の保険)
-      protectiveStop: sig.stopLoss,
-    };
+    const broker = this.brokerFor(sym);
+    const postOnly = limitPrice !== undefined && broker.capabilities?.postOnly === true;
+    const req: OrderRequest =
+      limitPrice !== undefined
+        ? {
+            clientId: this.positions.newClientId("e", now),
+            symbol: sym,
+            side,
+            type: "limit",
+            qty: decision.qty,
+            limitPrice,
+            tif: "GTC",
+            ...(postOnly ? { postOnly: true } : {}),
+            strategyId: c.strategy.id,
+            // 取引所側の保護ストップ (成行と同じく渡す。OANDA は stopLossOnFill = 約定で開いたトレードに付くので約定前には発動しない。
+            // GMO・ccxt・Alpaca は付けない。損切りの判定はエンジン側でも続ける)
+            protectiveStop: sig.stopLoss,
+          }
+        : {
+            clientId: this.positions.newClientId("e", now),
+            symbol: sym,
+            side,
+            type: "market",
+            qty: decision.qty,
+            strategyId: c.strategy.id,
+            // 取引所側の保護ストップ (対応するアダプターだけが付ける。プロセス停止時の保険)
+            protectiveStop: sig.stopLoss,
+          };
+    const limit: PendingLimit | undefined =
+      limitPrice !== undefined
+        ? {
+            price: limitPrice,
+            expiresAt: now + this.limitTimeoutMs(c.strategy),
+            ...(postOnly ? { postOnly: true } : {}),
+            stopLoss: sig.stopLoss,
+            direction: sig.direction === "long" ? "long" : "short",
+            shadow: { signal: { ...sig, horizon: sig.horizon ?? c.strategy.horizon }, quote: { bid: q.bid, ask: q.ask }, regime: c.regime.label, signalTs: now },
+          }
+        : undefined;
     const entry: PendingEntry = {
       input: {
         mode: this.mode,
@@ -1685,6 +2061,7 @@ export class TradingEngine {
         ...(sig.takeProfit !== undefined ? { takeProfit: sig.takeProfit } : {}),
         entryContext,
         ...(inst.contractSize !== undefined ? { contractSize: inst.contractSize } : {}),
+        entryOrderType: limit ? "limit" : "market",
       },
       plan: {
         ...(sig.trailingStopPct !== undefined ? { trailingStopPct: sig.trailingStopPct } : {}),
@@ -1694,6 +2071,7 @@ export class TradingEngine {
         direction: sig.direction,
         ...(isSimulatedShort(inst, this.mode, sig.direction) ? { simulatedShort: true } : {}),
         intendedPrice: intended,
+        ...(limit ? { orderType: "limit", limitPrice: limit.price, expiresAt: limit.expiresAt, postOnly: limit.postOnly === true } : { orderType: "market" }),
         stop: sig.stopLoss,
         ...(sig.takeProfit !== undefined ? { takeProfit: sig.takeProfit } : {}),
         confidence: Number(sig.confidence.toFixed(3)),
@@ -1705,6 +2083,9 @@ export class TradingEngine {
           ? { forecast: { horizon: fm!.horizon, direction: fm!.direction, pUp: Number((fm!.pUp ?? 0.5).toFixed(3)), mult: Number(fm!.mult.toFixed(3)), baseRiskMultiplier: Number(c.riskMultiplier.toFixed(3)) } }
           : {}),
         regime: c.regime.label,
+        ...(ctx.tempo
+          ? { tempo: { level: Number(ctx.tempo.level.toFixed(3)), ...(tempoExplore ? { explore: true, exploreSize: this.tempoExploreSize } : {}) } }
+          : {}),
         ...(c.intel ? { intel: { sentiment: Number(c.intel.sentiment.toFixed(3)), confidence: Number(c.intel.confidence.toFixed(3)) } } : {}),
         ...(liquidityUsd !== undefined ? { liquidityUsd: Math.round(liquidityUsd) } : {}),
         reason: sig.reason,
@@ -1713,7 +2094,7 @@ export class TradingEngine {
     };
     let r: EntryResult;
     try {
-      r = await this.positions.enter(req, entry, now);
+      r = await this.positions.enter(req, entry, now, limit);
     } catch (e) {
       const msg = errMsg(e);
       this.log.error("エントリーの処理に失敗", { symbol: sym, error: msg });
@@ -1731,6 +2112,13 @@ export class TradingEngine {
           // 学習用の記録だけなので無視する
         }
       }
+      if (r.position) {
+        try {
+          await this.positions.placeTakeProfit(r.position, q, now);
+        } catch (e) {
+          this.log.warn("利確の指値の発注に失敗 (次のティックで再試行)", { symbol: sym, error: errMsg(e) });
+        }
+      }
       this.saveSnapshot();
       ctx.account = await this.account(now, true);
       return;
@@ -1738,6 +2126,7 @@ export class TradingEngine {
     if (r.status === "pending") {
       // 保留中のエントリーを想定代金で口座情報に加え、同じティックの後続の銘柄のリスク判定に反映する
       ctx.account = await this.account(now);
+      if (limit) return this.skip("limit_placed", `${sym}: 指値 ${limit.price} で約定待ち (期限 ${new Date(limit.expiresAt).toISOString()})`);
       return this.skip("order_pending", `${sym}: ${r.reason ?? "未確定"}`);
     }
     this.acctCache = undefined;
@@ -2156,7 +2545,29 @@ export class TradingEngine {
           ...(fxApprox.length ? { fxApprox } : {}),
         };
       })(),
+      tempo: this.tempoStatus(now),
+      maxHoldMinutes: this.maxHoldMs !== undefined ? this.maxHoldMs / 60_000 : 0,
+      limitOrders: {
+        limitEntry: this.config.env.LIMIT_ENTRY ?? true,
+        limitTakeProfit: effectiveLimitTakeProfit(this.config.env, this.mode),
+        stats: readLimitStats(this.store, this.mode),
+        pendingEntries: this.positions
+          .pendingOrders()
+          .filter((o) => o.kind === "entry" && o.limit)
+          .map((o) => ({
+            symbol: o.symbol, clientId: o.clientId, price: o.limit!.price, expiresAt: o.limit!.expiresAt,
+            ...(o.limit!.cancelReason ? { cancelReason: o.limit!.cancelReason } : {}),
+          })),
+        restingTakeProfits: this.positions.restingTakeProfits().map((t) => ({
+          symbol: t.symbol, tradeId: t.tradeId, price: t.price, qty: t.qty, filledQty: t.appliedQty, status: t.status, ...(t.exit ? { exiting: t.exit.reason } : {}),
+        })),
+      },
     };
+  }
+
+  /** ダッシュボード・status 用のテンポの状態 (テンポのモードでなければ enabled: false) */
+  tempoStatus(now: number = this.clock.now()): TempoStatusView {
+    return tempoStatusView(this.tempo, now, this.tempoExploreAllowed);
   }
 
   /**

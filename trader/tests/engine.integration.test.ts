@@ -15,7 +15,7 @@ const START = Date.UTC(2026, 0, 5);
 
 const mkClock = (t = START): Clock & { t: number } => ({ t, now() { return this.t; } });
 const testConfig = (env: Record<string, string> = {}) =>
-  loadConfig({ NODE_ENV: "test", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "JPY", ...env });
+  loadConfig({ NODE_ENV: "test", LIMIT_ENTRY: "false", LIMIT_TAKE_PROFIT: "false", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "JPY", ...env });
 
 /** 常に同じ方向のシグナルを出すテスト用戦略 (保有中は何もしない) */
 function fixedStrategy(id: string, o: { classes: AssetClass[]; direction?: "long" | "short"; confidence?: number; edge?: number; stopPct?: number; flatWhenHolding?: boolean }): Strategy {

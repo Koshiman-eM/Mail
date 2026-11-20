@@ -9,11 +9,18 @@ import type { ArmSnapshot } from "../learning/allocator";
 import type { CauseSummary, LearningSnapshot } from "../learning/service";
 import { mulberry32 } from "../market/feeds/synthetic";
 import { createStore, MemoryStore } from "../storage";
+import { configuredStrategies } from "../strategies/registry";
+import { structureSettingsFromEnv } from "../structure/settings";
+import { isStructureWrapped, withFilterCounter } from "../structure/wrap";
 import { buildRuntime, syntheticDbPath, type Runtime } from "./setup";
+import { readLimitStats, type LimitStats } from "./orders";
+import { effectiveLimitTakeProfit } from "./limitOrders";
 import {
-  equityStats, EXIT_REASON_LABEL, exitFxRates, exitReasonCounts, fmtNum, fmtPct, fmtSigned, fmtTime, renderLearning, renderSideTable, renderStrategyTable,
-  summarizeBySide, summarizeByStrategy, type SideSummary, type StrategySummary,
+  equityStats, EXIT_REASON_LABEL, exitFxRates, exitReasonCounts, fmtNum, fmtPct, fmtSigned, fmtTime, renderLearning, renderLimitStats, renderOrderTypeTable,
+  renderSideTable, renderStrategyTable, renderTempoTable, summarizeByOrderType, summarizeBySide, summarizeByStrategy, summarizeByTempo, type OrderTypeSummary,
+  type SideSummary, type StrategySummary, type TempoSummary,
 } from "./report";
+import { formatTempoLine, type TempoStatusView } from "./tempo";
 
 const HOUR = 3_600_000;
 /** 既定の開始時刻 (再現性のため固定。月曜 00:00 UTC) */
@@ -68,6 +75,27 @@ export interface SimulationReport {
   byStrategy: StrategySummary[];
   /** 方向別 (買い / 売り / 空売り (paper 再現)) */
   bySide: SideSummary[];
+  /** 注文の種類別 (成行 / 指値) と手数料の maker / taker の内訳 */
+  byOrderType: OrderTypeSummary[];
+  /** 指値の利用: 設定と約定率の集計 */
+  limitOrders: { limitEntry: boolean; limitTakeProfit: boolean; stats: LimitStats };
+  /** エントリー頻度 (テンポ) と最大保有 (TARGET_ENTRIES_PER_HOUR / MAX_HOLD_MINUTES ほか。無効でも件数は出す) */
+  tempo?: {
+    /** 期間中のエントリー数 (決済済み + 保有中のうち期間内にエントリーしたもの) と 1 時間あたり */
+    entries: number;
+    entriesPerHour: number;
+    /** 平均保有時間 (分。決済済みの取引) */
+    avgHoldMinutes: number;
+    /** 期間の終わりのテンポの状態 */
+    status: TempoStatusView;
+    maxHoldMinutes: number;
+    exploreSize: number;
+    /** テンポの上限 (tempo_cap)・最大保有の対象外 (hold_limit) で見送った回数 (見送り理由の集計) */
+    capSkips: number;
+    holdLimitSkips: number;
+    /** 探索 / 通常の成績 */
+    byTempo: TempoSummary[];
+  };
   exitReasons: Partial<Record<ExitReason, number>>;
   causes: CauseSummary;
   attributedTrades: number;
@@ -88,6 +116,14 @@ export interface SimulationReport {
     forecast: LearningSnapshot["forecast"];
   };
   plans: number;
+  /** 相場構造のフィルター (STRUCTURE_MODE) */
+  structure?: {
+    mode: "off" | "filter";
+    /** ラップした戦略 */
+    strategies: string[];
+    /** フィルターで通さなかったシグナルの件数 (理由別。仮想トレードの重複の除外前) */
+    filtered: Record<string, number>;
+  };
 }
 
 /** シミュレーション用の設定 (paper・synthetic・AI なしに固定) */
@@ -132,8 +168,13 @@ export async function runSimulation(o: SimulationOptions = {}): Promise<{ report
   const start = Math.max(o.start ?? DEFAULT_SIM_START, lastEq ? lastEq.ts + stepMs : 0);
   const end = start + durationMs;
   const clock: Clock & { t: number } = { t: start, now() { return this.t; } };
+  // 相場構造のフィルター: 運用と同じ一覧 (configuredStrategies) を使い、通さなかった件数だけ数える (判定は変えない)
+  const structure = structureSettingsFromEnv(config.env);
+  const structureFiltered: Record<string, number> = {};
+  const strategies = configuredStrategies(structure).map((s) => (isStructureWrapped(s) ? withFilterCounter(s, structureFiltered) : s));
 
   const runtime = await buildRuntime(config, {
+    strategies,
     clock,
     store,
     intelSources: [],
@@ -179,6 +220,15 @@ export async function runSimulation(o: SimulationOptions = {}): Promise<{ report
   await engine.stop();
 
   const trades = store.listTrades({ since: start });
+  // エントリー頻度: 期間内にエントリーした取引 (決済済み + 保有中)。見送り理由の集計からテンポの上限・最大保有の件数を数える
+  const openEntries = engine.positions.list().filter((p) => p.entryTs >= start).length;
+  const entries = trades.filter((t) => t.entryTs >= start).length + openEntries;
+  const skipCount = (key: string) =>
+    store.listAudit({ type: "engine.skip_summary", since: start }).reduce((a, e) => {
+      const r = (e.data.reasons as Record<string, { count?: number }> | undefined)?.[key];
+      return a + (typeof r?.count === "number" ? r.count : 0);
+    }, 0);
+  const holdSum = trades.reduce((a, t) => a + Math.max(0, t.exitTs - t.entryTs), 0);
   const eqStats = equityStats(store.listEquity({ since: start, mode: "paper" }));
   const finalAcct = await engine.account(end, true);
   // 新しい DB なら初期資金、既存の DB に追記した場合は開始前の最後の評価額
@@ -205,6 +255,19 @@ export async function runSimulation(o: SimulationOptions = {}): Promise<{ report
     winRate: trades.length ? wins / trades.length : 0,
     byStrategy: summarizeByStrategy(trades, (c) => runtime.fx.toAccount(c), quoteOf, exitFxRates(store, start)),
     bySide: summarizeBySide(trades, (c) => runtime.fx.toAccount(c), quoteOf, exitFxRates(store, start)),
+    byOrderType: summarizeByOrderType(trades, (c) => runtime.fx.toAccount(c), quoteOf, exitFxRates(store, start)),
+    limitOrders: { limitEntry: config.env.LIMIT_ENTRY, limitTakeProfit: effectiveLimitTakeProfit(config.env, "paper"), stats: readLimitStats(store, "paper") },
+    tempo: {
+      entries,
+      entriesPerHour: entries / ((end - start) / HOUR),
+      avgHoldMinutes: trades.length ? holdSum / trades.length / 60_000 : 0,
+      status: engine.tempoStatus(end),
+      maxHoldMinutes: config.env.MAX_HOLD_MINUTES,
+      exploreSize: config.env.TEMPO_EXPLORE_SIZE,
+      capSkips: skipCount("tempo_cap"),
+      holdLimitSkips: skipCount("hold_limit"),
+      byTempo: summarizeByTempo(trades, (c) => runtime.fx.toAccount(c), quoteOf, exitFxRates(store, start)),
+    },
     exitReasons: exitReasonCounts(trades),
     causes: snapshot.causes,
     attributedTrades: trades.filter((t) => store.getAttribution(t.id) !== undefined).length,
@@ -222,6 +285,11 @@ export async function runSimulation(o: SimulationOptions = {}): Promise<{ report
       forecast: snapshot.forecast,
     },
     plans,
+    structure: {
+      mode: structure.mode,
+      strategies: strategies.filter(isStructureWrapped).map((s) => s.id),
+      filtered: { ...structureFiltered },
+    },
   };
   if (!o.store) runtime.close();
   return { report, runtime };
@@ -245,7 +313,37 @@ export function formatSimulationReport(r: SimulationReport): string {
   const reasons = Object.entries(r.exitReasons).map(([k, v]) => `${EXIT_REASON_LABEL[k as ExitReason] ?? k} ${v}`);
   if (reasons.length) lines.push(`決済理由: ${reasons.join(" / ")}`);
   if (r.killSwitch) lines.push(`キルスイッチ: ${r.killSwitch.reason} (${fmtTime(r.killSwitch.at)})`);
+  if (r.structure) {
+    const st = r.structure;
+    const total = Object.values(st.filtered).reduce((a, b) => a + b, 0);
+    lines.push(
+      st.mode === "filter"
+        ? `相場構造のフィルター: ${st.strategies.length} 戦略 / 通さなかったシグナル ${total} 件` +
+            (total ? ` (${Object.entries(st.filtered).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v}`).join(" / ")})` : "")
+        : "相場構造のフィルター: off",
+    );
+  }
+  if (r.tempo) {
+    const tp = r.tempo;
+    lines.push(
+      `エントリー頻度: ${tp.entries} 回 (平均 ${tp.entriesPerHour.toFixed(2)} 回/時${tp.status.enabled ? ` / 目標 ${+tp.status.target.toFixed(2)} 回/時` : ""})` +
+        `  平均保有 ${tp.avgHoldMinutes.toFixed(1)} 分`,
+      `${formatTempoLine(tp.status, tp.maxHoldMinutes)} (期間の終わり)`,
+      `  見送り: テンポの上限 ${tp.capSkips} 件 / 最大保有の対象外 (中期・長期) ${tp.holdLimitSkips} 件` +
+        (tp.status.enabled ? ` / 探索のサイズ ${tp.exploreSize} 倍` : ""),
+    );
+  }
   lines.push("", "■ 方向別の成績", renderSideTable(r.bySide ?? [], ccy));
+  if (r.limitOrders) {
+    lines.push(
+      "",
+      `■ 注文の種類と手数料 (指値のエントリー ${r.limitOrders.limitEntry ? "有効" : "無効"} / 利確の指値 ${r.limitOrders.limitTakeProfit ? "有効" : "無効"})`,
+      renderOrderTypeTable(r.byOrderType ?? [], ccy),
+      "  指値の約定率:",
+      renderLimitStats(r.limitOrders.stats),
+    );
+  }
+  if (r.tempo) lines.push("", "■ テンポの探索と通常のエントリー", renderTempoTable(r.tempo.byTempo, ccy));
   lines.push("", "■ 戦略別の成績 (全方向)", renderStrategyTable(r.byStrategy, ccy));
   lines.push("", `■ 学習の動き (学習ループ ${r.learning.learningRuns} 回 / 計画の更新 ${r.plans} 回)`);
   const applied = r.learning.adjustments.filter((a) => a.status === "applied").length;

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { Candle, Instrument, OrderBook, PositionView, RegimeFeatures, StrategyContext } from "../src/core/types";
+import type { Candle, Instrument, OrderBook, PositionView, RegimeFeatures, Signal, StrategyContext } from "../src/core/types";
 import { TIMEFRAME_MS } from "../src/core/types";
 import { createRng, generateCandles, syntheticInstrument } from "../src/backtest/synthetic";
 import { runBacktest } from "../src/backtest/engine";
@@ -419,5 +419,74 @@ describe("scalp_micro: onFiltered (見送りの観測通知)", () => {
     const a = scalpMicro.evaluate(ctxOf({ candles: ok }));
     const b = scalpMicro.evaluate({ ...ctxOf({ candles: ok }), onFiltered: () => {} });
     expect(b).toEqual(a);
+  });
+});
+
+// ───────────────────────── テンポ (ctx.tempo) ─────────────────────────
+
+describe("scalp_micro: テンポ", () => {
+  it("シグナルに edgeIsNet: true を付ける。tempo 未指定と 0 は同じ結果", () => {
+    const cs = noise(60, WIDE);
+    burst(cs, 1, WIDE);
+    const a = scalpMicro.evaluate(ctxOf({ candles: cs }))!;
+    expect(a.edgeIsNet).toBe(true);
+    expect(scalpMicro.evaluate({ ...ctxOf({ candles: cs }), tempo: 0 })).toEqual(a);
+  });
+
+  it("緩めるのは costMult だけ (1.5 まで)。設定が 1.5 未満なら設定のまま。期待値の条件は緩めない", () => {
+    const cs = noise(60, MID);
+    burst(cs, 1, MID);
+    const noEv = createScalpMicro({ minNetEdgeBps: -Infinity });
+    const ok = noEv.evaluate(ctxOf({ candles: cs }))!;
+    const ratio = ok.features.tpBps / ok.features.costBps;
+    expect(ratio).toBeGreaterThan(1.5);
+    const params = { costMult: ratio + 0.1 };
+    expect(noEv.evaluate(ctxOf({ candles: cs, params }))).toBeNull();
+    expect(noEv.evaluate({ ...ctxOf({ candles: cs, params }), tempo: 0 })).toBeNull();
+    expect(noEv.evaluate({ ...ctxOf({ candles: cs, params }), tempo: 1 })?.direction).toBe("long");
+    // 範囲外のテンポは 1 として扱う
+    expect(noEv.evaluate({ ...ctxOf({ candles: cs, params }), tempo: 7 })?.direction).toBe("long");
+    // 設定が下限 1.5 未満 (ここでは 0) なら、テンポ 1 でも設定のまま (結果が変わらない)
+    expect(createScalpMicro({ minNetEdgeBps: -Infinity }).evaluate({ ...ctxOf({ candles: cs, params: { costMult: 0 } }), tempo: 1 })).toEqual(
+      noEv.evaluate(ctxOf({ candles: cs, params: { costMult: 0 } })),
+    );
+    // 期待値 > minNetEdgeBps はテンポでも緩めない
+    const calls: string[] = [];
+    const strict = createScalpMicro({ minNetEdgeBps: 1e6 });
+    expect(strict.evaluate({ ...ctxOf({ candles: cs, instrument: { takerFeeRate: 0.0005 } }), tempo: 1, onFiltered: (_s, r) => void calls.push(r) })).toBeNull();
+    expect(calls).toEqual(["edge"]);
+  });
+});
+
+describe("scalp_micro: 探索 (ctx.tempoExplore)", () => {
+  it("tempoExplore が無い・false、または tempo 0 なら従来と同じ結果", () => {
+    const cs = noise(60, WIDE);
+    burst(cs, 1, WIDE);
+    const a = scalpMicro.evaluate(ctxOf({ candles: cs }));
+    expect(a).not.toBeNull();
+    expect(scalpMicro.evaluate({ ...ctxOf({ candles: cs }), tempoExplore: false })).toEqual(a);
+    expect(scalpMicro.evaluate({ ...ctxOf({ candles: cs }), tempo: 0, tempoExplore: true })).toEqual(a);
+    expect(scalpMicro.evaluate({ ...ctxOf({ candles: cs }), tempo: 1, tempoExplore: false })).toEqual(scalpMicro.evaluate({ ...ctxOf({ candles: cs }), tempo: 1 }));
+  });
+
+  it("期待値の下限を tempo × 往復コストだけ下げる (期待値 0 以下のシグナルを通す)。tempoExplore が無ければ edge のまま", () => {
+    const cs = noise(60, MID);
+    burst(cs, 1, MID);
+    const base = { candles: cs, params: { costMult: 0 }, instrument: { takerFeeRate: 0.0012 } };
+    const edge: Signal[] = [];
+    const on = (s: Signal, r: string) => void (r === "edge" && edge.push(s));
+    expect(scalpMicro.evaluate({ ...ctxOf(base), tempo: 1, onFiltered: on })).toBeNull();
+    expect(edge).toHaveLength(1);
+    const e = edge[0].expectedEdgeBps;
+    const c = edge[0].features.costBps;
+    expect(e).toBeLessThan(0);
+    expect(e).toBeGreaterThan(-c);
+    const sig = scalpMicro.evaluate({ ...ctxOf(base), tempo: 1, tempoExplore: true })!;
+    expect(sig).not.toBeNull();
+    expect(sig.expectedEdgeBps).toBeCloseTo(e, 9);
+    expect(sig.edgeIsNet).toBe(true);
+    // テンポが低ければ下げ幅も小さい (期待値 < -t × コスト なら edge)
+    const t = -e / c / 2;
+    expect(scalpMicro.evaluate({ ...ctxOf(base), tempo: t, tempoExplore: true })).toBeNull();
   });
 });

@@ -519,6 +519,10 @@ const MICRO_REASON_LABEL: Record<string, string> = {
   "strategy_filter:spread": "スプレッドで見送り",
   "strategy_filter:edge": "期待値で見送り",
   observe_only: "観測専用",
+  // MAX_HOLD_MINUTES で発注しなかった中期・長期の戦略 (observe_only と同じく通常の見送りとして腕に重み 0.25 で入る)
+  hold_limit: "最大保有の対象外",
+  // テンポの上限 (直近 1 時間のエントリー数) で見送ったもの (通常の見送りと同じ扱い)
+  tempo_cap: "テンポの上限",
 };
 export const microReasonLabel = (reason: string): string => MICRO_REASON_LABEL[reason] ?? reason;
 

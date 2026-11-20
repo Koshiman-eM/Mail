@@ -18,12 +18,26 @@
  *   (エンジンの「状態不明」の経路で getOrder により確かめる)。
  * - clientOrderId は無い (要確認)。orderId が無い照会は、hint (発注時刻・方向・数量) で有効注文と最近の約定を突き合わせ、
  *   候補がちょうど 1 件のときだけ採用する。
+ * - 指値 (maker):
+ *   - 新規の指値は /v1/order の LIMIT。timeInForce は送らない (取引所の既定 = FAS (GTC) の想定)。
+ *     post-only (timeInForce "SOK") は使わない: 公式資料では SOK は取引所現物だけ (要確認・未照合) で、ここで扱うのは
+ *     すべてレバレッジ銘柄のため (capabilities.postOnly = false。OrderRequest.postOnly が付いていても SOK を送らない)。
+ *     レバレッジ取引の手数料は maker / taker とも 0 の想定なので、post-only でなくてもコストは変わらない (要確認)。
+ *   - 利確の指値の板置き (restingTakeProfit) はエンジンが live では使わない (LIMIT_TAKE_PROFIT は paper 専用) ので、能力も false にする。
+ *     reduceOnly の LIMIT を受けた場合は /v1/closeBulkOrder の LIMIT (新規建てにならない) で送る。板にある間は positionSummary の
+ *     sumOrderQuantity (決済注文中の数量) に数えられる (要確認) ので、決済できる数量は「建玉 − sumOrderQuantity」。
+ *   - 新規の前の反対方向の注文の確認 (activeOrders) では、決済注文 (settleType CLOSE。自分の利確の指値を含む) を
+ *     反対方向の新規と数えない (決済注文は両建てを作らない)。
+ *   - 約定の liquidity は executionType が LIMIT なら maker とみなす (要確認: post-only でない指値が即時に約定した場合は taker)。
+ *     手数料は executions の fee (正が支払い、負が受け取り = maker のリベートの想定。要確認)。
  */
 import { D, Decimal, floorToStep } from "../core/decimal";
 import { HttpError } from "../core/http";
 import { createLogger } from "../core/logger";
 import { TerminalMap, isTerminalOrder } from "../core/sweep";
-import type { Balance, Broker, BrokerPosition, Fill, Instrument, OrderLookupHint, OrderRequest, OrderResult, OrderStatus } from "../core/types";
+import type {
+  Balance, Broker, BrokerCapabilities, BrokerPosition, Fill, Instrument, OrderLookupHint, OrderRequest, OrderResult, OrderStatus,
+} from "../core/types";
 import { GmoApiError, GmoClient, GMO_ERROR_KIND_LABEL, unifiedToGmo, type GmoClientOptions, type GmoOrder, type GmoOrderBody } from "../market/gmo/client";
 import { assertLive, type LiveGuard } from "./guard";
 
@@ -87,6 +101,11 @@ interface PositionState {
 export class GmoBroker implements Broker {
   readonly venue = "gmo";
   readonly mode = "live" as const;
+  /**
+   * post-only は不可 (SOK は現物だけの想定。要確認)。利確の板置きも使わない (live では LIMIT_TAKE_PROFIT を無視する)。
+   * 指値のエントリーは通常の LIMIT で送る
+   */
+  readonly capabilities: BrokerCapabilities = { postOnly: false, restingTakeProfit: false };
   private readonly client: GmoClient;
   private readonly inst = new Map<string, Instrument>();
   private readonly ccy: string;
@@ -274,6 +293,7 @@ export class GmoBroker implements Broker {
         return this.rejected(req, `反対側の建玉 (${req.side === "buy" ? "売り" : "買い"} ${opposite}) があるため新規注文を送りません (両建て防止)`);
       }
       const oppSide = req.side === "buy" ? "SELL" : "BUY";
+      // 決済注文 (CLOSE。自分の利確の指値を含む) は建玉を減らすだけなので数えない。反対方向の「新規」(OPEN) だけが両建ての原因
       const pendingOpen = active.filter((o) => o.side === oppSide && o.settleType === "OPEN");
       if (pendingOpen.length) {
         return this.rejected(req, `反対方向の新規注文 (未約定 ${pendingOpen.length} 件: ${pendingOpen.map((o) => o.orderId).join(", ")}) があるため新規注文を送りません (両建て防止)`);
@@ -286,7 +306,8 @@ export class GmoBroker implements Broker {
       executionType: req.type === "limit" ? "LIMIT" : "MARKET",
       size: qty.toFixed(),
       ...(req.type === "limit" ? { price: this.priceStr(inst, req.side, req.limitPrice!) } : {}),
-      // 要確認: GMO の timeInForce は FAK (= IOC) / FAS (= GTC) / FOK / SOK。GTC は既定に任せて送らない
+      // 要確認: GMO の timeInForce は FAK (= IOC) / FAS (= GTC) / FOK / SOK (= Post-only)。SOK は取引所現物だけの想定で、
+      // レバレッジ銘柄 (ここで扱うすべて) には送らない (postOnly は無視して通常の LIMIT)。GTC は既定に任せて送らない
       ...(req.type === "limit" && req.tif === "IOC" ? { timeInForce: "FAK" } : {}),
       ...(req.type === "limit" && req.tif === "FOK" ? { timeInForce: "FOK" } : {}),
     };

@@ -9,18 +9,24 @@ import { pathToFileURL } from "node:url";
 import { loadConfig, type AppConfig } from "./core/config";
 import type { Store, TradeRecord } from "./core/types";
 import { isLoopbackHost, startDashboard, type DashboardServer } from "./dashboard/server";
-import { formatBacktestRows, runBacktestCommand } from "./engine/backtestCommand";
+import { formatBacktestRows, runBacktestCommand, type BacktestSource } from "./engine/backtestCommand";
+import { compareFootnotes, formatCompareRows, runStructureCompare } from "./engine/structureCompare";
 import { DEFAULT_REGIME_TIMEFRAMES, runRegimeCommand } from "./engine/regimeReport";
 import { createFxConverter, quoteCurrencyOfSymbol } from "./engine/fx";
 import {
   equityStats, EXIT_REASON_LABEL, exitFxRates, exitReasonCounts, fmtNum, fmtPct, fmtSigned, fmtTime, isSimulatedShortTrade, liveExecutableTrades,
-  renderLearning, renderSideTable, renderStrategyTable, summarizeBySide, summarizeByStrategy,
+  renderLearning, renderLimitStats, renderOrderTypeTable, renderSideTable, renderStrategyTable, renderTempoTable, summarizeByOrderType, summarizeBySide,
+  summarizeByStrategy, summarizeByTempo,
 } from "./engine/report";
 import { D } from "./core/decimal";
-import { peekResolveRequests, PendingOrders, requestResolve, type PendingOrder, type ResolveRequest } from "./engine/orders";
+import {
+  peekResolveRequests, PendingOrders, readLimitStats, requestResolve, RestingTakeProfits, type PendingOrder, type ResolveRequest,
+} from "./engine/orders";
 import { acquireEngineLock, releaseEngineLock, startEngineLockHeartbeat, type LockOwner } from "./engine/lock";
 import { buildRuntime, parseVenues, resolveDbPath } from "./engine/setup";
+import { effectiveLimitTakeProfit, limitOrdersFromEnv } from "./engine/limitOrders";
 import { formatSimulationReport, runSimulation } from "./engine/simulate";
+import { formatTempoLine, TempoController, tempoSeedTimestamps, tempoStatusView } from "./engine/tempo";
 import { createDefaultSources, IntelService } from "./intel/service";
 import { TradeJournal } from "./learning/journal";
 import { LearningService } from "./learning/service";
@@ -33,7 +39,9 @@ import { requestResume } from "./risk/resumeRequest";
 import { riskOverrideLines } from "./risk/settings";
 import { createStore } from "./storage";
 import { ReadOnlyOverlayStore } from "./storage/readonly";
-import { getStrategy } from "./strategies/registry";
+import { configuredStrategies, getStrategy } from "./strategies/registry";
+import { structureSettingsFromEnv } from "./structure/settings";
+import { unifiedToGmo } from "./market/gmo/client";
 import { TIMEFRAME_MS, type ExitReason, type Timeframe } from "./core/types";
 
 // ───────── 引数解析 ─────────
@@ -135,16 +143,26 @@ export interface BacktestArgs {
   strategy: string;
   symbol?: string;
   days: number;
-  source: "synthetic" | "ccxt";
+  source: BacktestSource;
   seed: number;
+  /** 相場構造のフィルターの比較 (A〜G) */
+  structureCompare?: true;
+  /** pivotN 4 / 6 / 10 の頑健性 (structureCompare と併用) */
+  pivotSweep?: true;
+  /** 比較の区間数 (既定 5) */
+  folds?: number;
 }
 
 export function parseBacktestArgs(flags: ParsedArgs["flags"]): BacktestArgs {
-  const strategy = stringFlag(flags, "strategy", "");
+  const compare = flags["structure-compare"] === true;
+  const sweep = flags["pivot-sweep"] === true;
+  if (sweep && !compare) throw new CliError("--pivot-sweep は --structure-compare と一緒に指定してください");
+  // 比較は --strategy を省略すると all (フィルターの対象の戦略)
+  const strategy = stringFlag(flags, "strategy", compare ? "all" : "");
   if (!strategy) throw new CliError("--strategy <戦略ID|all> を指定してください");
   if (strategy !== "all" && !getStrategy(strategy)) throw new CliError(`未知の戦略: ${strategy}`);
   const source = stringFlag(flags, "source", "synthetic");
-  if (source !== "synthetic" && source !== "ccxt") throw new CliError("--source は synthetic または ccxt です");
+  if (source !== "synthetic" && source !== "ccxt" && source !== "gmo") throw new CliError("--source は synthetic / ccxt / gmo のどれかです");
   const symbol = flags.symbol === undefined ? undefined : stringFlag(flags, "symbol", "");
   return {
     strategy,
@@ -152,6 +170,8 @@ export function parseBacktestArgs(flags: ParsedArgs["flags"]): BacktestArgs {
     days: numberFlag(flags, "days", 30, { min: 0.01, max: 3650 }),
     source,
     seed: numberFlag(flags, "seed", 1, { integer: true }),
+    ...(compare ? { structureCompare: true as const, folds: numberFlag(flags, "folds", 5, { min: 2, max: 20, integer: true }) } : {}),
+    ...(sweep ? { pivotSweep: true as const } : {}),
   };
 }
 
@@ -194,8 +214,10 @@ export const HELP = `自己学習型マルチアセット自動売買ツール
   run                         実時間で起動 (既定は paper)。ダッシュボードも起動します
   simulate [--days 3] [--hours N] [--seed 1] [--db memory] [--step 15]
                               合成データ + 仮想時計で高速にペーパー運転 (ネット不要)
-  backtest --strategy <ID|all> [--symbol SYM] [--days 30] [--source synthetic|ccxt] [--seed 1]
-                              バックテスト (ccxt は CCXT_EXCHANGE の履歴を取得)
+  backtest --strategy <ID|all> [--symbol SYM] [--days 30] [--source synthetic|ccxt|gmo] [--seed 1]
+                              バックテスト (ccxt は CCXT_EXCHANGE、gmo は GMOコインの履歴を取得。STRUCTURE_* の構造フィルター込み)
+  backtest --structure-compare [--strategy <ID|all>] [--pivot-sweep] [--folds 5] [その他は backtest と同じ]
+                              相場構造のフィルターの比較 (A: ラップなし 〜 G: conservative 版) を区間検証で表示
   regime --symbol SYM [--hours 3] [--tf 1m,15m,1h,4h] [--step 5]
                               各時刻の相場の状態 (レジーム) を運用と同じ判定で表示 (ccxt の履歴。先読みなし)
   intel                       情報収集を 1 回実行してブリーフを表示
@@ -411,16 +433,46 @@ async function cmdBacktest(flags: ParsedArgs["flags"], io: Io): Promise<number> 
     io.out(`ccxt (${config.env.CCXT_EXCHANGE}) から履歴を取得します...`);
     feed = CcxtFeed.create(config.env.CCXT_EXCHANGE);
   }
-  const symbol = a.symbol ?? (a.source === "ccxt" ? (["bitflyer", "bitbank", "coincheck", "zaif"].includes(config.env.CCXT_EXCHANGE) ? "BTC/JPY" : "BTC/USDT") : "SYN/USDT");
-  const rows = await runBacktestCommand({
+  const symbol =
+    a.symbol ??
+    (a.source === "gmo"
+      ? "BTC/JPY"
+      : a.source === "ccxt"
+        ? ["bitflyer", "bitbank", "coincheck", "zaif"].includes(config.env.CCXT_EXCHANGE) ? "BTC/JPY" : "BTC/USDT"
+        : "SYN/USDT");
+  if (a.source === "gmo") {
+    io.out("GMOコインから履歴を取得します...");
+    // 履歴の取得だけ (発注しない)。レバレッジ銘柄の足が取れなければ現物の足で代用する (バックテスト用)
+    feed = new GmoFeed({ symbols: parseGmoSymbols(unifiedToGmo(symbol)), holdingFeeDaily: config.env.GMO_LEVERAGE_FEE_DAILY, allowSpotCandles: true });
+  }
+  const structure = structureSettingsFromEnv(config.env);
+  const sourceLabel = a.source === "synthetic" ? `合成データ (シード ${a.seed})` : a.source === "gmo" ? "GMOコイン" : `ccxt ${config.env.CCXT_EXCHANGE}`;
+  const common = {
     ...a,
     symbol,
     ...(feed ? { feed } : {}),
     minEdgeToCostRatio: config.risk.minEdgeToCostRatio,
     riskPerTrade: config.risk.riskPerTrade,
     maxPositionPct: config.risk.maxPositionPct,
-  });
-  io.out(`バックテスト: ${symbol} / ${a.days} 日 / ${a.source === "synthetic" ? `合成データ (シード ${a.seed})` : `ccxt ${config.env.CCXT_EXCHANGE}`}`);
+    // 指値 (maker) の前提を実運用 (LIMIT_ENTRY / LIMIT_TAKE_PROFIT。利確の指値は現在の mode で有効なときだけ) に合わせる
+    limitOrders: limitOrdersFromEnv(config.env, config.mode),
+  };
+  if (a.structureCompare) {
+    const folds = a.folds ?? 5;
+    const rows = await runStructureCompare({ ...common, settings: structure, folds, ...(a.pivotSweep ? { pivotSweep: true } : {}) });
+    io.out(`相場構造のフィルターの比較: ${symbol} / ${a.days} 日 / ${sourceLabel} / ${folds} 区間 / pivotN ${a.pivotSweep ? "4・6・10" : structure.config.pivotN}`);
+    io.out(formatCompareRows(rows));
+    compareFootnotes({ folds, ...(a.pivotSweep ? { pivotSweep: true } : {}) }).forEach((l) => io.out(l));
+    return 0;
+  }
+  // 運用・パラメータ検証と同じく、STRUCTURE_MODE=filter なら対象の戦略を相場構造のフィルターでラップする
+  // 最大保有 (MAX_HOLD_MINUTES) も実運用と同じ前提にする (0 = 無効)。テンポはバックテストに渡さない
+  const maxHold = config.env.MAX_HOLD_MINUTES > 0 ? config.env.MAX_HOLD_MINUTES : undefined;
+  const rows = await runBacktestCommand({ ...common, strategies: configuredStrategies(structure), ...(maxHold !== undefined ? { maxHoldMinutes: maxHold } : {}) });
+  io.out(
+    `バックテスト: ${symbol} / ${a.days} 日 / ${sourceLabel} / 構造フィルター ${structure.mode === "filter" ? "あり" : "なし"}` +
+      (maxHold !== undefined ? ` / 最大保有 ${maxHold} 分` : ""),
+  );
   io.out(formatBacktestRows(rows));
   io.out("※ 損益はクオート通貨建て (初期評価額 1,000,000)。期間の前にウォームアップ用の足を付けています。");
   return 0;
@@ -440,7 +492,9 @@ async function cmdRegime(flags: ParsedArgs["flags"], io: Io): Promise<number> {
     ? new GmoFeed({ symbols: parseGmoSymbols(config.env.GMO_SYMBOLS), holdingFeeDaily: config.env.GMO_LEVERAGE_FEE_DAILY, allowSpotCandles: true })
     : CcxtFeed.create(config.env.CCXT_EXCHANGE);
   io.out(useGmo ? "GMOコインから履歴を取得します..." : `ccxt (${config.env.CCXT_EXCHANGE}) から履歴を取得します...`);
-  io.out(await runRegimeCommand({ feed, symbol: a.symbol, hours: a.hours, timeframes: a.timeframes, stepMin: a.stepMin }));
+  const sc = structureSettingsFromEnv(config.env).config;
+  const structure = { pivotN: sc.pivotN, breakMode: sc.breakMode, reversalMode: sc.reversalMode, chopM: sc.chopM, chopR: sc.chopR };
+  io.out(await runRegimeCommand({ feed, symbol: a.symbol, hours: a.hours, timeframes: a.timeframes, stepMin: a.stepMin, structure }));
   return 0;
 }
 
@@ -514,6 +568,17 @@ export function buildReportText(config: AppConfig, store: Store, now: number = D
     lines.push("", "■ 戦略別の成績 (空売り (paper 再現)。live では空売りしません)");
     lines.push(renderStrategyTable(summarizeByStrategy(simShorts, toAcct, quoteOf, rates), ccy));
   }
+  // 注文の種類 (成行 / 指値) 別の取引数・手数料の maker / taker の内訳・平均の手数料率と、指値の約定率 (mode 別)
+  lines.push("", "■ 注文の種類と手数料 (エントリーの注文の種類別。記録の無い古い取引は成行・内訳なし)");
+  lines.push(renderOrderTypeTable(summarizeByOrderType(trades, toAcct, quoteOf, rates), ccy));
+  for (const mode of ["paper", "live"] as const) {
+    const ls = readLimitStats(store, mode);
+    if (ls.since === undefined) continue;
+    lines.push(`  指値の約定率 (${mode}):`, renderLimitStats(ls));
+  }
+  // テンポ (エントリー頻度の目標) の探索のエントリーと通常のエントリーの成績 (取引の印 entryContext.features.tempoExplore で分ける)
+  lines.push("", "■ テンポの探索と通常のエントリー");
+  lines.push(renderTempoTable(summarizeByTempo(trades, toAcct, quoteOf, rates), ccy));
   // 学習状態は取引 mode (paper / live) 別。report は読み取り専用なので、起動時の移行などの書き込みは DB に反映しない
   const learning = new LearningService({ store: new ReadOnlyOverlayStore(store), mode: config.mode, getStrategy: (id) => getStrategy(id) });
   lines.push("", `学習状態: ${config.mode}`);
@@ -726,6 +791,20 @@ function cmdOrders(positionals: string[], flags: ParsedArgs["flags"], io: Io): n
   }
 }
 
+/**
+ * status 用のテンポの 1 行 (目標・直近 1 時間のエントリー数・テンポ・上限・探索・最大保有)。
+ * エンジンと同じく、この mode の直近 1 時間の取引と保有中のポジションのエントリー時刻から計算する
+ * (エントリーが 1 件も無いときのテンポはエンジンの起動時刻が分からないので 0 と表示する。実行中の値はダッシュボード)
+ */
+export function tempoStatusLine(config: AppConfig, store: Pick<Store, "listTrades">, mode: "paper" | "live", openEntryTs: number[], now: number): string {
+  const env = config.env;
+  const target = env.TARGET_ENTRIES_PER_HOUR ?? 0;
+  const tc = target > 0 ? new TempoController({ targetPerHour: target, capMultiplier: env.TEMPO_CAP_MULTIPLIER ?? 2 }) : undefined;
+  if (tc) tc.seed(tempoSeedTimestamps(store.listTrades({ since: now - tc.windowMs, mode }).map((t) => t.entryTs), openEntryTs, now, tc.windowMs));
+  const explore = mode === "paper" || env.TEMPO_ALLOW_LIVE_EXPLORE === true;
+  return formatTempoLine(tempoStatusView(tc, now, explore), env.MAX_HOLD_MINUTES ?? 0);
+}
+
 function cmdStatus(io: Io): number {
   const config = loadConfig();
   const m = modeLines(config);
@@ -755,6 +834,15 @@ function cmdStatus(io: Io): number {
       io.out(`保留中の注文 (${mode}): ${pending.length} 件 (取引所で状態を確認してください。解消は npm run trader -- orders)`);
       for (const o of pending) io.out(pendingOrderLine(o));
     }
+    io.out(tempoStatusLine(config, store, mode, open.map((p) => p.entryTs), now));
+    io.out(`指値: エントリー ${config.env.LIMIT_ENTRY ? "有効" : "無効"} (期限 ${config.env.LIMIT_ENTRY_TIMEOUT_MS !== undefined ? `${config.env.LIMIT_ENTRY_TIMEOUT_MS}ms` : "主時間足 (20 秒〜15 分)"}) / 利確の板置き ${effectiveLimitTakeProfit(config.env, mode) ? "有効" : config.env.LIMIT_TAKE_PROFIT ? "無効 (live では使わない: LIMIT_TAKE_PROFIT は paper 専用)" : "無効"}`);
+    const tps = new RestingTakeProfits({ store, mode }).list();
+    if (tps.length) {
+      io.out(`板に置いた利確の指値 (${mode}): ${tps.length} 件`);
+      for (const t of tps) io.out(`  ${t.symbol} ${t.side === "buy" ? "買い" : "売り"} ${t.qty} @ ${t.price} 約定済み ${t.appliedQty} 状態 ${t.status}${t.exit ? ` (決済 ${t.exit.reason} のため取消中)` : ""} ${t.clientId}`);
+    }
+    const ls = readLimitStats(store, mode);
+    if (ls.since !== undefined) io.out(`指値の約定率 (${mode}):\n${renderLimitStats(ls)}`);
     const plan = store.latestPlan();
     io.out(`最新の計画: ${plan ? `${fmtTime(plan.generatedAt)} (有効期限 ${fmtTime(plan.validUntil)})` : "(なし)"}`);
     const brief = store.latestBrief();

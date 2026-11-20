@@ -3,6 +3,7 @@ export * from "./common";
 export * from "./scalp";
 export * from "./scalpMicro";
 export * from "./scalpRebound";
+export * from "./scalpPullback";
 export * from "./short";
 export * from "./mid";
 export * from "./long";

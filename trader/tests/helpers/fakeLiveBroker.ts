@@ -1,4 +1,4 @@
-import type { Balance, Broker, BrokerPosition, OrderLookupHint, OrderRequest, OrderResult, OrderStatus, Quote } from "../../src/core/types";
+import type { Balance, Broker, BrokerCapabilities, BrokerPosition, OrderLookupHint, OrderRequest, OrderResult, OrderStatus, Quote } from "../../src/core/types";
 
 /**
  * テスト用の「受付のみ」を返す live ブローカー (実在の取引所へは何も送らない)。
@@ -10,6 +10,8 @@ import type { Balance, Broker, BrokerPosition, OrderLookupHint, OrderRequest, Or
  */
 export class FakeLiveBroker implements Broker {
   readonly mode = "live" as const;
+  /** 能力 (既定は無し = 従来の動き。利確の指値の板置きの試験では { restingTakeProfit: true } にする) */
+  capabilities?: BrokerCapabilities;
   placeMode: "accept" | "fill" | "reject" | "throw" = "accept";
   getOrderMode: "normal" | "throw" | "missing" = "normal";
   /** getBalance / getPositions を失敗させる */

@@ -9,15 +9,16 @@
 
 ## 2. コマンド
 - `npm install` / `npm test` / `npm run typecheck`
-- `npm run simulate -- --days 1`: 合成データで高速にペーパー運転する (ネット不要)
-- `npm run backtest -- --strategy all`
+- `npm run simulate -- --days 1`: 合成データで高速にペーパー運転する (ネット不要)。構造フィルターの理由別の見送り数・エントリー/時・平均保有・テンポ・見送り件数も表示
+- `npm run backtest -- --strategy all [--source synthetic|ccxt|gmo]`
+- `npm run backtest -- --structure-compare [--strategy <id>|all] [--pivot-sweep] [--folds 5] [--days N] [--source ...]`: 相場構造フィルターの比較 (A: ラッパーなし 〜 G: conservative を evaluateParams の区間で比べる)。30 取引未満の区間は「回数不足」。`--pivot-sweep` (N=4/6/10) は頑健性の確認だけで、N を調整し続けない
 - `npm start`: 実時間で起動する。既定は paper
-- `npm run report`: 成績と学習状態 (現在の mode のもの) を表示
+- `npm run report`: 成績と学習状態 (現在の mode のもの) を表示。注文種別ごとの成績・maker/taker 手数料の内訳・指値の約定率・探索/通常 (テンポ) の表も出す
 - `npm run trader -- intel`: 情報収集を 1 回実行してブリーフを表示
-- `npm run status`: 設定と現在の状態を表示
+- `npm run status`: 設定と現在の状態を表示 (指値の設定と約定率、テンポ・最大保有も)
 - `npm run trader -- resume`: キルスイッチ・日次停止を解除 (監査ログに記録。動作中のエンジンにも次のティックで反映)
 - `npm run trader -- orders` (`orders list`): 保留中・状態不明の注文を一覧
-- `npm run trader -- regime --symbol BTC/JPY --hours 3 [--tf 1m,15m,1h,4h] [--step <分>]`: 各時刻の相場の状態 (レジーム) を運用と同じ detectRegime で表示 (確定足だけ。スプレッドは 0 扱い。VENUES に gmo があれば GMOコインの足)
+- `npm run trader -- regime --symbol BTC/JPY --hours 3 [--tf 1m,15m,1h,4h] [--step <分>]`: 各時刻の相場の状態 (レジーム) を運用と同じ detectRegime で表示 (確定足だけ。スプレッドは 0 扱い。VENUES に gmo があれば GMOコインの足)。目線・押し安値/戻り高値・choppiness も表示
 - `npm run trader -- gmo check`: GMOコインの API の応答の形を確かめる (公開 API と、`GMO_API_KEY` があれば読み取り専用の非公開 API。**注文・取消は呼ばない**。キーは表示しない)。live に切り替える前に必ず実行する
 - `npm run trader -- orders resolve <clientId> --none | --filled --qty <数量> --price <価格>`: 状態不明の注文を手動で確定する。escalated 以外は `--force` 必須。`--none` で取消に失敗したら保留のまま
 
@@ -59,10 +60,32 @@
    - レバレッジ銘柄の足が取れないときの現物の足への切り替えは、paper では許可 (監査ログ `gmo.spot_candles`)、live では `GMO_ALLOW_SPOT_CANDLES=true` のときだけ。
    - API の仕様は公式資料と未照合 (要確認の項目は `gmo check` が表示する)。応答の形が想定と違えば例外 (fail-closed)。
 
+14. **相場構造 (ダウ理論) フィルター** (`src/structure/`、`STRUCTURE_MODE=filter` が既定。`off` なら従来と同一):
+   - 戦略の一覧を作る箇所で `withStructure` / `configuredStrategies` がラッパーを掛ける。エンジン・バックテスト・`createParamValidator` は同じ一覧を使い、エンジン本体は変更しない。
+   - 確定足だけ (各時間足で直近 300 本)。スイング点は左は厳密・右は `>=` (横ばい対応) で、N 本後に確定する (リペイントしない)。上位足も確定足だけ (MTF: 1m→15m、5m/15m→1h、1h→4h、4h→1d、1d→1w。1w は直近 300 本の 1d から作り、形成中の週は除く)。
+   - 弾いたシグナルは観測専用の仮想トレード `strategy_filter:structure_*` (bias / mtf / chop / none / weak / po / stop) だけで、学習には使わない。
+   - 構造の損切り (`STRUCTURE_STOP_MODE=structure`) は損切りを押し安値/戻り高値 ± ATR × バッファへ動かすだけ。サイズは RiskManager が決め、期待値は増やさない。新しい損切り幅が元の 0.5 倍未満・3 倍超・0.5 ATR 未満、または利確が不正なら見送る。
+   - 既定の対象: scalp_momentum_burst, scalp_micro, short_ema_trend, short_breakout, mid_trend_follow, long_momentum, meme_momentum (対象外: scalp_obi, scalp_vwap_revert, short_rsi_revert, scalp_rebound, scalp_pullback)。未知の id と、purist での `STRUCTURE_EXIT_ON_WEAKENING` は起動時に警告する。
+   - 設定: `STRUCTURE_MODE` / `_STRATEGIES` / `_PIVOT_N` (3〜20、既定 6) / `_BREAK_MODE` / `_BIAS_METHOD` / `_REVERSAL_MODE` / `_USE_MTF` / `_USE_PERFECT_ORDER` / `_STOP_MODE` / `_STOP_ATR_BUFFER` / `_EXIT_ON_REVERSAL` / `_EXIT_ON_WEAKENING` / `_CHOP_M` / `_CHOP_R` (`config.ts`、既定は README)。
+15. **指値 (maker)** (`LIMIT_ENTRY` 既定 true、`src/engine/limitOrders.ts`、`orders.ts`):
+   - 新規は買いが最良の買い気配、売りが最良の売り気配への指値。優先順位は シグナル自身の指値価格 > 戦略の `entryOrder` > 設定。`scalp_micro` は成行。post-only は `capabilities.postOnly` のある取引先だけ (PaperBroker は可、GMO は不可。GMO の SOK は現物のみ (要確認) なので、レバレッジの指値は通常の LIMIT)。
+   - RiskManager は発注前に、指値価格でサイズを決めて評価する。待機中は kv `orders:pending:<mode>` に保存し、その銘柄の新規を止める。期限・反対シグナル・損切り価格の通過・新規を止める条件 (停止・日次停止・kill switch・状態不明の注文・口座取得不可・気配の古さ) で取り消す。
+   - 取消 → 照会で確認する。取消が確定し注文の消滅を確認するまで追跡から外さない (確認できなければ escalate し、新規を止める。取引所側に余分な建玉があれば異常 / kill switch)。一部約定はその数量の建玉にする。最小数量未満の端数は追跡外で、監査ログ `limit.dust_entry`。期限切れは仮想トレード `limit_unfilled` (重み 0.25)。protectiveStop は従来どおり渡す (OANDA の stopLossOnFill)。
+   - 待機の利確 (`LIMIT_TAKE_PROFIT`、既定 false、paper のみ。live では無視して起動時に警告): reduceOnly の指値を利確価格に置く。成行で決済する前に、必ず取り消して確認する。
+   - PaperBroker は気配が価格を通過したときだけ約定 (触れただけでは約定しない)、maker 手数料。バックテスト (`limitOrders`) は次の足から高値・安値が通過したときだけ約定し、maker 手数料、同じ足では損切り優先。検証・CLI のバックテストも現在の mode と同じ前提にする。約定率は kv `orders:limitStats:<mode>`。
+16. **テンポと最大保有** (`src/engine/tempo.ts`、`TARGET_ENTRIES_PER_HOUR` 既定 0 = 無効、`MAX_HOLD_MINUTES` 既定 0 = 無効):
+   - tempo (0〜1) = 不足 (1 − 直近 1 時間のエントリー / 目標) × 待ち (最後のエントリーから 60/目標 分まで 0、その 2 倍で 1)。ティックごとに 1 回計算し、新規エントリーの戦略評価 (`StrategyContext.tempo` / `tempoExplore`) と `RiskManager.evaluateEntry` (`EntryParams`) にだけ渡す。決済・バックテスト・パラメータ検証には渡さない。無効なら何も渡さず従来と同一。
+   - 緩めるのは戦略の costMult (1.5 へ)、scalp_pullback の閾値、MIN_EDGE_TO_COST (`TEMPO_MIN_EDGE_TO_COST` へ。1 未満にしない) だけ。edgeIsNet のシグナルはコストを二重計上しない。クールダウン・損切り幅の制限・最大保有・RiskManager のそのほかの判定は緩めない。
+   - 探索は paper では常に、live では `TEMPO_ALLOW_LIVE_EXPLORE=true` のときだけ。純期待値の下限を tempo × 往復コストだけ下げ (`tempoNetEdgeFloor`。RiskManager も同じ)、純期待値 ≤ 0 のエントリーはサイズ × `TEMPO_EXPLORE_SIZE` (既定 0.5) で `features.tempoExplore=1`。NaN は常に拒否。
+   - 上限: 直近 1 時間のエントリーが ceil(目標 × `TEMPO_CAP_MULTIPLIER` (既定 2)) に達したら新規を止め、仮想トレード `tempo_cap`。エントリーは約定して建玉になった時に 1 回数え、再起動時はこの mode の直近 1 時間の取引と建玉から復元する。
+   - `MAX_HOLD_MINUTES` (0 = 無効、5〜1440): mid / long は新規を発注せず仮想トレード `hold_limit` (observe_only と同じ扱い、重み 0.25、腕の停止には使わない)。ほかの戦略は maxHold を丸める。保有中の建玉は変えない。バックテスト・検証も同じ `maxHoldMinutes` (mid / long は丸めない)。
+
 ## 4. 構成
 - `src/core/`: 型の契約 (`types.ts`)、設定、decimal、HTTP リトライ、Claude 呼び出し (`ai.ts`。構造化出力、拒否時はサーバー側フォールバック、キー未設定時はルールベース)
 - `src/indicators/`, `src/regime/`: 指標・リサンプル・相場環境の判定
-- `src/strategies/`: 11 戦略 (scalp 5 / short 3 / mid / long / meme)。scalp_rebound は 15m の下降トレンド中の 1m の反発を買う (買いのみ・crypto。既定で観測専用)。パラメータの標準名は stopAtr, tpAtr, trailAtr, entryThreshold, maxHoldBars
+- `src/strategies/`: 12 戦略 (scalp 6 / short 3 / mid / long / meme)。scalp_rebound は 15m の下降トレンド中の 1m の反発を買う (買いのみ・crypto。既定で観測専用)。scalp_pullback は 15m EMA20 の傾きで方向を決め、上昇中の 1m の押しを買い・下降中の戻りを売る (crypto。売りは canShort。損切り = 押しの極値 ± stopAtr (0.3) ATR を 0.8〜3.5 ATR に収める (超えたら見送り)、利確 = tpR (2) × 損切り幅、保有 10〜30 分、純期待値 (edgeIsNet)、コスト条件と 5 本のクールダウンあり。構造ラッパーなし・観測専用でない)。パラメータの標準名は stopAtr, tpAtr, trailAtr, entryThreshold, maxHoldBars
+- `src/structure/`: 相場構造 (pivots・machine・perfectOrder・mtf・wrap・settings)。`src/engine/structureCompare.ts` は `--structure-compare`
+- `src/engine/tempo.ts`: テンポ・上限・探索。`limitOrders.ts`: 指値エントリー / 待機の利確の管理。`orders.ts`: 保留中・状態不明の注文の管理 (指値の取消確認・約定率の統計を含む)
 - `src/backtest/`: イベント駆動バックテスト、`evaluateParams`、`walkForward`、合成データ
 - `src/market/`: feed (ccxt / GMOコイン / OANDA / Alpaca / DexScreener / synthetic) と MarketHub。GMO は `src/market/gmo/` (client・klines・check) と `feeds/gmo.ts`
 - `src/execution/`: PaperBroker、実口座アダプター (ccxt / GMO `gmoBroker.ts` / OANDA / Alpaca)、router

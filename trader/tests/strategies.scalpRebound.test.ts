@@ -97,8 +97,8 @@ function ctxOf(o: CtxOpts): StrategyContext {
 }
 
 describe("scalp_rebound: 登録と既定値", () => {
-  it("registry に scalp・crypto・買いの戦略として登録され、戦略数は 11", () => {
-    expect(ALL_STRATEGIES).toHaveLength(11);
+  it("registry に scalp・crypto・買いの戦略として登録され、戦略数は 12", () => {
+    expect(ALL_STRATEGIES).toHaveLength(12);
     expect(getStrategy("scalp_rebound")).toBe(scalpRebound);
     expect(strategiesFor("crypto", "scalp").map((s) => s.id)).toContain("scalp_rebound");
     expect(strategiesFor("meme").map((s) => s.id)).not.toContain("scalp_rebound");
@@ -299,5 +299,57 @@ describe("scalp_rebound: 保有中", () => {
     expect(sig!.direction).toBe("flat");
     // 同じ足でも建玉が無ければ新規の買いは出さない (平均より上)
     expect(scalpRebound.evaluate(ctxOf({ c1 }))).toBeNull();
+  });
+});
+
+describe("scalp_rebound: テンポ", () => {
+  it("シグナルに edgeIsNet: true を付ける。tempo 未指定と 0 は同じ結果", () => {
+    const a = scalpRebound.evaluate(ctxOf({ c1: oneMinute() }))!;
+    expect(a.edgeIsNet).toBe(true);
+    expect(scalpRebound.evaluate({ ...ctxOf({ c1: oneMinute() }), tempo: 0 })).toEqual(a);
+  });
+
+  it("緩めるのは costMult だけ (1.5 まで)。期待値の条件は緩めない", () => {
+    const c1 = oneMinute();
+    const noEv = createScalpRebound({ minNetEdgeBps: -Infinity });
+    const ok = noEv.evaluate(ctxOf({ c1 }))!;
+    const ratio = ok.features.tpBps / ok.features.costBps;
+    expect(ratio).toBeGreaterThan(1.5);
+    const params = { costMult: ratio + 0.1 };
+    const filtered: string[] = [];
+    expect(noEv.evaluate(ctxOf({ c1, params, onFiltered: (_s, r) => filtered.push(r) }))).toBeNull();
+    expect(filtered).toEqual(["cost"]);
+    expect(noEv.evaluate({ ...ctxOf({ c1, params }), tempo: 1 })?.direction).toBe("long");
+    // 期待値が負 (勝率の上乗せ 0) ならテンポ 1 でも edge で見送る
+    const edge: string[] = [];
+    expect(createScalpRebound({ winEdgeMax: 0 }).evaluate({ ...ctxOf({ c1, onFiltered: (_s, r) => edge.push(r) }), tempo: 1 })).toBeNull();
+    expect(edge).toEqual(["edge"]);
+  });
+});
+
+describe("scalp_rebound: 探索 (ctx.tempoExplore)", () => {
+  it("tempoExplore が無い・false、または tempo 0 なら従来と同じ結果", () => {
+    const a = scalpRebound.evaluate(ctxOf({ c1: oneMinute() }));
+    expect(a).not.toBeNull();
+    expect(scalpRebound.evaluate({ ...ctxOf({ c1: oneMinute() }), tempoExplore: false })).toEqual(a);
+    expect(scalpRebound.evaluate({ ...ctxOf({ c1: oneMinute() }), tempo: 0, tempoExplore: true })).toEqual(a);
+    expect(scalpRebound.evaluate({ ...ctxOf({ c1: oneMinute() }), tempo: 1, tempoExplore: false })).toEqual(
+      scalpRebound.evaluate({ ...ctxOf({ c1: oneMinute() }), tempo: 1 }),
+    );
+  });
+
+  it("期待値の下限を tempo × 往復コストだけ下げる (期待値 0 以下のシグナルを通す)", () => {
+    const base = { c1: oneMinute(), params: { costMult: 0 }, instrument: { takerFeeRate: 0.0012 } };
+    const edge: Signal[] = [];
+    expect(scalpRebound.evaluate({ ...ctxOf({ ...base, onFiltered: (s, r) => void (r === "edge" && edge.push(s)) }), tempo: 1 })).toBeNull();
+    expect(edge).toHaveLength(1);
+    const e = edge[0].expectedEdgeBps;
+    const c = edge[0].features.costBps;
+    expect(e).toBeLessThan(0);
+    expect(e).toBeGreaterThan(-c);
+    const sig = scalpRebound.evaluate({ ...ctxOf(base), tempo: 1, tempoExplore: true })!;
+    expect(sig).not.toBeNull();
+    expect(sig.expectedEdgeBps).toBeCloseTo(e, 9);
+    expect(scalpRebound.evaluate({ ...ctxOf(base), tempo: -e / c / 2, tempoExplore: true })).toBeNull();
   });
 });

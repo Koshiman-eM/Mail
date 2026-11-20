@@ -83,6 +83,25 @@ export interface BacktestOptions {
   equitySampleMs?: number;
   /** TradeRecord.id の接頭辞 (既定 "bt") */
   idPrefix?: string;
+  /**
+   * 指値 (maker) の利用 (ライブの LIMIT_ENTRY / LIMIT_TAKE_PROFIT / LIMIT_ENTRY_TIMEOUT_MS と同じ前提)。
+   * 省略時は従来どおり (エントリーは成行、利確は従来の判定)。
+   * - entry: 戦略の entryOrder が無ければ指値でエントリーする (シグナルの指値 (価格あり) は常に優先)。
+   *   価格は買いなら買い気配 (終値 − 半スプレッド)、売りなら売り気配。次の足から、安値 (買い) が指値を「下回った」
+   *   (売りは高値が「上回った」) ときだけ指値の価格で maker 約定する。期限 (entryTimeoutMs を足の本数に換算) 内に
+   *   約定しなければ取引なし。待っている間に逆方向のシグナルが出たら取り消す。
+   * - takeProfit: 利確は板に置いた指値として、高値 (買い) が利確価格を「越えた」ときだけ利確価格で maker 約定する。
+   *   同じ足で損切りにも届いたら損切りを優先する (保守的)。実運用では paper 専用 (live では使わない) なので、
+   *   limitOrdersFromEnv は現在の mode で有効なときだけ true にする。
+   * - 指値で約定した足では、有利な側の極値 (約定前だったかもしれない) をトレーリング・MFE に使わない (約定価格から追う)。
+   */
+  limitOrders?: { entry?: boolean; takeProfit?: boolean; entryTimeoutMs?: number };
+  /**
+   * 最大保有 (分。ライブの MAX_HOLD_MINUTES と同じ前提)。シグナルの maxHoldMs をこの分数までに縮める
+   * (maxHoldMs が 0 = 時間切れ無しのシグナルもこの分数にする)。省略・0 以下なら従来どおり。
+   * 時間軸による扱い (中期・長期は運用で新規エントリーしない) は呼び出し側が決める (isHoldLimitedHorizon)
+   */
+  maxHoldMinutes?: number;
 }
 
 export interface BacktestMetrics {
@@ -117,6 +136,8 @@ export interface BacktestStats {
   signalExits: number;
   /** 見送り理由ごとの件数 (size / edge / short / equity) */
   skipped: Record<string, number>;
+  /** 指値のエントリー (limitOrders.entry のとき): 置いた / 約定 / 期限切れ / 逆シグナルで取消 */
+  limitEntries?: { placed: number; filled: number; expired: number; canceled: number };
 }
 
 export interface BacktestResult {

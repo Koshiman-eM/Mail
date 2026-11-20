@@ -322,7 +322,7 @@ function alwaysShort(holdMin = 60): Strategy {
 async function paperRuntime(env: Record<string, string> = {}, holdMin = 60) {
   const clock = mkClock();
   const store = new MemoryStore();
-  const config = loadConfig({ NODE_ENV: "test", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "USDT", ...env });
+  const config = loadConfig({ NODE_ENV: "test", LIMIT_ENTRY: "false", LIMIT_TAKE_PROFIT: "false", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "USDT", ...env });
   const rt = await buildRuntime(config, {
     clock, store, intelSources: [], ai: null, seed: 3, syntheticHistoryMs: 2 * DAY, rng: mulberry32(7), strategies: [alwaysShort(holdMin)],
     engine: { forecast: { enabled: false } },
@@ -389,7 +389,7 @@ describe("エンジン統合 (paper): 買いの腕と空売りの腕は独立", 
         realN: 60, realMeanR: -1, realVarR: 0, disabled: true, recMeanR: -50, recW: 1e6, disabledAt: START - 1, disableCount: 1,
       });
     }
-    const config = loadConfig({ NODE_ENV: "test", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "USDT" });
+    const config = loadConfig({ NODE_ENV: "test", LIMIT_ENTRY: "false", LIMIT_TAKE_PROFIT: "false", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "USDT" });
     // rng 0.99: 止まった腕の探索には当たらない
     const rt = await buildRuntime(config, { clock, store, intelSources: [], ai: null, seed: 3, syntheticHistoryMs: 2 * DAY, rng: () => 0.99, strategies: [alwaysShort()] });
     for (let i = 0; i < 12; i++) {
@@ -413,7 +413,7 @@ describe("エンジン統合 (live): 空売りの再現は効かない", () => {
     const broker = new FakeLiveBroker("paper");
     broker.placeMode = "fill";
     const brokerSet: BrokerSet = { mode: "live", brokers: new Map([[broker.venue, broker]]), brokerFor: () => broker };
-    const config = loadConfig({ NODE_ENV: "test", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "USD" });
+    const config = loadConfig({ NODE_ENV: "test", LIMIT_ENTRY: "false", LIMIT_TAKE_PROFIT: "false", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "USD" });
     const rt = await buildRuntime(config, {
       clock, store, intelSources: [], ai: null, rng: mulberry32(7), strategies: [alwaysShort()], markets: [{ feed, instruments }], brokerSet,
       engine: { liveAccountCacheMs: 0 },

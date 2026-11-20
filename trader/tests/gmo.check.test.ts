@@ -46,6 +46,9 @@ describe("gmo check", () => {
     expect(paths).toContain("/v1/klines?symbol=ETH_JPY&interval=4hour&date=2025");
     expect(r.text).toContain("非公開 API] GMO_API_KEY / GMO_API_SECRET が未設定");
     expect(r.text).toContain("06:00 JST");
+    // 公式資料と未照合の前提 (要確認) を表示する: レバレッジ銘柄では SOK (post-only) を使わない
+    expect(r.text).toContain("[要確認");
+    expect(r.text).toMatch(/SOK \(Post-only\) は取引所現物だけ/);
   });
 
   it("キーがあれば読み取り専用の非公開 API だけを呼び、キー・秘密は表示しない", async () => {

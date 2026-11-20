@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_RISK } from "../src/core/config";
-import { classExposure, costBps, exposureByClass, MAX_SIZE_MULTIPLIER, MIN_STOP_DISTANCE_SPREADS, RiskManager, type EntryParams } from "../src/risk/manager";
+import { classExposure, costBps, DEFAULT_TEMPO_MIN_EDGE_TO_COST, exposureByClass, MAX_SIZE_MULTIPLIER, MIN_STOP_DISTANCE_SPREADS, RiskManager, tempoEdgeRequirement, type EntryParams } from "../src/risk/manager";
 import type { AuditEvent, Instrument, RiskLimits, Signal, Store } from "../src/core/types";
 
 const NOW = Date.parse("2025-03-01T12:00:00Z");
@@ -289,5 +289,125 @@ describe("為替・非有限値で上限判定を素通りさせない", () => {
     expect(at(5)).toBeCloseTo(at(1.5), 9);
     const d = rm.evaluateEntry(params({ signal: sig({ stopLoss: 90 }), riskMultiplier: 3 }));
     expect(d.ok && d.notes.join(" ")).toMatch(/上限 1.5 に制限/);
+  });
+});
+
+describe("RiskManager.evaluateEntry: テンポのモード (EntryParams.tempo)", () => {
+  // cost = 往復手数料 20bps + スプレッド 2bps = 22bps、minEdgeToCostRatio = 2
+  const COST = 22;
+  const net = (edge: number) => sig({ expectedEdgeBps: edge, edgeIsNet: true });
+  const reasonOf = (d: ReturnType<RiskManager["evaluateEntry"]>) => (d.ok ? "" : d.reason);
+
+  it("tempo を渡さなければ従来の判定そのまま (edgeIsNet でも比率 × コスト)", () => {
+    const rm = new RiskManager(limits);
+    const old = rm.evaluateEntry(params({ signal: net(40) }));
+    expect(old.ok).toBe(false);
+    expect(reasonOf(old)).toBe(`期待値幅 40.0bps < コスト ${COST.toFixed(1)}bps × 2`);
+    const ok = rm.evaluateEntry(params({ signal: net(44.5) }));
+    expect(ok.ok && ok.notes[0]).toBe(`edge 44.5bps / cost ${COST.toFixed(1)}bps`);
+    // edgeIsNet の有無で結果は変わらない
+    expect(rm.evaluateEntry(params({ signal: sig({ expectedEdgeBps: 40 }) }))).toEqual(old);
+  });
+
+  it("tempo 0: edgeIsNet はコストを二重に数えない (比率 - 1)。控除前の期待値は従来どおり", () => {
+    const rm = new RiskManager(limits);
+    expect(rm.evaluateEntry(params({ signal: net(23), tempo: 0 })).ok).toBe(true);
+    const r = rm.evaluateEntry(params({ signal: net(21), tempo: 0 }));
+    expect(r.ok).toBe(false);
+    expect(reasonOf(r)).toMatch(/テンポ 0\.00: 期待値 \(コスト控除後\) 21\.0bps < コスト 22\.0bps × \(2\.00 - 1\)/);
+    // edgeIsNet でないシグナルは 2 × コストのまま
+    expect(rm.evaluateEntry(params({ signal: sig({ expectedEdgeBps: 40 }), tempo: 0 }))).toMatchObject({ ok: false, reason: expect.stringContaining("テンポ") });
+    expect(rm.evaluateEntry(params({ signal: sig({ expectedEdgeBps: 44.5 }), tempo: 0 })).ok).toBe(true);
+  });
+
+  it("tempo 1: 比率を下限 1.0 まで緩める。edgeIsNet は > 0 だけ、それ以外は 1 × コスト", () => {
+    const rm = new RiskManager(limits);
+    const d = rm.evaluateEntry(params({ signal: net(0.5), tempo: 1 }));
+    expect(d.ok).toBe(true);
+    expect(d.ok && d.notes[0]).toMatch(/\(net\).*テンポ 1\.00 \(比率 1\.00\)/);
+    for (const e of [0, -5, NaN]) {
+      const x = rm.evaluateEntry(params({ signal: net(e), tempo: 1 }));
+      expect(x.ok, String(e)).toBe(false);
+      expect(reasonOf(x)).toMatch(/テンポ.*0 以下/);
+    }
+    expect(rm.evaluateEntry(params({ signal: sig({ expectedEdgeBps: 23 }), tempo: 1 })).ok).toBe(true);
+    expect(rm.evaluateEntry(params({ signal: sig({ expectedEdgeBps: 21 }), tempo: 1 }))).toMatchObject({ ok: false, reason: expect.stringContaining("テンポ 1.00") });
+    expect(rm.evaluateEntry(params({ signal: sig({ expectedEdgeBps: NaN }), tempo: 1 })).ok).toBe(false);
+  });
+
+  it("tempo 0.5: 比率 1.5 (edgeIsNet は 0.5 × コスト)。範囲外の tempo は 0〜1 に収める", () => {
+    const rm = new RiskManager(limits);
+    expect(rm.evaluateEntry(params({ signal: net(11.5), tempo: 0.5 })).ok).toBe(true);
+    expect(rm.evaluateEntry(params({ signal: net(10.5), tempo: 0.5 })).ok).toBe(false);
+    expect(rm.evaluateEntry(params({ signal: net(0.5), tempo: 5 })).ok).toBe(true);
+    expect(rm.evaluateEntry(params({ signal: net(21), tempo: -1 })).ok).toBe(false);
+  });
+
+  it("tempoMinEdgeToCost で下限を上げられる (1.0 未満・非有限は 1.0)", () => {
+    expect(DEFAULT_TEMPO_MIN_EDGE_TO_COST).toBe(1);
+    const strict = new RiskManager({ ...limits, tempoMinEdgeToCost: 1.5 });
+    expect(strict.evaluateEntry(params({ signal: net(10.5), tempo: 1 })).ok).toBe(false);
+    expect(strict.evaluateEntry(params({ signal: net(11.5), tempo: 1 })).ok).toBe(true);
+    for (const v of [0.3, NaN]) {
+      const rm = new RiskManager({ ...limits, tempoMinEdgeToCost: v });
+      expect(rm.evaluateEntry(params({ signal: net(0.5), tempo: 1 })).ok, String(v)).toBe(true);
+      expect(rm.evaluateEntry(params({ signal: sig({ expectedEdgeBps: 21 }), tempo: 1 })).ok, String(v)).toBe(false);
+    }
+  });
+
+  it("minEdgeToCostRatio が下限より低ければ設定のまま (締めない)", () => {
+    const rm = new RiskManager({ ...limits, minEdgeToCostRatio: 0.8 });
+    // 0.8 × 22 = 17.6
+    expect(rm.evaluateEntry(params({ signal: sig({ expectedEdgeBps: 18 }), tempo: 1 })).ok).toBe(true);
+    expect(rm.evaluateEntry(params({ signal: sig({ expectedEdgeBps: 17 }), tempo: 1 })).ok).toBe(false);
+    expect(rm.evaluateEntry(params({ signal: net(0.1), tempo: 0 })).ok).toBe(true);
+    expect(tempoEdgeRequirement({ minEdgeToCostRatio: 0.8 }, 1, COST, false)).toEqual({ ratio: 0.8, minEdgeBps: 0.8 * COST, requirePositive: false });
+    expect(tempoEdgeRequirement({ minEdgeToCostRatio: 0.8 }, 1, COST, true)).toEqual({ ratio: 0.8, minEdgeBps: 0, requirePositive: true });
+  });
+
+  it("コスト比以外の判定は変えない (空売り不可・停止中・損切り・サイズ)", () => {
+    const rm = new RiskManager(limits);
+    expect(rm.evaluateEntry(params({ signal: sig({ direction: "short", stopLoss: 101, edgeIsNet: true }), tempo: 1 }))).toMatchObject({ ok: false, reason: expect.stringContaining("空売り不可") });
+    expect(rm.evaluateEntry(params({ signal: sig({ stopLoss: 101, expectedEdgeBps: 5, edgeIsNet: true }), tempo: 1 }))).toMatchObject({ ok: false, reason: expect.stringContaining("損切り") });
+    expect(rm.evaluateEntry(params({ signal: sig({ stopLoss: 99.995, expectedEdgeBps: 5, edgeIsNet: true }), tempo: 1 }))).toMatchObject({ ok: false, reason: expect.stringContaining("損切り") });
+    // サイズはテンポの有無で同じ
+    const a = rm.evaluateEntry(params({ signal: sig({ stopLoss: 90, expectedEdgeBps: 100, edgeIsNet: true }) }));
+    const b = rm.evaluateEntry(params({ signal: sig({ stopLoss: 90, expectedEdgeBps: 100, edgeIsNet: true }), tempo: 1 }));
+    expect(a.ok && b.ok && a.qty === b.qty).toBe(true);
+    rm.trip("test", NOW);
+    expect(rm.evaluateEntry(params({ signal: net(100), tempo: 1 }))).toMatchObject({ ok: false, reason: expect.stringContaining("キルスイッチ") });
+  });
+
+  it("探索 (tempoExplore): edgeIsNet は「> 0」を外し、下限を tempo × コスト下げる。NaN は拒否", () => {
+    const rm = new RiskManager(limits);
+    // tempo 1: 比率 1.0 → 下限 0 - 1 × 22 = -22
+    expect(tempoEdgeRequirement(limits, 1, COST, true, true)).toEqual({ ratio: 1, minEdgeBps: -COST, requirePositive: false });
+    const ok = rm.evaluateEntry(params({ signal: net(-21), tempo: 1, tempoExplore: true }));
+    expect(ok.ok).toBe(true);
+    expect(ok.ok && ok.notes[0]).toMatch(/テンポ 1\.00 \(探索\)/);
+    expect(rm.evaluateEntry(params({ signal: net(0), tempo: 1, tempoExplore: true })).ok).toBe(true);
+    const ng = rm.evaluateEntry(params({ signal: net(-23), tempo: 1, tempoExplore: true }));
+    expect(ng.ok).toBe(false);
+    expect(reasonOf(ng)).toMatch(/探索.*< コスト 22\.0bps × \(1\.00 - 1 - 1\.00\)/);
+    expect(rm.evaluateEntry(params({ signal: net(NaN), tempo: 1, tempoExplore: true })).ok).toBe(false);
+    // tempo 0.5: 比率 1.5 → 下限 0.5 × 22 - 0.5 × 22 = 0 (「> 0」は外れるので 0 は通る)
+    expect(tempoEdgeRequirement(limits, 0.5, COST, true, true)).toEqual({ ratio: 1.5, minEdgeBps: 0, requirePositive: false });
+    expect(rm.evaluateEntry(params({ signal: net(0), tempo: 0.5, tempoExplore: true })).ok).toBe(true);
+    expect(rm.evaluateEntry(params({ signal: net(-0.1), tempo: 0.5, tempoExplore: true })).ok).toBe(false);
+    // tempo 0: 探索でも下限は (比率 - 1) × コストのまま
+    expect(rm.evaluateEntry(params({ signal: net(21), tempo: 0, tempoExplore: true })).ok).toBe(false);
+    expect(rm.evaluateEntry(params({ signal: net(23), tempo: 0, tempoExplore: true })).ok).toBe(true);
+  });
+
+  it("探索でも控除前の期待値のシグナルは変えない。tempoExplore が false・tempo 無しなら従来どおり", () => {
+    const rm = new RiskManager(limits);
+    expect(tempoEdgeRequirement(limits, 1, COST, false, true)).toEqual(tempoEdgeRequirement(limits, 1, COST, false));
+    expect(rm.evaluateEntry(params({ signal: sig({ expectedEdgeBps: 21 }), tempo: 1, tempoExplore: true })).ok).toBe(false);
+    expect(rm.evaluateEntry(params({ signal: sig({ expectedEdgeBps: -5 }), tempo: 1, tempoExplore: true })).ok).toBe(false);
+    expect(rm.evaluateEntry(params({ signal: net(-5), tempo: 1, tempoExplore: false })).ok).toBe(false);
+    // tempo が無ければ tempoExplore は無視 (従来の比率 × コスト)
+    const old = rm.evaluateEntry(params({ signal: net(40) }));
+    expect(rm.evaluateEntry(params({ signal: net(40), tempoExplore: true }))).toEqual(old);
+    expect(rm.evaluateEntry(params({ signal: net(-5), tempoExplore: true })).ok).toBe(false);
   });
 });

@@ -3,6 +3,7 @@ import { TIMEFRAME_MS } from "../core/types";
 import { atrLast } from "../indicators/series";
 import { orderBookImbalance, tradeFlowImbalance } from "../indicators/microstructure";
 import { buildEntrySignal, candlesOf, clamp, entryBlocked, exitSignal, period, positionSide, refPrice } from "./common";
+import { relaxToward, TEMPO_COST_MULT_FLOOR, tempoNetEdgeFloor } from "../engine/tempo";
 
 /**
  * scalp_micro: 5〜10 分で利確・損切りを繰り返す超短期のモメンタム戦略 (主時間足 1m、成行 = taker)。
@@ -32,7 +33,10 @@ import { buildEntrySignal, candlesOf, clamp, entryBlocked, exitSignal, period, p
  *     winEdgeMax は学習で上げられないよう paramBounds に入れない (期待値を自己申告で膨らませない)。
  *   - 既存戦略の expectedEdgeBps (利確幅 × confidence、手数料控除前) とは定義が違う。RiskManager は
  *     expectedEdgeBps ≥ MIN_EDGE_TO_COST × コストで判定するため、この戦略では実質「控除前の期待値 ≥ (1 + 比率) × コスト」
- *     となり、より厳しい側 (安全側) に働く。
+ *     となり、より厳しい側 (安全側) に働く。シグナルには edgeIsNet: true を付ける (テンポのモードの RiskManager は比率から 1 を引く)。
+ *   - テンポ (ctx.tempo、0〜1) で緩めるのは costMult だけ (TEMPO_COST_MULT_FLOOR まで)。期待値 > minNetEdgeBps は緩めない。
+ *     例外は探索 (ctx.tempoExplore が true のときだけ): 期待値の下限を tempoNetEdgeFloor (minNetEdgeBps - tempo × 往復コスト) に下げる。
+ *     tempoExplore が無い・false なら従来どおり。
  *
  * 保有: maxHoldBars (5〜10 本 = 5〜10 分) で時間切れ。エンジン/バックテストが成行で決済する。
  *   paramBounds 外の値が渡されても evaluate 内で 5〜10 にクランプし、maxHoldMs は必ず 10 分以内。
@@ -168,6 +172,8 @@ export function createScalpMicro(opts: ScalpMicroOptions = {}): Strategy {
     regimes: ["trend_up", "trend_down", "high_vol"],
     primaryTimeframe: "1m",
     timeframes: ["1m"],
+    // 5〜10 分のブレイクを取る戦略なので、指値で約定を待たずに成行で速さを優先する (LIMIT_ENTRY によらない)
+    entryOrder: "market",
     warmup: 30,
     defaultParams: {
       /** 損切り幅 (ATR 倍)。1m の ATR は小さいので、スプレッドの数倍は確保する (minStopSpreads) */
@@ -291,6 +297,7 @@ export function createScalpMicro(opts: ScalpMicroOptions = {}): Strategy {
       const full: Signal = {
         ...sig,
         expectedEdgeBps: ev.edgeBps,
+        edgeIsNet: true,
         maxHoldMs: holdBars * TIMEFRAME_MS["1m"],
         features: { ...sig.features, costBps, tpBps, slBps, winProb: ev.p, winProbBase: ev.p0, netEdgeBps: ev.edgeBps },
       };
@@ -305,9 +312,11 @@ export function createScalpMicro(opts: ScalpMicroOptions = {}): Strategy {
         }
         return null;
       };
-      if (tpBps < Math.max(0, p.costMult) * costBps) return notify("cost");
+      // テンポ (ctx.tempo) では costMult だけを TEMPO_COST_MULT_FLOOR まで緩める (tempo 未指定・0 なら p.costMult そのもの)
+      const costMult = relaxToward(p.costMult, TEMPO_COST_MULT_FLOOR, ctx.tempo ?? 0);
+      if (tpBps < Math.max(0, costMult) * costBps) return notify("cost");
       if (slDist < Math.max(0, p.minStopSpreads) * spread) return notify("spread");
-      if (!(ev.edgeBps > minNetEdgeBps)) return notify("edge");
+      if (!(ev.edgeBps > tempoNetEdgeFloor(minNetEdgeBps, ctx.tempo, costBps, ctx.tempoExplore === true))) return notify("edge");
       return full;
     },
   };

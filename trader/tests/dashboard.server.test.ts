@@ -35,7 +35,7 @@ async function deps(items: IntelItem[] = []): Promise<DashboardDeps> {
   const clock = { t: START, now() { return this.t; } };
   const store = new MemoryStore();
   if (items.length) store.saveIntel(items);
-  const rt = await buildRuntime(loadConfig({ NODE_ENV: "test", VENUES: "synthetic", DB_PATH: "memory" }), {
+  const rt = await buildRuntime(loadConfig({ NODE_ENV: "test", LIMIT_ENTRY: "false", LIMIT_TAKE_PROFIT: "false", VENUES: "synthetic", DB_PATH: "memory" }), {
     clock, store, intelSources: [], ai: null, seed: 2, syntheticHistoryMs: 86_400_000, strategies: [flipper], rng: mulberry32(1),
   });
   await rt.engine.tick(START);

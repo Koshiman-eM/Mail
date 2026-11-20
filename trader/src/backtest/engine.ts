@@ -20,6 +20,7 @@ import { DEFAULT_RISK } from "../core/config";
 import { resample } from "../indicators/resample";
 import { detectRegime, regimeOptionsFor } from "../regime/detect";
 import { computeMetrics } from "./metrics";
+import { clampMaxHoldMs } from "../engine/tempo";
 import type { BacktestOptions, BacktestResult, BacktestStats, IntelSource, Sizer } from "./types";
 
 /**
@@ -36,7 +37,14 @@ import type { BacktestOptions, BacktestResult, BacktestStats, IntelSource, Sizer
  *   - 利確は指値扱い (スリッページなし)。判定は「高値 × (1 - 半スプレッド) >= 利確価格」(ロング)。
  *   - 保有時間が maxHoldMs に達したら次のバーの始値で成行決済 (time)。
  * 会計: 残高・手数料・損益は decimal.js。手数料は instrument.takerFeeRate (往復)。
- * 制約: 1 戦略 1 ポジション (ピラミッディング・ドテンなし)。指値エントリーも成行として扱う。
+ * 制約: 1 戦略 1 ポジション (ピラミッディング・ドテンなし)。
+ * 指値 (opts.limitOrders。省略時は従来どおり、指値のシグナルも成行として扱う):
+ *   - entry: シグナルの次の足から、安値 (買い) が指値を「下回った」(売りは高値が「上回った」) ときだけ指値の価格で約定する
+ *     (触れただけでは約定しない = 保守的)。手数料は makerFeeRate。期限 (足の本数) 内に約定しなければ取引なし。
+ *     待っている間に逆方向のシグナルが出たら取り消す。約定した足では利確を判定しない (足の中の順序が分からないため。損切りは判定する)。
+ *     成行の戦略 (entryOrder: "market") は従来どおり。
+ *   - takeProfit: 高値 (買い) が利確価格を「越えた」ときだけ利確価格で maker 約定する。同じ足で損切りにも届けば損切りを優先する。
+ * 最大保有 (opts.maxHoldMinutes。省略時は従来どおり): シグナルの maxHoldMs をその分数までに縮めて保有する (ライブの MAX_HOLD_MINUTES と同じ)。
  */
 
 /** 資産クラス別の既定スプレッド (bps, 全幅) とスリッページ (bps, 片道) */
@@ -93,10 +101,14 @@ interface OpenPos {
   maxHigh: number;
   minLow: number;
   context: EntryContext;
+  /** 指値で約定したエントリー (約定した足の番号。その足では利確を判定しない) */
+  limitFillIdx?: number;
+  entryLiq: "maker" | "taker";
 }
 
 type Pending =
   | { kind: "entry"; signal: Signal; qty: Decimal; intended: number; context: EntryContext }
+  | { kind: "limit"; signal: Signal; qty: Decimal; intended: number; price: number; expiresIdx: number; context: EntryContext }
   | { kind: "exit"; intended: number };
 
 export function runBacktest(opts: BacktestOptions): BacktestResult {
@@ -135,6 +147,17 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
   const hs = spreadBps / 2 / 1e4;
   const slip = slippageBps / 1e4;
   const feeRate = D(instrument.takerFeeRate);
+  const makerRate = D(Number.isFinite(instrument.makerFeeRate) ? instrument.makerFeeRate : instrument.takerFeeRate);
+  const limitOpts = opts.limitOrders;
+  // 最大保有 (ライブの MAX_HOLD_MINUTES と同じ前提)。無効なら undefined (シグナルのまま)
+  const holdLimitMs = opts.maxHoldMinutes !== undefined && Number.isFinite(opts.maxHoldMinutes) && opts.maxHoldMinutes > 0
+    ? Math.round(opts.maxHoldMinutes * 60_000)
+    : undefined;
+  const limitTp = limitOpts?.takeProfit === true;
+  const limitTimeoutMs = limitOpts?.entryTimeoutMs !== undefined && limitOpts.entryTimeoutMs > 0
+    ? limitOpts.entryTimeoutMs
+    : Math.min(15 * 60_000, Math.max(20_000, TIMEFRAME_MS[strategy.primaryTimeframe]));
+  if (limitOpts) stats.limitEntries = { placed: 0, filled: 0, expired: 0, canceled: 0 };
   const cs = instrument.contractSize ?? 1;
   const csD = D(cs);
   const riskPerTrade = opts.riskPerTrade ?? DEFAULT_RISK.riskPerTrade;
@@ -180,9 +203,9 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
     return { stop: p.initialStop, reason: "stop" };
   };
 
-  const closePosition = (i: number, px: number, ts: number, reason: ExitReason, intended: number) => {
+  const closePosition = (i: number, px: number, ts: number, reason: ExitReason, intended: number, liq: "maker" | "taker" = "taker") => {
     const p = pos!;
-    const exitFee = D(px).mul(p.qty).mul(csD).mul(feeRate);
+    const exitFee = D(px).mul(p.qty).mul(csD).mul(liq === "maker" ? makerRate : feeRate);
     const gross = D(px).minus(p.entryPrice).mul(p.qty).mul(csD).mul(p.dir);
     cash = cash.plus(gross).minus(exitFee);
     const fees = p.entryFee.plus(exitFee);
@@ -220,6 +243,14 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
       maePct: Math.max(0, adv / p.entryPrice),
       exitReason: reason,
       entryContext: p.context,
+      ...(limitOpts
+        ? {
+            entryOrderType: p.entryLiq === "maker" ? ("limit" as const) : ("market" as const),
+            exitOrderType: liq === "maker" ? ("limit" as const) : ("market" as const),
+            makerFees: (p.entryLiq === "maker" ? p.entryFee : D(0)).plus(liq === "maker" ? exitFee : 0).toNumber(),
+            takerFees: (p.entryLiq === "taker" ? p.entryFee : D(0)).plus(liq === "taker" ? exitFee : 0).toNumber(),
+          }
+        : {}),
     });
     exitIdx.push(i);
     pos = null;
@@ -231,8 +262,24 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
   const checkStops = (i: number, bar: Candle) => {
     const p = pos!;
     const { stop, reason } = currentStop(p);
-    const tp = p.takeProfit;
+    // 指値で約定した足では利確を判定しない (足の中で約定と利確の順序が分からない。損切りは判定する = 保守的)
+    const tp = p.limitFillIdx === i ? undefined : p.takeProfit;
     const end = bar.ts + baseMs;
+    if (limitTp) {
+      // 利確は板に置いた指値: 価格が利確価格を越えたときだけ利確価格で maker 約定 (触れただけでは約定しない)。損切りを先に判定する
+      if (p.dir === 1) {
+        if (bar.open <= stop) return closePosition(i, marketFill(bar.open, false), bar.ts, reason, stop);
+        if (tp !== undefined && bar.open > tp) return closePosition(i, tp, bar.ts, "take_profit", tp, "maker");
+        if (bar.low <= stop) return closePosition(i, marketFill(stop, false), end, reason, stop);
+        if (tp !== undefined && bar.high > tp) return closePosition(i, tp, end, "take_profit", tp, "maker");
+      } else {
+        if (bar.open >= stop) return closePosition(i, marketFill(bar.open, true), bar.ts, reason, stop);
+        if (tp !== undefined && bar.open < tp) return closePosition(i, tp, bar.ts, "take_profit", tp, "maker");
+        if (bar.high >= stop) return closePosition(i, marketFill(stop, true), end, reason, stop);
+        if (tp !== undefined && bar.low < tp) return closePosition(i, tp, end, "take_profit", tp, "maker");
+      }
+      return;
+    }
     if (p.dir === 1) {
       if (bar.open <= stop) return closePosition(i, marketFill(bar.open, false), bar.ts, reason, stop);
       if (tp !== undefined && bar.open * (1 - hs) >= tp) return closePosition(i, bar.open * (1 - hs), bar.ts, "take_profit", tp);
@@ -281,14 +328,49 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
           initialStop: pd.signal.stopLoss,
           takeProfit: pd.signal.takeProfit,
           trailPct: pd.signal.trailingStopPct,
-          maxHoldMs: pd.signal.maxHoldMs,
+          maxHoldMs: clampMaxHoldMs(pd.signal.maxHoldMs, holdLimitMs),
           highWater: bar.open,
           lowWater: bar.open,
           maxHigh: -Infinity,
           minLow: Infinity,
           context: pd.context,
+          entryLiq: "taker",
         };
         stats.entries++;
+      } else if (pd.kind === "limit" && !pos) {
+        // 板に置いた指値: 安値 (買い) が指値を下回った (売りは高値が上回った) ときだけ、指値の価格で maker 約定
+        const dir: 1 | -1 = pd.signal.direction === "long" ? 1 : -1;
+        const crossed = dir === 1 ? bar.low < pd.price : bar.high > pd.price;
+        if (crossed) {
+          const entryFee = D(pd.price).mul(pd.qty).mul(csD).mul(makerRate);
+          cash = cash.minus(entryFee);
+          pos = {
+            dir,
+            qty: pd.qty,
+            qtyNum: pd.qty.toNumber(),
+            entryIdx: i,
+            entryTs: bar.ts,
+            entryPrice: pd.price,
+            intendedEntryPrice: pd.intended,
+            entryFee,
+            initialStop: pd.signal.stopLoss,
+            takeProfit: pd.signal.takeProfit,
+            trailPct: pd.signal.trailingStopPct,
+            maxHoldMs: clampMaxHoldMs(pd.signal.maxHoldMs, holdLimitMs),
+            highWater: pd.price,
+            lowWater: pd.price,
+            maxHigh: -Infinity,
+            minLow: Infinity,
+            context: pd.context,
+            limitFillIdx: i,
+            entryLiq: "maker",
+          };
+          stats.entries++;
+          stats.limitEntries!.filled++;
+        } else if (i >= pd.expiresIdx) {
+          stats.limitEntries!.expired++;
+          skip("limit_unfilled");
+        } else pending = pd;
       }
     }
 
@@ -306,10 +388,27 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
     // 4. 保有中の極値を更新 (次バーのトレーリング・MFE/MAE 用)
     if (pos) {
       const p: OpenPos = pos;
-      p.highWater = Math.max(p.highWater, bar.high);
-      p.lowWater = Math.min(p.lowWater, bar.low);
-      p.maxHigh = Math.max(p.maxHigh, bar.high);
-      p.minLow = Math.min(p.minLow, bar.low);
+      if (p.limitFillIdx === i) {
+        // 指値で約定した足: 有利な側の極値は約定より前だったかもしれない (足の中の順序が分からない) ので使わず、約定価格から始める
+        // (トレーリングを約定前の高値で引き上げない・MFE を水増ししない)。不利な側は指値を越えた = 約定の後 (以降) なので含める (保守的)
+        const px = p.entryPrice;
+        if (p.dir === 1) {
+          p.highWater = Math.max(p.highWater, px);
+          p.maxHigh = Math.max(p.maxHigh, px);
+          p.lowWater = Math.min(p.lowWater, bar.low);
+          p.minLow = Math.min(p.minLow, bar.low);
+        } else {
+          p.lowWater = Math.min(p.lowWater, px);
+          p.minLow = Math.min(p.minLow, px);
+          p.highWater = Math.max(p.highWater, bar.high);
+          p.maxHigh = Math.max(p.maxHigh, bar.high);
+        }
+      } else {
+        p.highWater = Math.max(p.highWater, bar.high);
+        p.lowWater = Math.min(p.lowWater, bar.low);
+        p.maxHigh = Math.max(p.maxHigh, bar.high);
+        p.minLow = Math.min(p.minLow, bar.low);
+      }
     }
 
     // 5. 最終バーで決済
@@ -380,6 +479,15 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
       continue;
     }
     if (signal.direction === "flat") continue;
+    if (pending && pending.kind === "limit") {
+      // 指値のエントリーを待っている: 逆方向のシグナルなら取り消す (同じ方向なら置いたまま待つ)
+      if (signal.direction !== pending.signal.direction) {
+        pending = null;
+        stats.limitEntries!.canceled++;
+        skip("limit_canceled");
+      }
+      continue;
+    }
     stats.entrySignals++;
     if (signal.direction === "short" && !instrument.allowShort) {
       skip("short");
@@ -389,8 +497,13 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
       skip("edge");
       continue;
     }
-    const intended =
-      signal.entry.type === "limit" && signal.entry.price ? signal.entry.price : signal.direction === "long" ? quote.ask : quote.bid;
+    // 指値にするか (limitOrders があるときだけ): シグナルの指値 (価格あり) → 戦略の entryOrder → limitOrders.entry
+    const signalLimit = signal.entry.type === "limit" && signal.entry.price !== undefined && signal.entry.price > 0;
+    const useLimit = limitOpts !== undefined && (signalLimit || (strategy.entryOrder ? strategy.entryOrder === "limit" : limitOpts.entry === true));
+    const marketPx = signal.direction === "long" ? quote.ask : quote.bid;
+    // 指値の価格: シグナルの価格、無ければ買いは買い気配・売りは売り気配 (板に置く側)。サイズの計算もこの価格
+    const limitPx = useLimit ? (signalLimit ? signal.entry.price! : signal.direction === "long" ? quote.bid : quote.ask) : undefined;
+    const intended = limitPx ?? (signalLimit ? signal.entry.price! : marketPx);
     const validStop = signal.direction === "long" ? signal.stopLoss < intended : signal.stopLoss > intended;
     if (!validStop || !(signal.stopLoss > 0)) {
       skip("stop");
@@ -425,7 +538,11 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
       riskMultiplier,
       reason: signal.reason,
     };
-    pending = { kind: "entry", signal, qty, intended, context };
+    if (limitPx !== undefined) {
+      const bars = Math.max(1, Math.ceil(limitTimeoutMs / baseMs));
+      pending = { kind: "limit", signal, qty, intended: marketPx, price: limitPx, expiresIdx: i + bars, context };
+      stats.limitEntries!.placed++;
+    } else pending = { kind: "entry", signal, qty, intended, context };
   }
 
   // エグジット後の値動き (方向付き)

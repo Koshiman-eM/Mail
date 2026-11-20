@@ -1,5 +1,6 @@
 /** 学習サービスへ渡すフック (パラメータ検証・任意時刻の価格) */
 import { foldBoundaries, foldedBacktest } from "../backtest/evaluate";
+import type { BacktestOptions } from "../backtest/types";
 import { createLogger } from "../core/logger";
 import {
   TIMEFRAME_MS, type AssetClass, type Candle, type Clock, type Horizon, type Instrument, type IntelBias, type MarketBrief, type MarketDataFeed,
@@ -10,6 +11,7 @@ import type { ParamValidator, ValidationFold, ValidationRun } from "../learning/
 import type { MarketHub } from "../market/hub";
 import { fetchCandlesPaged, baseTimeframeOf } from "./backtestCommand";
 import { intelBiasFor } from "./context";
+import { isHoldLimitedHorizon } from "./tempo";
 
 const log = createLogger("learningHooks");
 const DAY = 86_400_000;
@@ -79,6 +81,13 @@ export interface ValidatorOptions {
   minEdgeToCostRatio?: number;
   riskPerTrade?: number;
   maxPositionPct?: number;
+  /** 指値 (maker) の前提 (実運用の LIMIT_ENTRY / LIMIT_TAKE_PROFIT と同じ。省略時は従来の成行) */
+  limitOrders?: BacktestOptions["limitOrders"];
+  /**
+   * 最大保有 (分。実運用の MAX_HOLD_MINUTES と同じ。0・省略で無効)。中期・長期以外の戦略の検証でシグナルの最大保有を縮める
+   * (中期・長期は運用で新規エントリーしないので縮めない)
+   */
+  maxHoldMinutes?: number;
   /** 区間数 (既定 5) */
   folds?: number;
   /** 主時間足での履歴の本数 (horizon 別) */
@@ -196,6 +205,8 @@ export function createParamValidator(o: ValidatorOptions): ParamValidator {
         ...(o.minEdgeToCostRatio !== undefined ? { minEdgeToCostRatio: o.minEdgeToCostRatio } : {}),
         ...(o.riskPerTrade !== undefined ? { riskPerTrade: o.riskPerTrade } : {}),
         ...(o.maxPositionPct !== undefined ? { maxPositionPct: o.maxPositionPct } : {}),
+        ...(o.limitOrders ? { limitOrders: o.limitOrders } : {}),
+        ...(o.maxHoldMinutes !== undefined && o.maxHoldMinutes > 0 && !isHoldLimitedHorizon(s.horizon) ? { maxHoldMinutes: o.maxHoldMinutes } : {}),
       });
       runs.forEach((r, i) => {
         agg[i].trades += r.trades.length;

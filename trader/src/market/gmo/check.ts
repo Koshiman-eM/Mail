@@ -39,6 +39,18 @@ export function createGmoCheckClient(env: GmoCheckOptions["env"], clientOptions?
   return new GmoClient({ ...(clientOptions ?? {}), ...(hasKey ? { apiKey: key, apiSecret: secret } : {}), allowPost: false });
 }
 
+/**
+ * 公式資料と未照合の前提 (要確認)。`gmo check` の最後に表示する (応答の形では確かめられないので、資料・サポートで確かめる)
+ */
+export const GMO_UNVERIFIED_ITEMS: readonly string[] = [
+  "timeInForce SOK (Post-only) は取引所現物だけで、レバレッジ銘柄では使えない想定。指値のエントリーは SOK を付けない通常の LIMIT (既定の FAS) で送る (post-only 無し)",
+  "レバレッジ取引の取引手数料は maker / taker とも 0 の想定 (post-only でなくてもコストは変わらない)。建玉の管理料 (GMO_LEVERAGE_FEE_DAILY) は別",
+  "clientOrderId は無い想定。orderId が分からない注文は発注時刻・方向・数量で有効注文と最近の約定 (latestExecutions は直近 1 日分の想定) から探す",
+  "positionSummary の sumOrderQuantity は決済注文中の数量の想定 (決済できる数量 = 建玉 − sumOrderQuantity)",
+  "executions の fee は正が支払い・負が受け取りの想定。executionType LIMIT の約定は maker とみなす",
+  "account/margin の actualProfitLoss を評価額、availableAmount を余力として使う",
+];
+
 /** 結果が 0 なら全部想定どおり、1 なら想定と違う項目か失敗がある */
 export async function runGmoCheck(o: GmoCheckOptions): Promise<number> {
   const out = o.out;
@@ -125,6 +137,9 @@ export async function runGmoCheck(o: GmoCheckOptions): Promise<number> {
       await step(`GET /v1/latestExecutions?symbol=${g}`, () => client.getLatestExecutions(g, 1, 10), listSummary);
     }
   }
+  out("");
+  out("[要確認 (公式資料と未照合の前提。応答の形では確かめられないので、資料で確かめてください)]");
+  for (const item of GMO_UNVERIFIED_ITEMS) out(`  -   ${item}`);
   out("");
   out(problems === 0 ? "結果: すべて想定どおりの形でした" : `結果: 想定と違う・失敗した項目が ${problems} 件あります (上の NG を確認してください)`);
   return problems === 0 ? 0 : 1;

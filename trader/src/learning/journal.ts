@@ -38,6 +38,16 @@ export interface OpenTradeInput {
   estimated?: boolean;
   /** paper で再現した空売り (TradeRecord.simulatedShort へ引き継ぐ) */
   simulatedShort?: boolean;
+  /** エントリーの注文の種類 (TradeRecord.entryOrderType へ引き継ぐ) */
+  entryOrderType?: "market" | "limit";
+  /** エントリーの手数料の liquidity 別の内訳 (クオート通貨建て。entryFees の内訳) */
+  feesByLiquidity?: FeesByLiquidity;
+}
+
+/** 手数料の liquidity 別の内訳 (クオート通貨建て。maker は受け取りなら負) */
+export interface FeesByLiquidity {
+  maker: number;
+  taker: number;
 }
 
 /** 追跡中のポジション */
@@ -66,6 +76,11 @@ export interface OpenTrade extends OpenTradeInput {
   realizedGross?: string;
   /** 一部決済の手数料 (クオート通貨建て) */
   exitFees?: string;
+  /** 手数料の liquidity 別の累計 (エントリー + 一部決済。decimal 文字列) */
+  makerFees?: string;
+  takerFees?: string;
+  /** 一部決済に指値 (利確の板置き) の約定を含む */
+  exitLimit?: boolean;
 }
 
 export interface CloseTradeInput {
@@ -80,6 +95,10 @@ export interface CloseTradeInput {
   fees?: number;
   /** 約定を確認できず推定した決済 (TradeRecord.estimated を付ける) */
   estimated?: boolean;
+  /** 決済の手数料の liquidity 別の内訳 (fees の内訳) */
+  feesByLiquidity?: FeesByLiquidity;
+  /** 決済の注文の種類 (板に置いた利確の指値なら limit) */
+  exitOrderType?: "market" | "limit";
 }
 
 /** 一部決済の入力。qty は決済した数量 (正の値) */
@@ -122,8 +141,10 @@ export class TradeJournal {
     if (!(input.entryPrice > 0)) throw new Error(`entryPrice が不正です: ${input.entryPrice}`);
     const id = input.id ?? randomUUID();
     if (this.open_.has(id)) throw new Error(`ポジション ${id} は既に追跡中です`);
+    const { feesByLiquidity: fl, ...rest } = input;
     const p: OpenTrade = {
-      ...input,
+      ...rest,
+      ...(fl ? { makerFees: D(fl.maker).toString(), takerFees: D(fl.taker).toString() } : {}),
       id,
       entryFees: input.entryFees ?? 0,
       contractSize: input.contractSize ?? 1,
@@ -210,6 +231,11 @@ export class TradeJournal {
       .plus(D(input.exitPrice).minus(p.entryPrice).mul(qty).mul(p.contractSize).mul(dir))
       .toString();
     p.exitFees = D(p.exitFees ?? 0).plus(input.fees ?? 0).toString();
+    if (input.feesByLiquidity) {
+      p.makerFees = D(p.makerFees ?? 0).plus(input.feesByLiquidity.maker).toString();
+      p.takerFees = D(p.takerFees ?? 0).plus(input.feesByLiquidity.taker).toString();
+    }
+    if (input.exitOrderType === "limit") p.exitLimit = true;
     p.qty = D(p.qty).minus(qty).toNumber();
     p.partials = (p.partials ?? 0) + 1;
     // 一部決済の価格も MFE/MAE に含める
@@ -286,6 +312,15 @@ export function buildTradeRecord(p: OpenTrade, c: CloseTradeInput): TradeRecord 
     entryContext: p.entryContext,
     ...(p.estimated || c.estimated ? { estimated: true } : {}),
     ...(p.simulatedShort ? { simulatedShort: true } : {}),
+    ...(p.entryOrderType ? { entryOrderType: p.entryOrderType } : {}),
+    ...(p.contractSize !== 1 ? { contractSize: p.contractSize } : {}),
+    ...(p.exitLimit || c.exitOrderType === "limit" ? { exitOrderType: "limit" as const } : c.exitOrderType ? { exitOrderType: c.exitOrderType } : {}),
+    ...(p.makerFees !== undefined || p.takerFees !== undefined || c.feesByLiquidity
+      ? {
+          makerFees: D(p.makerFees ?? 0).plus(c.feesByLiquidity?.maker ?? 0).toNumber(),
+          takerFees: D(p.takerFees ?? 0).plus(c.feesByLiquidity?.taker ?? 0).toNumber(),
+        }
+      : {}),
   };
 }
 

@@ -7,6 +7,7 @@ import type { CauseSummary, LearningSnapshot } from "../learning/service";
 import { SIMULATED_SHORT_ARM_SUFFIX } from "../learning/allocator";
 import { microReasonLabel, sideLabel, SIMULATED_SHORT_LABEL, type ShadowGroup, type ShadowSummary } from "../learning/shadow";
 import { quoteCurrencyOfSymbol } from "./fx";
+import type { LimitStats } from "./orders";
 
 export const EXIT_REASON_LABEL: Record<ExitReason, string> = {
   stop: "損切り",
@@ -154,6 +155,163 @@ export function renderSideTable(rows: SideSummary[], ccy: string): string {
     );
   }
   return lines.join("\n");
+}
+
+/** 注文の種類別 (エントリーの成行 / 指値) の取引数・手数料の内訳・平均の手数料率 */
+export interface OrderTypeSummary {
+  orderType: "market" | "limit";
+  label: string;
+  trades: number;
+  /** 決済が指値 (板に置いた利確) で約定した取引数 */
+  limitExits: number;
+  /** 純損益・手数料 (口座通貨) */
+  netPnl: number;
+  fees: number;
+  /** liquidity 別の手数料 (口座通貨。maker は受け取りなら負)。内訳の無い古い取引の分は unclassified */
+  makerFees: number;
+  takerFees: number;
+  unclassified: number;
+  /** 平均の手数料率 (片道, bps) = Σ手数料 ÷ Σ(エントリー + 決済の約定代金) */
+  avgFeeBps: number;
+  unconverted: number;
+}
+
+const ORDER_TYPE_LABEL = { market: "成行", limit: "指値" } as const;
+
+/** 注文の種類別の集計 (エントリーの注文の種類。記録の無い古い取引は成行) */
+export function summarizeByOrderType(
+  trades: TradeRecord[],
+  toAccount: (ccy: string) => number,
+  quoteOf?: (t: TradeRecord) => string | undefined,
+  exitRates?: Map<string, number>,
+): OrderTypeSummary[] {
+  const map = new Map<"market" | "limit", OrderTypeSummary & { notional: number }>();
+  for (const t of trades) {
+    const k = t.entryOrderType ?? "market";
+    let s = map.get(k);
+    if (!s) {
+      map.set(k, (s = {
+        orderType: k, label: ORDER_TYPE_LABEL[k], trades: 0, limitExits: 0, netPnl: 0, fees: 0, makerFees: 0, takerFees: 0, unclassified: 0, avgFeeBps: 0, unconverted: 0, notional: 0,
+      }));
+    }
+    s.trades++;
+    if (t.exitOrderType === "limit") s.limitExits++;
+    // 換算レートは tradePnlAccount と同じ (決済時点のレート、無ければ現在のレート)
+    const er = exitRates?.get(t.id);
+    const rate = er !== undefined && Number.isFinite(er) && er > 0 ? er : toAccount(quoteOf?.(t) ?? quoteCurrencyOfSymbol(t.symbol));
+    if (!Number.isFinite(rate) || !(rate > 0)) {
+      s.unconverted++;
+      continue;
+    }
+    const pnl = { net: t.netPnl * rate, fees: t.fees * rate };
+    s.netPnl += pnl.net;
+    s.fees += pnl.fees;
+    if (t.makerFees !== undefined || t.takerFees !== undefined) {
+      const m = (t.makerFees ?? 0) * rate;
+      const x = (t.takerFees ?? 0) * rate;
+      s.makerFees += m;
+      s.takerFees += x;
+      s.unclassified += pnl.fees - m - x;
+    } else s.unclassified += pnl.fees;
+    const cs = t.contractSize ?? 1;
+    const notional = Math.abs(t.qty) * cs * (Math.abs(t.entryPrice) + Math.abs(t.exitPrice)) * rate;
+    if (Number.isFinite(notional)) s.notional += notional;
+  }
+  return [...map.values()]
+    .map(({ notional, ...s }) => ({ ...s, unclassified: Math.abs(s.unclassified) < 1e-9 ? 0 : s.unclassified, avgFeeBps: notional > 0 ? (s.fees / notional) * 10_000 : 0 }))
+    .sort((a, b) => (a.orderType === b.orderType ? 0 : a.orderType === "market" ? -1 : 1));
+}
+
+/** 注文の種類別の表 */
+export function renderOrderTypeTable(rows: OrderTypeSummary[], ccy: string): string {
+  if (rows.length === 0) return "  (トレードなし)";
+  const table = formatTable(
+    ["エントリー", "取引数", "決済が指値", `純損益(${ccy})`, `手数料(${ccy})`, "maker", "taker", "内訳なし", "平均手数料率(片道)"],
+    rows.map((r) => [
+      r.label, r.trades, r.limitExits, fmtSigned(r.netPnl), fmtNum(r.fees, 0), fmtSigned(r.makerFees, 1), fmtSigned(r.takerFees, 1), fmtNum(r.unclassified, 0),
+      `${r.avgFeeBps.toFixed(2)}bps`,
+    ]),
+  );
+  const maker = rows.reduce((a, r) => a + r.makerFees, 0);
+  const taker = rows.reduce((a, r) => a + r.takerFees, 0);
+  return `${table}\n  手数料の内訳 (全体): maker ${fmtSigned(maker, 1)} ${ccy} / taker ${fmtSigned(taker, 1)} ${ccy} (maker の負は受け取り)`;
+}
+
+/** 指値の約定率 (置いた数・約定・期限切れ・取消) */
+export function renderLimitStats(s: LimitStats | undefined): string {
+  if (!s) return "  (記録なし)";
+  const canceled = Object.entries(s.entryCanceled ?? {}).filter(([, v]) => (v ?? 0) > 0);
+  const canceledN = canceled.reduce((a, [, v]) => a + (v ?? 0), 0);
+  const done = s.entryFilled + s.entryPartial + s.entryExpired + canceledN;
+  const fillRate = done > 0 ? (s.entryFilled + s.entryPartial) / done : NaN;
+  const label: Record<string, string> = {
+    opposite_signal: "逆シグナル", stop_crossed: "損切り越え", halted: "停止", order_unknown: "状態不明の注文", account_unavailable: "口座取得不可", market_data: "気配の不具合",
+  };
+  const lines = [
+    `  エントリー: 置いた ${s.entryPlaced} / 約定 ${s.entryFilled} / 一部約定 ${s.entryPartial} / 期限切れ ${s.entryExpired} / 取消 ${canceledN}` +
+      (canceled.length ? ` (${canceled.map(([k, v]) => `${label[k] ?? k} ${v}`).join(", ")})` : "") +
+      ` / 拒否 ${s.entryRejected}  約定率 ${fmtPct(fillRate, 1)}`,
+    `  利確の指値: 置いた ${s.tpPlaced} / 約定 ${s.tpFilled} / 一部約定 ${s.tpPartial} / 決済のため取消 ${s.tpCanceled} / 拒否 ${s.tpRejected}`,
+  ];
+  if (s.since !== undefined) lines.push(`  (集計開始 ${fmtTime(s.since)})`);
+  return lines.join("\n");
+}
+
+/** テンポ (エントリー頻度の目標) による区分: 探索 / テンポのモードの通常 / テンポ無効 */
+export type TempoClass = "explore" | "tempo_normal" | "no_tempo";
+
+export interface TempoSummary extends Omit<StrategySummary, "strategyId"> {
+  kind: TempoClass;
+  label: string;
+}
+
+const TEMPO_CLASS_ORDER: TempoClass[] = ["explore", "tempo_normal", "no_tempo"];
+const TEMPO_CLASS_LABEL: Record<TempoClass, string> = {
+  explore: "探索 (期待値 ≤ 0、縮小サイズ)",
+  tempo_normal: "通常 (テンポ有効)",
+  no_tempo: "通常 (テンポ無効)",
+};
+
+/**
+ * 取引のテンポの区分。エンジンがテンポのモードでエントリーした取引は entryContext.features.tempoLevel を持ち、
+ * 探索のエントリーは features.tempoExplore = 1 (古い取引・テンポ無効のときは印なし)
+ */
+export function tempoClassOf(t: Pick<TradeRecord, "entryContext">): TempoClass {
+  const f = t.entryContext?.features;
+  if (f && f.tempoExplore === 1) return "explore";
+  if (f && typeof f.tempoLevel === "number") return "tempo_normal";
+  return "no_tempo";
+}
+
+/** テンポの区分別の成績 (件数のある区分だけ。探索 → 通常 (テンポ有効) → 通常 (テンポ無効) の順) */
+export function summarizeByTempo(
+  trades: TradeRecord[],
+  toAccount: (ccy: string) => number,
+  quoteOf?: (t: TradeRecord) => string | undefined,
+  exitRates?: Map<string, number>,
+): TempoSummary[] {
+  const rows = summarizeByStrategy(
+    trades.map((t) => ({ ...t, strategyId: tempoClassOf(t) })),
+    toAccount,
+    quoteOf,
+    exitRates,
+  );
+  return rows
+    .map(({ strategyId, ...r }) => ({ ...r, kind: strategyId as TempoClass, label: TEMPO_CLASS_LABEL[strategyId as TempoClass] ?? strategyId }))
+    .sort((a, b) => TEMPO_CLASS_ORDER.indexOf(a.kind) - TEMPO_CLASS_ORDER.indexOf(b.kind));
+}
+
+/** テンポの区分別の成績の表 (探索の取引が無ければその旨を添える) */
+export function renderTempoTable(rows: TempoSummary[], ccy: string): string {
+  if (rows.length === 0) return "  (トレードなし)";
+  const table = formatTable(
+    ["区分", "取引数", "勝率", `純損益(${ccy})`, `手数料(${ccy})`, "平均R"],
+    rows.map((r) => [r.label, r.trades, fmtPct(r.winRate, 1), fmtSigned(r.netPnl), fmtNum(r.fees, 0), r.avgR.toFixed(2)]),
+  );
+  const notes: string[] = [];
+  if (!rows.some((r) => r.kind === "explore")) notes.push("  探索のエントリーはありません");
+  notes.push("  ※ 探索 = テンポで期待値の下限を下げて入った、コスト控除後の期待値が 0 以下の取引 (TEMPO_EXPLORE_SIZE 倍のサイズ)");
+  return [table, ...notes].join("\n");
 }
 
 export function exitReasonCounts(trades: TradeRecord[]): Partial<Record<ExitReason, number>> {

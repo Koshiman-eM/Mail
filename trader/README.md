@@ -25,7 +25,7 @@
                         ↓
  ┌───────────── 売買ループ (5 秒ごと) ──────────────┐
  │ 市場データ → 相場環境 (トレンド/レンジ/高ボラ/低流動性) │
- │ → 戦略 11 種がシグナル → 学習済みの配分倍率を適用  │
+ │ → 戦略 12 種がシグナル → 学習済みの配分倍率を適用  │
  │ → 値動きの予想 (15m/1h/4h) が統計的に有意なときだけ │
  │   エントリーサイズを 0.7〜1.2 倍                  │
  │ → リスク管理 (コスト比・サイズ・上限・停止判定)   │
@@ -58,6 +58,7 @@
 | | `scalp_momentum_burst` | 出来高急増を伴う直近高値・安値のブレイク |
 | | `scalp_micro` | 5〜10 分で利確・損切りする超短期のモメンタム (成行。コストの条件を満たすときだけ) |
 | | `scalp_rebound` | 15 分足が下降トレンドのときの、1 分足の売られ過ぎからの反発を買う (買いのみ。**既定で観測専用**) |
+| | `scalp_pullback` | 15 分足 EMA20 の傾きで方向を決め、上昇中の 1 分足の押しを買い、下降中の戻りを売る (暗号資産。売りは空売りできるとき。損切りは押しの極値の外側、利確は損切り幅の 2 倍、保有 10〜30 分。コスト条件を満たすときだけ) |
 
 `scalp_micro` がコストの条件 (利確幅・損切り幅・期待値) で見送ったシグナルは、「見るだけ」の仮想トレード (理由 `strategy_filter:cost` / `:spread` / `:edge`) として記録します。発注・リスク判定・腕の学習には使いません。
 `scalp_rebound` は既定で観測専用 (`OBSERVE_ONLY_STRATEGIES=scalp_rebound`) です。シグナルは発注せず、仮想トレード (理由 `observe_only`) としてだけ記録します。効果を確かめてから `OBSERVE_ONLY_STRATEGIES=` (空) にすると実際に取引します。
@@ -120,6 +121,103 @@ bitbank などの現物 (ccxt の spot) は空売りできないため、live �
 - **表示**: `report`・`simulate`・ダッシュボード (取引タブ・学習タブ) で、成績を「買い」「売り (取引所で可能な空売り)」「空売り (paper 再現)」に分けて表示します。**live で実際にできる成績は「空売り (paper 再現)」を除いたもの** (現物なら買いのみ) です。
 - 無効にするには `PAPER_SIMULATE_SHORT=false` にします (従来の動作)。保有中の再現した空売りは、無効にした後も決済 (買い戻し) だけはできます。
 
+## 相場構造 (ダウ理論) フィルター
+
+戦略のシグナルを、相場構造 (高値・安値の切り上げ / 切り下げ) の目線と照らして絞ります。既定で有効です (`STRUCTURE_MODE=filter`)。`off` にすると従来と完全に同じ動きです。
+
+- **確定足だけ**を使い、各時間足で直近 300 本を見ます。スイング点 (高値・安値) は N 本後に確定するので、後から書き換わりません。
+- 上位足の確認も確定足だけです (1m→15m、5m/15m→1h、1h→4h、4h→1d、1d→1w)。週足は直近 300 本の日足から作り、形成中の週は使いません。
+- 目線と逆のシグナル、上位足と食い違うシグナル、ちゃぶつき (目線が短期間に何度も反転) などは見送ります。見送りは観測専用の仮想トレード `strategy_filter:structure_*` (bias / mtf / chop / none / weak / po / stop) として記録するだけで、学習には使いません。
+- 既定の対象は `scalp_momentum_burst` / `scalp_micro` / `short_ema_trend` / `short_breakout` / `mid_trend_follow` / `long_momentum` / `meme_momentum` です。逆張りや反発を狙う `scalp_obi` / `scalp_vwap_revert` / `short_rsi_revert` / `scalp_rebound` / `scalp_pullback` は、目線と逆に入ること自体が設計なので対象外です。
+- 構造の損切り (`STRUCTURE_STOP_MODE=structure`) は、損切りを押し安値 (売りは戻り高値) の外側 ± ATR × バッファへ動かすだけです。サイズはリスク管理が決め、期待値は増やしません。新しい損切り幅が元の 0.5 倍未満・3 倍超・0.5 ATR 未満のとき、または利確が不正になるときは見送ります。
+- 起動時に、未知の戦略 ID と、`purist` での `STRUCTURE_EXIT_ON_WEAKENING` を警告します。
+
+| 変数 | 既定 | 内容 |
+|---|---|---|
+| `STRUCTURE_MODE` | `filter` | `off` / `filter` |
+| `STRUCTURE_STRATEGIES` | 上記 7 戦略 | 対象の戦略 ID (カンマ区切り) |
+| `STRUCTURE_PIVOT_N` | 6 | スイング点の確定に使う本数 (3〜20) |
+| `STRUCTURE_BREAK_MODE` | `close` | 高値・安値の更新を終値 (`close`) かヒゲ (`wick`) で判定 |
+| `STRUCTURE_BIAS_METHOD` | `method1` | 目線の判定方法 (`method1` / `method2` / `both`) |
+| `STRUCTURE_REVERSAL_MODE` | `purist` | 転換の判定 (`purist` / `conservative`) |
+| `STRUCTURE_USE_MTF` | `true` | 上位足の確認を使う |
+| `STRUCTURE_USE_PERFECT_ORDER` | `false` | 移動平均のパーフェクトオーダーも条件にする |
+| `STRUCTURE_STOP_MODE` | `existing` | `existing` (戦略の損切り) / `structure` |
+| `STRUCTURE_STOP_ATR_BUFFER` | 0.3 | 構造の損切りの ATR バッファ |
+| `STRUCTURE_EXIT_ON_REVERSAL` | `false` | 目線の転換で決済する |
+| `STRUCTURE_EXIT_ON_WEAKENING` | `false` | 目線の弱まりで決済する |
+| `STRUCTURE_CHOP_M` | 50 | ちゃぶつき判定の本数 (5〜300) |
+| `STRUCTURE_CHOP_R` | 3 | M 本の間の目線の反転回数がこの値以上なら新規を止める |
+
+```bash
+# 全戦略のバックテスト (--source synthetic / ccxt / gmo)
+npm run backtest -- --strategy all --source synthetic
+# フィルターの効果の比較: A (ラッパーなし) 〜 G (conservative) を区間ごとに比べる
+npm run backtest -- --structure-compare --strategy all --folds 5 --days 60 --source ccxt
+# N=4/6/10 での頑健性の確認 (N を調整し続けるためのものではありません)
+npm run backtest -- --structure-compare --strategy short_ema_trend --pivot-sweep
+# 各時刻の目線・押し安値/戻り高値・choppiness を見る
+npm run trader -- regime --symbol BTC/JPY --hours 3
+```
+
+- 取引が 30 回未満の区間は「回数不足」と表示し、判断に使いません。
+- `regime` は目線・押し安値 / 戻り高値・choppiness も表示します。`simulate` は理由別の見送り数を表示します。
+
+## 指値 (maker) でのエントリー
+
+新規エントリーを指値にして、手数料を maker にします (`LIMIT_ENTRY`、既定 `true`)。
+
+- 買いは最良の買い気配、売りは最良の売り気配に置きます。優先順位は、シグナル自身の指値価格 > 戦略の指定 (`entryOrder`) > 設定です。`scalp_micro` は成行です。
+- post-only は、対応する取引先 (ペーパー) だけで使います。GMOコインは公式資料上、post-only (SOK) が現物のみとされている (要確認) ため、レバレッジ取引は通常の指値です (GMOのレバレッジ取引の手数料は maker / taker とも 0)。
+- リスク判定は発注前に、指値価格でサイズを決めて行います。
+- 約定待ちの間は、その銘柄の新規エントリーを止めます。期限切れ・反対のシグナル・損切り価格の通過・新規を止める条件 (停止・日次停止・キルスイッチ・状態不明の注文・口座取得不可・気配の古さ) で取り消します。
+- 取り消したら照会で確認します。取消と注文の消滅を確認できるまで追跡から外しません。確認できない場合は状態不明として扱い、新規を止めます。取引所に余分な建玉があれば異常 (キルスイッチ) にします。
+- 一部約定は、約定した数量の建玉にします。最小数量未満の端数は追跡せず、監査ログ `limit.dust_entry` に残します。
+- 期限切れで約定しなかったものは、仮想トレード `limit_unfilled` (重み 0.25) として記録します。
+- ペーパーの約定は、気配が指値を通り抜けたときだけです (触れただけでは約定しません)。手数料は maker です。バックテストも、次の足から高値・安値が指値を通過したときだけ約定し、同じ足では損切りを優先します。検証と CLI のバックテストも、現在の mode と同じ前提です。
+- `npm run status` に指値の設定と約定率、`npm run report` に注文種別ごとの成績・maker/taker 手数料の内訳・平均手数料率・指値の約定率を表示します。
+
+| 変数 | 既定 | 内容 |
+|---|---|---|
+| `LIMIT_ENTRY` | `true` | 新規エントリーを指値にする |
+| `LIMIT_ENTRY_TIMEOUT_MS` | 主時間足の長さ (20 秒〜15 分) | 指値の有効期限 (1000〜86400000 ミリ秒) |
+| `LIMIT_TAKE_PROFIT` | `false` | 約定後に利確の指値 (reduceOnly) を板に置く。**paper のみ**。live では無視し、起動時に警告します。成行で決済する前に、取り消して確認します |
+
+## エントリー頻度の目標 (テンポ) と最大保有
+
+`TARGET_ENTRIES_PER_HOUR` を設定すると、1 時間あたりのエントリー回数が目標に足りないときだけ、条件を少しずつ緩めます (既定 0 = 無効。無効なら従来と同一です)。
+
+> **注意**
+> - **リスクは上がります。** 条件を緩めて入るので、質の低いエントリーが増えます。
+> - エントリーが増えても、利益が増えるとは限りません。手数料とスプレッドの負担が増えて、成績が悪化することがあります。
+> - 先にペーパーで効果を確認してください。
+> - 高頻度にするなら `VENUES=gmo` を推奨します。bitbank は taker 手数料が高く、1 分足のスキャルピングはコストの条件を満たせません。
+
+- **テンポ** (0〜1) = 不足 (1 − 直近 1 時間のエントリー数 / 目標) × 待ち (最後のエントリーから 60/目標 分までは 0、その 2 倍で 1)。ティックごとに 1 回計算し、**新規エントリーの判断にだけ**使います。決済・バックテスト・パラメータ検証には使いません。
+- **緩めるもの** (これだけ): 戦略のコスト倍率 (1.5 に向けて)、`scalp_pullback` の閾値 (RSI の距離・15 分足の傾きの下限・押しの深さ)、リスク管理のコスト比 (`TEMPO_MIN_EDGE_TO_COST` に向けて。1 未満にはしません)。コストを差し引いた期待値のシグナルは、テンポのときにコストを二重に数えません。
+- **緩めないもの**: クールダウン、損切り幅の制限、最大保有、リスク管理のそのほかの判定。
+- **探索**: ペーパーでは常に、live では `TEMPO_ALLOW_LIVE_EXPLORE=true` のときだけ。コスト差引後の期待値の下限を (テンポ × 往復コスト) だけ下げ、期待値が 0 以下のエントリーはサイズを `TEMPO_EXPLORE_SIZE` 倍にして「探索」として記録します。NaN は常に拒否します。
+- **上限**: 直近 1 時間のエントリーが ceil(目標 × `TEMPO_CAP_MULTIPLIER`) に達したら、新規を止めて仮想トレード `tempo_cap` を記録します。数えるのは約定して建玉になったときで、再起動後もこの mode の直近 1 時間の取引と建玉から復元します。
+- **最大保有** (`MAX_HOLD_MINUTES`、0 = 無効、5〜1440): 中期・長期の戦略は新規を発注せず、仮想トレード `hold_limit` (観測専用と同じ扱い。重み 0.25、腕は止めません) として記録します。ほかの戦略は最大保有をこの分数までに縮めます。保有中の建玉は変えません。バックテストと検証も同じ値を使います (中期・長期は縮めず、表に「運用では発注しない」と注記)。
+
+| 変数 | 既定 | 内容 |
+|---|---|---|
+| `TARGET_ENTRIES_PER_HOUR` | 0 | 目標のエントリー回数/時 (0〜60。0 で無効) |
+| `MAX_HOLD_MINUTES` | 0 | 最大保有の分数 (0 で無効、5〜1440) |
+| `TEMPO_MIN_EDGE_TO_COST` | 1 | テンポ時のコスト比の下限 (1 以上) |
+| `TEMPO_CAP_MULTIPLIER` | 2 | 上限 = 目標 × この値 (切り上げ) |
+| `TEMPO_EXPLORE_SIZE` | 0.5 | 探索のサイズ倍率 |
+| `TEMPO_ALLOW_LIVE_EXPLORE` | `false` | live でも探索する |
+
+```bash
+# 1 時間 6 回を目標、最大保有 30 分で、合成データを 2 日分ペーパー運転
+TARGET_ENTRIES_PER_HOUR=6 MAX_HOLD_MINUTES=30 npm run simulate -- --days 2
+```
+
+- `status` とダッシュボードに、目標・直近 1 時間の回数・テンポ・上限到達・探索の可否・最大保有を表示します。
+- `report` に、探索 / 通常 (テンポ有効) / 通常 (テンポ無効) の件数・勝率・純損益・平均 R の表を出します。
+- `simulate` は、エントリー/時・平均保有・テンポ・見送り件数を表示します。
+
 ## セットアップ
 
 Node.js 22.13 以上が必要です。
@@ -146,6 +244,9 @@ npm run backtest -- --strategy all --days 30
 npm run backtest -- --strategy short_ema_trend --symbol BTC/JPY --source ccxt --days 60
 # 合成データの乱数のシードを変える (既定 1)
 npm run backtest -- --strategy all --days 30 --seed 5
+
+# 相場構造フィルターの比較 (詳しくは「相場構造 (ダウ理論) フィルター」)
+npm run backtest -- --structure-compare --strategy all
 
 # 情報収集を 1 回実行して内容を確認
 npm run trader -- intel

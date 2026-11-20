@@ -1,4 +1,4 @@
-import type { ExitReason, OrderStatus, Side, Store, TradingMode } from "../core/types";
+import type { ExitReason, OrderStatus, Quote, RegimeLabel, Side, Signal, Store, TradingMode } from "../core/types";
 import type { OpenTradeInput } from "../learning/journal";
 import type { ExitPlan } from "./positions";
 
@@ -57,6 +57,158 @@ export interface PendingOrder {
   positionObs?: { verdict: PositionVerdict; qty: string; at: number; count?: number };
   entry?: PendingEntry;
   exit?: PendingExit;
+  /** 指値のエントリー (板に置いて約定を待つ)。無ければ成行 */
+  limit?: PendingLimit;
+}
+
+/**
+ * 指値のエントリーを取り消す理由。expired: 期限 / opposite_signal: 逆方向のシグナル / stop_crossed: 気配が損切り価格を越えた /
+ * halted: 停止 (kill switch・日次停止) / order_unknown: 状態不明の注文がある (新規を止めている) /
+ * account_unavailable: 口座情報を取得できない / market_data: 気配が古い・取得に失敗した
+ * (新規エントリーを止める理由はすべて、置いてある指値も取り消す。テンポの上限は置いた指値を取り消す理由にしない)
+ */
+export type LimitCancelReason = "expired" | "opposite_signal" | "stop_crossed" | "halted" | "order_unknown" | "account_unavailable" | "market_data";
+
+/**
+ * 指値のエントリー (板に置いて約定を待つ注文)。
+ * 期限・逆方向のシグナル・損切り価格の越え・新規を止める理由 (停止・状態不明・口座・気配) で取り消し、取消の後に照会して確定させる
+ * (取消と約定が競合しても、照会の累計の約定で反映する。確定しなければ既存の状態不明の経路)。
+ * 状態不明のまま建玉で判定する場合も、取消に成功して照会で板に無いと確かめるまで追跡から外さない (板に残ったまま後で約定しうるため)
+ */
+export interface PendingLimit {
+  price: number;
+  /** この時刻を過ぎても約定しなければ取り消す */
+  expiresAt: number;
+  postOnly?: boolean;
+  /** シグナルの損切り価格 (気配が越えたら取り消す) */
+  stopLoss: number;
+  direction: "long" | "short";
+  /** 取消を依頼した理由 (syncPending が取消 → 照会で確定させる) */
+  cancelReason?: LimitCancelReason;
+  /** 期限切れで見送ったときの仮想トレード (limit_unfilled) の材料。シグナル時点の気配・レジーム */
+  shadow?: { signal: Signal; quote: Pick<Quote, "bid" | "ask">; regime: RegimeLabel; signalTs: number };
+}
+
+/**
+ * 板に置いた利確の指値 (reduceOnly)。建玉 (trade) ごとに 1 つ。kv `orders:restingTp:<mode>` に保存し、再起動後も照会・取消を続ける。
+ * PendingOrders とは別に持つ (利確の指値がある間も、損切りなどの判定を止めないため)。
+ * - appliedQty / appliedFee: journal に反映済みの約定の累計 (照会の累計との差分だけを反映する)
+ * - exit: 損切りなどの成行の決済のために取消中。取消・照会で確定したら残りだけを成行で送る
+ *   (取消に失敗・状態不明の間は成行を送らない = 過剰決済・ドテンの防止)
+ */
+export interface RestingTakeProfit {
+  tradeId: string;
+  symbol: string;
+  clientId: string;
+  orderId?: string;
+  side: Side;
+  /** 発注数量 (decimal 文字列) */
+  qty: string;
+  price: number;
+  createdAt: number;
+  status: PendingStatus | "canceling";
+  appliedQty: string;
+  appliedFee: string;
+  appliedNotional?: string;
+  appliedMaker?: string;
+  appliedTaker?: string;
+  lastCheckedAt?: number;
+  /** 取引所が「無い」と答えた連続回数 (同じティックの照会は 1 回と数える) */
+  notFound?: number;
+  /** 最後に「無い」と答えられた時刻 (別のティックで続けて答えたときだけ数える) */
+  notFoundAt?: number;
+  /** 決済の取消中に状態不明が続いた (新規エントリーを止める) */
+  escalated?: boolean;
+  unknownCount: number;
+  unknownSince?: number;
+  lastError?: string;
+  exit?: { reason: ExitReason; intendedPrice: number; requestedAt: number };
+  /** 取消の依頼に成功した時刻 (失敗したら次の照会の前に再度取り消す) */
+  canceledAt?: number;
+}
+
+export const RESTING_TP_KEY = "orders:restingTp";
+export const restingTpKey = (mode: TradingMode) => `${RESTING_TP_KEY}:${mode}`;
+
+export class RestingTakeProfits {
+  private readonly items = new Map<string, RestingTakeProfit>();
+  readonly key: string;
+
+  constructor(private readonly opts: { store?: Store; mode: TradingMode }) {
+    this.key = restingTpKey(opts.mode);
+    const saved = opts.store?.kvGet<RestingTakeProfit[]>(this.key);
+    for (const o of Array.isArray(saved) ? saved : []) {
+      if (o && typeof o.tradeId === "string" && typeof o.clientId === "string" && typeof o.symbol === "string") this.items.set(o.tradeId, o);
+    }
+  }
+
+  private persist(): void {
+    this.opts.store?.kvSet(this.key, [...this.items.values()]);
+  }
+
+  list(): RestingTakeProfit[] {
+    return [...this.items.values()].map((o) => ({ ...o }));
+  }
+
+  get(tradeId: string): RestingTakeProfit | undefined {
+    const o = this.items.get(tradeId);
+    return o ? { ...o } : undefined;
+  }
+
+  get size(): number {
+    return this.items.size;
+  }
+
+  upsert(o: RestingTakeProfit): void {
+    this.items.set(o.tradeId, { ...o });
+    this.persist();
+  }
+
+  remove(tradeId: string): void {
+    if (this.items.delete(tradeId)) this.persist();
+  }
+}
+
+/** 指値の約定率の集計 (kv `orders:limitStats:<mode>`)。status / report / simulate が表示する */
+export interface LimitStats {
+  /** 指値のエントリー: 置いた / 全量約定 / 一部約定 (残りは取消) / 期限切れ (約定なし) / 取消 (理由別) / 拒否 (post-only など) */
+  entryPlaced: number;
+  entryFilled: number;
+  entryPartial: number;
+  entryExpired: number;
+  entryCanceled: Partial<Record<Exclude<LimitCancelReason, "expired">, number>>;
+  entryRejected: number;
+  /** 利確の指値: 置いた / 約定 (全量) / 一部約定 / 決済のために取消 / 拒否 */
+  tpPlaced: number;
+  tpFilled: number;
+  tpPartial: number;
+  tpCanceled: number;
+  tpRejected: number;
+  since?: number;
+}
+
+export const LIMIT_STATS_KEY = "orders:limitStats";
+export const limitStatsKey = (mode: TradingMode) => `${LIMIT_STATS_KEY}:${mode}`;
+
+export const emptyLimitStats = (): LimitStats => ({
+  entryPlaced: 0, entryFilled: 0, entryPartial: 0, entryExpired: 0, entryCanceled: {}, entryRejected: 0,
+  tpPlaced: 0, tpFilled: 0, tpPartial: 0, tpCanceled: 0, tpRejected: 0,
+});
+
+/** 保存された集計を読む (無い・壊れていれば空) */
+export function readLimitStats(store: Pick<Store, "kvGet">, mode: TradingMode): LimitStats {
+  const v = store.kvGet<LimitStats>(limitStatsKey(mode));
+  if (!v || typeof v !== "object") return emptyLimitStats();
+  return { ...emptyLimitStats(), ...v, entryCanceled: { ...(v.entryCanceled ?? {}) } };
+}
+
+/** 集計に加える (保存する) */
+export function bumpLimitStats(store: Pick<Store, "kvGet" | "kvSet"> | undefined, mode: TradingMode, now: number, fn: (s: LimitStats) => void): void {
+  if (!store) return;
+  const s = readLimitStats(store, mode);
+  s.since ??= now;
+  fn(s);
+  store.kvSet(limitStatsKey(mode), s);
 }
 
 /** 建玉による判定: none = 約定なし / filled = 全量約定 / partial = 一部約定 */

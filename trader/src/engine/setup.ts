@@ -21,11 +21,13 @@ import { SyntheticFeed } from "../market/feeds/synthetic";
 import { MarketHub } from "../market/hub";
 import { RiskManager } from "../risk/manager";
 import { createStore } from "../storage";
-import { ALL_STRATEGIES } from "../strategies/registry";
+import { ALL_STRATEGIES, configuredStrategies } from "../strategies/registry";
+import { structureConfigWarnings, structureSettingsFromEnv } from "../structure/settings";
 import { TradingEngine, type EngineOptions } from "./engine";
 import { ClosedCandleCacheFeed } from "./feedCache";
 import { createFxConverter, type FxConverter } from "./fx";
 import { createParamValidator, createPriceAt, type ValidatorOptions } from "./learningHooks";
+import { limitOrdersFromEnv } from "./limitOrders";
 
 const ASSET_CLASSES: AssetClass[] = ["crypto", "meme", "fx", "stock"];
 export const KNOWN_VENUES = ["synthetic", "ccxt", "gmo", "oanda", "alpaca", "dex"] as const;
@@ -158,7 +160,11 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
   const log = opts.logger ?? createLogger("setup");
   const env = config.env;
   const clock = opts.clock ?? systemClock;
-  const strategies = opts.strategies ?? ALL_STRATEGIES;
+  // 相場構造のフィルター (STRUCTURE_MODE) は戦略のラップで掛ける。エンジン・パラメータ検証・計画が同じラップ済みの一覧を使う。
+  // opts.strategies を渡したときはそのまま使う (テスト・独自の一覧)
+  const structureSettings = structureSettingsFromEnv(env);
+  for (const w of structureConfigWarnings(structureSettings, ALL_STRATEGIES.map((x) => x.id))) log.warn(w);
+  const strategies = opts.strategies ?? configuredStrategies(structureSettings);
   const venues = parseVenues(env.VENUES);
   const watch = parseWatchlist(env.WATCHLIST);
   if (config.mode === "live" && !opts.markets && venues.includes("synthetic")) throw new Error("synthetic は paper 専用です (live では使えません)");
@@ -342,6 +348,10 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
       minEdgeToCostRatio: config.risk.minEdgeToCostRatio,
       riskPerTrade: config.risk.riskPerTrade,
       maxPositionPct: config.risk.maxPositionPct,
+      // 指値 (maker) の前提を実運用 (LIMIT_ENTRY / LIMIT_TAKE_PROFIT。利確の指値は paper だけ) に合わせて検証する
+      limitOrders: limitOrdersFromEnv(config.env, brokerSet.mode),
+      // 最大保有 (MAX_HOLD_MINUTES) も実運用と同じ前提で検証する (0 = 無効。テンポはバックテストに渡さない)
+      ...((config.env.MAX_HOLD_MINUTES ?? 0) > 0 ? { maxHoldMinutes: config.env.MAX_HOLD_MINUTES } : {}),
       ...(opts.validation ?? {}),
     }),
     priceAt: createPriceAt(hub, clock),

@@ -2,10 +2,12 @@ import type { AssetClass, Horizon, Strategy } from "../core/types";
 import { scalpMomentumBurst, scalpObi, scalpVwapRevert } from "./scalp";
 import { scalpMicro } from "./scalpMicro";
 import { scalpRebound } from "./scalpRebound";
+import { scalpPullback } from "./scalpPullback";
 import { shortBreakout, shortEmaTrend, shortRsiRevert } from "./short";
 import { midTrendFollow } from "./mid";
 import { longMomentum } from "./long";
 import { memeMomentum } from "./meme";
+import { applyStructure, type StructureSettings } from "../structure/settings";
 
 /** 全戦略 (登録順 = スキャルピング → 短期 → 中期 → 長期 → ミーム) */
 export const ALL_STRATEGIES: readonly Strategy[] = [
@@ -14,6 +16,7 @@ export const ALL_STRATEGIES: readonly Strategy[] = [
   scalpMomentumBurst,
   scalpMicro,
   scalpRebound,
+  scalpPullback,
   shortEmaTrend,
   shortRsiRevert,
   shortBreakout,
@@ -21,6 +24,14 @@ export const ALL_STRATEGIES: readonly Strategy[] = [
   longMomentum,
   memeMomentum,
 ];
+
+/**
+ * 運用・バックテスト・パラメータ検証で使う戦略の一覧。相場構造のフィルター (STRUCTURE_MODE=filter) なら対象の戦略をラップする。
+ * settings が無い・mode が off なら ALL_STRATEGIES そのもの (従来と同じ)
+ */
+export function configuredStrategies(settings?: StructureSettings): readonly Strategy[] {
+  return applyStructure(ALL_STRATEGIES, settings);
+}
 
 const BY_ID = new Map(ALL_STRATEGIES.map((s) => [s.id, s]));
 

@@ -5,10 +5,13 @@ import { createLogger, type Logger } from "../core/logger";
 import type {
   Broker, BrokerPosition, ExitReason, Fill, Instrument, OrderRequest, OrderResult, PositionView, Quote, Store, TradeRecord,
 } from "../core/types";
-import type { OpenTrade, OpenTradeInput, TradeJournal } from "../learning/journal";
+import type { FeesByLiquidity, OpenTrade, OpenTradeInput, TradeJournal } from "../learning/journal";
 import { runGrouped, withDeadline } from "./deadline";
 import { normalizeCurrency } from "./fx";
-import { isFinalStatus, PendingOrders, type PendingEntry, type PendingOrder, type PositionVerdict, type ResolveRequest } from "./orders";
+import {
+  bumpLimitStats, isFinalStatus, PendingOrders, RestingTakeProfits, type LimitCancelReason, type PendingEntry, type PendingOrder, type PositionVerdict,
+  type ResolveRequest, type RestingTakeProfit,
+} from "./orders";
 
 /** エントリー時に決まる決済ルール (TradeJournal に無い分) */
 export interface ExitPlan {
@@ -18,7 +21,18 @@ export interface ExitPlan {
   maxHoldMs?: number;
   /** 一部約定で残った分は、決済判定に該当しなくても次のティックで同じ理由で決済する */
   retryExit?: { reason: ExitReason; intendedPrice: number };
+  /** 利確の指値を (もう) 板に置かない (決済のために取り消した・置けなかった) */
+  noRestingTp?: boolean;
+  /** 利確の指値を置こうとした回数 (取引所に拒否・取消されても無限に置き直さない) */
+  tpAttempts?: number;
 }
+
+/** 利確の指値を置き直す上限 (建玉ごと) */
+const MAX_TP_ATTEMPTS = 3;
+/** 利確の指値の取消を再送するまでの間隔 (取消が照会に反映されないとき) */
+const TP_RECANCEL_MS = 10_000;
+/** 利確の指値が「見つからない」と何回続けて答えられたら、約定なしで消えたとみなすか */
+const TP_NOT_FOUND_CONFIRMATIONS = 2;
 
 export interface ExitDecision {
   reason: ExitReason;
@@ -58,6 +72,8 @@ export interface SyncResult {
   resolved: number;
   /** 決済の拒否後の建玉確認で追跡を外した・減らした件数 */
   reconciled: number;
+  /** 約定せずに終わった指値のエントリー (cause: 取消の理由。rejected は取引所の拒否) */
+  limitUnfilled: { order: PendingOrder; cause: LimitCancelReason | "rejected" }[];
 }
 
 export interface OrderPolicy {
@@ -86,6 +102,8 @@ export interface OrderPolicy {
   exitMaxUnknownMs: number;
   /** escalated の決済注文を建玉で確定させるための getPositions の間隔 */
   exitPositionCheckMs: number;
+  /** 板に置いた利確の指値の照会の間隔 (銘柄ごと。気配が利確価格に触れたときは間隔によらず即時) */
+  tpPollMs: number;
 }
 
 export const DEFAULT_ORDER_POLICY: OrderPolicy = {
@@ -102,6 +120,7 @@ export const DEFAULT_ORDER_POLICY: OrderPolicy = {
   exitMaxUnknownCount: 2,
   exitMaxUnknownMs: 20_000,
   exitPositionCheckMs: 10_000,
+  tpPollMs: 3_000,
 };
 
 /** 決済が約定しなかった後に建玉を確認し、無い (少ない) と何回確認したら追跡を外すか */
@@ -122,6 +141,11 @@ export interface PositionManagerDeps {
   onTradeClosed?: (t: TradeRecord) => unknown;
   /** 発注の記録 (risk.recordOrder) */
   onOrder?: (now: number) => void;
+  /**
+   * 新しいポジションを登録した (成行の約定・指値の約定 (一部約定を含む)・照会や手動の申告による確定)。
+   * open() の中で 1 ポジションにつき 1 回だけ呼ぶ (engine はテンポのエントリーの記録に使う)。例外は握りつぶす
+   */
+  onOpened?: (p: OpenTrade, now: number) => void;
   store?: Store;
   logger?: Logger;
   /** 注文 clientId の接頭辞 */
@@ -146,6 +170,12 @@ export interface PositionManagerDeps {
    */
   onEscalated?: (o: PendingOrder, now: number) => void;
   orderPolicy?: Partial<OrderPolicy>;
+  /**
+   * エントリーの約定後、利確価格に reduceOnly の指値を板に置く (LIMIT_TAKE_PROFIT。paper 専用)。
+   * 発注先が capabilities.restingTakeProfit に対応しているときだけ (無ければ従来どおりエンジン側の成行で利確)。
+   * journal の mode が live なら true でも置かない
+   */
+  limitTakeProfit?: boolean;
 }
 
 /** 旧キー (mode なし)。paper 用として扱う */
@@ -177,14 +207,21 @@ interface FillSummary {
   qty: Decimal;
   /** 加重平均の約定価格 */
   price: number;
+  /** Σ 数量 × 価格 */
+  notional: Decimal;
   /** クオート通貨建ての手数料 */
   fee: Decimal;
+  /** 手数料の liquidity 別の内訳 (クオート通貨建て) */
+  maker: Decimal;
+  taker: Decimal;
   invalid?: string;
 }
 
+const byLiquidity = (maker: Decimal, taker: Decimal): FeesByLiquidity => ({ maker: maker.toNumber(), taker: taker.toNumber() });
+
 type Applied =
   | { kind: "pending"; reason?: string; unknown?: boolean }
-  | { kind: "rejected"; reason: string }
+  | { kind: "rejected"; reason: string; limitUnfilled?: { order: PendingOrder; cause: LimitCancelReason | "rejected" } }
   | { kind: "opened"; position: OpenTrade }
   | { kind: "closed"; trade: TradeRecord }
   | { kind: "reduced"; position: OpenTrade }
@@ -236,9 +273,13 @@ export class PositionManager {
   private readonly exitBackoff = new Map<string, { rejects: number; until: number }>();
   /** ブローカーの建玉が追跡と一致しなかった連続回数 (trade id ごと。照会の一時的な欠落で外さないため) */
   private readonly mismatchObs = new Map<string, number>();
+  /** 指値のエントリーを待っている銘柄で、取引所の建玉が説明できる範囲を超えた連続回数 (銘柄ごと) */
+  private readonly excessObs = new Map<string, number>();
   /** 決済の拒否後の建玉確認 (その場で待たずに次のティックへ回す) */
   private readonly verifyQueue = new Map<string, VerifyItem>();
   readonly pending: PendingOrders;
+  /** 板に置いた利確の指値 (建玉ごと) */
+  readonly tps: RestingTakeProfits;
 
   constructor(private readonly deps: PositionManagerDeps) {
     this.log = deps.logger ?? createLogger("positions");
@@ -249,6 +290,7 @@ export class PositionManager {
     const open = new Set(deps.journal.list().map((p) => p.id));
     this.plans = Object.fromEntries(Object.entries(saved ?? {}).filter(([id]) => open.has(id)));
     this.pending = new PendingOrders({ ...(deps.store ? { store: deps.store } : {}), mode });
+    this.tps = new RestingTakeProfits({ ...(deps.store ? { store: deps.store } : {}), mode });
     this.policy = { ...DEFAULT_ORDER_POLICY, ...(deps.orderPolicy ?? {}) };
   }
 
@@ -288,9 +330,39 @@ export class PositionManager {
     return this.pending.list();
   }
 
-  /** 状態不明が続いている (escalated) 保留中の注文 */
+  /**
+   * 状態不明が続いている (escalated) 保留中の注文。
+   * 決済のための取消を確かめられない利確の指値も含める (新規エントリーを止める。kind は exit)
+   */
   escalatedOrders(): PendingOrder[] {
-    return this.pending.escalated();
+    const tps = this.tps
+      .list()
+      .filter((t) => t.escalated)
+      .map(
+        (t): PendingOrder => ({
+          clientId: t.clientId, ...(t.orderId ? { orderId: t.orderId } : {}), symbol: t.symbol, side: t.side, qty: t.qty, kind: "exit", createdAt: t.createdAt,
+          status: "unknown", unknownCount: t.unknownCount, ...(t.lastError ? { lastError: t.lastError } : {}), escalated: true,
+        }),
+      );
+    return [...this.pending.escalated(), ...tps];
+  }
+
+  /** 板に置いた利確の指値の一覧 */
+  restingTakeProfits(): RestingTakeProfit[] {
+    return this.tps.list();
+  }
+
+  /**
+   * 追跡していない建玉の利確の指値 (孤児。取消を確かめる前) が銘柄に残っているか。
+   * 残っている間は新規エントリーしない (reduceOnly の指値が新しい建玉に当たって決済してしまうため)
+   */
+  hasOrphanTakeProfit(symbol: string): boolean {
+    return this.tps.list().some((t) => t.symbol === symbol && !this.deps.journal.get(t.tradeId));
+  }
+
+  /** 銘柄の保留中の指値のエントリー */
+  pendingLimitEntry(symbol: string): PendingOrder | undefined {
+    return this.pending.list().find((o) => o.symbol === symbol && o.kind === "entry" && o.limit !== undefined);
   }
 
   /** 次のティックへ回した確認 (決済の拒否後の建玉確認) があるか */
@@ -303,7 +375,7 @@ export class PositionManager {
   }
 
   /** 注文の clientId (再起動後の重複を避けるため短い乱数を付ける) */
-  newClientId(kind: "e" | "x", now: number): string {
+  newClientId(kind: "e" | "x" | "t", now: number): string {
     const rand = Math.random().toString(36).slice(2, 6);
     return `${this.deps.clientIdPrefix ?? "eng"}-${kind}-${now}-${++this.seq}-${rand}`;
   }
@@ -349,15 +421,26 @@ export class PositionManager {
     };
   }
 
-  /** エントリーの約定後に登録する */
-  open(input: OpenTradeInput, plan: ExitPlan): OpenTrade {
+  /**
+   * エントリーの約定後に登録する。新しいポジションの作成はすべてここを通る (deps.onOpened を 1 回だけ呼ぶ)。
+   * now は約定を反映した時刻 (省略時はエントリーの時刻)
+   */
+  open(input: OpenTradeInput, plan: ExitPlan, now?: number): OpenTrade {
     if (this.has(input.symbol)) throw new Error(`${input.symbol} は既にポジションがあります (1 銘柄 1 ポジション)`);
     const p = this.deps.journal.open(input);
     this.plans[p.id] = {
       ...(plan.trailingStopPct !== undefined && plan.trailingStopPct > 0 ? { trailingStopPct: plan.trailingStopPct } : {}),
       ...(plan.maxHoldMs !== undefined && plan.maxHoldMs > 0 ? { maxHoldMs: plan.maxHoldMs } : {}),
+      ...(plan.retryExit ? { retryExit: plan.retryExit } : {}),
     };
     this.persist();
+    if (this.deps.onOpened) {
+      try {
+        this.deps.onOpened({ ...p }, now ?? p.entryTs);
+      } catch (e) {
+        this.log.warn("ポジション登録の通知に失敗 (取引は継続)", { symbol: p.symbol, error: errMsg(e) });
+      }
+    }
     return p;
   }
 
@@ -367,7 +450,7 @@ export class PositionManager {
    * エントリーの成行を発注する。約定すれば約定数量・平均価格で journal に登録する。
    * 未約定・状態不明 (締め切り超過を含む) は保留中として記録し、syncPending で確定させる (その間この銘柄には発注しない)。
    */
-  async enter(req: OrderRequest, entry: PendingEntry, now: number): Promise<EntryResult> {
+  async enter(req: OrderRequest, entry: PendingEntry, now: number, limit?: PendingOrder["limit"]): Promise<EntryResult> {
     const symbol = req.symbol;
     if (this.has(symbol)) return { status: "rejected", reason: "既にポジションがあります" };
     if (this.hasPending(symbol)) return { status: "rejected", reason: "保留中の注文があります" };
@@ -379,6 +462,7 @@ export class PositionManager {
     }
     const o: PendingOrder = {
       clientId: req.clientId, symbol, side: req.side, qty: req.qty, kind: "entry", createdAt: now, status: "submitting", unknownCount: 0, entry,
+      ...(limit ? { limit } : {}),
     };
     // 発注前に書き込む (発注中に停止しても再起動後に clientId で照会できる)
     this.pending.upsert(o);
@@ -391,9 +475,11 @@ export class PositionManager {
       this.log.error("発注の結果が不明です (保留中として照会を続けます)", { symbol, clientId: req.clientId, error: msg });
       this.deps.store?.audit({ ts: now, type: "engine.order_error", data: { symbol, strategyId: req.strategyId, clientId: req.clientId, error: msg, pending: true } });
       this.markUnknown(o, now, `発注で例外: ${msg}`);
+      if (limit) this.bumpStats(now, (s) => s.entryPlaced++);
       return { status: "pending", reason: msg };
     }
     this.deps.onOrder?.(now);
+    if (limit && res.status !== "rejected") this.bumpStats(now, (s) => s.entryPlaced++);
     const a = this.applyResult(o, res, now);
     if (a.kind === "opened") return { status: "opened", position: a.position };
     if (a.kind === "pending") return { status: "pending", ...(a.reason ? { reason: a.reason } : {}) };
@@ -402,8 +488,11 @@ export class PositionManager {
 
   // ───────── 決済 ─────────
 
-  /** 決済判定 (副作用なし)。損切り → 利確 → トレーリング → 時間切れ の順 */
-  checkExit(p: OpenTrade, quote: Quote, now: number): ExitDecision | undefined {
+  /**
+   * 決済判定 (副作用なし)。損切り → 利確 → トレーリング → 時間切れ の順。
+   * skipTakeProfit: 利確の指値を板に置いている (利確は指値の約定で記録するので、成行の利確をしない)
+   */
+  checkExit(p: OpenTrade, quote: Quote, now: number, opts: { skipTakeProfit?: boolean } = {}): ExitDecision | undefined {
     const long = p.direction === "long";
     const { bid, ask } = quote;
     if (!(bid > 0) || !(ask > 0)) return undefined;
@@ -413,7 +502,7 @@ export class PositionManager {
       // 引き上げ済みのトレーリングストップを飛び越えて当初ストップまで動いた場合は、先に触れたトレーリング側で記録する
       return trail !== undefined ? { reason: "trailing", intendedPrice: trail } : { reason: "stop", intendedPrice: p.initialStop };
     }
-    if (p.takeProfit !== undefined && (long ? bid >= p.takeProfit : ask <= p.takeProfit)) {
+    if (!opts.skipTakeProfit && p.takeProfit !== undefined && (long ? bid >= p.takeProfit : ask <= p.takeProfit)) {
       return { reason: "take_profit", intendedPrice: p.takeProfit };
     }
     if (trail !== undefined && hit(trail)) return { reason: "trailing", intendedPrice: trail };
@@ -424,19 +513,39 @@ export class PositionManager {
     return undefined;
   }
 
-  /** 毎ティックの処理: 価格反映 → 決済判定 → 必要なら決済 (保留中の注文がある銘柄は照会の結果を待つ) */
+  /**
+   * 毎ティックの処理: 価格反映 → 利確の指値の照会 → 決済判定 → 必要なら決済 → 利確の指値を置く
+   * (保留中の注文がある銘柄は照会の結果を待つ)。
+   * 利確の指値は銘柄ごとに tpPollMs に 1 回照会する (気配が利確価格に触れたら即時)。
+   * 決済のために取消中の利確の指値があれば、取消の確認を続ける (確定するまで成行は送らない)
+   */
   async onQuote(symbol: string, quote: Quote, now: number): Promise<CloseResult> {
     const p0 = this.get(symbol);
     if (!p0) return { status: "none" };
     if (quote.bid > 0 && quote.ask > 0) this.deps.journal.mark(symbol, midOf(quote), now);
     if (this.hasPending(symbol)) return { status: "pending", reason: "保留中の注文があります" };
-    const p = this.get(symbol)!;
-    const d = this.checkExit(p, quote, now);
+    let reduced: OpenTrade | undefined;
+    const rtp = this.tps.get(p0.id);
+    if (rtp) {
+      if (rtp.exit) return this.close(symbol, rtp.exit.reason, rtp.exit.intendedPrice, now);
+      const long = p0.direction === "long";
+      const touched = quote.bid > 0 && quote.ask > 0 && (long ? quote.bid >= rtp.price : quote.ask <= rtp.price);
+      const due = rtp.lastCheckedAt === undefined || now - rtp.lastCheckedAt >= this.policy.tpPollMs || rtp.status === "submitting" || rtp.status === "unknown";
+      if (touched || due) {
+        const r = await this.pollTakeProfit(rtp, now);
+        if (r.applied?.kind === "closed") return { status: "closed", trade: r.applied.trade };
+        if (r.applied?.kind === "reduced") reduced = r.applied.position;
+      }
+    }
+    const p = this.get(symbol);
+    if (!p) return { status: "none" };
+    const d = this.checkExit(p, quote, now, { skipTakeProfit: this.tps.get(p.id) !== undefined });
     if (d) return this.close(symbol, d.reason, d.intendedPrice, now);
     // 一部約定で残った分
     const retry = this.plans[p.id]?.retryExit;
     if (retry) return this.close(symbol, retry.reason, retry.intendedPrice, now);
-    return { status: "none" };
+    await this.placeTakeProfit(p, quote, now);
+    return reduced ? { status: "reduced", position: reduced } : { status: "none" };
   }
 
   private allowExitOrder(now: number): boolean {
@@ -472,9 +581,18 @@ export class PositionManager {
         this.log.error("決済の発注先が見つかりません", { symbol, reason, error: msg });
         return { status: "error", reason: msg };
       }
-      const long = p.direction === "long";
-      // 数量は追跡数量 (と、指定があれば取引所の保有数量) を上限にする (reduceOnly と合わせて過剰決済しない)
-      let qty = D(p.qty);
+      // 板に置いた利確の指値があれば、先に取り消して結果 (または約定) を照会で確かめる。
+      // 確定するまで成行は送らない (取消に失敗・状態不明のまま成行を送ると、利確の約定と重なって過剰決済・ドテンになりうる)
+      if (this.tps.get(p.id)) {
+        const c = await this.clearTakeProfit(p, reason, intendedPrice, now);
+        if (c !== "cleared") return c;
+      }
+      const cur = this.get(symbol);
+      if (!cur || cur.id !== p.id) return { status: "none", reason: "ポジションがありません" };
+      const long = cur.direction === "long";
+      // 数量は追跡数量 (と、指定があれば取引所の保有数量) を上限にする (reduceOnly と合わせて過剰決済しない)。
+      // 利確の指値が一部約定していれば、その分を減らした残りの数量
+      let qty = D(cur.qty);
       if (opts.maxQty !== undefined) {
         if (!opts.maxQty.isFinite() || !opts.maxQty.gt(0)) return { status: "none", reason: "決済する数量がありません" };
         if (opts.maxQty.lt(qty)) qty = opts.maxQty;
@@ -544,6 +662,341 @@ export class PositionManager {
     return list.map((p) => out.get(p.id) ?? { status: "none" });
   }
 
+  // ───────── 利確の指値 (板に置く) ─────────
+
+  /**
+   * 発注先が利確の指値の板置きに対応していて、設定で有効か。
+   * live では設定によらず置かない (paper 専用。engine も live では limitTakeProfit を渡さないが、ここでも止める)。
+   * 既に板にある利確の指値 (以前の起動で置いたもの) の照会・取消は続ける
+   */
+  private tpBroker(symbol: string): Broker | undefined {
+    if (this.deps.limitTakeProfit !== true || this.deps.journal.mode === "live") return undefined;
+    try {
+      const b = this.deps.brokerFor(symbol);
+      return b.capabilities?.restingTakeProfit === true ? b : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * 利確価格に reduceOnly の指値を置く (LIMIT_TAKE_PROFIT で、発注先が対応しているときだけ)。
+   * 置かない条件: 利確価格が無い・既に置いている・決済の途中 (retryExit・取消済み)・保留中の注文がある・
+   * 気配が既に利確価格に届いている (置いた瞬間に約定する = maker にならない。従来どおり成行の利確に任せる)・数量が最小未満。
+   * 発注前に kv へ書き込む (発注中に停止しても再起動後に clientId で照会・取消できる)。置いたら true
+   */
+  async placeTakeProfit(p: OpenTrade, quote: Quote | undefined, now: number): Promise<boolean> {
+    const tp = p.takeProfit;
+    if (tp === undefined || !Number.isFinite(tp) || !(tp > 0)) return false;
+    if (this.tps.get(p.id) || this.hasPending(p.symbol) || this.closing.has(p.id)) return false;
+    const plan = this.plans[p.id] ?? {};
+    if (plan.retryExit || plan.noRestingTp || (plan.tpAttempts ?? 0) >= MAX_TP_ATTEMPTS) return false;
+    const broker = this.tpBroker(p.symbol);
+    if (!broker) return false;
+    const long = p.direction === "long";
+    if (!quote || !(quote.bid > 0) || !(quote.ask > 0)) return false;
+    if (long ? !(tp > quote.ask) : !(tp < quote.bid)) return false;
+    const minQty = this.deps.instrumentOf?.(p.symbol)?.minQty ?? 0;
+    const qty = D(p.qty);
+    if (!qty.gt(0) || (minQty > 0 && qty.lt(minQty))) return false;
+    const req: OrderRequest = {
+      clientId: this.newClientId("t", now),
+      symbol: p.symbol,
+      side: long ? "sell" : "buy",
+      type: "limit",
+      qty: qty.toString(),
+      limitPrice: tp,
+      tif: "GTC",
+      reduceOnly: true,
+      ...(broker.capabilities?.postOnly ? { postOnly: true } : {}),
+      strategyId: p.strategyId,
+    };
+    const rtp: RestingTakeProfit = {
+      tradeId: p.id, symbol: p.symbol, clientId: req.clientId, side: req.side, qty: req.qty, price: tp, createdAt: now, status: "submitting",
+      appliedQty: "0", appliedFee: "0", unknownCount: 0,
+    };
+    this.plans[p.id] = { ...plan, tpAttempts: (plan.tpAttempts ?? 0) + 1 };
+    this.persist();
+    this.tps.upsert(rtp);
+    let res: OrderResult;
+    try {
+      res = await this.call(() => broker.placeOrder(req), "placeOrder");
+    } catch (e) {
+      this.deps.onOrder?.(now);
+      this.markTpUnknown(rtp, now, `利確の指値の発注で例外: ${errMsg(e)}`);
+      this.bumpStats(now, (s) => s.tpPlaced++);
+      return true;
+    }
+    this.deps.onOrder?.(now);
+    if (res.status === "rejected") {
+      this.tps.remove(p.id);
+      const reason = res.reason !== undefined ? redactSecrets(res.reason) : "rejected";
+      this.bumpStats(now, (s) => s.tpRejected++);
+      this.auditThrottled(`tprej|${p.symbol}`, now, "engine.tp_rejected", { symbol: p.symbol, tradeId: p.id, price: tp, reason });
+      this.log.warn("利確の指値が拒否されました (成行の利確に任せます)", { symbol: p.symbol, price: tp, reason });
+      return false;
+    }
+    this.bumpStats(now, (s) => s.tpPlaced++);
+    this.deps.store?.audit({
+      ts: now, type: "engine.tp_placed",
+      data: { symbol: p.symbol, tradeId: p.id, clientId: req.clientId, orderId: res.orderId, price: tp, qty: req.qty, postOnly: req.postOnly === true },
+    });
+    this.applyTpResult(rtp, res, now);
+    return true;
+  }
+
+  /** 利確の指値の状態不明を記録する (決済の取消中に続いたら escalated = 新規エントリーを止める) */
+  private markTpUnknown(rtp: RestingTakeProfit, now: number, why: string): void {
+    const cur = this.tps.get(rtp.tradeId);
+    if (!cur) return;
+    const reason = redactSecrets(why);
+    cur.unknownCount = (cur.unknownCount ?? 0) + 1;
+    cur.unknownSince ??= now;
+    cur.lastError = reason;
+    cur.lastCheckedAt = now;
+    if (cur.status === "submitting") cur.status = "unknown";
+    this.auditThrottled(`tpunk|${cur.clientId}`, now, "engine.tp_unknown", {
+      symbol: cur.symbol, tradeId: cur.tradeId, clientId: cur.clientId, orderId: cur.orderId, count: cur.unknownCount, error: reason, exiting: cur.exit !== undefined,
+    });
+    const lim = this.unknownLimits({ kind: "exit" });
+    if (cur.exit && !cur.escalated && (cur.unknownCount >= lim.count || now - cur.unknownSince >= lim.ms)) {
+      cur.escalated = true;
+      const msg =
+        `利確の指値の状態を確認できないため、${cur.symbol} の決済 (${cur.exit.reason}) の成行を送れません (過剰決済の防止)。` +
+        `取引所で注文 ${cur.orderId ?? cur.clientId} と建玉を確認してください`;
+      this.log.error(msg, { error: reason });
+      this.deps.store?.audit({ ts: now, type: "order.tp_unknown_escalated", data: { symbol: cur.symbol, tradeId: cur.tradeId, clientId: cur.clientId, orderId: cur.orderId, error: reason } });
+      this.tps.upsert(cur);
+      this.deps.onEscalated?.(
+        { clientId: cur.clientId, ...(cur.orderId ? { orderId: cur.orderId } : {}), symbol: cur.symbol, side: cur.side, qty: cur.qty, kind: "exit", createdAt: cur.createdAt, status: "unknown", unknownCount: cur.unknownCount, lastError: reason, escalated: true },
+        now,
+      );
+      return;
+    }
+    this.tps.upsert(cur);
+  }
+
+  /**
+   * 利確の指値を照会し、新しい約定を take_profit (maker) として journal に反映する。
+   * final: 注文が終わった (約定・取消・見つからない) ので記録を消した
+   */
+  private async pollTakeProfit(rtp: RestingTakeProfit, now: number): Promise<{ final: boolean; applied?: Applied }> {
+    let broker: Broker;
+    try {
+      broker = this.deps.brokerFor(rtp.symbol);
+    } catch (e) {
+      this.markTpUnknown(rtp, now, `発注先が見つかりません: ${errMsg(e)}`);
+      return { final: false };
+    }
+    let res: OrderResult | undefined;
+    try {
+      res = await this.call(() => broker.getOrder(rtp.clientId, rtp.symbol, rtp.orderId, { createdAt: rtp.createdAt, side: rtp.side, qty: rtp.qty }), "getOrder");
+    } catch (e) {
+      this.markTpUnknown(rtp, now, `利確の指値の照会に失敗: ${errMsg(e)}`);
+      return { final: false };
+    }
+    const cur = this.tps.get(rtp.tradeId);
+    if (!cur) return { final: true };
+    if (!res) {
+      // 取引所が「無い」と答えた。反映遅れの間 (作成から notFoundGraceMs。orderId が無い = 発注の結果が不明な記録も同じ) は待ち、
+      // 別のティックで続けて答えたら約定なしで消えたとみなす (同じティックの 2 回の照会 = 定期の照会と取消の確認、では確定しない)
+      if (now - cur.createdAt < this.policy.notFoundGraceMs || (cur.notFoundAt !== undefined && now <= cur.notFoundAt)) {
+        cur.lastCheckedAt = now;
+        this.tps.upsert(cur);
+        return { final: false };
+      }
+      const n = (cur.notFound ?? 0) + 1;
+      if (n < TP_NOT_FOUND_CONFIRMATIONS) {
+        cur.notFound = n;
+        cur.notFoundAt = now;
+        cur.lastCheckedAt = now;
+        this.tps.upsert(cur);
+        return { final: false };
+      }
+      this.tps.remove(cur.tradeId);
+      this.deps.store?.audit({ ts: now, type: "engine.tp_missing", data: { symbol: cur.symbol, tradeId: cur.tradeId, clientId: cur.clientId, orderId: cur.orderId } });
+      this.log.warn("利確の指値が取引所に見つかりません (約定なしで消えたとみなします)", { symbol: cur.symbol, clientId: cur.clientId });
+      return { final: true };
+    }
+    return this.applyTpResult(cur, res, now);
+  }
+
+  /** 照会 (または発注) の結果を反映する。journal と記録の書き込みは 1 つのトランザクションで */
+  private applyTpResult(rtp: RestingTakeProfit, res: OrderResult, now: number): { final: boolean; applied?: Applied } {
+    const cur = this.tps.get(rtp.tradeId) ?? rtp;
+    if (res.orderId) cur.orderId = String(res.orderId);
+    cur.lastCheckedAt = now;
+    delete cur.notFound;
+    delete cur.notFoundAt;
+    const sum = this.summarize(cur.symbol, Array.isArray(res.fills) ? res.fills : [], now);
+    if (sum.invalid) {
+      this.markTpUnknown(cur, now, sum.invalid);
+      return { final: false };
+    }
+    const final = isFinalStatus(res.status);
+    if (res.status === "filled" && sum.qty.lte(0)) {
+      this.markTpUnknown(cur, now, "約定済みだが約定明細がありません");
+      return { final: false };
+    }
+    if (!final && cur.status !== "canceling") cur.status = res.status;
+    cur.unknownCount = 0;
+    delete cur.unknownSince;
+    delete cur.lastError;
+    if (cur.escalated) {
+      delete cur.escalated;
+      this.deps.store?.audit({ ts: now, type: "order.tp_unknown_resolved", data: { symbol: cur.symbol, tradeId: cur.tradeId, clientId: cur.clientId, status: res.status } });
+    }
+    return this.tx(() => {
+      let applied: Applied | undefined;
+      const delta = sum.qty.minus(cur.appliedQty);
+      const p = this.deps.journal.get(cur.tradeId);
+      if (delta.gt(0) && p) {
+        const feeDelta = sum.fee.minus(cur.appliedFee);
+        const notionalDelta = sum.notional.minus(cur.appliedNotional ?? 0);
+        const price = notionalDelta.gt(0) ? notionalDelta.div(delta).toNumber() : cur.price;
+        const tracked = D(p.qty);
+        const minQty = this.deps.instrumentOf?.(cur.symbol)?.minQty ?? 0;
+        const qty = Decimal.min(delta, tracked);
+        const remain = tracked.minus(qty);
+        const full = remain.lte(tracked.mul(1e-9)) || (remain.gt(0) && minQty > 0 && remain.lt(minQty));
+        // maker / taker の内訳は累計の比率で按分する (照会の結果は累計)
+        const share = (x: Decimal, prev: string | undefined) => x.minus(prev ?? 0);
+        const pseudo: PendingOrder = {
+          clientId: cur.clientId, ...(cur.orderId ? { orderId: cur.orderId } : {}), symbol: cur.symbol, side: cur.side, qty: cur.qty, kind: "exit",
+          createdAt: cur.createdAt, status: res.status, unknownCount: 0, exit: { tradeId: p.id, reason: "take_profit", intendedPrice: cur.price },
+        };
+        applied = this.recordExit(pseudo, p, {
+          qty: full ? tracked : qty, price, fee: feeDelta, full, now, exitOrderType: "limit", noRetry: true,
+          feesByLiquidity: byLiquidity(share(sum.maker, cur.appliedMaker), share(sum.taker, cur.appliedTaker)),
+          ...(cur.createdAt !== now ? { orderedAt: cur.createdAt } : {}),
+        });
+        cur.appliedQty = sum.qty.toString();
+        cur.appliedFee = sum.fee.toString();
+        cur.appliedNotional = sum.notional.toString();
+        cur.appliedMaker = sum.maker.toString();
+        cur.appliedTaker = sum.taker.toString();
+        const done = applied.kind === "closed";
+        this.bumpStats(now, (s) => (done && res.status === "filled" ? s.tpFilled++ : s.tpPartial++));
+      } else if (delta.gt(0) && !p) {
+        this.log.warn("追跡していない建玉の利確の指値が約定しました", { symbol: cur.symbol, tradeId: cur.tradeId, qty: delta.toString() });
+        this.deps.store?.audit({ ts: now, type: "engine.exit_untracked", data: { symbol: cur.symbol, tradeId: cur.tradeId, clientId: cur.clientId, qty: delta.toString(), price: cur.price } });
+      }
+      // 記録を消すのは注文が終わった (約定・取消・拒否) ときだけ。建玉の追跡が終わっていても (全量の利確・外部の決済)、
+      // 注文が板に残っている間は記録を残し、孤児の整理 (sweepTakeProfits) で取消 → 照会して確かめる
+      const closed = !this.deps.journal.get(cur.tradeId);
+      if (final) {
+        this.tps.remove(cur.tradeId);
+        if (res.status !== "filled" && cur.exit) this.bumpStats(now, (s) => s.tpCanceled++);
+        if (!closed && !cur.exit && res.status !== "filled") {
+          this.auditThrottled(`tpgone|${cur.symbol}`, now, "engine.tp_closed_by_venue", { symbol: cur.symbol, tradeId: cur.tradeId, status: res.status, reason: res.reason });
+        }
+      } else this.tps.upsert(cur);
+      return { final, ...(applied ? { applied } : {}) };
+    });
+  }
+
+  /**
+   * 決済 (成行) の前に利確の指値を取り消す: 取消を送り、すぐに照会して確定させる。
+   * - 照会で注文が終わった (取消・約定) と確かめられたら "cleared" (約定分は take_profit として反映済み。残りだけを成行で送る)
+   * - 全量が利確で約定していたら closed
+   * - 取消に失敗した・状態不明・取消が照会に反映されていない間は pending (成行を送らない。次のティックで照会を続ける)
+   */
+  private async clearTakeProfit(p: OpenTrade, reason: ExitReason, intendedPrice: number, now: number): Promise<"cleared" | CloseResult> {
+    const rtp = this.tps.get(p.id);
+    if (!rtp) return "cleared";
+    if (!rtp.exit) {
+      rtp.exit = { reason, intendedPrice, requestedAt: now };
+      this.plans[p.id] = { ...(this.plans[p.id] ?? {}), noRestingTp: true };
+      this.persist();
+      this.deps.store?.audit({ ts: now, type: "engine.tp_cancel", data: { symbol: p.symbol, tradeId: p.id, clientId: rtp.clientId, orderId: rtp.orderId, exitReason: reason } });
+    }
+    rtp.status = "canceling";
+    this.tps.upsert(rtp);
+    let broker: Broker;
+    try {
+      broker = this.deps.brokerFor(p.symbol);
+    } catch (e) {
+      return { status: "error", reason: errMsg(e) };
+    }
+    if (rtp.orderId && (rtp.canceledAt === undefined || now - rtp.canceledAt >= TP_RECANCEL_MS)) {
+      const orderId = rtp.orderId;
+      try {
+        await this.call(() => broker.cancelOrder(orderId, p.symbol), "cancelOrder");
+        const cur = this.tps.get(p.id);
+        if (cur) {
+          cur.canceledAt = now;
+          this.tps.upsert(cur);
+        }
+      } catch (e) {
+        const msg = errMsg(e);
+        this.auditThrottled(`tpcxl|${p.symbol}`, now, "engine.tp_cancel_failed", { symbol: p.symbol, tradeId: p.id, orderId, error: msg });
+        this.log.warn("利確の指値の取消に失敗 (照会で確かめるまで成行の決済は送りません)", { symbol: p.symbol, orderId, error: msg });
+      }
+    }
+    // 取消の結果 (または約定) をすぐに照会で確かめる (損切りを遅らせないため、間隔を空けない)
+    const cur = this.tps.get(p.id);
+    const r = cur ? await this.pollTakeProfit(cur, now) : { final: true };
+    if (r.applied?.kind === "closed") return { status: "closed", trade: r.applied.trade };
+    if (r.final) {
+      this.deps.store?.audit({ ts: now, type: "engine.tp_cleared", data: { symbol: p.symbol, tradeId: p.id, exitReason: reason, remaining: this.get(p.symbol)?.qty } });
+      return "cleared";
+    }
+    return { status: "pending", reason: "利確の指値の取消を確認中 (確定するまで成行の決済は送りません)" };
+  }
+
+  /**
+   * 追跡していない建玉 (決済済み・外部で決済) の利確の指値を取り消す (孤児の整理。起動時と毎ティック)。
+   * 記録を消すのは、照会で注文が終わった (取消・約定) と確かめたときだけ (取消に失敗しても板に残っている間は消さない)。
+   * 取消・照会に失敗したら次回に再試行する。消した件数を返す
+   */
+  async sweepTakeProfits(now: number): Promise<number> {
+    let n = 0;
+    for (const rtp of this.tps.list()) {
+      if (this.deps.journal.get(rtp.tradeId)) continue;
+      let broker: Broker;
+      try {
+        broker = this.deps.brokerFor(rtp.symbol);
+      } catch (e) {
+        // 発注先が無いと取消・照会で確かめられない: 記録は残す (板に残っているかもしれない注文を忘れない)
+        this.auditThrottled(`tporph|${rtp.symbol}`, now, "engine.tp_orphan_unverified", { symbol: rtp.symbol, tradeId: rtp.tradeId, clientId: rtp.clientId, error: errMsg(e) });
+        continue;
+      }
+      if (rtp.orderId && (rtp.canceledAt === undefined || now - rtp.canceledAt >= TP_RECANCEL_MS)) {
+        const orderId = rtp.orderId;
+        try {
+          await this.call(() => broker.cancelOrder(orderId, rtp.symbol), "cancelOrder");
+          rtp.canceledAt = now;
+          this.tps.upsert(rtp);
+        } catch (e) {
+          this.log.warn("孤児になった利確の指値の取消に失敗 (次回に再試行)", { symbol: rtp.symbol, orderId, error: errMsg(e) });
+        }
+      }
+      const cur = this.tps.get(rtp.tradeId);
+      if (!cur) continue;
+      const r = await this.pollTakeProfit(cur, now);
+      if (r.final) {
+        n++;
+        this.deps.store?.audit({ ts: now, type: "engine.tp_orphan", data: { symbol: rtp.symbol, tradeId: rtp.tradeId, clientId: rtp.clientId, orderId: rtp.orderId } });
+      }
+    }
+    return n;
+  }
+
+  /** 追跡中の建玉の利確の指値をすべて照会する (起動時・建玉の突き合わせの前。約定を先に反映して外部の決済と誤認しない) */
+  async pollAllTakeProfits(now: number): Promise<number> {
+    let n = 0;
+    for (const rtp of this.tps.list()) {
+      if (!this.deps.journal.get(rtp.tradeId)) continue;
+      try {
+        const r = await this.pollTakeProfit(rtp, now);
+        if (r.applied && (r.applied.kind === "closed" || r.applied.kind === "reduced")) n++;
+      } catch (e) {
+        this.log.warn("利確の指値の照会に失敗 (次回に再試行)", { symbol: rtp.symbol, error: errMsg(e) });
+      }
+    }
+    return n;
+  }
+
   // ───────── 保留中の注文 ─────────
 
   /**
@@ -553,14 +1006,18 @@ export class PositionManager {
    *   ブローカーの建玉で判定し、同じ判定が 2 回続いたら確定する。
    * - 決済が拒否された後の建玉の確認 (前のティックで予定したもの) もここで行う。
    */
-  async syncPending(now: number): Promise<SyncResult> {
-    const out: SyncResult = { opened: [], closed: [], reduced: 0, rejected: 0, pending: 0, resolved: 0, reconciled: 0 };
+  async syncPending(now: number, opts: { only?: ReadonlySet<string> } = {}): Promise<SyncResult> {
+    const out: SyncResult = { opened: [], closed: [], reduced: 0, rejected: 0, pending: 0, resolved: 0, reconciled: 0, limitUnfilled: [] };
     const memo = new Map<unknown, Promise<BrokerPosition[] | undefined>>();
     type Item = { order: PendingOrder } | { verify: VerifyItem };
-    const items: Item[] = [
-      ...this.pending.list().filter((o) => o.createdAt < now).map((order) => ({ order })),
-      ...[...this.verifyQueue.values()].filter((v) => v.at < now).map((verify) => ({ verify })),
-    ];
+    // only: 指定した注文だけを (作成したティックでも) 照会する (指値のエントリーの即時の取消用)
+    const only = opts.only;
+    const items: Item[] = only
+      ? this.pending.list().filter((o) => only.has(o.clientId)).map((order) => ({ order }))
+      : [
+          ...this.pending.list().filter((o) => o.createdAt < now).map((order) => ({ order })),
+          ...[...this.verifyQueue.values()].filter((v) => v.at < now).map((verify) => ({ verify })),
+        ];
     await runGrouped(items, (it) => this.brokerKey("order" in it ? it.order.symbol : it.verify.symbol), async (it) => {
       if ("verify" in it) {
         try {
@@ -595,10 +1052,82 @@ export class PositionManager {
       if (a.kind === "opened") out.opened.push(a.position);
       else if (a.kind === "closed") out.closed.push(a.trade);
       else if (a.kind === "reduced") out.reduced++;
-      else if (a.kind === "rejected") out.rejected++;
-      else if (a.kind === "pending") out.pending++;
+      else if (a.kind === "rejected") {
+        out.rejected++;
+        if (a.limitUnfilled) out.limitUnfilled.push(a.limitUnfilled);
+      } else if (a.kind === "pending") out.pending++;
     });
     return out;
+  }
+
+  // ───────── 指値のエントリーの取消 ─────────
+
+  /**
+   * 指値のエントリーの取消を依頼する (取消・照会は syncPending で行う)。既に依頼済みなら理由を変えない。
+   * 依頼したら true
+   */
+  requestLimitCancel(clientId: string, reason: LimitCancelReason, now: number): boolean {
+    const o = this.pending.get(clientId);
+    if (!o || !o.limit || o.limit.cancelReason !== undefined) return false;
+    o.limit = { ...o.limit, cancelReason: reason };
+    this.pending.upsert(o);
+    this.deps.store?.audit({
+      ts: now, type: "engine.limit_cancel_request",
+      data: { symbol: o.symbol, clientId: o.clientId, ...(o.orderId ? { orderId: o.orderId } : {}), reason, ageMs: now - o.createdAt },
+    });
+    return true;
+  }
+
+  /**
+   * 条件に合う指値のエントリーの取消を依頼し、その場で取消 → 照会して確定させる (停止・逆方向のシグナル・損切りの越え)。
+   * 取消と約定が競合した場合は照会の累計の約定で反映する (一部約定ならその数量で建玉になる)
+   */
+  async cancelLimitEntries(match: (o: PendingOrder) => boolean, reason: LimitCancelReason, now: number): Promise<SyncResult> {
+    return this.cancelLimitEntriesBy((o) => (match(o) ? reason : undefined), now);
+  }
+
+  /**
+   * 指値のエントリーごとに取消の理由を決めて取消を依頼し、その場で取消 → 照会して確定させる (理由が undefined のものは対象外)。
+   * 既に取消を依頼済みの注文も照会の対象にする (理由は変えない)
+   */
+  async cancelLimitEntriesBy(reasonOf: (o: PendingOrder) => LimitCancelReason | undefined, now: number): Promise<SyncResult> {
+    const ids = new Set<string>();
+    for (const o of this.pending.list()) {
+      if (o.kind !== "entry" || !o.limit) continue;
+      const reason = reasonOf(o);
+      if (reason === undefined) continue;
+      this.requestLimitCancel(o.clientId, reason, now);
+      ids.add(o.clientId);
+    }
+    if (ids.size === 0) return { opened: [], closed: [], reduced: 0, rejected: 0, pending: 0, resolved: 0, reconciled: 0, limitUnfilled: [] };
+    return this.syncPending(now, { only: ids });
+  }
+
+  /**
+   * 待っている指値のエントリーで、気配がシグナルの損切り価格を越えたものの取消を依頼する (syncPending で確定)。
+   * 気配が maxQuoteAgeMs より古ければ判定しない (古い気配で越えた・越えていないを決めない。
+   * 気配が古いことによる取消は engine が新規を止める理由として別に行う)。依頼した clientId を返す
+   */
+  checkLimitEntries(quoteOf: (symbol: string) => Quote | undefined, now: number, opts: { maxQuoteAgeMs?: number } = {}): string[] {
+    const out: string[] = [];
+    for (const o of this.pending.list()) {
+      const lim = o.limit;
+      if (o.kind !== "entry" || !lim || lim.cancelReason !== undefined) continue;
+      const q = quoteOf(o.symbol);
+      if (!q || !(q.bid > 0) || !(q.ask > 0)) continue;
+      if (opts.maxQuoteAgeMs !== undefined && !(now - q.ts <= opts.maxQuoteAgeMs)) continue;
+      const crossed = lim.direction === "long" ? q.bid <= lim.stopLoss : q.ask >= lim.stopLoss;
+      if (crossed && this.requestLimitCancel(o.clientId, "stop_crossed", now)) out.push(o.clientId);
+    }
+    return out;
+  }
+
+  private bumpStats(now: number, fn: Parameters<typeof bumpLimitStats>[3]): void {
+    try {
+      bumpLimitStats(this.deps.store, this.deps.journal.mode, now, fn);
+    } catch (e) {
+      this.log.warn("指値の集計の保存に失敗 (取引は継続)", { error: errMsg(e) });
+    }
   }
 
   /** 状態不明 → escalated の上限・建玉照会の間隔 (決済注文は損切りを長く止めないため短い) */
@@ -666,8 +1195,12 @@ export class PositionManager {
     if (res === "unknown") return { kind: "pending", unknown: true };
     if (res === "waiting") return { kind: "pending", reason: "注文の反映待ち" };
     let stuckAfterCancel = false;
-    // 成行が一定時間を過ぎても確定しない: 取消してから再照会する (取消の間に約定した分も累計の約定で反映される)
-    if (!isFinalStatus(res.status) && now - o.createdAt >= this.policy.cancelAfterMs && o.orderId) {
+    // 成行が一定時間を過ぎても確定しない: 取消してから再照会する (取消の間に約定した分も累計の約定で反映される)。
+    // 指値のエントリーは期限 (expiresAt) を過ぎたとき・取消を依頼されたとき (逆方向のシグナル・損切りの越え・停止)
+    const lim = o.limit;
+    const cancelDue = lim ? lim.cancelReason !== undefined || now >= lim.expiresAt : now - o.createdAt >= this.policy.cancelAfterMs;
+    if (!isFinalStatus(res.status) && cancelDue && o.orderId) {
+      if (lim && lim.cancelReason === undefined) o.limit = { ...lim, cancelReason: "expired" };
       const first = o.cancelRequestedAt === undefined;
       try {
         const orderId = o.orderId;
@@ -679,7 +1212,10 @@ export class PositionManager {
         o.cancelRequestedAt = now;
         this.deps.store?.audit({
           ts: now, type: "engine.order_cancel",
-          data: { symbol: o.symbol, clientId: o.clientId, orderId: o.orderId, kind: o.kind, ageMs: now - o.createdAt, status: res.status },
+          data: {
+            symbol: o.symbol, clientId: o.clientId, orderId: o.orderId, kind: o.kind, ageMs: now - o.createdAt, status: res.status,
+            ...(o.limit ? { limit: true, reason: o.limit.cancelReason } : {}),
+          },
         });
       }
       const again = await this.query(broker, o, now);
@@ -732,6 +1268,23 @@ export class PositionManager {
 
   private onNoFill(o: PendingOrder, res: OrderResult, now: number): Applied {
     const reason = res.reason !== undefined ? redactSecrets(res.reason) : res.status;
+    if (o.kind === "entry" && o.limit) {
+      // 指値のエントリーが約定せずに終わった (期限切れ・取消・拒否)
+      const cause: LimitCancelReason | "rejected" = res.status === "rejected" ? "rejected" : (o.limit.cancelReason ?? "expired");
+      this.deps.store?.audit({
+        ts: now, type: "engine.limit_unfilled",
+        data: {
+          symbol: o.symbol, strategyId: o.entry?.input.strategyId, clientId: o.clientId, ...(o.orderId ? { orderId: o.orderId } : {}), cause,
+          price: o.limit.price, ageMs: now - o.createdAt, status: res.status, ...(res.reason !== undefined ? { reason } : {}),
+        },
+      });
+      this.bumpStats(now, (s) => {
+        if (cause === "rejected") s.entryRejected++;
+        else if (cause === "expired") s.entryExpired++;
+        else s.entryCanceled[cause] = (s.entryCanceled[cause] ?? 0) + 1;
+      });
+      return { kind: "rejected", reason, limitUnfilled: { order: { ...o }, cause } };
+    }
     if (o.kind === "entry") {
       this.deps.store?.audit({
         ts: now, type: "engine.order_rejected",
@@ -757,7 +1310,21 @@ export class PositionManager {
       const e = o.entry;
       if (!e) throw new Error(`エントリー情報がありません: ${o.clientId}`);
       if (this.has(o.symbol)) return this.entryConflict(o, sum.qty, sum.price, now);
-      const opened = this.open({ ...e.input, qty: sum.qty.toNumber(), entryPrice: sum.price, entryFees: sum.fee.toNumber() }, e.plan);
+      const minQty = this.deps.instrumentOf?.(o.symbol)?.minQty ?? 0;
+      if (o.limit !== undefined && minQty > 0 && sum.qty.lt(minQty)) return this.dustEntry(o, sum, minQty, now);
+      const opened = this.open(
+        {
+          ...e.input, qty: sum.qty.toNumber(), entryPrice: sum.price, entryFees: sum.fee.toNumber(), feesByLiquidity: byLiquidity(sum.maker, sum.taker),
+          ...(e.input.entryOrderType === undefined ? { entryOrderType: o.limit ? "limit" : "market" } : {}),
+        },
+        e.plan,
+        now,
+      );
+      if (o.limit) {
+        const tol = Decimal.max(D(minQty), D(o.qty).mul(this.policy.positionTolerance));
+        const full = sum.qty.gte(D(o.qty).minus(tol));
+        this.bumpStats(now, (s) => (full ? s.entryFilled++ : s.entryPartial++));
+      }
       this.deps.store?.audit({
         ts: now,
         type: "engine.entry",
@@ -769,6 +1336,7 @@ export class PositionManager {
           qty: sum.qty.toString(),
           requestedQty: o.qty,
           price: sum.price,
+          ...(o.limit ? { orderType: "limit", limitPrice: o.limit.price, ...(o.limit.cancelReason ? { canceled: o.limit.cancelReason } : {}) } : {}),
           ...(delayed ? { delayed: true, orderedAt: o.createdAt } : {}),
         },
       });
@@ -798,7 +1366,7 @@ export class PositionManager {
     }
     if (full && dust) this.deps.store?.audit({ ts: now, type: "engine.exit_dust", data: { symbol: o.symbol, tradeId: p.id, remaining: remain.toString(), minQty } });
     return this.recordExit(o, p, {
-      qty: sum.qty, price: sum.price, fee: sum.fee, full, now,
+      qty: sum.qty, price: sum.price, fee: sum.fee, full, now, feesByLiquidity: byLiquidity(sum.maker, sum.taker), exitOrderType: "market",
       ...(delayed ? { orderedAt: o.createdAt } : {}),
     });
   }
@@ -810,7 +1378,12 @@ export class PositionManager {
   private recordExit(
     o: PendingOrder,
     p: OpenTrade,
-    f: { qty: Decimal; price: number; fee?: Decimal; full: boolean; now: number; orderedAt?: number; estimated?: boolean; source?: string },
+    f: {
+      qty: Decimal; price: number; fee?: Decimal; full: boolean; now: number; orderedAt?: number; estimated?: boolean; source?: string;
+      feesByLiquidity?: FeesByLiquidity; exitOrderType?: "market" | "limit";
+      /** 一部約定でも残りを次のティックで決済しない (板に置いた利確の指値の一部約定: 残りは指値のまま追跡を続ける) */
+      noRetry?: boolean;
+    },
   ): Applied {
     const x = o.exit!;
     const { now } = f;
@@ -818,6 +1391,8 @@ export class PositionManager {
     const input = {
       exitPrice: f.price, intendedExitPrice: x.intendedPrice, exitTs: now, exitReason: x.reason, fees: (f.fee ?? D(0)).toNumber(),
       ...(f.estimated ? { estimated: true } : {}),
+      ...(f.feesByLiquidity ? { feesByLiquidity: f.feesByLiquidity } : {}),
+      ...(f.exitOrderType ? { exitOrderType: f.exitOrderType } : {}),
     };
     let trade: TradeRecord | undefined;
     let rest: OpenTrade | undefined;
@@ -835,8 +1410,12 @@ export class PositionManager {
         this.verifyQueue.delete(p.id);
       } else {
         rest = r.position;
-        this.plans[p.id] = { ...(this.plans[p.id] ?? {}), retryExit: { reason: x.reason, intendedPrice: x.intendedPrice } };
-        this.log.warn("決済が一部約定のみ。残りは次のティックで決済します", { symbol: o.symbol, filled: f.qty.toString(), remaining: remain.toString() });
+        if (f.noRetry) {
+          this.log.info("利確の指値が一部約定しました。残りは指値のまま追跡を続けます", { symbol: o.symbol, filled: f.qty.toString(), remaining: remain.toString() });
+        } else {
+          this.plans[p.id] = { ...(this.plans[p.id] ?? {}), retryExit: { reason: x.reason, intendedPrice: x.intendedPrice } };
+          this.log.warn("決済が一部約定のみ。残りは次のティックで決済します", { symbol: o.symbol, filled: f.qty.toString(), remaining: remain.toString() });
+        }
       }
     }
     this.persist();
@@ -864,11 +1443,30 @@ export class PositionManager {
             }
           : { partial: true, remaining: remain.toString(), realizedGross: rest?.realizedGross }),
         ...(f.orderedAt !== undefined ? { delayed: true, orderedAt: f.orderedAt } : {}),
+        ...(f.exitOrderType === "limit" ? { orderType: "limit" } : {}),
         ...(f.estimated ? { estimated: true, source: f.source } : {}),
         ...(trade && Number.isFinite(fxRate) && fxRate > 0 ? { fxRate, netPnlAccount: D(trade.netPnl).mul(fxRate).toNumber() } : {}),
       },
     });
     return trade ? { kind: "closed", trade } : { kind: "reduced", position: rest! };
+  }
+
+  /**
+   * 指値のエントリーが最小数量未満だけ一部約定して終わった (取消・期限)。取引所では決済できない端数 (GMO は最小数量未満を
+   * 決済できない) なので建玉として追跡しない (追跡すると決済を送り続けて銘柄が止まる)。決済の端数 (engine.exit_dust) と同じく
+   * 追跡外の残りとして監査ログ limit.dust_entry に残す。新しい建玉ではないので onOpened (テンポのエントリー) も呼ばない。
+   * シグナルとしては約定しなかった扱い (期限切れなら仮想トレード limit_unfilled)
+   */
+  private dustEntry(o: PendingOrder, sum: FillSummary, minQty: number, now: number): Applied {
+    const cause: LimitCancelReason = o.limit?.cancelReason ?? "expired";
+    const data = {
+      symbol: o.symbol, strategyId: o.entry?.input.strategyId, clientId: o.clientId, ...(o.orderId ? { orderId: o.orderId } : {}),
+      side: o.side, qty: sum.qty.toString(), price: sum.price, fee: sum.fee.toString(), minQty, requestedQty: o.qty, cause,
+    };
+    this.log.warn("指値のエントリーが最小数量未満だけ約定しました。決済できない端数のため追跡しません (取引所に端数の建玉が残ります)", data);
+    this.deps.store?.audit({ ts: now, type: "limit.dust_entry", data });
+    this.bumpStats(now, (s) => s.entryPartial++);
+    return { kind: "rejected", reason: `最小数量未満の一部約定 (${sum.qty.toString()} < ${minQty})`, limitUnfilled: { order: { ...o }, cause } };
   }
 
   /** 追跡中のポジションがある銘柄でエントリーが約定した (建玉の不整合 = 異常) */
@@ -885,7 +1483,15 @@ export class PositionManager {
     let qty = D(0);
     let notional = D(0);
     let fee = D(0);
-    const bad = (why: string): FillSummary => ({ qty: D(0), price: 0, fee: D(0), invalid: why });
+    let maker = D(0);
+    let taker = D(0);
+    const bad = (why: string): FillSummary => ({ qty: D(0), price: 0, notional: D(0), fee: D(0), maker: D(0), taker: D(0), invalid: why });
+    const addFee = (f: Fill) => {
+      const x = this.feeInQuote(symbol, f, now);
+      fee = fee.plus(x);
+      if (f.liquidity === "maker") maker = maker.plus(x);
+      else taker = taker.plus(x);
+    };
     for (const f of fills) {
       let q: Decimal;
       try {
@@ -896,15 +1502,15 @@ export class PositionManager {
       if (!q.isFinite() || q.isNegative()) return bad(`約定数量が不正 (${String(f.qty)})`);
       if (q.isZero()) {
         // 数量 0・手数料だけの明細 (別通貨の手数料など) も手数料は計上する
-        fee = fee.plus(this.feeInQuote(symbol, f, now));
+        addFee(f);
         continue;
       }
       if (typeof f.price !== "number" || !Number.isFinite(f.price) || f.price <= 0) return bad(`約定価格が不正 (${String(f.price)})`);
       qty = qty.plus(q);
       notional = notional.plus(q.mul(f.price));
-      fee = fee.plus(this.feeInQuote(symbol, f, now));
+      addFee(f);
     }
-    return { qty, price: qty.gt(0) ? notional.div(qty).toNumber() : 0, fee };
+    return { qty, price: qty.gt(0) ? notional.div(qty).toNumber() : 0, notional, fee, maker, taker };
   }
 
   /** 手数料をクオート通貨建てにする。換算できなければ 0 (警告と監査ログを残す) */
@@ -981,7 +1587,8 @@ export class PositionManager {
   /**
    * 状態不明の注文を、ブローカーの建玉で判定する。照会に失敗したら何もしない。
    * 同じ判定が POSITION_RESOLVE_CONFIRMATIONS 回続いたら確定する (一覧の反映遅れ対策)。
-   * 「約定なし」で確定する前に、orderId が分かっていれば取消を試みる (後から約定するのを防ぐ。失敗してもよい)
+   * 「約定なし」で確定する前に、orderId が分かっていれば取消を試みる (後から約定するのを防ぐ。成行は失敗してもよい)。
+   * 指値のエントリーの「約定なし・一部約定」は、取消に成功して照会で板に無いと確かめたときだけ確定する (confirmLimitGone)
    */
   private async resolveByPosition(o: PendingOrder, now: number, memo: Map<unknown, Promise<BrokerPosition[] | undefined>>): Promise<Applied | undefined> {
     let broker: Broker;
@@ -1007,7 +1614,33 @@ export class PositionManager {
       });
       return undefined;
     }
-    const canceled = r.verdict !== "filled" && cur.orderId ? await this.tryCancel(broker, cur, "確定は続けます") : true;
+    let canceled = true;
+    if (cur.kind === "entry" && cur.limit && (r.verdict !== "filled" || r.qty.lt(D(cur.qty)))) {
+      // 指値のエントリーは板に残ったまま後で約定しうる: 取消に成功し、照会で板に無いと確かめるまで「約定なし・一部約定」で確定しない
+      // (許容差で「全量約定」と判定しても、発注数量に届かない残りは板に残りうるので同じ)。
+      // 確かめられなければ保留 (escalated) のまま。この銘柄の新規は保留中の注文で、全体の新規は状態不明で止まり続ける
+      const g = await this.confirmLimitGone(broker, cur, now);
+      if (g.kind === "applied") return g.applied;
+      if (g.kind === "open") {
+        const keep = this.pending.get(cur.clientId);
+        if (!keep) return undefined;
+        keep.positionCheckAt = now;
+        keep.lastError = redactSecrets(g.why);
+        if (keep.escalated) this.pending.upsert(keep);
+        else this.escalate(keep, now, g.why);
+        this.auditThrottled(`limunc|${keep.clientId}`, now, "order.limit_unconfirmed", {
+          symbol: keep.symbol, clientId: keep.clientId, ...(keep.orderId ? { orderId: keep.orderId } : {}), verdict: r.verdict, why: redactSecrets(g.why),
+        });
+        this.log.warn(
+          "状態不明の指値のエントリーが取引所の板に無いことを確かめられないため、追跡を続けます (取引所で注文を確認し、必要なら orders resolve で解消してください)",
+          { symbol: keep.symbol, clientId: keep.clientId, orderId: keep.orderId, verdict: r.verdict, why: g.why },
+        );
+        return undefined;
+      }
+      // gone: 取消に成功し、照会でも板に無いことを確かめた
+    } else if (r.verdict !== "filled" && cur.orderId) {
+      canceled = await this.tryCancel(broker, cur, "確定は続けます");
+    }
     const latest = this.pending.get(cur.clientId);
     if (!latest) return undefined;
     latest.positionCheckAt = now;
@@ -1058,10 +1691,67 @@ export class PositionManager {
     }
   }
 
-  /** 取消を試みる。成功 (または orderId が無く取消できない) なら true、失敗なら false */
+  /**
+   * 状態不明の指値のエントリーが取引所の板に残っていないかを確かめる (建玉で「約定なし・一部約定」と判定したものを確定する前)。
+   * - orderId が無ければ照会 (getOrder の hint。GmoBroker は有効注文と最近の約定から探す) で特定する。特定できなければ open
+   * - 取消を送り、照会し直す。照会で注文が終わった (取消・約定・拒否) と分かれば、その結果 (実際の約定) を反映する (applied)
+   * - 取消に成功し、照会で「見つからない」と答えたら gone (建玉による判定で確定してよい)
+   * - それ以外 (取消の失敗・照会の失敗・まだ板にある) は open (確定しない)
+   */
+  private async confirmLimitGone(
+    broker: Broker,
+    o: PendingOrder,
+    now: number,
+  ): Promise<{ kind: "gone" } | { kind: "open"; why: string } | { kind: "applied"; applied: Applied }> {
+    const hint = { createdAt: o.createdAt, side: o.side, qty: o.qty };
+    /** 照会の結果が「終わった」なら反映する (反映できなければ open) */
+    const applyFinal = (res: OrderResult): { kind: "applied"; applied: Applied } | { kind: "open"; why: string } => {
+      const cur = this.pending.get(o.clientId);
+      if (!cur) return { kind: "open", why: "照会の間に注文の記録が変わりました" };
+      const a = this.applyResult(cur, res, now);
+      return a.kind === "pending" ? { kind: "open", why: `照会の結果を反映できません (${a.reason ?? res.status})` } : { kind: "applied", applied: a };
+    };
+    let orderId = o.orderId;
+    if (!orderId) {
+      let found: OrderResult | undefined;
+      try {
+        found = await this.call(() => broker.getOrder(o.clientId, o.symbol, undefined, hint), "getOrder");
+      } catch (e) {
+        return { kind: "open", why: `orderId が分からず、照会でも注文を特定できません: ${errMsg(e)}` };
+      }
+      if (!found) return { kind: "open", why: "orderId が分からず、照会でも取引所の注文を特定できません (取消できないため確定しません)" };
+      if (isFinalStatus(found.status)) return applyFinal(found);
+      if (!found.orderId) return { kind: "open", why: "照会で注文の orderId が分かりません (取消できないため確定しません)" };
+      orderId = String(found.orderId);
+      const cur = this.pending.get(o.clientId);
+      if (cur) {
+        cur.orderId = orderId;
+        this.pending.upsert(cur);
+      }
+    }
+    const id = orderId;
+    let canceled = false;
+    try {
+      await this.call(() => broker.cancelOrder(id, o.symbol), "cancelOrder");
+      canceled = true;
+    } catch (e) {
+      this.log.warn("状態不明の指値のエントリーの取消に失敗 (照会で確かめます)", { symbol: o.symbol, clientId: o.clientId, orderId: id, error: errMsg(e) });
+    }
+    let res: OrderResult | undefined;
+    try {
+      res = await this.call(() => broker.getOrder(o.clientId, o.symbol, id, hint), "getOrder");
+    } catch (e) {
+      return { kind: "open", why: `取消${canceled ? "後" : "に失敗した後"}の照会に失敗: ${errMsg(e)}` };
+    }
+    if (res && isFinalStatus(res.status)) return applyFinal(res);
+    if (res) return { kind: "open", why: `取消${canceled ? "後" : "に失敗し"}も板に残っています (${res.status})` };
+    return canceled ? { kind: "gone" } : { kind: "open", why: "取消に失敗し、照会でも注文が見つかりません (板に無いことを確かめられません)" };
+  }
+
+  /** 取消を試みる。成功 (または orderId が無い成行で取消できない) なら true、失敗なら false。orderId の無い指値は false (板に残りうる) */
   private async tryCancel(broker: Broker, o: PendingOrder, onFail: string): Promise<boolean> {
     const orderId = o.orderId;
-    if (!orderId) return true;
+    if (!orderId) return o.limit === undefined;
     try {
       await this.call(() => broker.cancelOrder(orderId, o.symbol), "cancelOrder");
       return true;
@@ -1126,7 +1816,7 @@ export class PositionManager {
         if (!e) throw new Error(`エントリー情報がありません: ${o.clientId}`);
         if (this.has(o.symbol)) a = this.entryConflict(o, r.qty, r.price, now);
         else {
-          const opened = this.open({ ...e.input, qty: r.qty.toNumber(), entryPrice: r.price, entryFees: 0, estimated: true }, e.plan);
+          const opened = this.open({ ...e.input, qty: r.qty.toNumber(), entryPrice: r.price, entryFees: 0, estimated: true }, e.plan, now);
           this.deps.store?.audit({
             ts: now,
             type: "engine.entry",
@@ -1289,7 +1979,7 @@ export class PositionManager {
     brokerPositions: BrokerPosition[],
     now: number,
     opts: { priceOf?: (symbol: string) => number | undefined; minAgeMs?: number; phase?: string; confirmations?: number } = {},
-  ): { orphaned: string[]; reduced: string[]; waiting: string[]; untracked: string[]; trades: TradeRecord[] } {
+  ): { orphaned: string[]; reduced: string[]; waiting: string[]; untracked: string[]; trades: TradeRecord[]; limitExcess: string[] } {
     const bySymbol = sumPositions(brokerPositions);
     const orphaned: string[] = [];
     const reduced: string[] = [];
@@ -1312,7 +2002,70 @@ export class PositionManager {
     const untracked = [...bySymbol]
       .filter(([sym, q]) => !q.isZero() && !tracked.has(sym) && !this.hasPending(sym) && q.abs().gte(this.deps.instrumentOf?.(sym)?.minQty ?? 0))
       .map(([sym]) => sym);
-    return { orphaned, reduced, waiting, untracked, trades };
+    const limitExcess = this.checkLimitExcess(bySymbol, now, opts.confirmations ?? 1, phase);
+    return { orphaned, reduced, waiting, untracked, trades, limitExcess };
+  }
+
+  /**
+   * 指値のエントリーを待っている (状態不明を含む) 銘柄は、上の突き合わせの対象外 (保留中の注文がある)。その代わり、取引所の建玉が
+   * 「追跡数量 + 保留中の注文 (買い・売り) で説明できる範囲」を超えて大きい (または追跡していないのに建玉がある) なら異常として
+   * onAnomaly (engine は kill switch) を呼ぶ (取消を確かめられないまま板に残った指値の約定などで、追跡外の建玉ができている)。
+   * 待っている指値の約定 (照会の前) で説明できる分・最小数量未満の端数は異常にしない。confirmations 回続いたら確定する。異常にした銘柄を返す
+   */
+  private checkLimitExcess(bySymbol: Map<string, Decimal>, now: number, confirmations: number, phase: string): string[] {
+    const out: string[] = [];
+    const pend = this.pending.list();
+    const syms = new Set(pend.filter((o) => o.kind === "entry" && o.limit).map((o) => o.symbol));
+    for (const sym of [...this.excessObs.keys()]) if (!syms.has(sym)) this.excessObs.delete(sym);
+    for (const sym of syms) {
+      const b = bySymbol.get(sym) ?? D(0);
+      const t = this.get(sym);
+      const tracked = t ? D(t.qty).mul(t.direction === "long" ? 1 : -1) : D(0);
+      let buys = D(0);
+      let sells = D(0);
+      for (const o of pend) {
+        if (o.symbol !== sym) continue;
+        let q: Decimal;
+        try {
+          q = D(o.qty);
+        } catch {
+          continue;
+        }
+        if (!q.isFinite() || q.lte(0)) continue;
+        if (o.side === "buy") buys = buys.plus(q);
+        else sells = sells.plus(q);
+      }
+      const minQty = D(this.deps.instrumentOf?.(sym)?.minQty ?? 0);
+      const tol = Decimal.max(minQty, tracked.abs().plus(buys).plus(sells).mul(this.policy.positionTolerance));
+      // 説明できる範囲: [追跡 − 売りの保留, 追跡 + 買いの保留] (± 許容差)
+      const above = b.minus(tracked.plus(buys));
+      const below = tracked.minus(sells).minus(b);
+      // 追跡より小さい (外部の決済・保留中の決済) は対象外 (保留が確定してから上の突き合わせで扱う)。大きい・逆方向・追跡外だけ
+      const flipped = !b.isZero() && !tracked.isZero() && b.isPositive() !== tracked.isPositive();
+      const larger = b.abs().gt(tracked.abs().plus(tol)) || (flipped && b.abs().gt(tol));
+      if (!(larger && (above.gt(tol) || below.gt(tol)))) {
+        this.excessObs.delete(sym);
+        continue;
+      }
+      const base = { symbol: sym, brokerQty: b.toString(), trackedQty: tracked.toString(), pendingBuy: buys.toString(), pendingSell: sells.toString(), phase };
+      const n = (this.excessObs.get(sym) ?? 0) + 1;
+      if (n < confirmations) {
+        this.excessObs.set(sym, n);
+        this.log.warn("指値のエントリーを待っている銘柄で、取引所の建玉が追跡より大きくなっています (再確認します)", { ...base, observations: n });
+        this.deps.store?.audit({ ts: now, type: "reconcile.limit_excess_waiting", data: { ...base, observations: n, required: confirmations } });
+        continue;
+      }
+      this.excessObs.delete(sym);
+      const msg =
+        `${sym}: 指値のエントリーを待っている銘柄で、取引所の建玉 (${b.toString()}) が追跡 (${tracked.toString()}) と保留中の注文 ` +
+        `(買い ${buys.toString()} / 売り ${sells.toString()}) で説明できる範囲を超えています。板に残った注文の約定など追跡していない建玉の可能性があります。` +
+        "取引所で注文と建玉を確認してください";
+      this.log.error(msg);
+      this.deps.store?.audit({ ts: now, type: "reconcile.limit_excess", data: base });
+      this.deps.onAnomaly?.(msg, now);
+      out.push(sym);
+    }
+    return out;
   }
 
   /** 1 ポジションの突き合わせ。不一致が confirmations 回続いたら manual として外す (または減らす) */

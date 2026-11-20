@@ -1651,6 +1651,13 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     }
     set("sentiment", '<div class="scroll">' + h + "</div>");
   }
+  // テンポ (エントリー頻度の目標) と最大保有の 1 行: 目標 n 回/時・直近 1 時間 n 回・テンポ x.xx・上限到達・探索 可/不可・最大保有 n 分
+  function tempoText(t, mh) {
+    var hold = mh > 0 ? "最大保有 " + mh + " 分" : "最大保有 無効";
+    if (!t || !t.enabled) return "無効 · " + hold;
+    return "目標 " + t.target + " 回/時 · 直近 1 時間 " + t.entriesInWindow + " 回 · テンポ " + num(t.tempo, 2) +
+      (t.capped ? " · 上限到達 (" + t.capAt + " 回)" : "") + " · 探索 " + (t.exploreAllowed ? "可" : "不可") + " · " + hold;
+  }
   function renderOverview(s) {
     var ccy = s.baseCurrency, e = s.equity, diff = e.current - e.initial;
     set("equity", esc(num(e.current, 0)) + ' <span class="muted" style="font-size:14px">' + esc(ccy) + "</span>");
@@ -1665,6 +1672,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
       "<span class=muted>日次損失</span><span>" + esc(pct(Math.max(0, dl))) + " / 上限 " + esc(pct(r.limits.maxDailyLoss, 0)) + "</span>" +
       "<span class=muted>1回のリスク</span><span>" + esc(pct(r.limits.riskPerTrade)) + "</span>" +
       "<span class=muted>最大保有数</span><span>" + esc(s.positions.length) + " / " + esc(r.limits.maxOpenPositions) + "</span>" +
+      (s.tempo ? "<span class=muted>テンポ</span><span" + (s.tempo.capped ? ' class="err"' : "") + ">" + esc(tempoText(s.tempo, s.maxHoldMinutes || 0)) + "</span>" : "") +
       "<span class=muted>監視銘柄</span><span>" + s.watched.map(function (w) { return '<span class="chip">' + esc(w.symbol) + (w.lastError ? ' <span class="err">!</span>' : "") + "</span>"; }).join("") + "</span>");
     if (cur === "overview") set("chart", chart(s.equityHistory, ccy));
   }
@@ -1759,7 +1767,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     h += "<h2>BY REASON · 見送り理由ごと</h2>" + '<div class="scroll">' + table(["見送り理由"].concat(heads), shadowRows(sh.byReason || []), numc) + "</div>";
     h += "<h2>BY STRATEGY · 戦略ごと</h2>" + '<div class="scroll">' + table(["戦略"].concat(heads), shadowRows(sh.byStrategy || []), numc) + "</div>";
     if ((sh.micro || []).some(function (g) { return g.n > 0; })) {
-      var MICRO_LBL = { 'strategy_filter:cost': 'コストで見送り', 'strategy_filter:spread': 'スプレッドで見送り', 'strategy_filter:edge': '期待値で見送り', 'observe_only': '観測専用' };
+      var MICRO_LBL = { 'strategy_filter:cost': 'コストで見送り', 'strategy_filter:spread': 'スプレッドで見送り', 'strategy_filter:edge': '期待値で見送り', 'observe_only': '観測専用', 'hold_limit': '最大保有の対象外', 'tempo_cap': 'テンポの上限' };
       h += '<h2>MICRO · 超短期 (scalp_micro / scalp_rebound) の答え合わせ</h2><div class="scroll">' + table(['戦略', '見送り理由', '件数', '利確到達率', 'ランダム時の勝率 p0', '平均R (コスト前)', '平均純R'], sh.micro.map(function (g) {
         return [esc(g.strategyId || '-'), esc(MICRO_LBL[g.key] || g.key), esc(g.n), esc(pct(g.tpRate, 1)), esc(pct(g.p0, 1)),
           '<span class="' + cls(g.avgGrossR) + '">' + esc(signed(g.avgGrossR, 3)) + '</span>', '<span class="' + cls(g.avgNetR) + '">' + esc(signed(g.avgNetR, 3)) + '</span>'];

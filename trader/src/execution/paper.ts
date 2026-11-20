@@ -4,7 +4,8 @@ import { createLogger } from "../core/logger";
 import { canShort, DEFAULT_SHORT_BORROW_RATE_DAILY } from "../core/short";
 import { holdingFeeDailyOf, jstCutoffCrossings } from "../core/holdingFee";
 import {
-  systemClock, type Balance, type Broker, type BrokerPosition, type Clock, type Fill, type Instrument, type OrderRequest, type OrderResult, type Quote,
+  systemClock, type Balance, type Broker, type BrokerCapabilities, type BrokerPosition, type Clock, type Fill, type Instrument, type OrderRequest, type OrderResult,
+  type Quote,
 } from "../core/types";
 
 export interface PaperBrokerOptions {
@@ -76,9 +77,16 @@ export interface PaperSnapshot {
 const DEFAULT_LEVERAGE = { crypto: 1, meme: 1, fx: 10, stock: 2 };
 const log = createLogger("paper");
 
+/**
+ * 仮想の発注先。指値は板に置き (resting)、気配が指値を「越えた」ときだけ maker で約定する
+ * (買いは売り気配 < 指値、売りは買い気配 > 指値。触れただけでは約定しない = 楽観しない)。
+ * post-only の指値は、置いた瞬間に約定する価格 (marketable) なら拒否する。reduceOnly の指値は約定時に保有数量で上限を掛け、
+ * 決済する建玉が無ければ取り消す (ドテンしない)。
+ */
 export class PaperBroker implements Broker {
   readonly venue = "paper";
   readonly mode = "paper" as const;
+  readonly capabilities: BrokerCapabilities = { postOnly: true, restingTakeProfit: true };
 
   private readonly inst = new Map<string, Instrument>();
   private readonly base: string;
@@ -307,6 +315,7 @@ export class PaperBroker implements Broker {
     if (req.limitPrice === undefined || !(req.limitPrice > 0)) return this.reject(req, "指値価格が必要");
     const limit = roundToStep(req.limitPrice, inst.tickSize);
     const marketable = isBuy ? limit.gte(q.ask) : limit.lte(q.bid);
+    if (marketable && req.postOnly) return this.reject(req, `post-only: 即時に約定する価格のため拒否 (指値 ${limit}, ${isBuy ? "売り気配" : "買い気配"} ${isBuy ? q.ask : q.bid})`);
     if (marketable) {
       // 板を食う約定: 有利な側の現在値で約定 (taker)
       return this.fillNow(req, orderId, inst, qty, D(isBuy ? q.ask : q.bid), "taker");
@@ -402,16 +411,27 @@ export class PaperBroker implements Broker {
     for (const r of [...this.resting.values()]) {
       if (r.req.symbol !== symbol) continue;
       const isBuy = r.req.side === "buy";
-      if (!(isBuy ? quote.ask <= r.limitPrice.toNumber() : quote.bid >= r.limitPrice.toNumber())) continue;
+      // 気配が指値を越えたときだけ約定する (触れただけでは約定しない)
+      if (!(isBuy ? D(quote.ask).lt(r.limitPrice) : D(quote.bid).gt(r.limitPrice))) continue;
       this.resting.delete(r.orderId);
-      // 売りでドテン防止: 空売り不可銘柄で保有が減っていたら取消
       const cur = this.positions.get(symbol)?.qty ?? D(0);
+      let qty = r.qty;
+      if (r.req.reduceOnly) {
+        // reduceOnly: 約定時の保有数量で上限を掛ける (建玉が無ければ取消。ドテンしない)
+        const closable = isBuy ? Decimal.max(cur.neg(), 0) : Decimal.max(cur, 0);
+        qty = Decimal.min(qty, closable);
+        if (qty.lte(0)) {
+          this.results.set(r.req.clientId, { orderId: r.orderId, clientId: r.req.clientId, status: "canceled", fills: [], reason: "reduceOnly だが決済対象のポジションがありません" });
+          continue;
+        }
+      }
+      // 売りでドテン防止: 空売り不可銘柄で保有が減っていたら取消
       const fx = this.fx(inst);
-      if (!fx || (!this.shortable(inst) && !isBuy && r.qty.gt(Decimal.max(cur, 0))) || !this.canAfford(inst, r.req.side, r.qty, r.limitPrice)) {
+      if (!fx || (!this.shortable(inst) && !isBuy && qty.gt(Decimal.max(cur, 0))) || !this.canAfford(inst, r.req.side, qty, r.limitPrice)) {
         this.results.set(r.req.clientId, { orderId: r.orderId, clientId: r.req.clientId, status: "canceled", fills: [], reason: "約定時に条件を満たさず取消" });
         continue;
       }
-      const fill = this.applyFill(r.req, r.orderId, inst, r.qty, r.limitPrice, "maker", fx);
+      const fill = this.applyFill(r.req, r.orderId, inst, qty, r.limitPrice, "maker", fx);
       this.results.set(r.req.clientId, { orderId: r.orderId, clientId: r.req.clientId, status: "filled", fills: [fill] });
       fills.push(fill);
     }

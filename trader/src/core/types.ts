@@ -256,6 +256,18 @@ export interface StrategyContext {
    * 発注・腕の学習には使わない。バックテスト・パラメータ検証では渡さない (挙動は変わらない)。
    */
   onFiltered?: (signal: Signal, reason: string) => void;
+  /**
+   * テンポ (0〜1)。エントリー頻度の目標に届かないときにエンジンが上げる (`src/engine/tempo.ts`)。
+   * 戦略は決められた範囲だけ条件を緩める (コスト控除後の期待値 > 0 などは緩めない。例外は tempoExplore)。
+   * 省略時は 0 と同じ (従来どおり)。バックテスト・パラメータ検証では渡さない
+   */
+  tempo?: number;
+  /**
+   * 探索を許すか (テンポのモードで、paper または live で TEMPO_ALLOW_LIVE_EXPLORE=true のときだけ true)。
+   * true なら、コスト控除後の期待値の下限を tempoNetEdgeFloor (往復コストの tempo 倍まで) に下げる。
+   * 省略時・false は従来どおり。バックテスト・パラメータ検証では渡さない
+   */
+  tempoExplore?: boolean;
 }
 
 export interface Signal {
@@ -267,6 +279,11 @@ export interface Signal {
   confidence: number;
   /** 期待される値幅 (手数料控除前, bps)。手数料・スプレッドとの比較に使う */
   expectedEdgeBps: number;
+  /**
+   * expectedEdgeBps がコスト控除後 (往復コストを引いた期待値) なら true。
+   * テンポのモードの RiskManager は、このときコストを二重に数えないよう比率から 1 を引いて判定する
+   */
+  edgeIsNet?: boolean;
   entry: { type: "market" | "limit"; price?: number };
   /** エントリー時の損切り価格 (flat の場合は 0 でよい) */
   stopLoss: number;
@@ -297,6 +314,11 @@ export interface Strategy {
   defaultParams: Params;
   /** 学習による自動調整の上下限 */
   paramBounds: Record<string, [number, number]>;
+  /**
+   * 新規エントリーの注文の種類。未指定ならエンジンの設定 (LIMIT_ENTRY、既定 true = 指値) に従う。
+   * シグナルが entry.type === "limit" で価格を持つときは、そちらを優先する
+   */
+  entryOrder?: "market" | "limit";
   /** 純粋関数。副作用なし・同じ入力なら同じ出力 */
   evaluate(ctx: StrategyContext): Signal | null;
 }
@@ -318,6 +340,11 @@ export interface OrderRequest {
   limitPrice?: number;
   tif?: TimeInForce;
   reduceOnly?: boolean;
+  /**
+   * 指値を板に置く側だけで受け付ける (post-only。置いた瞬間に約定する価格なら取引所が拒否・取消する)。
+   * Broker.capabilities.postOnly が true のアダプターだけが解釈する
+   */
+  postOnly?: boolean;
   strategyId: string;
   /**
    * 取引所側に置く保護用ストップ価格 (対応アダプターのみ。エンジン側の損切りが主で、これはプロセス停止時の保険)。
@@ -375,10 +402,22 @@ export interface BrokerPosition {
   avgPrice: number;
 }
 
+/**
+ * 発注先の能力 (任意)。無い・false の能力はエンジンが使わない (従来の動き)。
+ * - postOnly: 指値の post-only (OrderRequest.postOnly) を取引所の機能で扱える
+ * - restingTakeProfit: reduceOnly の指値 (利確) を板に置いたまま、照会・取消で追跡できる
+ *   (エンジンは決済の成行の前に必ず取り消し、取消の結果を照会で確かめてから残りだけを成行で送る)
+ */
+export interface BrokerCapabilities {
+  postOnly?: boolean;
+  restingTakeProfit?: boolean;
+}
+
 /** 発注先。ペーパーと実口座で同じインターフェース */
 export interface Broker {
   readonly venue: string;
   readonly mode: "paper" | "live";
+  readonly capabilities?: BrokerCapabilities;
   getBalance(): Promise<Balance>;
   getPositions(): Promise<BrokerPosition[]>;
   placeOrder(req: OrderRequest): Promise<OrderResult>;
@@ -429,6 +468,11 @@ export interface RiskLimits {
   maxOrdersPerMinute: number;
   /** 期待値幅が (手数料+スプレッド) の何倍以上でないと入らないか */
   minEdgeToCostRatio: number;
+  /**
+   * テンポのモード (EntryParams.tempo あり) で minEdgeToCostRatio を緩める下限 (既定 1.0。1.0 未満は 1.0 として扱う)。
+   * 設定が下限より低ければ設定のまま (締めも緩めもしない)
+   */
+  tempoMinEdgeToCost?: number;
   /** ミームコインの最低流動性 (USD) */
   memeMinLiquidityUsd: number;
 }
@@ -509,6 +553,15 @@ export interface TradeRecord {
    * 腕は方向別のキー (…|short) で学習し、パラメータ調整・振り返り・情報源の信頼度には使わない。表示も買いと分ける
    */
   simulatedShort?: boolean;
+  /** エントリーの注文の種類 (記録の無い古い取引は成行とみなす) */
+  entryOrderType?: "market" | "limit";
+  /** 1 単位あたりの契約サイズ (1 以外のときだけ。手数料率の集計に使う) */
+  contractSize?: number;
+  /** 決済の注文の種類 (板に置いた利確の指値で決済したら limit。一部だけ指値の約定でも limit) */
+  exitOrderType?: "market" | "limit";
+  /** 手数料の内訳 (約定の liquidity 別、クオート通貨建て。maker は受け取りなら負)。古い取引には無い */
+  makerFees?: number;
+  takerFees?: number;
 }
 
 export type CauseCode =

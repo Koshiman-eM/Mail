@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_OBSERVE_ONLY_STRATEGIES, LIVE_CONFIRM_PHRASE, loadConfig, resolveMode } from "../src/core/config";
 import { D, floorToStep } from "../src/core/decimal";
+import { effectiveLimitTakeProfit, limitOrdersFromEnv } from "../src/engine/limitOrders";
 
 describe("安全ガード: 実弾モード", () => {
   it("既定は paper", () => {
@@ -81,5 +82,74 @@ describe("OBSERVE_ONLY_STRATEGIES (観測専用の戦略)", () => {
   });
   it("カンマ区切り。前後の空白・空要素・重複を除く", () => {
     expect(loadConfig({ OBSERVE_ONLY_STRATEGIES: " scalp_rebound , scalp_micro,,scalp_rebound " }).env.OBSERVE_ONLY_STRATEGIES).toEqual(["scalp_rebound", "scalp_micro"]);
+  });
+});
+
+describe("テンポ・最大保有 (TARGET_ENTRIES_PER_HOUR ほか)", () => {
+  it("既定値: テンポ・最大保有は無効、下限 1・上限の倍率 2・探索のサイズ 0.5・live の探索は不可", () => {
+    const c = loadConfig({});
+    expect(c.env.TARGET_ENTRIES_PER_HOUR).toBe(0);
+    expect(c.env.MAX_HOLD_MINUTES).toBe(0);
+    expect(c.env.TEMPO_MIN_EDGE_TO_COST).toBe(1);
+    expect(c.env.TEMPO_CAP_MULTIPLIER).toBe(2);
+    expect(c.env.TEMPO_EXPLORE_SIZE).toBe(0.5);
+    expect(c.env.TEMPO_ALLOW_LIVE_EXPLORE).toBe(false);
+    // RiskManager の上限に渡る
+    expect(c.risk.tempoMinEdgeToCost).toBe(1);
+  });
+
+  it("範囲内の値は読み込める (空文字は既定値)", () => {
+    const c = loadConfig({
+      TARGET_ENTRIES_PER_HOUR: "6", MAX_HOLD_MINUTES: "30", TEMPO_MIN_EDGE_TO_COST: "1.5", TEMPO_CAP_MULTIPLIER: "3",
+      TEMPO_EXPLORE_SIZE: "0.25", TEMPO_ALLOW_LIVE_EXPLORE: "true",
+    });
+    expect(c.env).toMatchObject({
+      TARGET_ENTRIES_PER_HOUR: 6, MAX_HOLD_MINUTES: 30, TEMPO_MIN_EDGE_TO_COST: 1.5, TEMPO_CAP_MULTIPLIER: 3, TEMPO_EXPLORE_SIZE: 0.25, TEMPO_ALLOW_LIVE_EXPLORE: true,
+    });
+    expect(c.risk.tempoMinEdgeToCost).toBe(1.5);
+    for (const [k, v] of [["TARGET_ENTRIES_PER_HOUR", 60], ["MAX_HOLD_MINUTES", 5], ["MAX_HOLD_MINUTES", 1440], ["TEMPO_MIN_EDGE_TO_COST", 10], ["TEMPO_CAP_MULTIPLIER", 1], ["TEMPO_EXPLORE_SIZE", 0.1], ["TEMPO_EXPLORE_SIZE", 1]] as const) {
+      expect(loadConfig({ [k]: String(v) }).env[k], `${k}=${v}`).toBe(v);
+    }
+    expect(loadConfig({ TARGET_ENTRIES_PER_HOUR: " ", MAX_HOLD_MINUTES: "" }).env).toMatchObject({ TARGET_ENTRIES_PER_HOUR: 0, MAX_HOLD_MINUTES: 0 });
+  });
+
+  it("範囲外・数値でない値は、キーと値を含む日本語のエラーで止まる", () => {
+    const cases: [string, string, RegExp][] = [
+      ["TARGET_ENTRIES_PER_HOUR", "61", /TARGET_ENTRIES_PER_HOUR=61 は不正です。0 \(無効\) 以上 60 以下/],
+      ["TARGET_ENTRIES_PER_HOUR", "-1", /TARGET_ENTRIES_PER_HOUR=-1 は不正です/],
+      ["TARGET_ENTRIES_PER_HOUR", "abc", /TARGET_ENTRIES_PER_HOUR=abc は不正です/],
+      ["MAX_HOLD_MINUTES", "3", /MAX_HOLD_MINUTES=3 は不正です。0 \(無効\) か、5 以上 1440 以下の分/],
+      ["MAX_HOLD_MINUTES", "1441", /MAX_HOLD_MINUTES=1441 は不正です/],
+      ["MAX_HOLD_MINUTES", "-5", /MAX_HOLD_MINUTES=-5 は不正です/],
+      ["TEMPO_MIN_EDGE_TO_COST", "0.5", /TEMPO_MIN_EDGE_TO_COST=0\.5 は不正です。1 以上 10 以下/],
+      ["TEMPO_MIN_EDGE_TO_COST", "11", /TEMPO_MIN_EDGE_TO_COST=11 は不正です/],
+      ["TEMPO_CAP_MULTIPLIER", "0.5", /TEMPO_CAP_MULTIPLIER=0\.5 は不正です。1 以上 5 以下/],
+      ["TEMPO_CAP_MULTIPLIER", "6", /TEMPO_CAP_MULTIPLIER=6 は不正です/],
+      ["TEMPO_EXPLORE_SIZE", "0.05", /TEMPO_EXPLORE_SIZE=0\.05 は不正です。0\.1 以上 1 以下/],
+      ["TEMPO_EXPLORE_SIZE", "50", /TEMPO_EXPLORE_SIZE=50 は不正です/],
+      ["TEMPO_ALLOW_LIVE_EXPLORE", "maybe", /TEMPO_ALLOW_LIVE_EXPLORE=maybe は true \/ false で指定してください/],
+    ];
+    for (const [k, v, re] of cases) {
+      expect(() => loadConfig({ [k]: v }), `${k}=${v}`).toThrow(re);
+      expect(() => loadConfig({ [k]: v }), `${k}=${v}`).toThrow(/設定が不正です/);
+    }
+  });
+});
+
+describe("指値 (maker) の設定", () => {
+  it("既定は LIMIT_ENTRY=true・LIMIT_TAKE_PROFIT=false", () => {
+    const c = loadConfig({});
+    expect(c.env.LIMIT_ENTRY).toBe(true);
+    expect(c.env.LIMIT_TAKE_PROFIT).toBe(false);
+    expect(limitOrdersFromEnv(c.env, "paper")).toEqual({ entry: true, takeProfit: false });
+  });
+  it("利確の指値は paper 専用: live では LIMIT_TAKE_PROFIT=true でも無効 (バックテスト・検証の前提も同じ)", () => {
+    const env = loadConfig({ LIMIT_TAKE_PROFIT: "true", LIMIT_ENTRY_TIMEOUT_MS: "30000" }).env;
+    expect(effectiveLimitTakeProfit(env, "paper")).toBe(true);
+    expect(effectiveLimitTakeProfit(env, "live")).toBe(false);
+    expect(limitOrdersFromEnv(env, "paper")).toEqual({ entry: true, takeProfit: true, entryTimeoutMs: 30_000 });
+    expect(limitOrdersFromEnv(env, "live")).toEqual({ entry: true, takeProfit: false, entryTimeoutMs: 30_000 });
+    // 手組みの設定で未設定なら既定値と同じ
+    expect(limitOrdersFromEnv({}, "paper")).toEqual({ entry: true, takeProfit: false });
   });
 });

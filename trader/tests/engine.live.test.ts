@@ -98,7 +98,7 @@ async function liveRuntime(
       return brokerOf(symbol);
     },
   };
-  const config = loadConfig({ NODE_ENV: "test", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "USD", ...(o.env ?? {}) });
+  const config = loadConfig({ NODE_ENV: "test", LIMIT_ENTRY: "false", LIMIT_TAKE_PROFIT: "false", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "USD", ...(o.env ?? {}) });
   const rt = await buildRuntime(config, {
     clock, store, intelSources: [], ai: null, rng: mulberry32(7), strategies: [alwaysLong()], markets: [{ feed, instruments }], brokerSet,
     engine: { liveAccountCacheMs: 0, ...(o.engine ?? {}) },
@@ -441,7 +441,7 @@ describe("paper と live の分離", () => {
     const store = new MemoryStore();
     // paper で BTC / ETH を保有 (評価額 100 万 JPY 基準のリスク状態)
     const paperClock = mkClock();
-    const paper = await buildRuntime(loadConfig({ NODE_ENV: "test", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "JPY" }), {
+    const paper = await buildRuntime(loadConfig({ NODE_ENV: "test", LIMIT_ENTRY: "false", LIMIT_TAKE_PROFIT: "false", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "JPY" }), {
       clock: paperClock, store, intelSources: [], ai: null, seed: 3, syntheticHistoryMs: 2 * 86_400_000, rng: mulberry32(7), strategies: [alwaysLong()],
     });
     await paper.engine.tick(START);
@@ -666,7 +666,7 @@ describe("live: 再開要求・古い気配・エラー文", () => {
 
     // paper のエンジンは mode の無い古い要求を消す
     const paperStore = new MemoryStore();
-    const paper = await buildRuntime(loadConfig({ NODE_ENV: "test", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "USD" }), {
+    const paper = await buildRuntime(loadConfig({ NODE_ENV: "test", LIMIT_ENTRY: "false", LIMIT_TAKE_PROFIT: "false", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "USD" }), {
       clock: mkClock(), store: paperStore, intelSources: [], ai: null, seed: 3, syntheticHistoryMs: 2 * 86_400_000, rng: mulberry32(7), strategies: [alwaysLong()],
     });
     requestResume(paperStore, { at: 4, by: "cli", mode: "live" });
@@ -806,7 +806,7 @@ describe("live 前の安全対策 (決済の再送・約定直後の建玉・為
 
   it("paper: 追跡中の建玉は PaperBroker の建玉と一致し、口座情報に差分を足さない (挙動は変わらない)", async () => {
     const clock = mkClock();
-    const rt = await buildRuntime(loadConfig({ NODE_ENV: "test", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "JPY" }), {
+    const rt = await buildRuntime(loadConfig({ NODE_ENV: "test", LIMIT_ENTRY: "false", LIMIT_TAKE_PROFIT: "false", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "JPY" }), {
       clock, store: new MemoryStore(), intelSources: [], ai: null, seed: 3, syntheticHistoryMs: 2 * 86_400_000, rng: mulberry32(7),
     });
     let opened = 0;

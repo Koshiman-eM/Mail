@@ -3,6 +3,7 @@ import { TIMEFRAME_MS } from "../core/types";
 import { atr, closesOf, ema, rsi } from "../indicators/series";
 import { buildEntrySignal, candlesOf, clamp, entryBlocked, exitSignal, period, positionSide, refPrice } from "./common";
 import { DEFAULT_WIN_EDGE_MAX, microExpectedEdge, roundTripCostBps } from "./scalpMicro";
+import { relaxToward, TEMPO_COST_MULT_FLOOR, tempoNetEdgeFloor } from "../engine/tempo";
 
 /**
  * scalp_rebound: 下降トレンドの中の短い反発を買いで取る超短期の逆張り (主時間足 1m、上位足 15m、買いのみ)。
@@ -40,6 +41,11 @@ import { DEFAULT_WIN_EDGE_MAX, microExpectedEdge, roundTripCostBps } from "./sca
  * 期待値 (expectedEdgeBps): scalp_micro の microExpectedEdge を使う。ランダムウォークの勝率 p0 = 損切り / (利確 + 損切り)
  *   に、シグナルの強さに応じて最大 winEdgeMax (既定 10%pt) を上乗せした p で、p × 利確 - (1 - p) × 損切り - 往復コスト (bps)。
  *   トレンドに逆らう買いなので confidence をそのまま勝率とみなさない (保守的)。winEdgeMax は paramBounds に入れない。
+ *   期待値はコスト控除後なので、シグナルに edgeIsNet: true を付ける。
+ *
+ * テンポ (ctx.tempo、0〜1) で緩めるのは costMult だけ (TEMPO_COST_MULT_FLOOR まで)。期待値 > minNetEdgeBps は緩めない。
+ *   例外は探索 (ctx.tempoExplore が true のときだけ): 期待値の下限を tempoNetEdgeFloor (minNetEdgeBps - tempo × 往復コスト) に下げる。
+ *   tempoExplore が無い・false なら従来どおり。
  *
  * クールダウン: 直前 cooldownBars 本のどれかでも同じ条件が成立していたら見送る (同じ反発での連続エントリーを防ぐ)。
  *
@@ -320,6 +326,7 @@ export function createScalpRebound(opts: ScalpReboundOptions = {}): Strategy {
       const full: Signal = {
         ...sig,
         expectedEdgeBps: ev.edgeBps,
+        edgeIsNet: true,
         maxHoldMs: holdBars * TIMEFRAME_MS["1m"],
         features: { ...sig.features, costBps, tpBps, slBps, winProb: ev.p, winProbBase: ev.p0, netEdgeBps: ev.edgeBps },
       };
@@ -334,9 +341,11 @@ export function createScalpRebound(opts: ScalpReboundOptions = {}): Strategy {
         }
         return null;
       };
-      if (tpBps < Math.max(0, p.costMult) * costBps) return notify("cost");
+      // テンポ (ctx.tempo) では costMult だけを TEMPO_COST_MULT_FLOOR まで緩める (tempo 未指定・0 なら p.costMult そのもの)
+      const costMult = relaxToward(p.costMult, TEMPO_COST_MULT_FLOOR, ctx.tempo ?? 0);
+      if (tpBps < Math.max(0, costMult) * costBps) return notify("cost");
       if (slDist < Math.max(0, p.minStopSpreads) * spread) return notify("spread");
-      if (!(ev.edgeBps > minNetEdgeBps)) return notify("edge");
+      if (!(ev.edgeBps > tempoNetEdgeFloor(minNetEdgeBps, ctx.tempo, costBps, ctx.tempoExplore === true))) return notify("edge");
       return full;
     },
   };

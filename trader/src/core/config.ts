@@ -122,6 +122,48 @@ const idList = (def: string) =>
 /** 観測専用 (発注せず仮想トレードだけ記録する) 戦略の既定値 */
 export const DEFAULT_OBSERVE_ONLY_STRATEGIES = "scalp_rebound";
 
+/**
+ * 相場構造 (ダウ理論) のフィルターを掛ける戦略の既定値 (トレンド・ブレイク系だけ)。
+ * 逆張り (scalp_vwap_revert, short_rsi_revert)・板 (scalp_obi)・下降中の反発買い (scalp_rebound) は、
+ * 目線と逆向きに入ること自体が設計なので対象外 (src/structure/settings.ts)
+ */
+export const DEFAULT_STRUCTURE_STRATEGIES =
+  "scalp_momentum_burst,scalp_micro,short_ema_trend,short_breakout,mid_trend_follow,long_momentum,meme_momentum";
+
+/** 列挙値の環境変数 (大文字小文字は問わない)。未設定・空は def。それ以外は起動を止める */
+const choice = <T extends string>(key: string, values: readonly T[], def: T) =>
+  z
+    .string()
+    .optional()
+    .transform((v, ctx): T => {
+      const x = (v ?? "").trim().toLowerCase();
+      if (x === "") return def;
+      const hit = values.find((s) => s.toLowerCase() === x);
+      if (hit) return hit;
+      ctx.addIssue({ code: "custom", message: `${key}=${v} は ${values.join(" / ")} のどれかで指定してください` });
+      return z.NEVER;
+    });
+
+/** 範囲つきの数値 (integer なら整数に限る) */
+const ranged = (key: string, def: number, min: number, max: number, integer = false) =>
+  num(def).refine((x) => x >= min && x <= max && (!integer || Number.isInteger(x)), {
+    message: `${key} は ${min} 以上 ${max} 以下の${integer ? "整数" : "数値"}で指定してください`,
+  });
+
+/**
+ * 数値の環境変数 (未設定・空は def)。数値でない・ok を満たさない値は、値と message を含む文言で起動を止める
+ */
+const checkedNum = (key: string, def: number, ok: (x: number) => boolean, message: string) =>
+  z
+    .string()
+    .optional()
+    .transform((v, ctx) => {
+      const x = v === undefined || v.trim() === "" ? def : Number(v);
+      if (Number.isFinite(x) && ok(x)) return x;
+      ctx.addIssue({ code: "custom", message: `${key}=${v} は不正です。${message}` });
+      return z.NEVER;
+    });
+
 const EnvSchema = z.object({
   NODE_ENV: str("development"),
   TRADING_MODE: str("paper"),
@@ -210,6 +252,102 @@ const EnvSchema = z.object({
    */
   OBSERVE_ONLY_STRATEGIES: idList(DEFAULT_OBSERVE_ONLY_STRATEGIES),
 
+  // 指値 (maker) の利用
+  /**
+   * 新規エントリーを指値 (買いは最良の買い気配、売りは最良の売り気配。対応する取引先では post-only) にする (既定 true)。
+   * 戦略の entryOrder ("market" / "limit") が優先。期限内に約定しなければ取り消して見送る (仮想トレード limit_unfilled)
+   */
+  LIMIT_ENTRY: bool("LIMIT_ENTRY", true),
+  /**
+   * 指値のエントリーの有効期限 (ミリ秒)。未設定 (空) なら戦略の主時間足の長さを 20 秒〜15 分に収めた値
+   */
+  LIMIT_ENTRY_TIMEOUT_MS: z
+    .string()
+    .optional()
+    .transform((v) => (v === undefined || v.trim() === "" ? undefined : Number(v)))
+    .refine((x) => x === undefined || (Number.isFinite(x) && x >= 1_000 && x <= 86_400_000), {
+      message: "LIMIT_ENTRY_TIMEOUT_MS は 1000 以上 86400000 以下のミリ秒で指定してください (未設定なら主時間足の長さ)",
+    }),
+  /**
+   * エントリーの約定後、シグナルの利確価格に reduceOnly の指値を板に置く (既定 false。paper 専用で、取引先が
+   * restingTakeProfit に対応しているときだけ)。損切りなどで成行の決済をするときは、先に取り消して結果を確かめてから残りだけを送る。
+   * live では true でも無視する (起動時に警告と監査ログ limit.tp_live_ignored。取消の失敗・照会の遅れで損切りが止まる・
+   * 過剰決済になる経路を実弾に持ち込まないため。src/engine/limitOrders.ts の effectiveLimitTakeProfit)
+   */
+  LIMIT_TAKE_PROFIT: bool("LIMIT_TAKE_PROFIT", false),
+
+  // エントリー頻度の目標 (テンポ) と保有時間の上限 (src/engine/tempo.ts)
+  /**
+   * 1 時間あたりの目標のエントリー回数 (0〜60。既定 0 = 無効)。例: 6 = おおむね 10 分に 1 回。
+   * 0 より大きいとテンポのモードになり、エントリーが目標より途切れているときだけ、戦略と RiskManager の決められた条件を
+   * 決められた下限まで緩める。直近 1 時間のエントリーが 目標 × TEMPO_CAP_MULTIPLIER (切り上げ) に達したら新規を止める
+   */
+  TARGET_ENTRIES_PER_HOUR: checkedNum(
+    "TARGET_ENTRIES_PER_HOUR", 0, (x) => x >= 0 && x <= 60,
+    "0 (無効) 以上 60 以下の 1 時間あたりの回数で指定してください (10 分に 1 回なら 6)",
+  ),
+  /**
+   * 新規エントリーの最大保有時間 (分)。0 (既定) = 無効、それ以外は 5〜1440。
+   * 有効なら、時間軸が中期・長期 (mid / long) の戦略は新規エントリーを発注せず仮想トレード (hold_limit) としてだけ記録し、
+   * ほかの戦略はシグナルの最大保有時間をこの分数までに縮める (保有中の建玉は変えない)
+   */
+  MAX_HOLD_MINUTES: checkedNum(
+    "MAX_HOLD_MINUTES", 0, (x) => x === 0 || (x >= 5 && x <= 1440),
+    "0 (無効) か、5 以上 1440 以下の分で指定してください (30 分なら 30)",
+  ),
+  /**
+   * テンポのモードで RiskManager の期待値幅 / コストの比 (MIN_EDGE_TO_COST) を緩める下限 (1〜10、既定 1)。
+   * MIN_EDGE_TO_COST がこれより低ければ MIN_EDGE_TO_COST のまま (締めも緩めもしない)
+   */
+  TEMPO_MIN_EDGE_TO_COST: checkedNum(
+    "TEMPO_MIN_EDGE_TO_COST", 1, (x) => x >= 1 && x <= 10,
+    "1 以上 10 以下の倍率で指定してください (期待値幅 / コスト の下限)",
+  ),
+  /** 直近 1 時間のエントリーが 目標 × これ (切り上げ) に達したら新規エントリーを止める (1〜5、既定 2) */
+  TEMPO_CAP_MULTIPLIER: checkedNum(
+    "TEMPO_CAP_MULTIPLIER", 2, (x) => x >= 1 && x <= 5,
+    "1 以上 5 以下の倍率で指定してください (目標の何倍で新規エントリーを止めるか)",
+  ),
+  /**
+   * 探索のエントリー (テンポで緩めた結果、コスト控除後の期待値が 0 以下のシグナル) のサイズの倍率 (0.1〜1、既定 0.5)。
+   * 探索は paper では常に、live では TEMPO_ALLOW_LIVE_EXPLORE=true のときだけ行う
+   */
+  TEMPO_EXPLORE_SIZE: checkedNum(
+    "TEMPO_EXPLORE_SIZE", 0.5, (x) => x >= 0.1 && x <= 1,
+    "0.1 以上 1 以下の倍率で指定してください (探索のエントリーのサイズ。半分なら 0.5)",
+  ),
+  /** live でも探索のエントリーを許可する (既定 false。paper では常に許可) */
+  TEMPO_ALLOW_LIVE_EXPLORE: bool("TEMPO_ALLOW_LIVE_EXPLORE", false),
+
+  // 相場構造 (ダウ理論) のフィルター・損切り (src/structure/)
+  /** off: ラップしない (従来と同じ) / filter: 対象の戦略をラップする (既定) */
+  STRUCTURE_MODE: choice("STRUCTURE_MODE", ["off", "filter"] as const, "filter"),
+  /** フィルターを掛ける戦略 id (カンマ区切り)。空文字なら対象なし */
+  STRUCTURE_STRATEGIES: idList(DEFAULT_STRUCTURE_STRATEGIES),
+  /** スイングの左右の本数 (3〜20。一度決めたら固定して使う。最適化しない) */
+  STRUCTURE_PIVOT_N: ranged("STRUCTURE_PIVOT_N", 6, 3, 20, true),
+  /** ブレイクの判定 (終値 / ヒゲ) */
+  STRUCTURE_BREAK_MODE: choice("STRUCTURE_BREAK_MODE", ["close", "wick"] as const, "close"),
+  /** method1: 押し安値・戻り高値 / method2: HH+HL・LH+LL / both: 両方が一致したときだけ */
+  STRUCTURE_BIAS_METHOD: choice("STRUCTURE_BIAS_METHOD", ["method1", "method2", "both"] as const, "method1"),
+  /** purist: 押し安値割れで転換 / conservative: 高値・安値の両方の切り下げで転換 (途中は新規エントリーしない) */
+  STRUCTURE_REVERSAL_MODE: choice("STRUCTURE_REVERSAL_MODE", ["purist", "conservative"] as const, "purist"),
+  /** 上位足の目線とも一致を必須にする */
+  STRUCTURE_USE_MTF: bool("STRUCTURE_USE_MTF", true),
+  /** パーフェクトオーダー (SMA 5/20/50) の一致も必須にする */
+  STRUCTURE_USE_PERFECT_ORDER: bool("STRUCTURE_USE_PERFECT_ORDER", false),
+  /** existing: 戦略の損切りのまま / structure: 押し安値 − ATR × バッファ (売りは 戻り高値 + ATR × バッファ) */
+  STRUCTURE_STOP_MODE: choice("STRUCTURE_STOP_MODE", ["existing", "structure"] as const, "existing"),
+  /** 構造の損切りのバッファ (ATR の倍数、0〜2) */
+  STRUCTURE_STOP_ATR_BUFFER: ranged("STRUCTURE_STOP_ATR_BUFFER", 0.3, 0, 2),
+  /** 保有中に保有方向と逆へ目線が転換したら決済する */
+  STRUCTURE_EXIT_ON_REVERSAL: bool("STRUCTURE_EXIT_ON_REVERSAL", false),
+  /** conservative の転換の途中 (weakening) に入ったら決済する */
+  STRUCTURE_EXIT_ON_WEAKENING: bool("STRUCTURE_EXIT_ON_WEAKENING", false),
+  /** ちゃぶつきの判定: 直近 M 本で目線が R 回以上反転したら新規エントリーを止める (M は構造の窓 STRUCTURE_WINDOW_BARS = 300 以下) */
+  STRUCTURE_CHOP_M: ranged("STRUCTURE_CHOP_M", 50, 5, 300, true),
+  STRUCTURE_CHOP_R: ranged("STRUCTURE_CHOP_R", 3, 1, 100, true),
+
   // ループ間隔
   SCALP_LOOP_MS: num(5_000),
   INTEL_LOOP_MS: num(900_000),
@@ -279,6 +417,8 @@ export function loadConfig(source: Record<string, string | undefined> = process.
       maxPositionPct: env.MAX_POSITION_PCT,
       maxOrdersPerMinute: env.MAX_ORDERS_PER_MINUTE,
       minEdgeToCostRatio: env.MIN_EDGE_TO_COST,
+      // テンポのモード (EntryParams.tempo あり) でだけ使う。テンポが無効なら判定に影響しない
+      tempoMinEdgeToCost: env.TEMPO_MIN_EDGE_TO_COST,
       memeMinLiquidityUsd: env.MEME_MIN_LIQUIDITY_USD,
     },
     ai: { apiKey: env.ANTHROPIC_API_KEY, model: env.ANTHROPIC_MODEL, enabled: env.ANTHROPIC_API_KEY !== "" },
