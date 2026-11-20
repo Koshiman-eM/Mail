@@ -28,6 +28,7 @@ import { ClosedCandleCacheFeed } from "./feedCache";
 import { createFxConverter, type FxConverter } from "./fx";
 import { createParamValidator, createPriceAt, type ValidatorOptions } from "./learningHooks";
 import { limitOrdersFromEnv } from "./limitOrders";
+import { thesisSettingsFromEnv } from "./thesis";
 
 const ASSET_CLASSES: AssetClass[] = ["crypto", "meme", "fx", "stock"];
 export const KNOWN_VENUES = ["synthetic", "ccxt", "gmo", "oanda", "alpaca", "dex"] as const;
@@ -352,6 +353,8 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
       limitOrders: limitOrdersFromEnv(config.env, brokerSet.mode),
       // 最大保有 (MAX_HOLD_MINUTES) も実運用と同じ前提で検証する (0 = 無効。テンポはバックテストに渡さない)
       ...((config.env.MAX_HOLD_MINUTES ?? 0) > 0 ? { maxHoldMinutes: config.env.MAX_HOLD_MINUTES } : {}),
+      // 読みの管理 (THESIS_*) も実運用と同じ規則で検証する
+      thesis: thesisSettingsFromEnv(config.env),
       ...(opts.validation ?? {}),
     }),
     priceAt: createPriceAt(hub, clock),

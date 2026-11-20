@@ -292,6 +292,12 @@ export interface Signal {
   trailingStopPct?: number;
   /** 最大保有時間 */
   maxHoldMs: number;
+  /**
+   * いつ頃までに利益が出る読みか (エントリーからの ms。読みの期限)。省略時は maxHoldMs を読みの期限にする。
+   * 読みの管理 (THESIS_EXIT) が有効なら、期限で利益が出ていなければ決済し、出ていれば延長する (src/engine/thesis.ts)。
+   * MAX_HOLD_MINUTES が有効なら maxHoldMs と同じく丸める
+   */
+  expectedMs?: number;
   reason: string;
   /** 学習用の特徴量 (判断に使った指標値) */
   features: Record<string, number>;
@@ -493,7 +499,19 @@ export interface RiskState {
 
 // ───────────────────────── 学習 (トレード記録・要因分析) ─────────────────────────
 
-export type ExitReason = "stop" | "take_profit" | "trailing" | "signal" | "time" | "kill_switch" | "manual";
+/**
+ * 決済理由。thesis_failed: 読みの期限の途中で読み外れ / thesis_timeout: 期限で読み外れ / thesis_cap: 読み当たりで延長した上限
+ * (読みの管理。src/engine/thesis.ts)
+ */
+export type ExitReason =
+  | "stop" | "take_profit" | "trailing" | "signal" | "time" | "kill_switch" | "manual"
+  | "thesis_failed" | "thesis_timeout" | "thesis_cap";
+
+/** 時間に関する決済理由 (従来の時間切れ time と読みの管理の 3 つ)。要因分析・パラメータ調整で time と同じ扱いにする */
+export const TIME_LIKE_EXIT_REASONS: readonly string[] = ["time", "thesis_failed", "thesis_timeout", "thesis_cap"];
+
+/** 時間に関する決済理由か (TIME_LIKE_EXIT_REASONS) */
+export const isTimeLikeExit = (reason: string | undefined): boolean => reason !== undefined && TIME_LIKE_EXIT_REASONS.includes(reason);
 
 export interface EntryContext {
   regime: RegimeFeatures;
@@ -562,6 +580,20 @@ export interface TradeRecord {
   /** 手数料の内訳 (約定の liquidity 別、クオート通貨建て。maker は受け取りなら負)。古い取引には無い */
   makerFees?: number;
   takerFees?: number;
+  /**
+   * 読みの管理 (THESIS_EXIT) の記録。読みの管理を使った取引だけ (古い取引・無効のときは無い)。
+   * thesisExpectedMs: 読みの期限までの時間 / thesisDeadlineTs: 期限の時刻 (エントリー時刻 + thesisExpectedMs) /
+   * thesisExtendedAt: 期限で読み当たりとして延長した時刻 / thesisOutcome: 答え合わせの結果 /
+   * thesisNetRAtDeadline: 期限の時点の純 R の見積り (延長・期限で読み外れのときだけ) /
+   * thesisStopExit: 延長後の保護ストップ (建値・トレーリング) での決済 (exitReason は trailing。戦略のトレーリングとは別。
+   * ParamTuner はトレーリングの調整の根拠に使わない)
+   */
+  thesisExpectedMs?: number;
+  thesisDeadlineTs?: number;
+  thesisExtendedAt?: number;
+  thesisOutcome?: "failed_early" | "timeout" | "extended" | "none";
+  thesisNetRAtDeadline?: number;
+  thesisStopExit?: boolean;
 }
 
 export type CauseCode =
@@ -653,8 +685,11 @@ export interface SourceReliability {
 
 // ───────────────────────── 仮想トレード (見送ったシグナルの答え合わせ) ─────────────────────────
 
-/** 仮想トレードの決済理由。unwatched は監視をやめたため捨てたもの (学習には使わない) */
-export type ShadowExitReason = "stop" | "take_profit" | "time" | "unwatched";
+/**
+ * 仮想トレードの決済理由。unwatched は監視をやめたため捨てたもの (学習には使わない)。
+ * trailing・thesis_* は読みの管理 (延長後の建値・トレーリング、途中・期限での読み外れ、延長の上限)
+ */
+export type ShadowExitReason = "stop" | "take_profit" | "time" | "unwatched" | "trailing" | "thesis_failed" | "thesis_timeout" | "thesis_cap";
 
 /**
  * 見送ったシグナルの仮想トレード (決済済み)。R は統計値なので number。
@@ -707,6 +742,15 @@ export interface ShadowTradeRecord {
   borrowRateDaily?: number;
   /** 建玉の持ち越し手数料の日率 (meta.holdingFeeDaily がある銘柄 = GMO のとき。買い・売りとも。src/core/holdingFee.ts) */
   holdingFeeDaily?: number;
+  /**
+   * 読みの管理 (シグナルに最大保有・読みの期限があったものだけ。古い記録には無い)。
+   * thesisExpectedMs: 読みの期限までの時間 / thesisExtendedAt: 延長した時刻 / thesisNetRAtDeadline: 期限の時点の純 R /
+   * thesisOutcome: 答え合わせの結果 (読みの管理で判定したときだけ)
+   */
+  thesisExpectedMs?: number;
+  thesisExtendedAt?: number;
+  thesisNetRAtDeadline?: number;
+  thesisOutcome?: "failed_early" | "timeout" | "extended" | "none";
 }
 
 export interface ShadowTradeFilter {

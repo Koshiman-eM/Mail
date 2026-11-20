@@ -12,6 +12,7 @@ import type {
   TradeRecord,
 } from "../core/types";
 import type { RegimeOptions } from "../regime/detect";
+import type { ThesisSettings } from "../engine/thesis";
 
 export interface SizerArgs {
   /** 現在の評価額 (クオート通貨) */
@@ -102,6 +103,11 @@ export interface BacktestOptions {
    * 時間軸による扱い (中期・長期は運用で新規エントリーしない) は呼び出し側が決める (isHoldLimitedHorizon)
    */
   maxHoldMinutes?: number;
+  /**
+   * 読みの管理 (ライブの THESIS_* と同じ src/engine/thesis.ts の規則。省略・無効なら従来の時間切れ)。
+   * 判定はバーの終値 (∓ 半スプレッド、手数料の見積り込みの純 R) で行い、決済は次のバーの始値。延長後の保護ストップは次のバーから効く
+   */
+  thesis?: ThesisSettings;
 }
 
 export interface BacktestMetrics {

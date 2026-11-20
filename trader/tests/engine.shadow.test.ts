@@ -68,7 +68,8 @@ const entryLog = (store: MemoryStore) =>
 
 describe("見送ったシグナルの仮想トレード (エンジン統合)", () => {
   it("コスト比で見送ったシグナルから作られ、時間切れ等で閉じて腕を重み付きで更新する (実際の取引は 0)", async () => {
-    const { rt, clock, store } = await runtime({}, { strategies: [fixedStrategy("cheap", { edge: 0.5 })] });
+    // 従来の時間切れ (time) を確かめるため読みの管理は無効にする (有効時は tests/thesis.shadow.test.ts)
+    const { rt, clock, store } = await runtime({ THESIS_EXIT: "false" }, { strategies: [fixedStrategy("cheap", { edge: 0.5 })] });
     await run(rt, clock, START, START + 5 * MIN);
     const open = rt.engine.shadow!.list();
     expect(open.length).toBeGreaterThan(0);

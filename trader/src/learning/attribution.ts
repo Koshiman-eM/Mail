@@ -1,4 +1,4 @@
-import type { Cause, CauseCode, RegimeLabel, TradeAttribution, TradeRecord } from "../core/types";
+import { isTimeLikeExit, type Cause, type CauseCode, type RegimeLabel, type TradeAttribution, type TradeRecord } from "../core/types";
 
 /**
  * トレードの損益要因分析 (純粋関数)。比率・リターンはすべて小数 (0.01 = 1%)。
@@ -239,12 +239,12 @@ export function attributeTrade(trade: TradeRecord, opts: AttributionOptions = {}
     }
   }
 
-  // time_decay: 時間切れ決済で値幅が小さい
-  if (t.exitReason === "time") {
+  // time_decay: 時間切れ決済で値幅が小さい (読みの管理の決済 = 途中・期限で読み外れ・延長の上限も時間切れと同じ扱い)
+  if (isTimeLikeExit(t.exitReason)) {
     const ret = Math.abs(t.returnPct);
     const limit = stopWidthPct > 0 ? T.timeDecayStopFrac * stopWidthPct : T.timeDecayCostMult * costPct;
     if (ret < limit) {
-      add("time_decay", 1, `時間切れ決済、リターン ${pct(t.returnPct)} (基準 ±${pct(limit)} 未満)`);
+      add("time_decay", 1, `${t.exitReason === "time" ? "時間切れ決済" : `時間切れ決済 (読みの管理: ${t.exitReason})`}、リターン ${pct(t.returnPct)} (基準 ±${pct(limit)} 未満)`);
     }
   }
 

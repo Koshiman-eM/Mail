@@ -5,9 +5,13 @@ import { createLogger, type Logger } from "../core/logger";
 import type {
   Broker, BrokerPosition, ExitReason, Fill, Instrument, OrderRequest, OrderResult, PositionView, Quote, Store, TradeRecord,
 } from "../core/types";
-import type { FeesByLiquidity, OpenTrade, OpenTradeInput, TradeJournal } from "../learning/journal";
+import type { FeesByLiquidity, OpenTrade, OpenTradeInput, TradeJournal, TradeThesisFields } from "../learning/journal";
 import { runGrouped, withDeadline } from "./deadline";
 import { normalizeCurrency } from "./fx";
+import {
+  activeThesisMs, advancePeak, decideThesis, initialRiskPerUnit, THESIS_DISABLED, thesisGrossR, thesisNetR, thesisOutcomeOf, thesisTrailStop,
+  tighterStop, type ThesisExitReason, type ThesisPricing, type ThesisSettings,
+} from "./thesis";
 import {
   bumpLimitStats, isFinalStatus, PendingOrders, RestingTakeProfits, type LimitCancelReason, type PendingEntry, type PendingOrder, type PositionVerdict,
   type ResolveRequest, type RestingTakeProfit,
@@ -19,8 +23,21 @@ export interface ExitPlan {
   trailingStopPct?: number;
   /** 最大保有時間 (0 / 未設定なら時間切れなし) */
   maxHoldMs?: number;
-  /** 一部約定で残った分は、決済判定に該当しなくても次のティックで同じ理由で決済する */
-  retryExit?: { reason: ExitReason; intendedPrice: number };
+  /** 読みの期限 (シグナルの expectedMs。無ければ maxHoldMs を読みの期限にする。src/engine/thesis.ts) */
+  expectedMs?: number;
+  /**
+   * 読みの管理の状態 (再起動しても続ける)。extendedAt: 期限で読み当たりとして延長した時刻 /
+   * netRAtDeadline: 期限の時点の純 R の見積り (延長・期限で読み外れの判定に使った値) /
+   * peak: 延長後の有利な極値 (決済できる価格: 買いは bid の高値、売りは ask の安値。延長した時点の気配から始める) /
+   * stop: 延長後の保護ストップ (きつくなる方へだけ更新。設定・手数料が変わっても緩めない。THESIS_EXIT=false で再起動しても保護に使う) /
+   * exit: 決めた読みの決済 (読み外れ・延長の上限)。約定するまで同じ理由で再試行し、その間は延長しない
+   */
+  thesis?: {
+    extendedAt?: number; netRAtDeadline?: number; peak?: number; stop?: number;
+    exit?: { reason: ThesisExitReason; netR?: number; at: number };
+  };
+  /** 一部約定で残った分は、決済判定に該当しなくても次のティックで同じ理由で決済する (thesisStop: 延長後の保護ストップでの決済) */
+  retryExit?: { reason: ExitReason; intendedPrice: number; thesisStop?: boolean };
   /** 利確の指値を (もう) 板に置かない (決済のために取り消した・置けなかった) */
   noRestingTp?: boolean;
   /** 利確の指値を置こうとした回数 (取引所に拒否・取消されても無限に置き直さない) */
@@ -38,6 +55,12 @@ export interface ExitDecision {
   reason: ExitReason;
   /** 意図した決済価格 (ストップ価格・利確価格・判定時点の価格) */
   intendedPrice: number;
+  /** 読みの管理の決済のときの純 R の見積り */
+  netR?: number;
+  /** 延長後の保護ストップ (建値・トレーリング) での決済 (reason は trailing) */
+  thesisStop?: boolean;
+  /** 延長していない建玉が延長の上限に届いた (期限で読み当たり → 同時に上限)。決済の前に延長を記録する */
+  thesisExtend?: { netR: number };
 }
 
 export interface CloseResult {
@@ -153,8 +176,8 @@ export interface PositionManagerDeps {
   /** 決済時点の口座通貨換算 (監査ログに残し、レポートで使う) */
   toAccount?: (ccy: string) => number;
   quoteCurrencyOf?: (symbol: string) => string | undefined;
-  /** 銘柄情報 (手数料の通貨換算・端数の判定) */
-  instrumentOf?: (symbol: string) => Pick<Instrument, "baseCurrency" | "quoteCurrency" | "minQty"> | undefined;
+  /** 銘柄情報 (手数料の通貨換算・端数の判定。takerFeeRate は読みの管理の純 R の見積り) */
+  instrumentOf?: (symbol: string) => (Pick<Instrument, "baseCurrency" | "quoteCurrency" | "minQty"> & Partial<Pick<Instrument, "takerFeeRate">>) | undefined;
   /** 通貨換算 (1 from = ? to)。換算できなければ NaN */
   fxRate?: (from: string, to: string) => number;
   /** 現在値 (建玉による確定の推定価格)。無ければ追跡中の最終価格 */
@@ -176,11 +199,36 @@ export interface PositionManagerDeps {
    * journal の mode が live なら true でも置かない
    */
   limitTakeProfit?: boolean;
+  /**
+   * 読みの管理 (THESIS_EXIT。src/engine/thesis.ts)。省略・無効なら従来どおり maxHoldMs で時間切れ (time)。
+   * 有効なら、決済計画に maxHoldMs (または expectedMs) がある建玉は、期限で答え合わせをして決済・延長する
+   */
+  thesis?: ThesisSettings;
 }
 
 /** 旧キー (mode なし)。paper 用として扱う */
 const LEGACY_PLANS_KEY = "positions:exitPlans";
 const plansKey = (mode: string) => `${LEGACY_PLANS_KEY}:${mode}`;
+
+/** 保存済みの決済計画 (status の表示用。読み取りだけ) */
+export function readExitPlans(store: Pick<Store, "kvGet">, mode: string): Record<string, ExitPlan> {
+  const saved = store.kvGet<Record<string, ExitPlan>>(plansKey(mode));
+  return saved && typeof saved === "object" ? saved : {};
+}
+
+/** 建玉の読みの状態 (ダッシュボード・status の表示用) */
+export interface ThesisView {
+  /** 読みの期限 (エントリー時刻 + 期限までの時間) */
+  deadlineTs: number;
+  /** 延長の上限の時刻 (期限 × THESIS_EXTEND_MULT) */
+  capTs: number;
+  /** 期限 (延長中は上限) までの残り (分。過ぎていれば 0) */
+  remainingMin: number;
+  /** watching: 期限まで監視中 / extended: 期限で読み当たり → 延長中 */
+  state: "watching" | "extended";
+  /** 現在の純 R の見積り (気配が無ければ省略) */
+  netR?: number;
+}
 const AUDIT_THROTTLE_MS = 60_000;
 
 const midOf = (q: Quote) => (q.bid + q.ask) / 2;
@@ -249,6 +297,7 @@ interface VerifyItem {
 /**
  * 保有ポジションの管理。1 銘柄 1 ポジション (PaperBroker が銘柄単位でネッティングするため)。
  * - 毎ティック: 価格を journal に反映し、損切り → 利確 → トレーリング → 時間切れ の順で決済を判定する。
+ *   読みの管理 (deps.thesis) が有効なら、時間切れの代わりに読みの期限で答え合わせをする (途中・期限で読み外れ / 延長 / 延長の上限。src/engine/thesis.ts)。
  * - 戦略の flat シグナル・kill switch でも決済する。
  * - 発注は成行。結果が確定 (filled / canceled / rejected) したら約定数量で journal に反映する。
  *   受付済み・未約定 (open / partially_filled) や例外で状態不明の注文は「保留中」(PendingOrders) として記録し、
@@ -389,16 +438,173 @@ export class PositionManager {
     }
   }
 
-  /** トレーリングストップ価格 (当初ストップより有利な場合のみ) */
+  /**
+   * トレーリングストップ価格 (当初ストップより有利な場合のみ)。
+   * 読みの管理で延長した建玉は、建値 (往復手数料込み) と 極値 − THESIS_TRAIL_R × 当初のリスク の有利な方とも比べ、きつい方を使う
+   */
   trailingStop(p: OpenTrade): number | undefined {
     const pct = this.plans[p.id]?.trailingStopPct;
-    if (!(pct !== undefined && pct > 0)) return undefined;
-    if (p.direction === "long") {
-      const s = p.highWater * (1 - pct);
-      return s > p.initialStop ? s : undefined;
+    const long = p.direction === "long";
+    let out: number | undefined;
+    if (pct !== undefined && pct > 0) {
+      const s = long ? p.highWater * (1 - pct) : p.lowWater * (1 + pct);
+      if (long ? s > p.initialStop : s < p.initialStop) out = s;
     }
-    const s = p.lowWater * (1 + pct);
-    return s < p.initialStop ? s : undefined;
+    const t = this.thesisStop(p);
+    if (t !== undefined && (long ? t > p.initialStop : t < p.initialStop) && (out === undefined || (long ? t > out : t < out))) out = t;
+    return out;
+  }
+
+  // ───────── 読みの管理 ─────────
+
+  /** 読みの管理を使う建玉なら期限 (ms) と当初のリスク (無効・期限なし・リスク 0 以下なら undefined = 従来の時間切れ) */
+  private thesisOf(p: OpenTrade): { ms: number; risk: number; plan: ExitPlan } | undefined {
+    const plan = this.plans[p.id];
+    if (!plan) return undefined;
+    const risk = initialRiskPerUnit(p.entryPrice, p.initialStop);
+    const ms = activeThesisMs(this.deps.thesis, plan.expectedMs, plan.maxHoldMs, risk);
+    return ms === undefined ? undefined : { ms, risk, plan };
+  }
+
+  /** 純 R・建値の計算に使う値 (エントリー手数料は実際に払った額を 1 単位あたりにする。一部決済後も元の数量で割る) */
+  private thesisPricing(p: OpenTrade, risk: number): ThesisPricing {
+    const units = D(p.qty).plus(p.exitedQty ?? 0).mul(p.contractSize).toNumber();
+    const rate = this.deps.instrumentOf?.(p.symbol)?.takerFeeRate;
+    return {
+      direction: p.direction,
+      entryPrice: p.entryPrice,
+      risk,
+      entryFeePerUnit: units > 0 && Number.isFinite(p.entryFees) ? p.entryFees / units : 0,
+      ...(rate !== undefined && Number.isFinite(rate) ? { takerFeeRate: rate } : {}),
+    };
+  }
+
+  /** 今決済したときの純 R の見積り (決済できる価格: 買いは bid、売りは ask) */
+  private thesisNetRAt(p: OpenTrade, quote: Pick<Quote, "bid" | "ask">, risk: number): number {
+    return thesisNetR(this.thesisPricing(p, risk), p.direction === "long" ? quote.bid : quote.ask);
+  }
+
+  /**
+   * 延長後の保護ストップ (延長していない建玉は undefined)。
+   * 極値は延長した時点から測る (plan.thesis.peak。延長より前の高値・安値は使わない)。保存済みのストップ (plan.thesis.stop) と
+   * 今の計算のきつい方を使い、設定・手数料が変わっても緩めない。読みの管理を使わなくなった建玉 (THESIS_EXIT=false で再起動など) も
+   * 保存済みのストップで守り続ける
+   */
+  private thesisStop(p: OpenTrade): number | undefined {
+    const t = this.plans[p.id]?.thesis;
+    if (!t || t.extendedAt === undefined) return undefined;
+    const th = this.thesisOf(p);
+    const cur = th ? thesisTrailStop(this.thesisPricing(p, th.risk), t.peak ?? Number.NaN, this.deps.thesis!.trailR) : undefined;
+    return tighterStop(p.direction, t.stop, cur);
+  }
+
+  /** 延長後の有利な極値を気配で進め、保護ストップを保存する (変わったら決済計画に保存する) */
+  private advanceThesisPeak(p: OpenTrade, quote: Quote): void {
+    const plan = this.plans[p.id];
+    const t = plan?.thesis;
+    if (!t || t.extendedAt === undefined) return;
+    let peak = t.peak;
+    if (this.thesisOf(p) && quote.bid > 0 && quote.ask > 0) peak = advancePeak(p.direction, t.peak, p.direction === "long" ? quote.bid : quote.ask);
+    this.plans[p.id] = { ...plan, thesis: { ...t, ...(peak !== undefined ? { peak } : {}) } };
+    const stop = this.thesisStop(p);
+    if (stop !== undefined) this.plans[p.id] = { ...this.plans[p.id], thesis: { ...this.plans[p.id].thesis, stop } };
+    if (peak !== t.peak || stop !== t.stop) this.persist();
+  }
+
+  /** 延長を記録する (決済計画に保存して再起動後も続ける。監査ログ thesis.extended) */
+  private recordExtension(p: OpenTrade, ms: number, quote: Pick<Quote, "bid" | "ask">, netR: number, now: number, capped: boolean): void {
+    const plan = this.plans[p.id] ?? {};
+    const peak = p.direction === "long" ? quote.bid : quote.ask;
+    this.plans[p.id] = { ...plan, thesis: { ...(plan.thesis ?? {}), extendedAt: now, netRAtDeadline: netR, peak } };
+    const stop = this.thesisStop(p);
+    if (stop !== undefined) this.plans[p.id] = { ...this.plans[p.id], thesis: { ...this.plans[p.id].thesis, stop } };
+    this.persist();
+    const data = {
+      tradeId: p.id, symbol: p.symbol, strategyId: p.strategyId, direction: p.direction, netR: Number(netR.toFixed(4)),
+      deadlineTs: p.entryTs + ms, capTs: p.entryTs + ms * Math.max(1, this.deps.thesis!.extendMult), ...(stop !== undefined ? { stop } : {}),
+      ...(capped ? { capped: true } : {}),
+    };
+    this.deps.store?.audit({ ts: now, type: "thesis.extended", data });
+    this.log.info(capped ? "読みの期限で利益が出ていますが延長の上限に達しているため決済します" : "読みの期限で利益が出ているため延長します (建値・トレーリングで保護)", data);
+  }
+
+  /**
+   * 期限で読み当たりなら延長を記録する。延長後の極値は今の決済できる価格から始める
+   * (保護ストップは max(建値, 価格 − THESIS_TRAIL_R × R) より厳しくならない。この気配では判定し直さない)。
+   * onQuote が、checkExit で決済に該当しなかったときに呼ぶ。決済の再試行中 (retryExit・読みの決済) は延長しない。延長したら true
+   */
+  private markThesisExtension(p: OpenTrade, quote: Quote, now: number): boolean {
+    const th = this.thesisOf(p);
+    if (!th || th.plan.thesis?.extendedAt !== undefined || th.plan.thesis?.exit || th.plan.retryExit) return false;
+    if (!(quote.bid > 0) || !(quote.ask > 0)) return false;
+    const pricing = this.thesisPricing(p, th.risk);
+    const d = decideThesis(
+      {
+        elapsedMs: now - p.entryTs, expectedMs: th.plan.expectedMs, maxHoldMs: th.plan.maxHoldMs, extended: false,
+        netR: thesisNetR(pricing, p.direction === "long" ? quote.bid : quote.ask), grossR: thesisGrossR(pricing, midOf(quote)),
+      },
+      this.deps.thesis!,
+    );
+    if (!d.extend || d.exit) return false;
+    this.recordExtension(p, th.ms, quote, d.extend.netR, now, false);
+    return true;
+  }
+
+  /**
+   * 読みの決済 (読み外れ・延長の上限) を決めたら決済計画に保存する (約定するまで同じ理由で再試行し、その間は延長しない)。
+   * 延長していない建玉が上限に届いた (THESIS_EXTEND_MULT = 1・停止中に上限を過ぎた) ときは、先に延長を記録する (答え合わせは延長)
+   */
+  private noteThesisExit(p: OpenTrade, d: ExitDecision, quote: Pick<Quote, "bid" | "ask">, now: number): void {
+    const plan = this.plans[p.id];
+    if (!plan || plan.thesis?.exit) return;
+    if (d.reason !== "thesis_failed" && d.reason !== "thesis_timeout" && d.reason !== "thesis_cap") return;
+    if (d.thesisExtend && plan.thesis?.extendedAt === undefined) {
+      const th = this.thesisOf(p);
+      if (th) this.recordExtension(p, th.ms, quote, d.thesisExtend.netR, now, true);
+    }
+    const cur = this.plans[p.id];
+    const t = { ...(cur.thesis ?? {}) };
+    t.exit = { reason: d.reason, ...(d.netR !== undefined && Number.isFinite(d.netR) ? { netR: d.netR } : {}), at: now };
+    if (d.reason === "thesis_timeout" && d.netR !== undefined && Number.isFinite(d.netR) && t.netRAtDeadline === undefined) t.netRAtDeadline = d.netR;
+    this.plans[p.id] = { ...cur, thesis: t };
+    this.persist();
+  }
+
+  /**
+   * 決済時の読みの管理の記録 (TradeRecord に付ける。読みの管理を使わない建玉は undefined)。
+   * 読み外れ (途中・期限) の決済には延長の記録を付けない。thesisStop は約定した決済の注文が延長後の保護ストップによるものか
+   */
+  private thesisRecord(p: OpenTrade, reason: ExitReason, thesisStop: boolean): TradeThesisFields | undefined {
+    const th = this.thesisOf(p);
+    if (!th) return undefined;
+    const t = th.plan.thesis;
+    const failed = reason === "thesis_failed" || reason === "thesis_timeout";
+    const extended = !failed && t?.extendedAt !== undefined;
+    return {
+      thesisExpectedMs: th.ms,
+      thesisDeadlineTs: p.entryTs + th.ms,
+      ...(extended ? { thesisExtendedAt: t!.extendedAt } : {}),
+      thesisOutcome: thesisOutcomeOf(reason, extended),
+      ...(t?.netRAtDeadline !== undefined && Number.isFinite(t.netRAtDeadline) ? { thesisNetRAtDeadline: t.netRAtDeadline } : {}),
+      ...(thesisStop && reason === "trailing" ? { thesisStopExit: true } : {}),
+    };
+  }
+
+  /** 建玉の読みの状態 (表示用。読みの管理を使わない建玉は undefined) */
+  thesisView(p: OpenTrade, quote: Pick<Quote, "bid" | "ask"> | undefined, now: number): ThesisView | undefined {
+    const th = this.thesisOf(p);
+    if (!th) return undefined;
+    const extended = th.plan.thesis?.extendedAt !== undefined;
+    const deadlineTs = p.entryTs + th.ms;
+    const capTs = p.entryTs + th.ms * Math.max(1, this.deps.thesis!.extendMult);
+    const netR = quote && quote.bid > 0 && quote.ask > 0 ? this.thesisNetRAt(p, quote, th.risk) : NaN;
+    return {
+      deadlineTs,
+      capTs,
+      remainingMin: Math.max(0, ((extended ? capTs : deadlineTs) - now) / 60_000),
+      state: extended ? "extended" : "watching",
+      ...(Number.isFinite(netR) ? { netR } : {}),
+    };
   }
 
   /** 現在の実効ストップ (トレーリング込み) */
@@ -431,6 +637,7 @@ export class PositionManager {
     this.plans[p.id] = {
       ...(plan.trailingStopPct !== undefined && plan.trailingStopPct > 0 ? { trailingStopPct: plan.trailingStopPct } : {}),
       ...(plan.maxHoldMs !== undefined && plan.maxHoldMs > 0 ? { maxHoldMs: plan.maxHoldMs } : {}),
+      ...(plan.expectedMs !== undefined && plan.expectedMs > 0 ? { expectedMs: plan.expectedMs } : {}),
       ...(plan.retryExit ? { retryExit: plan.retryExit } : {}),
     };
     this.persist();
@@ -489,7 +696,9 @@ export class PositionManager {
   // ───────── 決済 ─────────
 
   /**
-   * 決済判定 (副作用なし)。損切り → 利確 → トレーリング → 時間切れ の順。
+   * 決済判定 (副作用なし)。損切り → 利確 → トレーリング → 時間切れ (読みの管理) の順。
+   * 読みの管理を使う建玉は、時間切れの代わりに 途中で読み外れ / 期限で読み外れ / 延長の上限 で決済する
+   * (期限で読み当たりのときは何も返さず、延長の記録は onQuote が行う。延長後の建値・トレーリングはトレーリングとして判定する)。
    * skipTakeProfit: 利確の指値を板に置いている (利確は指値の約定で記録するので、成行の利確をしない)
    */
   checkExit(p: OpenTrade, quote: Quote, now: number, opts: { skipTakeProfit?: boolean } = {}): ExitDecision | undefined {
@@ -497,18 +706,42 @@ export class PositionManager {
     const { bid, ask } = quote;
     if (!(bid > 0) || !(ask > 0)) return undefined;
     const trail = this.trailingStop(p);
+    // 実効のトレーリングが読みの管理の保護ストップ (延長後の建値・トレーリング) か
+    const ts = trail !== undefined ? this.thesisStop(p) : undefined;
+    const byThesis = ts !== undefined && trail === ts ? { thesisStop: true } : {};
     const hit = (stop: number) => (long ? bid <= stop : ask >= stop);
     if (hit(p.initialStop)) {
       // 引き上げ済みのトレーリングストップを飛び越えて当初ストップまで動いた場合は、先に触れたトレーリング側で記録する
-      return trail !== undefined ? { reason: "trailing", intendedPrice: trail } : { reason: "stop", intendedPrice: p.initialStop };
+      return trail !== undefined ? { reason: "trailing", intendedPrice: trail, ...byThesis } : { reason: "stop", intendedPrice: p.initialStop };
     }
     if (!opts.skipTakeProfit && p.takeProfit !== undefined && (long ? bid >= p.takeProfit : ask <= p.takeProfit)) {
       return { reason: "take_profit", intendedPrice: p.takeProfit };
     }
-    if (trail !== undefined && hit(trail)) return { reason: "trailing", intendedPrice: trail };
-    const maxHold = this.plans[p.id]?.maxHoldMs;
-    if (maxHold !== undefined && maxHold > 0 && now - p.entryTs >= maxHold) {
-      return { reason: "time", intendedPrice: long ? bid : ask };
+    if (trail !== undefined && hit(trail)) return { reason: "trailing", intendedPrice: trail, ...byThesis };
+    const plan = this.plans[p.id];
+    // 決めた読みの決済 (読み外れ・延長の上限) は、約定するまで同じ理由で再試行する (従来の時間切れと同じ。損切り・利確・トレーリングが先)
+    const pendingExit = plan?.thesis?.exit;
+    if (pendingExit) return { reason: pendingExit.reason, intendedPrice: long ? bid : ask, ...(pendingExit.netR !== undefined ? { netR: pendingExit.netR } : {}) };
+    const th = this.thesisOf(p);
+    const pricing = th ? this.thesisPricing(p, th.risk) : undefined;
+    const d = decideThesis(
+      {
+        elapsedMs: now - p.entryTs,
+        ...(plan?.expectedMs !== undefined ? { expectedMs: plan.expectedMs } : {}),
+        ...(plan?.maxHoldMs !== undefined ? { maxHoldMs: plan.maxHoldMs } : {}),
+        extended: plan?.thesis?.extendedAt !== undefined,
+        netR: pricing ? thesisNetR(pricing, long ? bid : ask) : NaN,
+        // 途中で読み外れは値動きだけ (仲値) で判定する (コストだけでは切らない)
+        grossR: pricing ? thesisGrossR(pricing, (bid + ask) / 2) : NaN,
+      },
+      // 読みの管理を使わない建玉は従来の時間切れ
+      th ? this.deps.thesis! : THESIS_DISABLED,
+    );
+    if (d.exit) {
+      return {
+        reason: d.exit.reason, intendedPrice: long ? bid : ask, ...(d.exit.netR !== undefined ? { netR: d.exit.netR } : {}),
+        ...(d.extend && d.exit.reason === "thesis_cap" ? { thesisExtend: d.extend } : {}),
+      };
     }
     return undefined;
   }
@@ -522,12 +755,16 @@ export class PositionManager {
   async onQuote(symbol: string, quote: Quote, now: number): Promise<CloseResult> {
     const p0 = this.get(symbol);
     if (!p0) return { status: "none" };
-    if (quote.bid > 0 && quote.ask > 0) this.deps.journal.mark(symbol, midOf(quote), now);
+    if (quote.bid > 0 && quote.ask > 0) {
+      this.deps.journal.mark(symbol, midOf(quote), now);
+      // 延長後の極値も気配で進める (journal の高値・安値と同じく、保留中の注文があっても記録する)
+      this.advanceThesisPeak(p0, quote);
+    }
     if (this.hasPending(symbol)) return { status: "pending", reason: "保留中の注文があります" };
     let reduced: OpenTrade | undefined;
     const rtp = this.tps.get(p0.id);
     if (rtp) {
-      if (rtp.exit) return this.close(symbol, rtp.exit.reason, rtp.exit.intendedPrice, now);
+      if (rtp.exit) return this.close(symbol, rtp.exit.reason, rtp.exit.intendedPrice, now, rtp.exit.thesisStop ? { thesisStop: true } : {});
       const long = p0.direction === "long";
       const touched = quote.bid > 0 && quote.ask > 0 && (long ? quote.bid >= rtp.price : quote.ask <= rtp.price);
       const due = rtp.lastCheckedAt === undefined || now - rtp.lastCheckedAt >= this.policy.tpPollMs || rtp.status === "submitting" || rtp.status === "unknown";
@@ -539,11 +776,19 @@ export class PositionManager {
     }
     const p = this.get(symbol);
     if (!p) return { status: "none" };
-    const d = this.checkExit(p, quote, now, { skipTakeProfit: this.tps.get(p.id) !== undefined });
-    if (d) return this.close(symbol, d.reason, d.intendedPrice, now);
+    const skipTakeProfit = this.tps.get(p.id) !== undefined;
+    const d = this.checkExit(p, quote, now, { skipTakeProfit });
+    if (d) {
+      // 読みの決済は決済計画に保存して、約定するまで同じ理由で再試行する (延長の上限に先に届いた建玉は延長を記録してから)
+      this.noteThesisExit(p, d, quote, now);
+      return this.close(symbol, d.reason, d.intendedPrice, now, d.thesisStop ? { thesisStop: true } : {});
+    }
+    // 決済に該当しないときだけ、読みの期限で利益が出ていれば延長を記録する (延長した気配では保護ストップを判定しない =
+    // 延長そのもので決済しない。決済の再試行中は延長しない)
+    this.markThesisExtension(p, quote, now);
     // 一部約定で残った分
     const retry = this.plans[p.id]?.retryExit;
-    if (retry) return this.close(symbol, retry.reason, retry.intendedPrice, now);
+    if (retry) return this.close(symbol, retry.reason, retry.intendedPrice, now, retry.thesisStop ? { thesisStop: true } : {});
     await this.placeTakeProfit(p, quote, now);
     return reduced ? { status: "reduced", position: reduced } : { status: "none" };
   }
@@ -558,7 +803,7 @@ export class PositionManager {
    * 発注が締め切りを過ぎたら状態不明の保留として扱う (保留は発注前に書き込み済み)。
    * 拒否された場合の建玉の確認は、その場で待たずに次のティック (syncPending) へ回す。
    */
-  async close(symbol: string, reason: ExitReason, intendedPrice: number, now: number, opts: { maxQty?: Decimal } = {}): Promise<CloseResult> {
+  async close(symbol: string, reason: ExitReason, intendedPrice: number, now: number, opts: { maxQty?: Decimal; thesisStop?: boolean } = {}): Promise<CloseResult> {
     const p = this.get(symbol);
     if (!p) return { status: "none", reason: "ポジションがありません" };
     if (this.closing.has(p.id)) return { status: "none", reason: "決済中" };
@@ -584,7 +829,7 @@ export class PositionManager {
       // 板に置いた利確の指値があれば、先に取り消して結果 (または約定) を照会で確かめる。
       // 確定するまで成行は送らない (取消に失敗・状態不明のまま成行を送ると、利確の約定と重なって過剰決済・ドテンになりうる)
       if (this.tps.get(p.id)) {
-        const c = await this.clearTakeProfit(p, reason, intendedPrice, now);
+        const c = await this.clearTakeProfit(p, reason, intendedPrice, now, opts.thesisStop === true);
         if (c !== "cleared") return c;
       }
       const cur = this.get(symbol);
@@ -608,7 +853,7 @@ export class PositionManager {
       };
       const o: PendingOrder = {
         clientId: req.clientId, symbol, side: req.side, qty: req.qty, kind: "exit", createdAt: now, status: "submitting", unknownCount: 0,
-        exit: { tradeId: p.id, reason, intendedPrice },
+        exit: { tradeId: p.id, reason, intendedPrice, ...(opts.thesisStop ? { thesisStop: true } : {}) },
       };
       this.pending.upsert(o);
       this.exitOrderTs.push(now);
@@ -901,11 +1146,11 @@ export class PositionManager {
    * - 全量が利確で約定していたら closed
    * - 取消に失敗した・状態不明・取消が照会に反映されていない間は pending (成行を送らない。次のティックで照会を続ける)
    */
-  private async clearTakeProfit(p: OpenTrade, reason: ExitReason, intendedPrice: number, now: number): Promise<"cleared" | CloseResult> {
+  private async clearTakeProfit(p: OpenTrade, reason: ExitReason, intendedPrice: number, now: number, thesisStop = false): Promise<"cleared" | CloseResult> {
     const rtp = this.tps.get(p.id);
     if (!rtp) return "cleared";
     if (!rtp.exit) {
-      rtp.exit = { reason, intendedPrice, requestedAt: now };
+      rtp.exit = { reason, intendedPrice, requestedAt: now, ...(thesisStop ? { thesisStop: true } : {}) };
       this.plans[p.id] = { ...(this.plans[p.id] ?? {}), noRestingTp: true };
       this.persist();
       this.deps.store?.audit({ ts: now, type: "engine.tp_cancel", data: { symbol: p.symbol, tradeId: p.id, clientId: rtp.clientId, orderId: rtp.orderId, exitReason: reason } });
@@ -1388,8 +1633,11 @@ export class PositionManager {
     const x = o.exit!;
     const { now } = f;
     const remain = D(p.qty).minus(f.qty);
+    // 読みの管理の記録は決済計画を消す前に作る (全量の決済のときだけ TradeRecord に付く)
+    const thesis = this.thesisRecord(p, x.reason, x.thesisStop === true);
     const input = {
       exitPrice: f.price, intendedExitPrice: x.intendedPrice, exitTs: now, exitReason: x.reason, fees: (f.fee ?? D(0)).toNumber(),
+      ...(thesis ? { thesis } : {}),
       ...(f.estimated ? { estimated: true } : {}),
       ...(f.feesByLiquidity ? { feesByLiquidity: f.feesByLiquidity } : {}),
       ...(f.exitOrderType ? { exitOrderType: f.exitOrderType } : {}),
@@ -1413,7 +1661,9 @@ export class PositionManager {
         if (f.noRetry) {
           this.log.info("利確の指値が一部約定しました。残りは指値のまま追跡を続けます", { symbol: o.symbol, filled: f.qty.toString(), remaining: remain.toString() });
         } else {
-          this.plans[p.id] = { ...(this.plans[p.id] ?? {}), retryExit: { reason: x.reason, intendedPrice: x.intendedPrice } };
+          this.plans[p.id] = {
+            ...(this.plans[p.id] ?? {}), retryExit: { reason: x.reason, intendedPrice: x.intendedPrice, ...(x.thesisStop ? { thesisStop: true } : {}) },
+          };
           this.log.warn("決済が一部約定のみ。残りは次のティックで決済します", { symbol: o.symbol, filled: f.qty.toString(), remaining: remain.toString() });
         }
       }

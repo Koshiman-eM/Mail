@@ -3,6 +3,7 @@ import { createLogger } from "../core/logger";
 import type {
   AssetClass, CauseCode, ParamAdjustment, Params, RegimeLabel, Store, TradeAttribution, TradeRecord, TradingMode,
 } from "../core/types";
+import { isTimeLikeExit } from "../core/types";
 import { attributeTrade, pct, tradeOutcome } from "./attribution";
 import { proportionGreaterPValue, sampleStats, signTestPValue, welchLessPValue, type SampleStats } from "./stats";
 
@@ -204,11 +205,12 @@ export const TUNER_RULES: readonly Rule[] = [
     evidence: (_t, a) => hasCause(a, "early_exit"),
     pick: (p) => (has(p, "tpAtr") ? { param: "tpAtr", direction: "up" } : undefined),
   },
-  // 十分な含み益を吐き出した → トレーリングを詰める (無効なら利確幅を縮める)
+  // 十分な含み益を吐き出した → トレーリングを詰める (無効なら利確幅を縮める)。
+  // 読みの管理の延長後の保護ストップでの決済 (thesisStopExit) は戦略のトレーリング・利確幅の結果ではないので数えない
   {
     id: "exit_sooner",
     label: "late_exit (含み益の吐き出し)",
-    evidence: (_t, a) => hasCause(a, "late_exit"),
+    evidence: (t, a) => hasCause(a, "late_exit") && t.thesisStopExit !== true,
     pick: (p) =>
       has(p, "trailAtr") && p.trailAtr > 0
         ? { param: "trailAtr", direction: "down" }
@@ -216,13 +218,14 @@ export const TUNER_RULES: readonly Rule[] = [
           ? { param: "tpAtr", direction: "down" }
           : undefined,
   },
-  // トレーリングで決済した後、実現リターン以上に有利方向へ伸びた (トレーリングが近すぎる) → トレーリングを緩める
+  // トレーリングで決済した後、実現リターン以上に有利方向へ伸びた (トレーリングが近すぎる) → トレーリングを緩める。
+  // 読みの管理の延長後の保護ストップでの決済 (thesisStopExit) は戦略のトレーリング (trailAtr) の結果ではないので数えない
   {
     id: "trail_loosen",
     label: "トレーリング決済後にさらに伸びた",
     evidence: (t) => {
       const post = postMove(t);
-      if (t.exitReason !== "trailing" || post === undefined) return false;
+      if (!isStrategyTrailingExit(t) || post === undefined) return false;
       return post > 0 && post >= Math.max(Math.abs(t.returnPct), costPctOf(t), 0.25 * stopWidthPct(t));
     },
     pick: (p) => (has(p, "trailAtr") && p.trailAtr > 0 ? { param: "trailAtr", direction: "up" } : undefined),
@@ -249,17 +252,25 @@ export const TUNER_RULES: readonly Rule[] = [
     evidence: (_t, a) => hasCause(a, "time_decay"),
     pick: (p) => (has(p, "maxHoldBars") ? { param: "maxHoldBars", direction: "down" } : undefined),
   },
-  // 時間切れで決済した後、有利方向へ大きく動いた (保有時間が短すぎる) → 保有時間を長く
+  // 時間切れ (読みの管理の決済を含む) で決済した後、有利方向へ大きく動いた (保有時間が短すぎる) → 保有時間を長く
   {
     id: "hold_extend",
     label: "時間切れ決済後に有利方向へ伸びた",
     evidence: (t) => {
       const post = postMove(t);
-      return t.exitReason === "time" && post !== undefined && post > 0 && post >= Math.max(0.5 * stopWidthPct(t), 2 * costPctOf(t));
+      return isTimeLikeExit(t.exitReason) && post !== undefined && post > 0 && post >= Math.max(0.5 * stopWidthPct(t), 2 * costPctOf(t));
     },
     pick: (p) => (has(p, "maxHoldBars") ? { param: "maxHoldBars", direction: "up" } : undefined),
   },
 ];
+
+/**
+ * 戦略のトレーリング (trailingStopPct / trailAtr) による決済か。読みの管理の延長後の保護ストップ (建値・トレーリング) での
+ * 決済 (TradeRecord.thesisStopExit) は除く (トレーリングの調整の根拠にしない)
+ */
+export function isStrategyTrailingExit(t: Pick<TradeRecord, "exitReason" | "thesisStopExit">): boolean {
+  return t.exitReason === "trailing" && t.thesisStopExit !== true;
+}
 
 /** 学習済みパラメータの kv キー (mode 別) */
 export const paramsKey = (mode: TradingMode, strategyId: string, assetClass: AssetClass) => `params:${mode}:${strategyId}:${assetClass}`;

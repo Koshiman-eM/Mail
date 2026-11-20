@@ -39,8 +39,9 @@ import {
   peekResolveRequests, readLimitStats, removeResolveRequests, type LimitCancelReason, type LimitStats, type PendingEntry, type PendingLimit, type PendingOrder,
   type PendingStatus,
 } from "./orders";
-import { DEFAULT_ORDER_POLICY, PositionManager, type EntryResult, type OrderPolicy, type SyncResult } from "./positions";
+import { DEFAULT_ORDER_POLICY, PositionManager, type EntryResult, type OrderPolicy, type SyncResult, type ThesisView } from "./positions";
 import { clampMaxHoldMs, isHoldLimitedHorizon, TempoController, tempoSeedTimestamps, tempoStatusView, type TempoStatusView } from "./tempo";
+import { thesisSettingsFromEnv, type ThesisSettings } from "./thesis";
 import { effectiveLimitTakeProfit } from "./limitOrders";
 
 export const PAPER_SNAPSHOT_KEY = "paper:snapshot";
@@ -223,6 +224,8 @@ export interface PositionStatus {
   unrealizedPnl: number;
   unrealizedPnlAccount?: number;
   quoteCurrency: string;
+  /** 読みの管理の状態 (読みの管理を使う建玉だけ。src/engine/positions.ts の ThesisView) */
+  thesis?: ThesisView;
 }
 
 export interface EngineStatus {
@@ -282,8 +285,10 @@ export interface EngineStatus {
    * minutesSinceLastEntry: 最後のエントリーからの経過 (分。無ければ null) / exploreAllowed: 探索を許すか
    */
   tempo?: TempoStatusView;
-  /** 新規エントリーの最大保有時間 (分。0 = 無効。MAX_HOLD_MINUTES) */
+  /** 新規エントリーの最大保有時間 (分。0 = 無効。MAX_HOLD_MINUTES。読みの管理が有効なら読みの期限の上限) */
   maxHoldMinutes?: number;
+  /** 読みの管理の設定 (THESIS_*) */
+  thesis?: ThesisSettings;
   /** 指値 (maker) の利用状況: 設定・約定率の集計・待っている指値のエントリー・板に置いた利確の指値 */
   limitOrders?: {
     limitEntry: boolean;
@@ -402,6 +407,8 @@ export class TradingEngine {
   private readonly tempoExploreSize: number;
   /** 新規エントリーの最大保有時間 (ms。MAX_HOLD_MINUTES > 0 のときだけ) */
   private readonly maxHoldMs?: number;
+  /** 読みの管理 (THESIS_*。手組みの設定 (テスト) で未設定の項目は config の既定値) */
+  readonly thesis: ThesisSettings;
   private readonly opt: Required<Omit<EngineOptions, "tickMs" | "intelEveryMs" | "learnEveryMs" | "shadow" | "newsEvalEveryMs" | "forecast">> & {
     tickMs: number;
     intelEveryMs: number;
@@ -468,6 +475,7 @@ export class TradingEngine {
     this.tempoExploreSize = ex !== undefined && Number.isFinite(ex) && ex > 0 && ex <= 1 ? ex : 0.5;
     const mh = env.MAX_HOLD_MINUTES ?? 0;
     if (Number.isFinite(mh) && mh > 0) this.maxHoldMs = Math.round(mh * 60_000);
+    this.thesis = thesisSettingsFromEnv(env);
     const o = deps.options ?? {};
     this.opt = {
       equityEveryMs: o.equityEveryMs ?? 60_000,
@@ -510,13 +518,16 @@ export class TradingEngine {
       // 利確の指値の板置きは paper 専用 (live では LIMIT_TAKE_PROFIT=true でも置かない。起動時に警告する)。
       // 手組みの設定 (テスト) で未設定なら config の既定値 (false) と同じ扱い
       limitTakeProfit: effectiveLimitTakeProfit(env, deps.brokerSet.mode),
+      // 読みの管理: 期限で答え合わせをして決済・延長する (無効なら従来の時間切れ)
+      thesis: this.thesis,
     });
     const { enabled: shadowEnabled, ...shadowOpts } = o.shadow ?? {};
     if (shadowEnabled !== false) {
       this.shadow = new ShadowTracker({
         store: deps.store,
         mode: deps.brokerSet.mode,
-        options: shadowOpts,
+        // 仮想トレードも実際の建玉と同じ読みの管理で決済する (腕の学習をそろえるため)
+        options: { thesis: this.thesis, ...shadowOpts },
         onClosed: (t) => this.onShadowClosed(t),
         onError: (where, e) => this.warnThrottled(where, this.clock.now(), "仮想トレードの処理に失敗 (取引は継続)", { error: errMsg(e) }),
       });
@@ -691,11 +702,30 @@ export class TradingEngine {
     if (pending.length) this.log.warn("保留中の注文があります。照会して確定させます", { orders: pending.map((o) => `${o.symbol} ${o.kind} ${o.clientId}`) });
     this.entryPause(now);
     this.seedTempo(now);
+    this.warnThesisLive(now);
     this.store.audit({
       ts: now,
       type: "engine.start",
       data: { mode: this.mode, watched: this.hub.watched().map((i) => i.symbol), openPositions: this.journal.list().length, pendingOrders: pending.length },
     });
+  }
+
+  /**
+   * live で読みの管理が有効なまま、最大保有・読みの期限のある建玉を引き継いだら、起動時に 1 回だけ警告して監査ログ thesis.enabled_live に残す
+   * (以前の時間切れではなく、期限で読み外れ・延長で決済されるため)
+   */
+  private warnThesisLive(now: number): void {
+    if (this.mode !== "live" || !this.thesis.enabled) return;
+    const managed = this.positions.list().filter((p) => {
+      const plan = this.positions.planOf(p.id);
+      return (plan.maxHoldMs ?? 0) > 0 || (plan.expectedMs ?? 0) > 0;
+    });
+    if (managed.length === 0) return;
+    const data = { settings: { ...this.thesis }, positions: managed.map((p) => ({ tradeId: p.id, symbol: p.symbol, entryTs: p.entryTs })) };
+    this.log.warn("live: 読みの管理 (THESIS_EXIT) が有効です。保有中の建玉は期限で答え合わせをして決済・延長します (時間切れではありません)", {
+      positions: managed.map((p) => p.symbol), ...data.settings,
+    });
+    this.store.audit({ ts: now, type: "thesis.enabled_live", data });
   }
 
   /**
@@ -1484,12 +1514,14 @@ export class TradingEngine {
 
   /**
    * MAX_HOLD_MINUTES: シグナルの最大保有を上限までに縮める (0・非有限 = 時間切れ無しも上限にする)。
+   * 読みの期限 (expectedMs) があれば同じく上限までに縮める (読みの管理が有効なら MAX_HOLD_MINUTES は読みの期限の上限)。
    * 無効・flat ならそのまま (同じオブジェクト)
    */
   private clampHold(sig: Signal): Signal {
     if (this.maxHoldMs === undefined || sig.direction === "flat") return sig;
     const next = clampMaxHoldMs(sig.maxHoldMs, this.maxHoldMs);
-    return next === sig.maxHoldMs ? sig : { ...sig, maxHoldMs: next };
+    const exp = sig.expectedMs !== undefined && Number.isFinite(sig.expectedMs) && sig.expectedMs > 0 ? Math.min(sig.expectedMs, this.maxHoldMs) : sig.expectedMs;
+    return next === sig.maxHoldMs && exp === sig.expectedMs ? sig : { ...sig, maxHoldMs: next, ...(exp !== undefined ? { expectedMs: exp } : {}) };
   }
 
   /** 前回の判定以降の 1m 確定足の高値・安値 */
@@ -2066,6 +2098,7 @@ export class TradingEngine {
       plan: {
         ...(sig.trailingStopPct !== undefined ? { trailingStopPct: sig.trailingStopPct } : {}),
         ...(sig.maxHoldMs !== undefined ? { maxHoldMs: sig.maxHoldMs } : {}),
+        ...(sig.expectedMs !== undefined && sig.expectedMs > 0 ? { expectedMs: sig.expectedMs } : {}),
       },
       audit: {
         direction: sig.direction,
@@ -2439,6 +2472,10 @@ export class TradingEngine {
         unrealizedPnl: upnl.toNumber(),
         ...(Number.isFinite(rate) ? { unrealizedPnlAccount: upnl.mul(rate).toNumber() } : {}),
         quoteCurrency: ccy,
+        ...((() => {
+          const th = this.positions.thesisView(p, q, now);
+          return th ? { thesis: th } : {};
+        })()),
       };
     });
     const plan = this.store.latestPlan();
@@ -2547,6 +2584,7 @@ export class TradingEngine {
       })(),
       tempo: this.tempoStatus(now),
       maxHoldMinutes: this.maxHoldMs !== undefined ? this.maxHoldMs / 60_000 : 0,
+      thesis: { ...this.thesis },
       limitOrders: {
         limitEntry: this.config.env.LIMIT_ENTRY ?? true,
         limitTakeProfit: effectiveLimitTakeProfit(this.config.env, this.mode),

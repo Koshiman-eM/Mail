@@ -35,6 +35,8 @@ export interface BacktestCommandOptions {
    * 中期・長期は縮めずに計算し、運用では新規エントリーしない旨を備考に出す
    */
   maxHoldMinutes?: number;
+  /** 読みの管理 (実運用の THESIS_* に合わせる。省略で従来の時間切れ) */
+  thesis?: BacktestOptions["thesis"];
 }
 
 export interface BacktestRow {
@@ -170,6 +172,7 @@ export async function runBacktestCommand(o: BacktestCommandOptions): Promise<Bac
       ...(o.maxPositionPct !== undefined ? { maxPositionPct: o.maxPositionPct } : {}),
       ...(o.limitOrders ? { limitOrders: o.limitOrders } : {}),
       ...(holdOn && !isHoldLimitedHorizon(s.horizon) ? { maxHoldMinutes: o.maxHoldMinutes } : {}),
+      ...(o.thesis ? { thesis: o.thesis } : {}),
     });
     const notes = [
       ...(r.metrics.trades === 0 ? [r.stats.evaluations === 0 ? "ウォームアップ不足" : "シグナルなし"] : []),

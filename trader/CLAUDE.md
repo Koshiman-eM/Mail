@@ -9,13 +9,13 @@
 
 ## 2. コマンド
 - `npm install` / `npm test` / `npm run typecheck`
-- `npm run simulate -- --days 1`: 合成データで高速にペーパー運転する (ネット不要)。構造フィルターの理由別の見送り数・エントリー/時・平均保有・テンポ・見送り件数も表示
+- `npm run simulate -- --days 1`: 合成データで高速にペーパー運転する (ネット不要)。構造フィルターの理由別の見送り数・エントリー/時・平均保有・テンポ・見送り件数・読みの答え合わせも表示
 - `npm run backtest -- --strategy all [--source synthetic|ccxt|gmo]`
 - `npm run backtest -- --structure-compare [--strategy <id>|all] [--pivot-sweep] [--folds 5] [--days N] [--source ...]`: 相場構造フィルターの比較 (A: ラッパーなし 〜 G: conservative を evaluateParams の区間で比べる)。30 取引未満の区間は「回数不足」。`--pivot-sweep` (N=4/6/10) は頑健性の確認だけで、N を調整し続けない
 - `npm start`: 実時間で起動する。既定は paper
-- `npm run report`: 成績と学習状態 (現在の mode のもの) を表示。注文種別ごとの成績・maker/taker 手数料の内訳・指値の約定率・探索/通常 (テンポ) の表も出す
+- `npm run report`: 成績と学習状態 (現在の mode のもの) を表示。注文種別ごとの成績・maker/taker 手数料の内訳・指値の約定率・探索/通常 (テンポ) の表・読みの答え合わせ (途中/期限で読み外れ・延長・期限前に決着、期限での的中率) も出す
 - `npm run trader -- intel`: 情報収集を 1 回実行してブリーフを表示
-- `npm run status`: 設定と現在の状態を表示 (指値の設定と約定率、テンポ・最大保有も)
+- `npm run status`: 設定と現在の状態を表示 (指値の設定と約定率、テンポ・最大保有、読みの管理の設定と各建玉の読みの期限も)
 - `npm run trader -- resume`: キルスイッチ・日次停止を解除 (監査ログに記録。動作中のエンジンにも次のティックで反映)
 - `npm run trader -- orders` (`orders list`): 保留中・状態不明の注文を一覧
 - `npm run trader -- regime --symbol BTC/JPY --hours 3 [--tf 1m,15m,1h,4h] [--step <分>]`: 各時刻の相場の状態 (レジーム) を運用と同じ detectRegime で表示 (確定足だけ。スプレッドは 0 扱い。VENUES に gmo があれば GMOコインの足)。目線・押し安値/戻り高値・choppiness も表示
@@ -78,14 +78,26 @@
    - 緩めるのは戦略の costMult (1.5 へ)、scalp_pullback の閾値、MIN_EDGE_TO_COST (`TEMPO_MIN_EDGE_TO_COST` へ。1 未満にしない) だけ。edgeIsNet のシグナルはコストを二重計上しない。クールダウン・損切り幅の制限・最大保有・RiskManager のそのほかの判定は緩めない。
    - 探索は paper では常に、live では `TEMPO_ALLOW_LIVE_EXPLORE=true` のときだけ。純期待値の下限を tempo × 往復コストだけ下げ (`tempoNetEdgeFloor`。RiskManager も同じ)、純期待値 ≤ 0 のエントリーはサイズ × `TEMPO_EXPLORE_SIZE` (既定 0.5) で `features.tempoExplore=1`。NaN は常に拒否。
    - 上限: 直近 1 時間のエントリーが ceil(目標 × `TEMPO_CAP_MULTIPLIER` (既定 2)) に達したら新規を止め、仮想トレード `tempo_cap`。エントリーは約定して建玉になった時に 1 回数え、再起動時はこの mode の直近 1 時間の取引と建玉から復元する。
-   - `MAX_HOLD_MINUTES` (0 = 無効、5〜1440): mid / long は新規を発注せず仮想トレード `hold_limit` (observe_only と同じ扱い、重み 0.25、腕の停止には使わない)。ほかの戦略は maxHold を丸める。保有中の建玉は変えない。バックテスト・検証も同じ `maxHoldMinutes` (mid / long は丸めない)。
+   - `MAX_HOLD_MINUTES` (0 = 無効、5〜1440): mid / long は新規を発注せず仮想トレード `hold_limit` (observe_only と同じ扱い、重み 0.25、腕の停止には使わない)。ほかの戦略は maxHold (と expectedMs) を丸める。保有中の建玉は変えない。バックテスト・検証も同じ `maxHoldMinutes` (mid / long は丸めない)。
+   - `THESIS_EXIT` が有効 (既定) なら `MAX_HOLD_MINUTES` は読みの期限の上限で、読みが当たっている建玉は 期限 × `THESIS_EXTEND_MULT` まで持ちうる (17)。
+17. **読みの管理** (`THESIS_EXIT` 既定 true、`src/engine/thesis.ts` が純粋な判定。false なら従来の時間切れ `time` と同一):
+   - 期限 = entryTs + expectedMs (`Signal.expectedMs`、無ければ丸めた maxHoldMs)。plan に maxHoldMs / expectedMs が無い建玉・当初リスク |建値 − 当初ストップ| ≤ 0 は従来どおり。
+   - 純 R = (方向 × (決済できる価格 (買い bid / 売り ask) − 建値) − 実際のエントリー手数料/単位 − taker 率 × 決済できる価格) / 当初リスク。建玉の純 R には GMO の持ち越し手数料と paper の空売りの借入コストを含めない (仮想トレードの純 R は含む)。そのため日本時間 6:00 をまたいだ GMO の建玉の「建値」決済はわずかな損失になりうる。
+   - 途中で読み外れ `thesis_failed`: 期限の半分以降で 値動きだけの R (grossR = 方向 × (仲値 − 建値) / 当初リスク。バックテストは終値) ≤ −`THESIS_EARLY_CUT_R` (0〜1、既定 0.5。0 で無効)。コスト (手数料・スプレッド) だけでは切らない。期限 `thesis_timeout`: 純 R < `THESIS_MIN_R` (0〜2、既定 0.1)。それ以外は延長。期限 × `THESIS_EXTEND_MULT` (1〜20、既定 4) → `thesis_cap` (延長前に上限に届いた建玉も、利益が出ていれば延長を記録してから決済 = 答え合わせは延長)。
+   - 決めた読みの決済は決済計画の `thesis.exit` に保存し、約定するまで同じ理由で再試行する (従来の時間切れと同じく損切り・利確・トレーリングが先、再試行の待ちも同じ)。その間・一部約定の残り (`retryExit`) の間は延長しない。
+   - 延長: 決済計画 (kv `positions:exitPlans:<mode>`) の `thesis` (extendedAt・peak・stop) に保存 (再起動後も継続)、監査ログ `thesis.extended`。保護ストップ = 今のストップと max(建値 (往復手数料込み), 延長後の極値 − `THESIS_TRAIL_R` (0.1〜3、既定 0.5) × 当初リスク) のきつい方 (売りは逆)。極値は延長した時点の決済できる価格から始め、延長より前の高値・安値は使わない。延長した判定ではストップを判定しない (延長そのもので決済しない)。保存したストップ (`thesis.stop`) とのきつい方を使い、設定・手数料が変わっても緩めない。`THESIS_EXIT=false` で再起動しても保存したストップで守る。この決済は `trailing` で、決済の注文 (`PendingExit.thesisStop`) に印を付けて約定したときだけ `thesisStopExit: true` (ParamTuner の trail_loosen・exit_sooner の根拠から除く: `isStrategyTrailingExit`)。利確・損切り・シグナルは従来どおり。
+   - 判定は PositionManager の毎ティック (時間切れと同じ位置)。決済は通常の成行 (利確の指値の取消確認・reduceOnly・状態不明の扱いはそのまま)。live で読みの管理が有効なまま決済計画つきの建玉を引き継いだら、起動時に警告して監査ログ `thesis.enabled_live` (設定と建玉)。
+   - バックテストは足の終値で判定 (期限は終値 ∓ 半スプレッドの純 R、途中は終値の grossR) して次の足の始値で決済、延長後のストップは次の足から、極値は延長した足以降の高値・安値 (∓ 半スプレッド) を前の足まで (先読みなし)。`thesis` を backtest・`createParamValidator`・setup・backtest コマンドへ渡す。
+   - 仮想トレードも同じ規則。`thesisExpectedMs` は読みの管理が有効なときだけ記録 (無い古い記録は従来どおり)。極値と延長後の保護ストップの判定は、延長した時刻以降に始まった 1m 足と気配だけ (当初の損切りは従来どおりの範囲)。
+   - TradeRecord / ShadowTradeRecord に `thesisExpectedMs` / `thesisDeadlineTs` / `thesisExtendedAt` / `thesisOutcome` (failed_early / timeout / extended / none) / `thesisNetRAtDeadline` / `thesisStopExit` (TradeRecord のみ) (任意。古い記録も読める)。要因分析・ParamTuner は 3 つの理由を time と同じ扱い (`isTimeLikeExit`)。
+   - 表示: report / simulate の「読みの答え合わせ」(テンポの表と同じく「うち空売り (paper 再現)」の件数・純損益を注記)、ダッシュボードの保有ポジション (読みの期限・残り分・状態・現在の R)、status の設定と各建玉の期限。ラベルは 読み外れ(途中) / 読み外れ(期限) / 延長の上限。
 
 ## 4. 構成
 - `src/core/`: 型の契約 (`types.ts`)、設定、decimal、HTTP リトライ、Claude 呼び出し (`ai.ts`。構造化出力、拒否時はサーバー側フォールバック、キー未設定時はルールベース)
 - `src/indicators/`, `src/regime/`: 指標・リサンプル・相場環境の判定
 - `src/strategies/`: 12 戦略 (scalp 6 / short 3 / mid / long / meme)。scalp_rebound は 15m の下降トレンド中の 1m の反発を買う (買いのみ・crypto。既定で観測専用)。scalp_pullback は 15m EMA20 の傾きで方向を決め、上昇中の 1m の押しを買い・下降中の戻りを売る (crypto。売りは canShort。損切り = 押しの極値 ± stopAtr (0.3) ATR を 0.8〜3.5 ATR に収める (超えたら見送り)、利確 = tpR (2) × 損切り幅、保有 10〜30 分、純期待値 (edgeIsNet)、コスト条件と 5 本のクールダウンあり。構造ラッパーなし・観測専用でない)。パラメータの標準名は stopAtr, tpAtr, trailAtr, entryThreshold, maxHoldBars
 - `src/structure/`: 相場構造 (pivots・machine・perfectOrder・mtf・wrap・settings)。`src/engine/structureCompare.ts` は `--structure-compare`
-- `src/engine/tempo.ts`: テンポ・上限・探索。`limitOrders.ts`: 指値エントリー / 待機の利確の管理。`orders.ts`: 保留中・状態不明の注文の管理 (指値の取消確認・約定率の統計を含む)
+- `src/engine/tempo.ts`: テンポ・上限・探索。`thesis.ts`: 読みの管理の純粋な判定 (期限・純 R・延長後の保護ストップ・決済理由)。`limitOrders.ts`: 指値エントリー / 待機の利確の管理。`orders.ts`: 保留中・状態不明の注文の管理 (指値の取消確認・約定率の統計を含む)
 - `src/backtest/`: イベント駆動バックテスト、`evaluateParams`、`walkForward`、合成データ
 - `src/market/`: feed (ccxt / GMOコイン / OANDA / Alpaca / DexScreener / synthetic) と MarketHub。GMO は `src/market/gmo/` (client・klines・check) と `feeds/gmo.ts`
 - `src/execution/`: PaperBroker、実口座アダプター (ccxt / GMO `gmoBroker.ts` / OANDA / Alpaca)、router

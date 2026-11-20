@@ -387,8 +387,9 @@ function trade(id: string, entryTs: number, mode: "paper" | "live"): TradeRecord
 describe("simulate: テンポ・最大保有の環境変数", () => {
   it("TARGET_ENTRIES_PER_HOUR / MAX_HOLD_MINUTES を反映し、1 時間あたりのエントリー数とテンポの状態を出す", async () => {
     const store = new MemoryStore();
+    // 最大保有 = 時間切れ (従来) を確かめるため読みの管理は無効にする (有効時は下のテスト)
     const { report } = await runSimulation({
-      hours: 2, stepMs: 30_000, seed: 2, store, env: { NODE_ENV: "test", TARGET_ENTRIES_PER_HOUR: "6", MAX_HOLD_MINUTES: "30" },
+      hours: 2, stepMs: 30_000, seed: 2, store, env: { NODE_ENV: "test", TARGET_ENTRIES_PER_HOUR: "6", MAX_HOLD_MINUTES: "30", THESIS_EXIT: "false" },
     });
     const tp = report.tempo!;
     expect(tp.status).toMatchObject({ enabled: true, target: 6, exploreAllowed: true });
@@ -407,6 +408,26 @@ describe("simulate: テンポ・最大保有の環境変数", () => {
     expect(text).toContain("最大保有 30 分");
     expect(text).toContain("■ テンポの探索と通常のエントリー");
   }, 60_000);
+
+  it("読みの管理が有効なら MAX_HOLD_MINUTES は読みの期限: 利益が出ている建玉は 期限 × THESIS_EXTEND_MULT まで持ち、答え合わせの表を出す", async () => {
+    const store = new MemoryStore();
+    const { report } = await runSimulation({
+      hours: 3, stepMs: 30_000, seed: 2, store, env: { NODE_ENV: "test", TARGET_ENTRIES_PER_HOUR: "6", MAX_HOLD_MINUTES: "30", THESIS_EXTEND_MULT: "2" },
+    });
+    const trades = store.listTrades();
+    expect(trades.length).toBeGreaterThan(0);
+    // 上限は 30 分 × 2 (+ 判定の刻み)。読みの管理の記録が全取引に付く (期限 30 分以内)
+    expect(trades.every((t) => t.exitTs - t.entryTs <= 60 * MIN + 30_000)).toBe(true);
+    expect(trades.every((t) => t.thesisOutcome !== undefined && t.thesisExpectedMs! <= 30 * MIN && t.thesisDeadlineTs === t.entryTs + t.thesisExpectedMs!)).toBe(true);
+    expect(trades.some((t) => t.exitReason === "time")).toBe(false);
+    // 期限を過ぎて保有した取引は延長したものだけ
+    expect(trades.filter((t) => t.exitTs > t.thesisDeadlineTs! + 30_000).every((t) => t.thesisOutcome === "extended")).toBe(true);
+    expect(report.thesis?.settings).toMatchObject({ enabled: true, extendMult: 2 });
+    expect(report.thesis!.summary.rows.reduce((a, r) => a + r.trades, 0)).toBe(trades.length);
+    const text = formatSimulationReport(report);
+    expect(text).toContain("■ 読みの答え合わせ (読みの管理 有効");
+    expect(text).toContain("期限での的中率");
+  }, 90_000);
 
   it("環境変数が無ければテンポ・最大保有は無効 (表示だけ)", async () => {
     const { report } = await runSimulation({ hours: 1, stepMs: 30_000, seed: 2, store: new MemoryStore(), env: { NODE_ENV: "test" } });

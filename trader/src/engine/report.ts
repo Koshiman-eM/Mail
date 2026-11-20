@@ -8,6 +8,7 @@ import { SIMULATED_SHORT_ARM_SUFFIX } from "../learning/allocator";
 import { microReasonLabel, sideLabel, SIMULATED_SHORT_LABEL, type ShadowGroup, type ShadowSummary } from "../learning/shadow";
 import { quoteCurrencyOfSymbol } from "./fx";
 import type { LimitStats } from "./orders";
+import { THESIS_OUTCOME_LABEL, type ThesisOutcome } from "./thesis";
 
 export const EXIT_REASON_LABEL: Record<ExitReason, string> = {
   stop: "損切り",
@@ -17,6 +18,9 @@ export const EXIT_REASON_LABEL: Record<ExitReason, string> = {
   time: "時間切れ",
   kill_switch: "キルスイッチ",
   manual: "手動",
+  thesis_failed: "読み外れ(途中)",
+  thesis_timeout: "読み外れ(期限)",
+  thesis_cap: "延長の上限",
 };
 
 export const ADJUSTMENT_STATUS_LABEL: Record<string, string> = {
@@ -263,7 +267,34 @@ export type TempoClass = "explore" | "tempo_normal" | "no_tempo";
 export interface TempoSummary extends Omit<StrategySummary, "strategyId"> {
   kind: TempoClass;
   label: string;
+  /** うち空売り (paper 再現。live では実行できない) の件数・純損益 (口座通貨) */
+  simShortTrades: number;
+  simShortNetPnl: number;
 }
+
+/** 区分の行に「うち空売り (paper 再現)」の件数・純損益を付ける (区分のキー → 件数・純損益) */
+function simShortByKey(
+  trades: TradeRecord[],
+  keyOf: (t: TradeRecord) => string,
+  toAccount: (ccy: string) => number,
+  quoteOf?: (t: TradeRecord) => string | undefined,
+  exitRates?: Map<string, number>,
+): Map<string, { trades: number; netPnl: number }> {
+  const rows = summarizeByStrategy(
+    trades.filter(isSimulatedShortTrade).map((t) => ({ ...t, strategyId: keyOf(t) })),
+    toAccount,
+    quoteOf,
+    exitRates,
+  );
+  return new Map(rows.map((r) => [r.strategyId, { trades: r.trades, netPnl: r.netPnl }]));
+}
+
+/** 「うち空売り (paper 再現)」の列 (該当する行が無ければ列を出さない) と注記 */
+const SIM_SHORT_COLUMN = "うち空売り(paper再現)";
+const simShortCell = (r: { simShortTrades: number; simShortNetPnl: number }) =>
+  r.simShortTrades > 0 ? `${r.simShortTrades} 件 (${fmtSigned(r.simShortNetPnl)})` : "-";
+const SIM_SHORT_NOTE =
+  `  ※ うち空売り (paper 再現) = 取引所では空売りできない現物を paper でだけ売り建てた取引 (各区分の件数・純損益に含む)。live では空売りしません。live で実際にできる成績は「方向別の成績」を参照`;
 
 const TEMPO_CLASS_ORDER: TempoClass[] = ["explore", "tempo_normal", "no_tempo"];
 const TEMPO_CLASS_LABEL: Record<TempoClass, string> = {
@@ -296,22 +327,116 @@ export function summarizeByTempo(
     quoteOf,
     exitRates,
   );
+  const sim = simShortByKey(trades, tempoClassOf, toAccount, quoteOf, exitRates);
   return rows
-    .map(({ strategyId, ...r }) => ({ ...r, kind: strategyId as TempoClass, label: TEMPO_CLASS_LABEL[strategyId as TempoClass] ?? strategyId }))
+    .map(({ strategyId, ...r }) => ({
+      ...r, kind: strategyId as TempoClass, label: TEMPO_CLASS_LABEL[strategyId as TempoClass] ?? strategyId,
+      simShortTrades: sim.get(strategyId)?.trades ?? 0, simShortNetPnl: sim.get(strategyId)?.netPnl ?? 0,
+    }))
     .sort((a, b) => TEMPO_CLASS_ORDER.indexOf(a.kind) - TEMPO_CLASS_ORDER.indexOf(b.kind));
 }
 
 /** テンポの区分別の成績の表 (探索の取引が無ければその旨を添える) */
 export function renderTempoTable(rows: TempoSummary[], ccy: string): string {
   if (rows.length === 0) return "  (トレードなし)";
+  const sim = rows.some((r) => (r.simShortTrades ?? 0) > 0);
   const table = formatTable(
-    ["区分", "取引数", "勝率", `純損益(${ccy})`, `手数料(${ccy})`, "平均R"],
-    rows.map((r) => [r.label, r.trades, fmtPct(r.winRate, 1), fmtSigned(r.netPnl), fmtNum(r.fees, 0), r.avgR.toFixed(2)]),
+    ["区分", "取引数", "勝率", `純損益(${ccy})`, `手数料(${ccy})`, "平均R", ...(sim ? [SIM_SHORT_COLUMN] : [])],
+    rows.map((r) => [
+      r.label, r.trades, fmtPct(r.winRate, 1), fmtSigned(r.netPnl), fmtNum(r.fees, 0), r.avgR.toFixed(2), ...(sim ? [simShortCell(r)] : []),
+    ]),
   );
   const notes: string[] = [];
   if (!rows.some((r) => r.kind === "explore")) notes.push("  探索のエントリーはありません");
   notes.push("  ※ 探索 = テンポで期待値の下限を下げて入った、コスト控除後の期待値が 0 以下の取引 (TEMPO_EXPLORE_SIZE 倍のサイズ)");
+  if (sim) notes.push(SIM_SHORT_NOTE);
   return [table, ...notes].join("\n");
+}
+
+// ───────── 読みの答え合わせ (読みの管理 THESIS_EXIT) ─────────
+
+export interface ThesisRow extends Omit<StrategySummary, "strategyId"> {
+  outcome: ThesisOutcome;
+  label: string;
+  /** うち空売り (paper 再現。live では実行できない) の件数・純損益 (口座通貨) */
+  simShortTrades: number;
+  simShortNetPnl: number;
+}
+
+export interface ThesisSummary {
+  /** 区分別 (途中で読み外れ / 期限で読み外れ / 期限で読み当たり→延長 / 期限前に決着。件数のある区分だけ) */
+  rows: ThesisRow[];
+  /** 延長した取引の期限からの追加の保有時間の平均 (分) */
+  extendedAvgExtraMinutes: number;
+  /** 延長した取引の最終的な決済理由 */
+  extendedExits: Partial<Record<ExitReason, number>>;
+  /** 期限での的中率 = 延長 / (延長 + 期限で読み外れ)。どちらも 0 件なら NaN */
+  deadlineHitRate: number;
+  extended: number;
+  timeout: number;
+  /** 読みの管理の記録が無い取引 (古い取引・無効のとき・期限の無い建玉) */
+  untracked: number;
+}
+
+const THESIS_ORDER: ThesisOutcome[] = ["failed_early", "timeout", "extended", "none"];
+
+/** 読みの答え合わせの集計 (TradeRecord.thesisOutcome がある取引だけ) */
+export function summarizeThesis(
+  trades: TradeRecord[],
+  toAccount: (ccy: string) => number,
+  quoteOf?: (t: TradeRecord) => string | undefined,
+  exitRates?: Map<string, number>,
+): ThesisSummary {
+  const tracked = trades.filter((t) => t.thesisOutcome !== undefined);
+  const sim = simShortByKey(tracked, (t) => t.thesisOutcome!, toAccount, quoteOf, exitRates);
+  const rows = summarizeByStrategy(
+    tracked.map((t) => ({ ...t, strategyId: t.thesisOutcome! })),
+    toAccount,
+    quoteOf,
+    exitRates,
+  )
+    .map(({ strategyId, ...r }) => ({
+      ...r, outcome: strategyId as ThesisOutcome, label: THESIS_OUTCOME_LABEL[strategyId as ThesisOutcome] ?? strategyId,
+      simShortTrades: sim.get(strategyId)?.trades ?? 0, simShortNetPnl: sim.get(strategyId)?.netPnl ?? 0,
+    }))
+    .sort((a, b) => THESIS_ORDER.indexOf(a.outcome) - THESIS_ORDER.indexOf(b.outcome));
+  const ext = tracked.filter((t) => t.thesisOutcome === "extended");
+  const extra = ext.map((t) => Math.max(0, t.exitTs - (t.thesisDeadlineTs ?? t.thesisExtendedAt ?? t.exitTs)) / 60_000);
+  const extended = ext.length;
+  const timeout = tracked.filter((t) => t.thesisOutcome === "timeout").length;
+  return {
+    rows,
+    extendedAvgExtraMinutes: extra.length ? extra.reduce((a, b) => a + b, 0) / extra.length : 0,
+    extendedExits: exitReasonCounts(ext),
+    deadlineHitRate: extended + timeout > 0 ? extended / (extended + timeout) : NaN,
+    extended,
+    timeout,
+    untracked: trades.length - tracked.length,
+  };
+}
+
+/** 読みの答え合わせの表 (report / simulate 共通) */
+export function renderThesisTable(s: ThesisSummary | undefined, ccy: string): string {
+  if (!s || s.rows.length === 0) {
+    return `  (読みの管理の記録がある取引はまだありません${s && s.untracked ? `。記録なし ${s.untracked} 件 (古い取引・THESIS_EXIT=false・期限の無い建玉)` : ""})`;
+  }
+  const sim = s.rows.some((r) => (r.simShortTrades ?? 0) > 0);
+  const lines = [
+    formatTable(
+      ["区分", "取引数", "勝率", `純損益(${ccy})`, "平均R", ...(sim ? [SIM_SHORT_COLUMN] : [])],
+      s.rows.map((r) => [r.label, r.trades, fmtPct(r.winRate, 1), fmtSigned(r.netPnl), r.avgR.toFixed(2), ...(sim ? [simShortCell(r)] : [])]),
+    ),
+  ];
+  lines.push(
+    `  期限での的中率: ${fmtPct(s.deadlineHitRate, 1)} (延長 ${s.extended} / (延長 ${s.extended} + 期限で読み外れ ${s.timeout}))`,
+  );
+  if (s.extended > 0) {
+    const exits = Object.entries(s.extendedExits).map(([k, v]) => `${EXIT_REASON_LABEL[k as ExitReason] ?? k} ${v}`).join(" / ");
+    lines.push(`  延長した取引: 期限からの追加の保有 平均 ${s.extendedAvgExtraMinutes.toFixed(1)} 分 / 最終的な決済: ${exits || "-"}`);
+  }
+  if (s.untracked > 0) lines.push(`  ※ 読みの管理の記録が無い取引 ${s.untracked} 件は含みません (古い取引・THESIS_EXIT=false・期限の無い建玉)`);
+  if (sim) lines.push(SIM_SHORT_NOTE);
+  return lines.join("\n");
 }
 
 export function exitReasonCounts(trades: TradeRecord[]): Partial<Record<ExitReason, number>> {
@@ -406,7 +531,10 @@ export function renderCauses(c: CauseSummary): string {
   return `${head}\n${table}`;
 }
 
-const SHADOW_EXIT_LABEL: Record<string, string> = { stop: "損切り", take_profit: "利確", time: "時間切れ", unwatched: "監視終了" };
+const SHADOW_EXIT_LABEL: Record<string, string> = {
+  stop: "損切り", take_profit: "利確", time: "時間切れ", unwatched: "監視終了", trailing: "トレーリング",
+  thesis_failed: "読み外れ(途中)", thesis_timeout: "読み外れ(期限)", thesis_cap: "延長の上限",
+};
 
 function shadowGroupTable(title: string, rows: ShadowGroup[], limit: number): string {
   return formatTable(

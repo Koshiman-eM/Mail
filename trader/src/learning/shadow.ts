@@ -15,10 +15,22 @@
  *   - 利確: 指値扱い (約定ずれなし)。時間切れ: 決済側の気配 ∓ 約定ずれ
  *   - エントリーした 1m 足 (確定後) も判定に含める。その足にはエントリー前の値動きも入るので、不利側 (損切り・MAE) にだけ使い、
  *     有利側 (利確・MFE) はエントリー時刻以降に始まった足と毎ティックの気配だけで判定する (保守的。確定足だけを使うので先読みはしない)
+ * - 読みの管理 (options.thesis が有効): シグナルに最大保有・読みの期限があった仮想トレード (thesisExpectedMs あり) は、
+ *   実際の建玉と同じ src/engine/thesis.ts の規則で 途中で読み外れ / 期限で読み外れ / 延長 / 延長の上限 を判定する。
+ *   純 R は「今時間切れで決済したら」の netR (約定ずれ・借入コスト・持ち越し手数料込み)。延長後の建値・トレーリングは
+ *   延長した時点からの有利な極値 (thesisPeak。延長した時点の決済側の気配から始め、延長した時刻以降に始まった 1m 足と気配だけで進める)
+ *   から計算する。前回の判定までの極値を使い (同じ判定の足の高値でストップを上げない = 保守的)、延長した判定ではストップを判定しない。
+ *   延長後の保護ストップに触れたかは、延長した時刻以降に始まった 1m 足と気配だけで判定する (当初の損切りは従来どおり)。決済理由は trailing。
+ *   途中で読み外れは値動きだけの R (方向 × (仲値 − エントリー価格) / 1R) で判定する (コストだけでは切らない)。
+ *   thesisExpectedMs は読みの管理が有効なときだけ記録する。
+ *   thesisExpectedMs の無い古い記録は従来どおり。
  */
 import { randomUUID } from "node:crypto";
 import { defaultCosts } from "../backtest/engine";
 import { holdingFeeDailyOf, jstCutoffCrossings } from "../core/holdingFee";
+import {
+  advancePeak, decideThesis, resolveThesisMs, thesisGrossR, thesisOutcomeOf, thesisTrailStop, tighterStop, type ThesisSettings,
+} from "../engine/thesis";
 import type {
   AssetClass, Horizon, Instrument, Quote, RegimeLabel, ShadowExitReason, ShadowTradeRecord, Signal, Store, TradingMode,
 } from "../core/types";
@@ -35,6 +47,8 @@ export interface ShadowOptions {
   maxPerMinute: number;
   /** シグナルに maxHoldMs が無い (0 以下) ときの保有上限 */
   defaultMaxHoldMs: number;
+  /** 読みの管理 (省略・無効なら従来どおり maxHoldMs で時間切れ) */
+  thesis?: ThesisSettings;
 }
 
 export const DEFAULT_SHADOW_OPTIONS: ShadowOptions = {
@@ -51,6 +65,13 @@ export interface ShadowOpen extends Omit<ShadowTradeRecord, "exitTs" | "exitPric
   maeR: number;
   /** 判定に使った最後の 1m 確定足の開始時刻 (同じ足を二重に使わない) */
   lastCandleTs?: number;
+  /**
+   * 読みの管理で延長した後の有利な極値 (決済側の価格: 買いは bid 側の高値、売りは ask 側の安値)。
+   * 延長した時点の決済側の気配から始め、延長した時刻以降に始まった 1m 足と気配だけで進める。決済の記録には残さない
+   */
+  thesisPeak?: number;
+  /** 延長後の保護ストップ (きつくなる方へだけ更新する。決済の記録には残さない) */
+  thesisStop?: number;
 }
 
 /** 件数の記録 (捨てた理由別) */
@@ -68,7 +89,7 @@ export interface ShadowRecordInput {
   /** meta.holdingFeeDaily がある銘柄 (GMO) は持ち越し手数料を PaperBroker と同じ計算で costR / netR に含める */
   instrument: Pick<Instrument, "symbol" | "assetClass" | "takerFeeRate"> & Partial<Pick<Instrument, "meta">>;
   quote: Pick<Quote, "bid" | "ask">;
-  signal: Pick<Signal, "strategyId" | "direction" | "confidence" | "expectedEdgeBps" | "stopLoss" | "takeProfit" | "maxHoldMs"> & { horizon?: Horizon };
+  signal: Pick<Signal, "strategyId" | "direction" | "confidence" | "expectedEdgeBps" | "stopLoss" | "takeProfit" | "maxHoldMs" | "expectedMs"> & { horizon?: Horizon };
   regime: RegimeLabel;
   /** 見送り理由 (正規化したキー) */
   reason: string;
@@ -265,6 +286,8 @@ export class ShadowTracker {
       return false;
     }
     const tpOk = finite(sig.takeProfit) && (long ? sig.takeProfit > entryPrice : sig.takeProfit < entryPrice);
+    // 読みの期限 (シグナルの expectedMs、無ければ最大保有。読みの管理が有効なときだけ)。既定の保有上限 (defaultMaxHoldMs) は読みの期限にしない
+    const thesisMs = this.opts.thesis?.enabled === true ? resolveThesisMs(sig.expectedMs, sig.maxHoldMs) : undefined;
     const o: ShadowOpen = {
       id: `sh_${now.toString(36)}_${randomUUID().slice(0, 8)}`,
       mode: this.mode,
@@ -284,6 +307,7 @@ export class ShadowTracker {
       stopLoss: sig.stopLoss,
       ...(tpOk ? { takeProfit: sig.takeProfit } : {}),
       maxHoldMs: finite(sig.maxHoldMs) && sig.maxHoldMs > 0 ? sig.maxHoldMs : this.opts.defaultMaxHoldMs,
+      ...(thesisMs !== undefined ? { thesisExpectedMs: thesisMs } : {}),
       takerFeeRate: finite(inst.takerFeeRate) ? Math.max(0, inst.takerFeeRate) : 0,
       slippageBps: shadowSlippageBps(inst.assetClass as AssetClass, this.opts.slippageBps),
       risk,
@@ -335,6 +359,7 @@ export class ShadowTracker {
       }
       let adverse: PriceRange | undefined;
       let favorable: PriceRange | undefined;
+      let thesisFav: PriceRange | undefined;
       try {
         if (opts.rangeOf) {
           if (o.lastCandleTs === undefined) {
@@ -345,14 +370,19 @@ export class ShadowTracker {
           } else {
             adverse = favorable = opts.rangeOf(o.symbol, o.lastCandleTs + 1);
           }
+          // 延長後の極値は、延長した時刻以降に始まった足だけで進める (延長より前の高値・安値を使わない)
+          if (o.thesisExtendedAt !== undefined) {
+            thesisFav = opts.rangeOf(o.symbol, o.lastCandleTs !== undefined ? Math.max(o.lastCandleTs + 1, o.thesisExtendedAt) : o.thesisExtendedAt);
+          }
         }
       } catch (e) {
         this.onError?.("shadow.range", e);
       }
-      const before = `${o.mfeR}|${o.maeR}|${o.lastCandleTs ?? ""}`;
-      const res = this.step(o, q, now, adverse, favorable);
+      const key = () => `${o.mfeR}|${o.maeR}|${o.lastCandleTs ?? ""}|${o.thesisExtendedAt ?? ""}|${o.thesisPeak ?? ""}|${o.thesisStop ?? ""}`;
+      const before = key();
+      const res = this.step(o, q, now, adverse, favorable, thesisFav);
       if (!res) {
-        if (before !== `${o.mfeR}|${o.maeR}|${o.lastCandleTs ?? ""}`) this.dirty = true;
+        if (before !== key()) this.dirty = true;
         keep.push(o);
         continue;
       }
@@ -377,9 +407,12 @@ export class ShadowTracker {
 
   /**
    * 1 件の判定 (決済したら記録を返す)。o の MFE / MAE は更新する。
-   * adverse: 不利側 (損切り・MAE) に使う足の値幅、favorable: 有利側 (利確・MFE) に使う足の値幅 (どちらも仲値ベース)
+   * adverse: 不利側 (損切り・MAE) に使う足の値幅、favorable: 有利側 (利確・MFE) に使う足の値幅 (どちらも仲値ベース)。
+   * thesisFav: 延長した時刻以降に始まった足の値幅 (延長後の極値と、延長後の保護ストップの判定に使う)
    */
-  private step(o: ShadowOpen, q: Pick<Quote, "bid" | "ask">, now: number, adverse?: PriceRange, favorable?: PriceRange): ShadowTradeRecord | undefined {
+  private step(
+    o: ShadowOpen, q: Pick<Quote, "bid" | "ask">, now: number, adverse?: PriceRange, favorable?: PriceRange, thesisFav?: PriceRange,
+  ): ShadowTradeRecord | undefined {
     const long = o.direction === "long";
     const dir = long ? 1 : -1;
     const half = (q.ask - q.bid) / 2;
@@ -396,31 +429,99 @@ export class ShadowTracker {
     const lastTs = Math.max(adv?.lastCandleTs ?? -Infinity, fav?.lastCandleTs ?? -Infinity);
     if (Number.isFinite(lastTs)) o.lastCandleTs = Math.max(o.lastCandleTs ?? -Infinity, lastTs);
 
+    // 読みの管理 (延長後の保護ストップは、この判定で更新する前の延長後の極値 = 前回までの有利な極値から計算する)
+    const thesis = this.opts.thesis?.enabled === true && finite(o.thesisExpectedMs) && o.thesisExpectedMs > 0 ? this.opts.thesis : undefined;
+    const rate = Math.max(0, finite(o.slippageBps) ? o.slippageBps : 0) / 10_000;
+    const entryFill = o.entryMid + dir * (Math.max(0, o.entrySpread) / 2 + rate * o.entryMid);
+    const pricing = { direction: o.direction, entryPrice: entryFill, risk: o.risk, entryFeePerUnit: Math.max(0, o.takerFeeRate) * entryFill, takerFeeRate: Math.max(0, o.takerFeeRate) };
+    const wasExtended = o.thesisExtendedAt !== undefined;
+    // 延長後の保護ストップ: 保存済みのストップと今の計算のきつい方 (設定が変わっても緩めない。読みの管理が無効になっても保存済みで守る)。
+    // 当初の損切りより有利なときだけ使う
+    let thesisStop: number | undefined;
+    if (wasExtended) {
+      const cur = thesis ? thesisTrailStop(pricing, o.thesisPeak ?? Number.NaN, thesis.trailR) : undefined;
+      const t = tighterStop(o.direction, o.thesisStop, cur);
+      if (t !== undefined && (long ? t > o.stopLoss : t < o.stopLoss)) thesisStop = t;
+    }
+    // 延長後の保護ストップは、延長した時刻以降に始まった足と気配だけで判定する (延長より前の安値・高値で決済しない)。
+    // 当初の損切りは従来どおりの範囲で判定する
+    const tr = ok(thesisFav) ? thesisFav : undefined;
+    const thesisAdvExit = long ? Math.min(q.bid, tr ? tr.low - half : Infinity) : Math.max(q.ask, tr ? tr.high + half : -Infinity);
+
     // MFE / MAE (仲値ベース, R)
     o.mfeR = Math.max(o.mfeR, (dir * (favMid - o.entryMid)) / o.risk, 0);
     o.maeR = Math.max(o.maeR, (dir * (o.entryMid - advMid)) / o.risk, 0);
 
+    const thesisHit = thesisStop !== undefined && (long ? thesisAdvExit <= thesisStop : thesisAdvExit >= thesisStop);
     const stopHit = long ? advExit <= o.stopLoss : advExit >= o.stopLoss;
     const tp = o.takeProfit;
     const tpHit = tp !== undefined && (long ? favExit >= tp : favExit <= tp);
-    const rate = Math.max(0, finite(o.slippageBps) ? o.slippageBps : 0) / 10_000;
+    const timeSlip = rate * exitSide;
+    const timeExit: ShadowExitFill = { fill: exitSide - dir * timeSlip, halfSpread: half, slip: timeSlip };
+    const stopFill = (stop: number): ShadowExitFill => {
+      // 窓開けで越えていれば現在の決済側の気配。約定ずれを不利側に加える
+      const level = long ? Math.min(stop, q.bid) : Math.max(stop, q.ask);
+      const slip = rate * level;
+      return { fill: level - dir * slip, halfSpread: half, slip };
+    };
     let reason: ShadowExitReason | undefined;
     let exit: ShadowExitFill | undefined;
-    if (stopHit) {
-      // 保守的に損切りを先にする。窓開けで損切りを越えていれば現在の決済側の気配。どちらも約定ずれを不利側に加える
+    if (thesisHit) {
+      // 延長後の保護ストップ (当初の損切りより建玉に近いので先に触れる)
+      reason = "trailing";
+      exit = stopFill(thesisStop!);
+    } else if (stopHit) {
+      // 保守的に損切りを先にする
       reason = "stop";
-      const level = long ? Math.min(o.stopLoss, q.bid) : Math.max(o.stopLoss, q.ask);
-      const slip = rate * level;
-      exit = { fill: level - dir * slip, halfSpread: half, slip };
+      exit = stopFill(o.stopLoss);
     } else if (tpHit) {
       reason = "take_profit";
       exit = { fill: tp!, halfSpread: half, slip: 0 };
+    } else if (thesis) {
+      const netR = this.closeR(o, timeExit, now).netR;
+      // 途中で読み外れは値動きだけ (仲値 − エントリー価格) で判定する (コストだけでは切らない)
+      const grossR = thesisGrossR({ direction: o.direction, entryPrice: o.entryPrice, risk: o.risk }, mid);
+      const d = decideThesis(
+        { elapsedMs: now - o.entryTs, expectedMs: o.thesisExpectedMs, maxHoldMs: o.maxHoldMs, extended: wasExtended, netR, grossR },
+        thesis,
+      );
+      if (d.extend) {
+        // 延長: 極値は今の決済側の気配から始める (ストップは max(建値, 気配 − trailR × R) より厳しくならず、この判定では決済しない)
+        o.thesisExtendedAt = now;
+        o.thesisNetRAtDeadline = d.extend.netR;
+        o.thesisPeak = exitSide;
+        const st = thesisTrailStop(pricing, exitSide, thesis.trailR);
+        if (st !== undefined) o.thesisStop = st;
+        this.urgent = true;
+      }
+      if (d.exit) {
+        if (d.exit.reason === "thesis_timeout" && d.exit.netR !== undefined) o.thesisNetRAtDeadline = d.exit.netR;
+        reason = d.exit.reason;
+        exit = timeExit;
+      }
     } else if (now - o.entryTs >= o.maxHoldMs) {
       reason = "time";
-      const slip = rate * exitSide;
-      exit = { fill: exitSide - dir * slip, halfSpread: half, slip };
+      exit = timeExit;
     }
-    if (!reason || !exit) return undefined;
+    if (!reason || !exit) {
+      // 延長後の極値と保護ストップを進める (延長した時刻以降に始まった足と今の気配。次の判定のストップから効く)
+      if (thesis && wasExtended) {
+        const px = long ? Math.max(q.bid, tr ? tr.high - half : -Infinity) : Math.min(q.ask, tr ? tr.low + half : Infinity);
+        o.thesisPeak = advancePeak(o.direction, o.thesisPeak, px);
+        o.thesisStop = tighterStop(o.direction, o.thesisStop, thesisTrailStop(pricing, o.thesisPeak ?? Number.NaN, thesis.trailR));
+      }
+      return undefined;
+    }
+    const r = this.closeR(o, exit, now);
+    const { risk: _risk, lastCandleTs: _l, mfeR, maeR, thesisPeak: _tp, thesisStop: _ts, ...base } = o;
+    return {
+      ...base, exitTs: now, exitPrice: exit.fill, exitReason: reason, ...r, mfeR, maeR,
+      ...(thesis ? { thesisOutcome: thesisOutcomeOf(reason, o.thesisExtendedAt !== undefined) } : {}),
+    };
+  }
+
+  /** 決済したときの R (shadowR + 再現した空売りの借入コスト + 持ち越し手数料) */
+  private closeR(o: ShadowOpen, exit: ShadowExitFill, now: number): { grossR: number; costR: number; netR: number } {
     const r = shadowR(o, exit);
     // 再現した空売りの借入コスト (PaperBroker と同じ: 建玉代金 × 日率 × 保有日数。ここでは 1 単位あたりを R に換算)
     const borrow = o.simulatedShort && finite(o.borrowRateDaily) && o.borrowRateDaily > 0
@@ -438,8 +539,7 @@ export class ShadowTracker {
       r.netR -= holding;
       r.costR += holding;
     }
-    const { risk: _risk, lastCandleTs: _l, mfeR, maeR, ...base } = o;
-    return { ...base, exitTs: now, exitPrice: exit.fill, exitReason: reason, ...r, mfeR, maeR };
+    return r;
   }
 
   /**

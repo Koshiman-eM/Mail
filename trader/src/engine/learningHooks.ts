@@ -88,6 +88,8 @@ export interface ValidatorOptions {
    * (中期・長期は運用で新規エントリーしないので縮めない)
    */
   maxHoldMinutes?: number;
+  /** 読みの管理 (実運用の THESIS_* と同じ。省略で従来の時間切れ) */
+  thesis?: BacktestOptions["thesis"];
   /** 区間数 (既定 5) */
   folds?: number;
   /** 主時間足での履歴の本数 (horizon 別) */
@@ -207,6 +209,7 @@ export function createParamValidator(o: ValidatorOptions): ParamValidator {
         ...(o.maxPositionPct !== undefined ? { maxPositionPct: o.maxPositionPct } : {}),
         ...(o.limitOrders ? { limitOrders: o.limitOrders } : {}),
         ...(o.maxHoldMinutes !== undefined && o.maxHoldMinutes > 0 && !isHoldLimitedHorizon(s.horizon) ? { maxHoldMinutes: o.maxHoldMinutes } : {}),
+        ...(o.thesis ? { thesis: o.thesis } : {}),
       });
       runs.forEach((r, i) => {
         agg[i].trades += r.trades.length;

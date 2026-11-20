@@ -539,7 +539,8 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
 <script>
 (function () {
   "use strict";
-  var EXIT = { stop: "損切り", take_profit: "利確", trailing: "トレーリング", signal: "シグナル", time: "時間切れ", kill_switch: "キルスイッチ", manual: "手動" };
+  var EXIT = { stop: "損切り", take_profit: "利確", trailing: "トレーリング", signal: "シグナル", time: "時間切れ", kill_switch: "キルスイッチ", manual: "手動",
+    thesis_failed: "読み外れ(途中)", thesis_timeout: "読み外れ(期限)", thesis_cap: "延長の上限" };
   var ADJ = { proposed: "提案のみ", applied: "適用", rejected: "却下", reverted: "差し戻し" };
   var DIR = { long: "買い", short: "売り" };
   /** paper で再現した空売り (live では実行できない取引・腕) */
@@ -1652,8 +1653,9 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     set("sentiment", '<div class="scroll">' + h + "</div>");
   }
   // テンポ (エントリー頻度の目標) と最大保有の 1 行: 目標 n 回/時・直近 1 時間 n 回・テンポ x.xx・上限到達・探索 可/不可・最大保有 n 分
-  function tempoText(t, mh) {
-    var hold = mh > 0 ? "最大保有 " + mh + " 分" : "最大保有 無効";
+  function tempoText(t, mh, th) {
+    var hold = (mh > 0 ? "最大保有 " + mh + " 分" : "最大保有 無効") +
+      (th ? (th.enabled ? " · 読みの管理 有効 (延長 ×" + th.extendMult + ")" : " · 読みの管理 無効") : "");
     if (!t || !t.enabled) return "無効 · " + hold;
     return "目標 " + t.target + " 回/時 · 直近 1 時間 " + t.entriesInWindow + " 回 · テンポ " + num(t.tempo, 2) +
       (t.capped ? " · 上限到達 (" + t.capAt + " 回)" : "") + " · 探索 " + (t.exploreAllowed ? "可" : "不可") + " · " + hold;
@@ -1672,7 +1674,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
       "<span class=muted>日次損失</span><span>" + esc(pct(Math.max(0, dl))) + " / 上限 " + esc(pct(r.limits.maxDailyLoss, 0)) + "</span>" +
       "<span class=muted>1回のリスク</span><span>" + esc(pct(r.limits.riskPerTrade)) + "</span>" +
       "<span class=muted>最大保有数</span><span>" + esc(s.positions.length) + " / " + esc(r.limits.maxOpenPositions) + "</span>" +
-      (s.tempo ? "<span class=muted>テンポ</span><span" + (s.tempo.capped ? ' class="err"' : "") + ">" + esc(tempoText(s.tempo, s.maxHoldMinutes || 0)) + "</span>" : "") +
+      (s.tempo ? "<span class=muted>テンポ</span><span" + (s.tempo.capped ? ' class="err"' : "") + ">" + esc(tempoText(s.tempo, s.maxHoldMinutes || 0, s.thesis)) + "</span>" : "") +
       "<span class=muted>監視銘柄</span><span>" + s.watched.map(function (w) { return '<span class="chip">' + esc(w.symbol) + (w.lastError ? ' <span class="err">!</span>' : "") + "</span>"; }).join("") + "</span>");
     if (cur === "overview") set("chart", chart(s.equityHistory, ccy));
   }
@@ -1691,11 +1693,17 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
   }
   function renderPositions(s) {
     var ccy = s.baseCurrency;
-    set("positions", table(["銘柄", "戦略", "方向", "数量", "建値", "現在値", "ストップ", "利確", "含み損益(" + ccy + ")", "建玉時刻"], s.positions.map(function (x) {
+    // 読みの管理: 読みの期限 (延長中は上限の時刻も)・残り分 (延長中は上限まで)・状態 (監視中 / 延長中)・現在の純 R
+    set("positions", table(["銘柄", "戦略", "方向", "数量", "建値", "現在値", "ストップ", "利確", "含み損益(" + ccy + ")", "建玉時刻", "読みの期限", "残り分", "状態", "現在のR"], s.positions.map(function (x) {
       var u = x.unrealizedPnlAccount != null ? x.unrealizedPnlAccount : x.unrealizedPnl;
+      var th = x.thesis;
       return [esc(x.symbol), esc(x.strategyId), esc(DIR[x.direction]), esc(num(x.qty)), esc(num(x.entryPrice)), esc(num(x.lastPrice)), esc(num(x.stop)),
-        esc(x.takeProfit != null ? num(x.takeProfit) : "-"), '<span class="' + cls(u) + '">' + esc(signed(u, 0)) + "</span>", esc(time(x.entryTs))];
-    }), [false, false, false, true, true, true, true, true, true, false]));
+        esc(x.takeProfit != null ? num(x.takeProfit) : "-"), '<span class="' + cls(u) + '">' + esc(signed(u, 0)) + "</span>", esc(time(x.entryTs)),
+        th ? esc(time(th.deadlineTs)) + (th.state === "extended" ? '<br><span class="muted">上限 ' + esc(time(th.capTs)) + "</span>" : "") : "-",
+        th ? esc(num(th.remainingMin, 1)) : "-",
+        th ? (th.state === "extended" ? '<span class="pos">延長中</span>' : "監視中") : "-",
+        th && th.netR != null ? '<span class="' + cls(th.netR) + '">' + esc(signed(th.netR, 2)) + "</span>" : "-"];
+    }), [false, false, false, true, true, true, true, true, true, false, false, true, false, true]));
   }
   function renderTrades(t) {
     var ccy = t.baseCurrency;
@@ -1748,7 +1756,8 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     safe("newsCheck", function () { renderNewsCheck(l.news); });
     safe("forecast", function () { renderForecast(l.forecast); });
   }
-  var SH_EXIT = { stop: "損切り", take_profit: "利確", time: "時間切れ", unwatched: "監視終了" };
+  var SH_EXIT = { stop: "損切り", take_profit: "利確", time: "時間切れ", unwatched: "監視終了", trailing: "トレーリング",
+    thesis_failed: "読み外れ(途中)", thesis_timeout: "読み外れ(期限)", thesis_cap: "延長の上限" };
   function shadowRows(rows) {
     return rows.slice(0, 20).map(function (g) {
       return [esc(g.key), esc(g.n), esc(pct(g.winRate, 1)), '<span class="' + cls(g.avgNetR) + '">' + esc(signed(g.avgNetR, 3)) + "</span>",

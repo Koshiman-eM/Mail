@@ -99,7 +99,14 @@ export interface CloseTradeInput {
   feesByLiquidity?: FeesByLiquidity;
   /** 決済の注文の種類 (板に置いた利確の指値なら limit) */
   exitOrderType?: "market" | "limit";
+  /** 読みの管理の記録 (TradeRecord にそのまま付ける。読みの管理を使った建玉だけ) */
+  thesis?: TradeThesisFields;
 }
+
+/** TradeRecord の読みの管理の項目 */
+export type TradeThesisFields = Pick<
+  TradeRecord, "thesisExpectedMs" | "thesisDeadlineTs" | "thesisExtendedAt" | "thesisOutcome" | "thesisNetRAtDeadline" | "thesisStopExit"
+>;
 
 /** 一部決済の入力。qty は決済した数量 (正の値) */
 export type ReduceTradeInput = Omit<CloseTradeInput, "id"> & { qty: number };
@@ -321,7 +328,21 @@ export function buildTradeRecord(p: OpenTrade, c: CloseTradeInput): TradeRecord 
           takerFees: D(p.takerFees ?? 0).plus(c.feesByLiquidity?.taker ?? 0).toNumber(),
         }
       : {}),
+    ...thesisFields(c.thesis),
   };
+}
+
+/** 読みの管理の項目 (値のあるものだけ) */
+function thesisFields(t: TradeThesisFields | undefined): TradeThesisFields {
+  if (!t) return {};
+  const out: TradeThesisFields = {};
+  if (t.thesisExpectedMs !== undefined) out.thesisExpectedMs = t.thesisExpectedMs;
+  if (t.thesisDeadlineTs !== undefined) out.thesisDeadlineTs = t.thesisDeadlineTs;
+  if (t.thesisExtendedAt !== undefined) out.thesisExtendedAt = t.thesisExtendedAt;
+  if (t.thesisOutcome !== undefined) out.thesisOutcome = t.thesisOutcome;
+  if (t.thesisNetRAtDeadline !== undefined && Number.isFinite(t.thesisNetRAtDeadline)) out.thesisNetRAtDeadline = t.thesisNetRAtDeadline;
+  if (t.thesisStopExit === true) out.thesisStopExit = true;
+  return out;
 }
 
 /** 負なら 0 */

@@ -15,9 +15,11 @@ import { DEFAULT_REGIME_TIMEFRAMES, runRegimeCommand } from "./engine/regimeRepo
 import { createFxConverter, quoteCurrencyOfSymbol } from "./engine/fx";
 import {
   equityStats, EXIT_REASON_LABEL, exitFxRates, exitReasonCounts, fmtNum, fmtPct, fmtSigned, fmtTime, isSimulatedShortTrade, liveExecutableTrades,
-  renderLearning, renderLimitStats, renderOrderTypeTable, renderSideTable, renderStrategyTable, renderTempoTable, summarizeByOrderType, summarizeBySide,
-  summarizeByStrategy, summarizeByTempo,
+  renderLearning, renderLimitStats, renderOrderTypeTable, renderSideTable, renderStrategyTable, renderTempoTable, renderThesisTable, summarizeByOrderType,
+  summarizeBySide, summarizeByStrategy, summarizeByTempo, summarizeThesis,
 } from "./engine/report";
+import { readExitPlans } from "./engine/positions";
+import { activeThesisMs, formatThesisSettings, initialRiskPerUnit, thesisSettingsFromEnv } from "./engine/thesis";
 import { D } from "./core/decimal";
 import {
   peekResolveRequests, PendingOrders, readLimitStats, requestResolve, RestingTakeProfits, type PendingOrder, type ResolveRequest,
@@ -468,10 +470,13 @@ async function cmdBacktest(flags: ParsedArgs["flags"], io: Io): Promise<number> 
   // 運用・パラメータ検証と同じく、STRUCTURE_MODE=filter なら対象の戦略を相場構造のフィルターでラップする
   // 最大保有 (MAX_HOLD_MINUTES) も実運用と同じ前提にする (0 = 無効)。テンポはバックテストに渡さない
   const maxHold = config.env.MAX_HOLD_MINUTES > 0 ? config.env.MAX_HOLD_MINUTES : undefined;
-  const rows = await runBacktestCommand({ ...common, strategies: configuredStrategies(structure), ...(maxHold !== undefined ? { maxHoldMinutes: maxHold } : {}) });
+  // 読みの管理 (THESIS_*) も実運用と同じ規則にする
+  const thesis = thesisSettingsFromEnv(config.env);
+  const rows = await runBacktestCommand({ ...common, strategies: configuredStrategies(structure), ...(maxHold !== undefined ? { maxHoldMinutes: maxHold } : {}), thesis });
   io.out(
     `バックテスト: ${symbol} / ${a.days} 日 / ${sourceLabel} / 構造フィルター ${structure.mode === "filter" ? "あり" : "なし"}` +
-      (maxHold !== undefined ? ` / 最大保有 ${maxHold} 分` : ""),
+      (maxHold !== undefined ? ` / 最大保有 ${maxHold} 分` : "") +
+      ` / 読みの管理 ${thesis.enabled ? "有効" : "無効"}`,
   );
   io.out(formatBacktestRows(rows));
   io.out("※ 損益はクオート通貨建て (初期評価額 1,000,000)。期間の前にウォームアップ用の足を付けています。");
@@ -579,6 +584,9 @@ export function buildReportText(config: AppConfig, store: Store, now: number = D
   // テンポ (エントリー頻度の目標) の探索のエントリーと通常のエントリーの成績 (取引の印 entryContext.features.tempoExplore で分ける)
   lines.push("", "■ テンポの探索と通常のエントリー");
   lines.push(renderTempoTable(summarizeByTempo(trades, toAcct, quoteOf, rates), ccy));
+  // 読みの管理 (THESIS_EXIT): 途中・期限での読み外れ、期限で読み当たり → 延長、期限前に決着 の成績と期限での的中率
+  lines.push("", `■ 読みの答え合わせ (読みの管理 ${thesisSettingsFromEnv(config.env).enabled ? "有効" : "無効"})`);
+  lines.push(renderThesisTable(summarizeThesis(trades, toAcct, quoteOf, rates), ccy));
   // 学習状態は取引 mode (paper / live) 別。report は読み取り専用なので、起動時の移行などの書き込みは DB に反映しない
   const learning = new LearningService({ store: new ReadOnlyOverlayStore(store), mode: config.mode, getStrategy: (id) => getStrategy(id) });
   lines.push("", `学習状態: ${config.mode}`);
@@ -827,14 +835,27 @@ function cmdStatus(io: Io): number {
     const eq = store.listEquity({ mode }).at(-1);
     io.out(`最新の評価額: ${eq ? `${fmtNum(eq.equity, 0)} ${config.env.BASE_CURRENCY} (${fmtTime(eq.ts)}, ${eq.mode})` : "(記録なし)"}`);
     const open = new TradeJournal({ store, mode }).list();
+    const thesis = thesisSettingsFromEnv(config.env);
+    const plans = readExitPlans(store, mode);
     io.out(`保有ポジション (${mode}): ${open.length} 件`);
-    for (const p of open) io.out(`  ${p.symbol} ${p.direction === "long" ? "買い" : "売り"} ${p.qty} @ ${p.entryPrice} (${p.strategyId}, ${fmtTime(p.entryTs)})`);
+    for (const p of open) {
+      // 読みの期限 (読みの管理を使う建玉だけ): 期限の時刻と 監視中 / 延長中 (延長中は上限の時刻)
+      const plan = plans[p.id];
+      const ms = plan ? activeThesisMs(thesis, plan.expectedMs, plan.maxHoldMs, initialRiskPerUnit(p.entryPrice, p.initialStop)) : undefined;
+      const th = ms === undefined
+        ? ""
+        : plan?.thesis?.extendedAt !== undefined
+          ? ` / 読みの期限 ${fmtTime(p.entryTs + ms)} → 延長中 (上限 ${fmtTime(p.entryTs + ms * Math.max(1, thesis.extendMult))})`
+          : ` / 読みの期限 ${fmtTime(p.entryTs + ms)} (監視中)`;
+      io.out(`  ${p.symbol} ${p.direction === "long" ? "買い" : "売り"} ${p.qty} @ ${p.entryPrice} (${p.strategyId}, ${fmtTime(p.entryTs)})${th}`);
+    }
     const pending = new PendingOrders({ store, mode }).list();
     if (pending.length) {
       io.out(`保留中の注文 (${mode}): ${pending.length} 件 (取引所で状態を確認してください。解消は npm run trader -- orders)`);
       for (const o of pending) io.out(pendingOrderLine(o));
     }
     io.out(tempoStatusLine(config, store, mode, open.map((p) => p.entryTs), now));
+    io.out(`読みの管理 (THESIS_EXIT): ${formatThesisSettings(thesis)}${thesis.enabled && (config.env.MAX_HOLD_MINUTES ?? 0) > 0 ? ` / 読みの期限の上限 ${config.env.MAX_HOLD_MINUTES} 分 (MAX_HOLD_MINUTES)` : ""}`);
     io.out(`指値: エントリー ${config.env.LIMIT_ENTRY ? "有効" : "無効"} (期限 ${config.env.LIMIT_ENTRY_TIMEOUT_MS !== undefined ? `${config.env.LIMIT_ENTRY_TIMEOUT_MS}ms` : "主時間足 (20 秒〜15 分)"}) / 利確の板置き ${effectiveLimitTakeProfit(config.env, mode) ? "有効" : config.env.LIMIT_TAKE_PROFIT ? "無効 (live では使わない: LIMIT_TAKE_PROFIT は paper 専用)" : "無効"}`);
     const tps = new RestingTakeProfits({ store, mode }).list();
     if (tps.length) {

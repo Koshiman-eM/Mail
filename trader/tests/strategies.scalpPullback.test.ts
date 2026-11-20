@@ -451,7 +451,8 @@ describe("scalp_pullback: 確定足だけを使う", () => {
     };
     runBacktest({ strategy: spy, instrument: syntheticInstrument({ takerFeeRate: 0 }), candles, baseTimeframe: "1m", spreadBps: 0, slippageBps: 0 });
     expect(checked).toBeGreaterThan(100);
-  });
+    // 長い合成データでバックテストを丸ごと回すため単独でも 4 秒前後かかる。並列実行の負荷で既定の 5 秒を越えないよう余裕を持たせる
+  }, 30_000);
 });
 
 describe("scalp_pullback: 探索 (ctx.tempoExplore)", () => {

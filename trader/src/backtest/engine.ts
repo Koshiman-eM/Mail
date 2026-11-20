@@ -21,6 +21,9 @@ import { resample } from "../indicators/resample";
 import { detectRegime, regimeOptionsFor } from "../regime/detect";
 import { computeMetrics } from "./metrics";
 import { clampMaxHoldMs } from "../engine/tempo";
+import {
+  activeThesisMs, advancePeak, decideThesis, initialRiskPerUnit, THESIS_DISABLED, thesisGrossR, thesisNetR, thesisOutcomeOf, thesisTrailStop, type ThesisPricing,
+} from "../engine/thesis";
 import type { BacktestOptions, BacktestResult, BacktestStats, IntelSource, Sizer } from "./types";
 
 /**
@@ -45,6 +48,13 @@ import type { BacktestOptions, BacktestResult, BacktestStats, IntelSource, Sizer
  *     成行の戦略 (entryOrder: "market") は従来どおり。
  *   - takeProfit: 高値 (買い) が利確価格を「越えた」ときだけ利確価格で maker 約定する。同じ足で損切りにも届けば損切りを優先する。
  * 最大保有 (opts.maxHoldMinutes。省略時は従来どおり): シグナルの maxHoldMs をその分数までに縮めて保有する (ライブの MAX_HOLD_MINUTES と同じ)。
+ *   シグナルの読みの期限 (expectedMs) も同じ分数までに縮める。
+ * 読みの管理 (opts.thesis。省略・無効なら従来の時間切れ。ライブの THESIS_* と同じ src/engine/thesis.ts の規則):
+ *   - バー i の終値で判定する (期限は純 R = 決済できる価格 (終値 ∓ 半スプレッド) と手数料の見積り込み、途中で読み外れは値動きだけの R =
+ *     終値を仲値として)。決済はバー i+1 の始値の成行
+ *     (従来の時間切れと同じタイミング。始値で損切りを越えていれば損切りの理由)。
+ *   - 延長した建玉の保護ストップ (建値・トレーリング) はバー i+1 から効く。極値は延長から測り (判定した終値の決済できる価格から始め、
+ *     バー i+1 以降の高値・安値 ∓ 半スプレッドで進める)、前バーまでの値を使う (先読みしない)。理由は trailing (thesisStopExit)。
  */
 
 /** 資産クラス別の既定スプレッド (bps, 全幅) とスリッページ (bps, 片道) */
@@ -104,6 +114,16 @@ interface OpenPos {
   /** 指値で約定したエントリー (約定した足の番号。その足では利確を判定しない) */
   limitFillIdx?: number;
   entryLiq: "maker" | "taker";
+  /** 読みの期限 (シグナルの expectedMs を最大保有で丸めたもの。無ければ maxHoldMs を使う) */
+  expectedMs?: number;
+  /** 読みの管理で延長した時刻・期限の時点の純 R */
+  extendedAt?: number;
+  netRAtDeadline?: number;
+  /**
+   * 延長後の有利な極値 (決済できる価格: 買いは高値 × (1 − 半スプレッド)、売りは安値 × (1 + 半スプレッド))。
+   * 延長を判定した終値の決済できる価格から始め、延長した足以降の高値・安値だけで進める (その足の判定には使わない)
+   */
+  thesisPeak?: number;
 }
 
 type Pending =
@@ -154,6 +174,12 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
     ? Math.round(opts.maxHoldMinutes * 60_000)
     : undefined;
   const limitTp = limitOpts?.takeProfit === true;
+  const thesis = opts.thesis ?? THESIS_DISABLED;
+  /** シグナルの読みの期限 (最大保有で丸める。無ければ undefined = maxHoldMs を期限にする) */
+  const expectedOf = (sig: Signal): number | undefined =>
+    sig.expectedMs !== undefined && Number.isFinite(sig.expectedMs) && sig.expectedMs > 0
+      ? holdLimitMs !== undefined ? Math.min(sig.expectedMs, holdLimitMs) : sig.expectedMs
+      : undefined;
   const limitTimeoutMs = limitOpts?.entryTimeoutMs !== undefined && limitOpts.entryTimeoutMs > 0
     ? limitOpts.entryTimeoutMs
     : Math.min(15 * 60_000, Math.max(20_000, TIMEFRAME_MS[strategy.primaryTimeframe]));
@@ -195,15 +221,45 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
   let peakEquity = initialEquity;
   let barMaxDd = 0;
 
-  const currentStop = (p: OpenPos): { stop: number; reason: ExitReason } => {
+  /** 読みの管理: 純 R・建値の計算に使う値 (エントリー手数料は実際の額を 1 単位あたりに) */
+  const pricingOf = (p: OpenPos): ThesisPricing => {
+    const units = p.qtyNum * cs;
+    return {
+      direction: p.dir === 1 ? "long" : "short",
+      entryPrice: p.entryPrice,
+      risk: initialRiskPerUnit(p.entryPrice, p.initialStop),
+      entryFeePerUnit: units > 0 ? p.entryFee.toNumber() / units : 0,
+      takerFeeRate: instrument.takerFeeRate,
+    };
+  };
+  /** 読みの管理を使う建玉なら期限 (ms) */
+  const thesisMsOf = (p: OpenPos) => activeThesisMs(thesis, p.expectedMs, p.maxHoldMs, initialRiskPerUnit(p.entryPrice, p.initialStop));
+
+  const currentStop = (p: OpenPos): { stop: number; reason: ExitReason; byThesis: boolean } => {
+    let stop = p.initialStop;
+    let reason: ExitReason = "stop";
+    let byThesis = false;
     if (p.trailPct !== undefined && p.trailPct > 0) {
       const trail = p.dir === 1 ? p.highWater * (1 - p.trailPct) : p.lowWater * (1 + p.trailPct);
-      if (p.dir === 1 ? trail > p.initialStop : trail < p.initialStop) return { stop: trail, reason: "trailing" };
+      if (p.dir === 1 ? trail > p.initialStop : trail < p.initialStop) {
+        stop = trail;
+        reason = "trailing";
+      }
     }
-    return { stop: p.initialStop, reason: "stop" };
+    // 読みの管理で延長した建玉: 建値 (手数料込み) と 延長後の極値 (前バーまで) − THESIS_TRAIL_R × リスク の有利な方 (きつい方を使う)
+    if (p.extendedAt !== undefined && thesisMsOf(p) !== undefined) {
+      const t = thesisTrailStop(pricingOf(p), p.thesisPeak ?? Number.NaN, thesis.trailR);
+      if (t !== undefined && (p.dir === 1 ? t > stop : t < stop)) {
+        stop = t;
+        reason = "trailing";
+        byThesis = true;
+      }
+    }
+    return { stop, reason, byThesis };
   };
 
-  const closePosition = (i: number, px: number, ts: number, reason: ExitReason, intended: number, liq: "maker" | "taker" = "taker") => {
+  /** byThesis: 延長後の保護ストップでの決済 (TradeRecord.thesisStopExit) */
+  const closePosition = (i: number, px: number, ts: number, reason: ExitReason, intended: number, liq: "maker" | "taker" = "taker", byThesis = false) => {
     const p = pos!;
     const exitFee = D(px).mul(p.qty).mul(csD).mul(liq === "maker" ? makerRate : feeRate);
     const gross = D(px).minus(p.entryPrice).mul(p.qty).mul(csD).mul(p.dir);
@@ -243,6 +299,18 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
       maePct: Math.max(0, adv / p.entryPrice),
       exitReason: reason,
       entryContext: p.context,
+      ...(() => {
+        const ms = thesisMsOf(p);
+        if (ms === undefined) return {};
+        return {
+          thesisExpectedMs: ms,
+          thesisDeadlineTs: p.entryTs + ms,
+          ...(p.extendedAt !== undefined ? { thesisExtendedAt: p.extendedAt } : {}),
+          thesisOutcome: thesisOutcomeOf(reason, p.extendedAt !== undefined),
+          ...(p.netRAtDeadline !== undefined && Number.isFinite(p.netRAtDeadline) ? { thesisNetRAtDeadline: p.netRAtDeadline } : {}),
+          ...(byThesis && reason === "trailing" ? { thesisStopExit: true } : {}),
+        };
+      })(),
       ...(limitOpts
         ? {
             entryOrderType: p.entryLiq === "maker" ? ("limit" as const) : ("market" as const),
@@ -261,34 +329,34 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
 
   const checkStops = (i: number, bar: Candle) => {
     const p = pos!;
-    const { stop, reason } = currentStop(p);
+    const { stop, reason, byThesis } = currentStop(p);
     // 指値で約定した足では利確を判定しない (足の中で約定と利確の順序が分からない。損切りは判定する = 保守的)
     const tp = p.limitFillIdx === i ? undefined : p.takeProfit;
     const end = bar.ts + baseMs;
     if (limitTp) {
       // 利確は板に置いた指値: 価格が利確価格を越えたときだけ利確価格で maker 約定 (触れただけでは約定しない)。損切りを先に判定する
       if (p.dir === 1) {
-        if (bar.open <= stop) return closePosition(i, marketFill(bar.open, false), bar.ts, reason, stop);
+        if (bar.open <= stop) return closePosition(i, marketFill(bar.open, false), bar.ts, reason, stop, "taker", byThesis);
         if (tp !== undefined && bar.open > tp) return closePosition(i, tp, bar.ts, "take_profit", tp, "maker");
-        if (bar.low <= stop) return closePosition(i, marketFill(stop, false), end, reason, stop);
+        if (bar.low <= stop) return closePosition(i, marketFill(stop, false), end, reason, stop, "taker", byThesis);
         if (tp !== undefined && bar.high > tp) return closePosition(i, tp, end, "take_profit", tp, "maker");
       } else {
-        if (bar.open >= stop) return closePosition(i, marketFill(bar.open, true), bar.ts, reason, stop);
+        if (bar.open >= stop) return closePosition(i, marketFill(bar.open, true), bar.ts, reason, stop, "taker", byThesis);
         if (tp !== undefined && bar.open < tp) return closePosition(i, tp, bar.ts, "take_profit", tp, "maker");
-        if (bar.high >= stop) return closePosition(i, marketFill(stop, true), end, reason, stop);
+        if (bar.high >= stop) return closePosition(i, marketFill(stop, true), end, reason, stop, "taker", byThesis);
         if (tp !== undefined && bar.low < tp) return closePosition(i, tp, end, "take_profit", tp, "maker");
       }
       return;
     }
     if (p.dir === 1) {
-      if (bar.open <= stop) return closePosition(i, marketFill(bar.open, false), bar.ts, reason, stop);
+      if (bar.open <= stop) return closePosition(i, marketFill(bar.open, false), bar.ts, reason, stop, "taker", byThesis);
       if (tp !== undefined && bar.open * (1 - hs) >= tp) return closePosition(i, bar.open * (1 - hs), bar.ts, "take_profit", tp);
-      if (bar.low <= stop) return closePosition(i, marketFill(stop, false), end, reason, stop);
+      if (bar.low <= stop) return closePosition(i, marketFill(stop, false), end, reason, stop, "taker", byThesis);
       if (tp !== undefined && bar.high * (1 - hs) >= tp) return closePosition(i, tp, end, "take_profit", tp);
     } else {
-      if (bar.open >= stop) return closePosition(i, marketFill(bar.open, true), bar.ts, reason, stop);
+      if (bar.open >= stop) return closePosition(i, marketFill(bar.open, true), bar.ts, reason, stop, "taker", byThesis);
       if (tp !== undefined && bar.open * (1 + hs) <= tp) return closePosition(i, bar.open * (1 + hs), bar.ts, "take_profit", tp);
-      if (bar.high >= stop) return closePosition(i, marketFill(stop, true), end, reason, stop);
+      if (bar.high >= stop) return closePosition(i, marketFill(stop, true), end, reason, stop, "taker", byThesis);
       if (tp !== undefined && bar.low * (1 + hs) <= tp) return closePosition(i, tp, end, "take_profit", tp);
     }
   };
@@ -329,6 +397,7 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
           takeProfit: pd.signal.takeProfit,
           trailPct: pd.signal.trailingStopPct,
           maxHoldMs: clampMaxHoldMs(pd.signal.maxHoldMs, holdLimitMs),
+          ...(expectedOf(pd.signal) !== undefined ? { expectedMs: expectedOf(pd.signal) } : {}),
           highWater: bar.open,
           lowWater: bar.open,
           maxHigh: -Infinity,
@@ -357,6 +426,7 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
             takeProfit: pd.signal.takeProfit,
             trailPct: pd.signal.trailingStopPct,
             maxHoldMs: clampMaxHoldMs(pd.signal.maxHoldMs, holdLimitMs),
+            ...(expectedOf(pd.signal) !== undefined ? { expectedMs: expectedOf(pd.signal) } : {}),
             highWater: pd.price,
             lowWater: pd.price,
             maxHigh: -Infinity,
@@ -374,12 +444,37 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
       }
     }
 
-    // 2. 時間切れ (エントリーしたバーより後の始値で判定)
-    if (pos && i > pos.entryIdx && pos.maxHoldMs > 0 && bar.ts - pos.entryTs >= pos.maxHoldMs) {
+    // 2. 時間切れ・読みの管理 (前バーの終値 = この足の始値の時刻までに確定した価格で判定し、この足の始値で決済する。
+    //    エントリーしたバーより後だけ。読みの管理が無効・使えない建玉は従来どおり maxHoldMs で time)
+    if (pos && i > pos.entryIdx) {
       const p: OpenPos = pos;
-      const { stop, reason } = currentStop(p);
-      const gapped = p.dir === 1 ? bar.open <= stop : bar.open >= stop;
-      closePosition(i, marketFill(bar.open, p.dir === -1), bar.ts, gapped ? reason : "time", gapped ? stop : bar.open);
+      const ms = thesisMsOf(p);
+      let netR = NaN;
+      let grossR = NaN;
+      const close = candles[i - 1].close;
+      const mark = p.dir === 1 ? close * (1 - hs) : close * (1 + hs);
+      if (ms !== undefined) {
+        netR = thesisNetR(pricingOf(p), mark);
+        // 途中で読み外れは値動きだけ (終値を仲値として) で判定する (コストだけでは切らない)
+        grossR = thesisGrossR(pricingOf(p), close);
+      }
+      const d = decideThesis(
+        { elapsedMs: bar.ts - p.entryTs, expectedMs: p.expectedMs, maxHoldMs: p.maxHoldMs, extended: p.extendedAt !== undefined, netR, grossR },
+        ms !== undefined ? thesis : THESIS_DISABLED,
+      );
+      if (d.extend) {
+        // 延長: 保護ストップ (建値・トレーリング) はこの足 (判定した足の次) から効く。
+        // 延長後の極値は判定に使った終値の決済できる価格から始める (延長より前の高値・安値は使わない)
+        p.extendedAt = bar.ts;
+        p.netRAtDeadline = d.extend.netR;
+        p.thesisPeak = mark;
+      }
+      if (d.exit) {
+        if (d.exit.reason === "thesis_timeout" && d.exit.netR !== undefined) p.netRAtDeadline = d.exit.netR;
+        const { stop, reason, byThesis } = currentStop(p);
+        const gapped = p.dir === 1 ? bar.open <= stop : bar.open >= stop;
+        closePosition(i, marketFill(bar.open, p.dir === -1), bar.ts, gapped ? reason : d.exit.reason, gapped ? stop : bar.open, "taker", gapped && byThesis);
+      }
     }
 
     // 3. 損切り・利確 (バー内)
@@ -408,6 +503,10 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
         p.lowWater = Math.min(p.lowWater, bar.low);
         p.maxHigh = Math.max(p.maxHigh, bar.high);
         p.minLow = Math.min(p.minLow, bar.low);
+      }
+      // 延長後の極値 (延長した足以降の足だけ。この足の損切りの判定の後なので次の足から効く)
+      if (p.extendedAt !== undefined && p.extendedAt <= bar.ts) {
+        p.thesisPeak = advancePeak(p.dir === 1 ? "long" : "short", p.thesisPeak, p.dir === 1 ? bar.high * (1 - hs) : bar.low * (1 + hs));
       }
     }
 

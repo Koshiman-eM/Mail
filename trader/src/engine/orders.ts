@@ -26,6 +26,8 @@ export interface PendingExit {
   tradeId: string;
   reason: ExitReason;
   intendedPrice: number;
+  /** 読みの管理の延長後の保護ストップでの決済 (TradeRecord.thesisStopExit。約定したこの注文の判定にだけ付く) */
+  thesisStop?: boolean;
 }
 
 export interface PendingOrder {
@@ -122,7 +124,7 @@ export interface RestingTakeProfit {
   unknownCount: number;
   unknownSince?: number;
   lastError?: string;
-  exit?: { reason: ExitReason; intendedPrice: number; requestedAt: number };
+  exit?: { reason: ExitReason; intendedPrice: number; requestedAt: number; thesisStop?: boolean };
   /** 取消の依頼に成功した時刻 (失敗したら次の照会の前に再度取り消す) */
   canceledAt?: number;
 }

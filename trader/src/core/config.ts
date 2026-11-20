@@ -319,6 +319,32 @@ const EnvSchema = z.object({
   /** live でも探索のエントリーを許可する (既定 false。paper では常に許可) */
   TEMPO_ALLOW_LIVE_EXPLORE: bool("TEMPO_ALLOW_LIVE_EXPLORE", false),
 
+  // 読みの管理 (src/engine/thesis.ts)
+  /**
+   * 読みの管理を使う (既定 true)。エントリー時に「いつ頃までに利益が出る読みか」(読みの期限 = シグナルの expectedMs、
+   * 無ければ最大保有。MAX_HOLD_MINUTES で丸める) を決め、期限の途中で大きく逆行したら途中で決済、期限で利益が出ていなければ決済、
+   * 利益が出ていれば建値とトレーリングで守りながら 期限 × THESIS_EXTEND_MULT まで持ち続ける。
+   * false なら従来どおり最大保有で時間切れ (time) にする
+   */
+  THESIS_EXIT: bool("THESIS_EXIT", true),
+  /** 期限の時点で、手数料を引いた純 R がこれ以上なら読み当たり (延長)。未満なら読み外れで決済 (0〜2、既定 0.1) */
+  THESIS_MIN_R: checkedNum("THESIS_MIN_R", 0.1, (x) => x >= 0 && x <= 2, "0 以上 2 以下の R で指定してください (期限で延長する純 R の下限)"),
+  /** 期限の半分を過ぎて、値動きだけの R (手数料・スプレッドを含めない) が −これ 以下なら途中で読み外れとして決済 (0〜1、既定 0.5。0 で途中の決済なし) */
+  THESIS_EARLY_CUT_R: checkedNum(
+    "THESIS_EARLY_CUT_R", 0.5, (x) => x >= 0 && x <= 1,
+    "0 (無効) 以上 1 以下の R で指定してください (期限の半分を過ぎてこれだけ逆行したら途中で決済)",
+  ),
+  /** 延長の上限 (読みの期限の何倍まで持つか。1〜20、既定 4。1 なら延長しない) */
+  THESIS_EXTEND_MULT: checkedNum(
+    "THESIS_EXTEND_MULT", 4, (x) => x >= 1 && x <= 20,
+    "1 以上 20 以下の倍率で指定してください (読みの期限の何倍まで持ち続けるか。1 で延長なし)",
+  ),
+  /** 延長後のトレーリングの幅 (当初の損切り幅 = 1R の何倍。0.1〜3、既定 0.5) */
+  THESIS_TRAIL_R: checkedNum(
+    "THESIS_TRAIL_R", 0.5, (x) => x >= 0.1 && x <= 3,
+    "0.1 以上 3 以下の R で指定してください (延長後、最も有利な価格からこれだけ戻したら決済)",
+  ),
+
   // 相場構造 (ダウ理論) のフィルター・損切り (src/structure/)
   /** off: ラップしない (従来と同じ) / filter: 対象の戦略をラップする (既定) */
   STRUCTURE_MODE: choice("STRUCTURE_MODE", ["off", "filter"] as const, "filter"),
