@@ -1158,9 +1158,15 @@ export class TradingEngine {
     try {
       const regime = this.regimeFor(view, s.primaryTimeframe, ctx);
       const intel = this.intelFor(inst, ctx);
-      const signal = s.evaluate({ market: view, regime, ...(intel ? { intel } : {}), params: this.paramsFor(s, inst), mode: this.mode });
+      // 戦略自身が見送ったシグナルも観測用に集める (停止中でも新規エントリーの評価なので渡す)
+      const filtered: { signal: Signal; reason: string }[] = [];
+      const signal = s.evaluate({
+        market: view, regime, ...(intel ? { intel } : {}), params: this.paramsFor(s, inst), mode: this.mode,
+        onFiltered: (fs, reason) => { filtered.push({ signal: fs, reason }); },
+      });
       if (signal) this.rememberSignal(inst.symbol, signal, ctx.now);
       if (signal && signal.direction !== "flat") this.shadowRecord(key, inst, view, s, signal, regime, ctx.now);
+      for (const f of filtered) if (f.signal.direction !== "flat") this.shadowRecord(`strategy_filter:${f.reason}`, inst, view, s, f.signal, regime, ctx.now);
     } catch (e) {
       this.warnThrottled("shadow.evaluate", ctx.now, "仮想トレード用の戦略評価に失敗 (取引は継続)", { strategyId: s.id, symbol: inst.symbol, error: errMsg(e) });
     }
@@ -1479,6 +1485,7 @@ export class TradingEngine {
       }
       const params = this.paramsFor(s, inst);
       const intel = this.intelFor(inst, ctx);
+      const filtered: { signal: Signal; reason: string }[] = [];
       const sctx: StrategyContext = {
         market: view,
         regime,
@@ -1487,6 +1494,8 @@ export class TradingEngine {
         params,
         // 空売りの再現は paper だけ (戦略は canShort(inst, mode) で判定する)
         mode: this.mode,
+        // 新規エントリーの評価のときだけ、戦略が自分で見送ったシグナルを観測用に集める (記録だけ。発注・腕の学習には使わない)
+        ...(owner ? {} : { onFiltered: (fs: Signal, reason: string) => { filtered.push({ signal: fs, reason }); } }),
       };
       ctx.evaluations++;
       let signal: Signal | null;
@@ -1496,6 +1505,7 @@ export class TradingEngine {
         this.log.error("戦略の評価に失敗", { strategyId: s.id, symbol: sym, error: errMsg(e) });
         continue;
       }
+      for (const f of filtered) if (f.signal.direction !== "flat") this.shadowRecord(`strategy_filter:${f.reason}`, inst, view, s, f.signal, regime, ctx.now);
       if (!signal) continue;
       this.rememberSignal(sym, signal, ctx.now);
 

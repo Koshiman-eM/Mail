@@ -376,3 +376,42 @@ describe("LearningService: 仮想トレードの保存・腕の更新・集計",
     expect(store.listShadowTrades().map((t) => t.id)).toEqual(["new"]);
   });
 });
+
+describe("scalp_micro の答え合わせの集計と表示", () => {
+  it("micro 集計 (利確到達率・p0・平均R) と renderShadow の表", async () => {
+    const { summarizeShadowTrades, isObserveOnlyShadowReason } = await import("../src/learning/shadow");
+    const { renderShadow } = await import("../src/engine/report");
+    const mk = (id: string, reason: string, exitReason: "take_profit" | "stop", grossR: number, netR: number, tp: number | undefined) => ({
+      id, mode: "paper", symbol: "BTC/JPY", assetClass: "crypto", strategyId: "scalp_micro", horizon: "scalp", regime: "high_vol",
+      direction: "long", reason, confidence: 0.6, expectedEdgeBps: 5, entryTs: 0, entryPrice: 100, entryMid: 100, entrySpread: 0,
+      stopLoss: 99, ...(tp !== undefined ? { takeProfit: tp } : {}), maxHoldMs: 600_000, takerFeeRate: 0.001, slippageBps: 1,
+      exitTs: 1, exitPrice: 100, exitReason, grossR, costR: grossR - netR, netR, mfeR: 0, maeR: 0,
+    }) as unknown as import("../src/core/types").ShadowTradeRecord;
+    const recs = [
+      mk("a", "strategy_filter:cost", "take_profit", 2, 1, 102), // p0 = 1/3
+      mk("b", "strategy_filter:cost", "stop", -1, -1.2, 101), // p0 = 1/2
+      mk("c", "strategy_filter:edge", "stop", -1, -1.4, undefined), // p0 除外
+    ];
+    expect(isObserveOnlyShadowReason("strategy_filter:cost")).toBe(true);
+    expect(isObserveOnlyShadowReason("lower_score")).toBe(false);
+    const s = summarizeShadowTrades(recs);
+    const cost = s.micro!.find((g) => g.key === "strategy_filter:cost")!;
+    expect(cost.n).toBe(2);
+    expect(cost.tpRate).toBeCloseTo(0.5, 9);
+    expect(cost.p0).toBeCloseTo((1 / 3 + 1 / 2) / 2, 9);
+    expect(cost.avgGrossR).toBeCloseTo(0.5, 9);
+    expect(cost.avgNetR).toBeCloseTo(-0.1, 9);
+    const edge = s.micro!.find((g) => g.key === "strategy_filter:edge")!;
+    expect(Number.isNaN(edge.p0)).toBe(true);
+    const total = s.micro!.find((g) => g.key === "合計")!;
+    expect(total.n).toBe(3);
+    expect(total.tpRate).toBeCloseTo(1 / 3, 9);
+    expect(total.p0).toBeCloseTo((1 / 3 + 1 / 2) / 2, 9);
+    expect(summarizeShadowTrades([{ ...recs[0], strategyId: "other" }]).micro).toBeUndefined();
+    const text = renderShadow(s);
+    expect(text).toContain("超短期 (scalp_micro) の答え合わせ");
+    expect(text).toContain("コストで見送り");
+    expect(text).toContain("期待値で見送り");
+    expect(text).toContain("合計");
+  });
+});

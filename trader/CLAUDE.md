@@ -37,7 +37,7 @@
    - LLM の提案も同じ検証経路を通す (`ParamTuner.propose`)。
    - 値動きの予想 (`forecast.ts`) によるエントリーサイズの倍率はパラメータの変更ではない。consensus を除いた基礎モデルで、同じ時刻・同じ資産クラスの予想を 1 観測にまとめ、12 グループの多重検定 (Bonferroni) で補正した有意性 (入る z ≥ 2.638、出る z < 2.138、判定済み 100 件以上) を満たしたときだけ 0.7〜1.2 倍で効く。結果は RiskManager の上限 (`MAX_SIZE_MULTIPLIER` = 1.5) の範囲内に収まる。満たさない間は常に 1.0。リスク判定は迂回しない。
 8. **学習状態は mode 別キー**: 腕・パラメータ・調整履歴・情報源の信頼度・ニュースの答え合わせ・予想・仮想トレードの kv は `<名前空間>:<mode>:...` (信頼度は `intel:sourceReliability:<mode>`)。paper の学習を live に持ち込まない。旧キー (mode なし) は paper にだけ初回起動時に引き継ぐ (`migration.ts`)。live は初期状態から始める。
-9. **仮想トレードの重みと停止中の扱い**: 見送ったシグナルの結果は腕の配分に重み 0.25 (腕を止める判定には使わず、止まった腕の回復判定にだけ使う)。ニュースの答え合わせは 1 記事あたり合計 0.3 (時間 × 資産の数で割る)。取引による信頼度の更新は (情報源, 記事) ごとに 1 回。停止中 (`HALT_SHADOW_REASONS`) に記録した仮想トレードは学習に使わない。
+9. **仮想トレードの重みと停止中の扱い**: 見送ったシグナルの結果は腕の配分に重み 0.25 (腕を止める判定には使わず、止まった腕の回復判定にだけ使う)。ニュースの答え合わせは 1 記事あたり合計 0.3 (時間 × 資産の数で割る)。取引による信頼度の更新は (情報源, 記事) ごとに 1 回。停止中 (`HALT_SHADOW_REASONS`) に記録した仮想トレードは学習に使わない。戦略がコストで見送ったシグナル (`strategy_filter:*`、`StrategyContext.onFiltered`) は観測専用で、保存だけして腕・情報の効き具合には使わない。
 10. **腕の停止と回復**: 止めるのは実取引だけの統計で、件数 ≥ 30 かつ「縮小推定の平均 + 2.5·SE < 0」のとき。止まった腕も戦略は評価し、仮想トレード (`arm_disabled`) を記録して、回復の推定が 0 を越えたら戻す (`allocator.ts`)。
 11. **ダッシュボードの書き込みはリスク設定だけ**: `/api/risk-settings` (kv `risk:limits:<mode>`)。CSRF トークン・Origin 確認・ループバック待ち受け (それ以外は `DASHBOARD_WRITE_TOKEN`) が必須。live でリスクを上げる変更は確認語が必要。範囲は `config.ts` の `RISK_SETTING_SPECS` が唯一の定義。
 12. **空売りの再現は paper だけ** (`PAPER_SIMULATE_SHORT`、既定 true。`src/core/short.ts`): live では空売りしない。
@@ -50,7 +50,7 @@
 ## 4. 構成
 - `src/core/`: 型の契約 (`types.ts`)、設定、decimal、HTTP リトライ、Claude 呼び出し (`ai.ts`。構造化出力、拒否時はサーバー側フォールバック、キー未設定時はルールベース)
 - `src/indicators/`, `src/regime/`: 指標・リサンプル・相場環境の判定
-- `src/strategies/`: 9 戦略 (scalp 3 / short 3 / mid / long / meme)。パラメータの標準名は stopAtr, tpAtr, trailAtr, entryThreshold, maxHoldBars
+- `src/strategies/`: 10 戦略 (scalp 4 / short 3 / mid / long / meme)。パラメータの標準名は stopAtr, tpAtr, trailAtr, entryThreshold, maxHoldBars
 - `src/backtest/`: イベント駆動バックテスト、`evaluateParams`、`walkForward`、合成データ
 - `src/market/`: feed (ccxt / OANDA / Alpaca / DexScreener / synthetic) と MarketHub
 - `src/execution/`: PaperBroker、実口座アダプター、router

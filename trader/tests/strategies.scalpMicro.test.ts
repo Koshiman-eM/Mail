@@ -353,3 +353,71 @@ describe("scalp_micro: バックテスト (合成データ)", () => {
     expect(r.trades.length).toBe(0);
   });
 });
+
+// ───────────────────────── 見送りの観測 (onFiltered) ─────────────────────────
+
+describe("scalp_micro: onFiltered (見送りの観測通知)", () => {
+  type Sig = import("../src/core/types").Signal;
+  const collect = () => {
+    const calls: { sig: Sig; reason: string }[] = [];
+    return { calls, cb: (sig: Sig, reason: string) => { calls.push({ sig, reason }); } };
+  };
+  const midCtx = (o: Partial<CtxOpts> = {}) => {
+    const cs = noise(60, MID);
+    burst(cs, 1, MID);
+    return ctxOf({ candles: cs, ...o });
+  };
+
+  it("cost: null を返し、reason cost で 1 回だけ通知。シグナルは完成形 (10 分以内・有限な SL/TP)", () => {
+    const { calls, cb } = collect();
+    const ctx = { ...midCtx({ instrument: { takerFeeRate: 0.01 } }), onFiltered: cb };
+    expect(scalpMicro.evaluate(ctx)).toBeNull();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].reason).toBe("cost");
+    const s = calls[0].sig;
+    expect(s.direction).toBe("long");
+    expect(s.maxHoldMs).toBeLessThanOrEqual(10 * MIN);
+    expect(Number.isFinite(s.stopLoss)).toBe(true);
+    expect(Number.isFinite(s.takeProfit!)).toBe(true);
+    expect(Number.isFinite(s.expectedEdgeBps)).toBe(true);
+    for (const k of ["costBps", "tpBps", "slBps", "winProb", "winProbBase", "netEdgeBps"]) expect(Number.isFinite(s.features[k])).toBe(true);
+  });
+
+  it("spread: 損切り幅がスプレッドに近すぎるとき reason spread", () => {
+    const { calls, cb } = collect();
+    const cs = noise(60, WIDE);
+    burst(cs, 1, WIDE);
+    const ctx = { ...ctxOf({ candles: cs, halfSpread: 0.008, params: { costMult: 0 } }), onFiltered: cb };
+    expect(scalpMicro.evaluate(ctx)).toBeNull();
+    expect(calls.map((c) => c.reason)).toEqual(["spread"]);
+  });
+
+  it("edge: 期待値が下限以下のとき reason edge", () => {
+    const { calls, cb } = collect();
+    const ctx = { ...midCtx({ instrument: { takerFeeRate: 0.0005 } }), onFiltered: cb };
+    expect(createScalpMicro({ minNetEdgeBps: 1e6 }).evaluate(ctx)).toBeNull();
+    expect(calls.map((c) => c.reason)).toEqual(["edge"]);
+  });
+
+  it("通るケース・バーストなし・保有中は通知しない", () => {
+    const { calls, cb } = collect();
+    const wide = noise(60, WIDE);
+    burst(wide, 1, WIDE);
+    expect(scalpMicro.evaluate({ ...ctxOf({ candles: wide }), onFiltered: cb })).not.toBeNull();
+    const quietCs = noise(60, WIDE);
+    expect(scalpMicro.evaluate({ ...ctxOf({ candles: quietCs }), onFiltered: cb })).toBeNull();
+    expect(calls).toHaveLength(0);
+  });
+
+  it("onFiltered が throw しても null。渡さなくても戻り値は同じ", () => {
+    const base = midCtx({ instrument: { takerFeeRate: BITBANK_TAKER } });
+    const thrower = { ...base, onFiltered: () => { throw new Error("boom"); } };
+    expect(scalpMicro.evaluate(thrower)).toBeNull();
+    expect(scalpMicro.evaluate(base)).toBeNull();
+    const ok = noise(60, WIDE);
+    burst(ok, 1, WIDE);
+    const a = scalpMicro.evaluate(ctxOf({ candles: ok }));
+    const b = scalpMicro.evaluate({ ...ctxOf({ candles: ok }), onFiltered: () => {} });
+    expect(b).toEqual(a);
+  });
+});

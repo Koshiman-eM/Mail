@@ -103,6 +103,16 @@ export function isHaltShadowReason(reason: string | undefined): boolean {
   return HALT_SHADOW_REASONS.includes(reason) || HALT_SHADOW_REASON_PREFIXES.some((p) => reason.startsWith(p));
 }
 
+/**
+ * 戦略自身が自分の条件 (コスト) で見送ったシグナルの仮想トレードの理由の接頭辞 (StrategyContext.onFiltered)。
+ * 測定専用で、保存はするが腕・情報の効き具合には使わない
+ */
+export const OBSERVE_ONLY_SHADOW_REASON_PREFIX = "strategy_filter:";
+
+export function isObserveOnlyShadowReason(reason: string | undefined): boolean {
+  return typeof reason === "string" && reason.startsWith(OBSERVE_ONLY_SHADOW_REASON_PREFIX);
+}
+
 export const shadowOpenKey = (mode: TradingMode) => `shadow:open:${mode}`;
 export const shadowCountersKey = (mode: TradingMode) => `shadow:counters:${mode}`;
 
@@ -471,6 +481,57 @@ export interface ShadowSummary {
   bySide?: ShadowGroup[];
   exitReasons: Partial<Record<ShadowExitReason, number>>;
   counters: ShadowCounters;
+  /** scalp_micro の決済済み仮想トレードの見送り理由別の答え合わせ (最後の行が "合計")。無ければ省略 */
+  micro?: MicroObservationGroup[];
+}
+
+export interface MicroObservationGroup {
+  /** 見送り理由 (合計は "合計") */
+  key: string;
+  n: number;
+  /** 利確到達率 (exitReason === "take_profit" の割合) */
+  tpRate: number;
+  /** ランダムウォーク勝率 p0 の平均 (算出できないものは除外。1 件も無ければ NaN) */
+  p0: number;
+  avgGrossR: number;
+  avgNetR: number;
+}
+
+export const MICRO_STRATEGY_ID = "scalp_micro";
+export const MICRO_TOTAL_KEY = "合計";
+const MICRO_REASON_LABEL: Record<string, string> = {
+  "strategy_filter:cost": "コストで見送り",
+  "strategy_filter:spread": "スプレッドで見送り",
+  "strategy_filter:edge": "期待値で見送り",
+};
+export const microReasonLabel = (reason: string): string => MICRO_REASON_LABEL[reason] ?? reason;
+
+function summarizeMicro(records: readonly ShadowTradeRecord[]): MicroObservationGroup[] {
+  const rs = records.filter((t) => t.strategyId === MICRO_STRATEGY_ID);
+  if (rs.length === 0) return [];
+  const mk = (key: string, list: ShadowTradeRecord[]): MicroObservationGroup => {
+    let tp = 0, g = 0, nn = 0, p0s = 0, p0n = 0;
+    for (const t of list) {
+      if (t.exitReason === "take_profit") tp++;
+      g += finite(t.grossR) ? t.grossR : 0;
+      nn += finite(t.netR) ? t.netR : 0;
+      if (finite(t.takeProfit) && finite(t.entryMid) && finite(t.stopLoss)) {
+        const tpD = Math.abs(t.takeProfit - t.entryMid);
+        const slD = Math.abs(t.entryMid - t.stopLoss);
+        const den = tpD + slD;
+        if (den > 0) {
+          p0s += slD / den;
+          p0n++;
+        }
+      }
+    }
+    const n = list.length;
+    return { key, n, tpRate: n ? tp / n : 0, p0: p0n ? p0s / p0n : NaN, avgGrossR: n ? g / n : 0, avgNetR: n ? nn / n : 0 };
+  };
+  const by = new Map<string, ShadowTradeRecord[]>();
+  for (const t of rs) by.set(t.reason, [...(by.get(t.reason) ?? []), t]);
+  const rows = [...by.entries()].map(([k, l]) => mk(k, l)).sort((a, b) => b.n - a.n || a.key.localeCompare(b.key));
+  return [...rows, mk(MICRO_TOTAL_KEY, rs)];
 }
 
 /** 方向の表示名。paper で再現した空売りは「空売り (paper 再現)」として買い・取引所で可能な売りと分ける */
@@ -519,6 +580,7 @@ export function summarizeShadowTrades(
     bySide: group((t) => sideLabel(t.direction, t.simulatedShort)),
     exitReasons,
     counters: extra.counters ?? emptyCounters(),
+    ...(records.some((t) => t.strategyId === MICRO_STRATEGY_ID) ? { micro: summarizeMicro(records) } : {}),
   };
 }
 

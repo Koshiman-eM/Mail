@@ -251,6 +251,11 @@ export interface StrategyContext {
    * 省略時 (バックテスト・パラメータ検証) は取引所の allowShort だけで判定する
    */
   mode?: TradingMode;
+  /**
+   * 戦略が自分の条件 (コストなど) で見送ったシグナルを観測用に知らせる。エンジンは仮想トレードとしてだけ記録し、
+   * 発注・腕の学習には使わない。バックテスト・パラメータ検証では渡さない (挙動は変わらない)。
+   */
+  onFiltered?: (signal: Signal, reason: string) => void;
 }
 
 export interface Signal {

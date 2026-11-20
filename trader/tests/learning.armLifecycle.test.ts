@@ -108,3 +108,15 @@ describe("情報の効き具合: direction_bias の仮想トレードの答え�
     expect(off.intelInfluence("crypto")).toBe(1);
   });
 });
+
+describe("LearningService: 観測専用の仮想トレード (strategy_filter:*)", () => {
+  it("保存はするが腕の shadowN は増えない", () => {
+    const store = new MemoryStore();
+    const svc = new LearningService({ store });
+    svc.onShadowClosed(shadow(1.5, { reason: "strategy_filter:cost", direction: "long" }));
+    expect(store.listShadowTrades()).toHaveLength(1);
+    expect(svc.allocator.snapshot().every((a) => (a.shadowN ?? 0) === 0)).toBe(true);
+    svc.onShadowClosed(shadow(1.5, { reason: "lower_score", direction: "long" }));
+    expect(svc.allocator.snapshot().some((a) => (a.shadowN ?? 0) > 0)).toBe(true);
+  });
+});

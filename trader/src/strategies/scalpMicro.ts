@@ -21,6 +21,9 @@ import { buildEntrySignal, candlesOf, clamp, entryBlocked, exitSignal, period, p
  *   - 損切り幅 ≥ minStopSpreads × 現在のスプレッド (RiskManager の下限 2 倍より厳しく)。
  *   - 期待値 (下記) > 0。
  *
+ * コストで見送ったシグナルは ctx.onFiltered で観測用に通知する (理由: cost / spread / edge)。
+ *   エンジンは仮想トレードとしてだけ記録し、発注・腕の学習には使わない。戻り値は従来どおり null。
+ *
  * 期待値 (expectedEdgeBps): p × 利確 - (1 - p) × 損切り - 往復コスト (bps, コスト控除後)。
  *   - p0 = 損切り / (利確 + 損切り) は、値動きがランダムウォークのときに利確に先に届く確率
  *     (このとき p0 × 利確 - (1 - p0) × 損切り = 0 で、期待値はちょうど -往復コスト)。
@@ -282,19 +285,30 @@ export function createScalpMicro(opts: ScalpMicroOptions = {}): Strategy {
       const tpBps = (tpDist / price) * 1e4;
       const slBps = (slDist / price) * 1e4;
       // 利確幅がコストの costMult 倍未満、または損切りがスプレッドに近すぎるなら出さない
-      if (tpBps < Math.max(0, p.costMult) * costBps) return null;
-      if (slDist < Math.max(0, p.minStopSpreads) * spread) return null;
       // インテルの補正後の confidence で勝率を推定する
       const ev = microExpectedEdge({ tpBps, slBps, costBps, confidence: sig.confidence, winEdgeMax });
-      if (!(ev.edgeBps > minNetEdgeBps)) return null;
-
       const holdBars = Math.min(SCALP_MICRO_HOLD_BOUNDS[1], Math.max(SCALP_MICRO_HOLD_BOUNDS[0], period(p.maxHoldBars)));
-      return {
+      const full: Signal = {
         ...sig,
         expectedEdgeBps: ev.edgeBps,
         maxHoldMs: holdBars * TIMEFRAME_MS["1m"],
         features: { ...sig.features, costBps, tpBps, slBps, winProb: ev.p, winProbBase: ev.p0, netEdgeBps: ev.edgeBps },
       };
+      // 見送ったシグナルを観測用に通知する (失敗しても戦略の結果は変えない)
+      const notify = (reason: string): null => {
+        if (ctx.onFiltered && Number.isFinite(ev.edgeBps) && Number.isFinite(sig.stopLoss) && Number.isFinite(sig.takeProfit)) {
+          try {
+            ctx.onFiltered(full, reason);
+          } catch {
+            /* 観測用。握りつぶす */
+          }
+        }
+        return null;
+      };
+      if (tpBps < Math.max(0, p.costMult) * costBps) return notify("cost");
+      if (slDist < Math.max(0, p.minStopSpreads) * spread) return notify("spread");
+      if (!(ev.edgeBps > minNetEdgeBps)) return notify("edge");
+      return full;
     },
   };
   return strategy;

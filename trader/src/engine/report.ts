@@ -5,7 +5,7 @@ import { FORECAST_FEATURES, FORECAST_FEATURE_LABEL, type ForecastSummary } from 
 import type { NewsCheckSummary } from "../learning/newsCheck";
 import type { CauseSummary, LearningSnapshot } from "../learning/service";
 import { SIMULATED_SHORT_ARM_SUFFIX } from "../learning/allocator";
-import { sideLabel, SIMULATED_SHORT_LABEL, type ShadowGroup, type ShadowSummary } from "../learning/shadow";
+import { microReasonLabel, sideLabel, SIMULATED_SHORT_LABEL, type ShadowGroup, type ShadowSummary } from "../learning/shadow";
 import { quoteCurrencyOfSymbol } from "./fx";
 
 export const EXIT_REASON_LABEL: Record<ExitReason, string> = {
@@ -279,6 +279,17 @@ export function renderShadow(s: ShadowSummary | undefined, opts: { limit?: numbe
   if (s.bySide && s.bySide.some((g) => g.key === SIMULATED_SHORT_LABEL)) out.push(shadowGroupTable("方向", s.bySide, limit), "");
   out.push(shadowGroupTable("見送り理由", s.byReason, limit));
   out.push("", shadowGroupTable("戦略", s.byStrategy, limit));
+  if (s.micro && s.micro.some((g) => g.n > 0)) {
+    out.push(
+      "",
+      "  超短期 (scalp_micro) の答え合わせ",
+      formatTable(
+        ["見送り理由", "件数", "利確到達率", "ランダム時の勝率 p0", "平均R (コスト前)", "平均純R"],
+        s.micro.slice(0, limit + 1).map((g) => [microReasonLabel(g.key), g.n, fmtPct(g.tpRate, 1), fmtPct(g.p0, 1), fmtR(g.avgGrossR), fmtR(g.avgNetR)]),
+      ),
+      "  ※ 利確到達率が p0 を安定して上回るなら、値動きに優位性があります。平均R (コスト前) が正でも平均純R が負なら、手数料が利益を上回っています。見るだけの記録で、腕の学習・発注には使いません。",
+    );
+  }
   out.push("  ※ 純R = 往復手数料・スプレッド・約定ずれ (片道 2bps 既定) を差し引いた値。平均純R が正の見送り理由は、フィルターが厳しすぎる可能性があります (設定は自動では変えません)。");
   return out.join("\n");
 }

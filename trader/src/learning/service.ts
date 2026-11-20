@@ -25,7 +25,7 @@ import { NewsOutcomeTracker, type NewsCheckOptions, type NewsCheckSummary } from
 import { DEFAULT_INFLUENCE_SHADOW_WEIGHT, observeInfluenceWeighted } from "./influence";
 import { reflect, type ReflectionResult } from "./reflection";
 import { SourceReliabilityTracker, type ReliabilityOptions } from "./reliability";
-import { isHaltShadowReason, shadowCountersKey, shadowOpenKey, summarizeShadowTrades, sumShadowCounters, type ShadowCounters, type ShadowSummary } from "./shadow";
+import { isHaltShadowReason, isObserveOnlyShadowReason, shadowCountersKey, shadowOpenKey, summarizeShadowTrades, sumShadowCounters, type ShadowCounters, type ShadowSummary } from "./shadow";
 import { ParamTuner, type ParamValidator, type TunerOptions } from "./tuner";
 
 const log = createLogger("learning");
@@ -201,6 +201,7 @@ export class LearningService {
    * 次のものは保存だけして腕の更新には使わない:
    * - 新規停止中 (halted / kill switch / 日次停止 / 状態不明の注文による一時停止) に記録したもの (isHaltShadowReason)
    * - 別の mode の仮想トレード
+   * - 戦略がコストで見送ったシグナル (strategy_filter:*。測定専用, isObserveOnlyShadowReason)
    * 有効な腕では配分倍率にだけ効き、無効化中の腕では回復の判定にも使う (allocator)。
    * 計画の片側バイアスで止めたもの (reason "direction_bias") は、エントリー時の情報バイアス
    * (opts.intelSentiment。エンジンが記録時に覚えておく) があれば、情報の効き具合にも重み influenceShadowWeight で入れる
@@ -210,6 +211,8 @@ export class LearningService {
     this.store.saveShadowTrade(t);
     if (t.mode !== undefined && t.mode !== this.mode) return;
     if (isHaltShadowReason(t.reason)) return;
+    // 戦略自身がコストで落としたシグナルは、取る前提のシグナルではないので腕の配分に混ぜない。測定専用
+    if (isObserveOnlyShadowReason(t.reason)) return;
     const arm = this.allocator.updateShadow(t);
     this.auditArmTransition(arm, t.exitTs, { shadowId: t.id, source: "shadow", reason: t.reason });
     const w = this.deps.influenceShadowWeight ?? DEFAULT_INFLUENCE_SHADOW_WEIGHT;
