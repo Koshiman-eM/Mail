@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/core/config";
 import type { Candle } from "../src/core/types";
 import { createParamValidator, createPriceAt } from "../src/engine/learningHooks";
-import { brokerVenues, buildRuntime, hubTimeframesFor, parseVenues, parseWatchlist, resolveDbPath, syntheticDbPath } from "../src/engine/setup";
+import { assertLiveVenues, buildRuntime, hubTimeframesFor, parseVenues, parseWatchlist, resolveDbPath, syntheticDbPath } from "../src/engine/setup";
 import { assertSimulationDb } from "../src/engine/simulate";
 import { DEFAULT_REVERSAL_SETTINGS, type ReversalSettings } from "../src/engine/reversalExit";
 import { ClosedCandleCacheFeed } from "../src/engine/feedCache";
@@ -34,30 +34,40 @@ describe("設定の解析", () => {
     expect(() => parseWatchlist("ccxt|BTC/JPY|bond")).toThrow(/資産クラス/);
   });
 
-  it("VENUES と broker 用の表記", () => {
-    expect(parseVenues("synthetic, CCXT ,ccxt:binance,dex")).toEqual(["synthetic", "ccxt", "ccxt:binance", "dex"]);
+  it("VENUES: 廃止した取引先 (oanda / alpaca / dex) は警告して除く (起動は止めない)。それ以外の未知の値はエラー", () => {
+    expect(parseVenues("synthetic, CCXT ,ccxt:binance,gmo")).toEqual(["synthetic", "ccxt", "ccxt:binance", "gmo"]);
+    const warn = vi.fn();
+    expect(parseVenues("gmo,oanda,alpaca,dex,ccxt", warn)).toEqual(["gmo", "ccxt"]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toMatch(/^VENUES の oanda, alpaca, dex は廃止した取引先のため無視します/);
+    expect(parseVenues("oanda")).toEqual([]);
     expect(() => parseVenues("nasdaq")).toThrow(/未知/);
-    expect(brokerVenues(["ccxt", "oanda", "ccxt:binance"], "bitflyer")).toBe("ccxt:bitflyer,oanda,ccxt:binance");
   });
 
-  it("hub の時間足 = 資産クラスに合う戦略の時間足の和集合 + 1m", () => {
-    expect(hubTimeframesFor([{ assetClass: "meme" }], ALL_STRATEGIES)).toEqual(["1m", "5m"]);
-    expect(hubTimeframesFor([{ assetClass: "fx" }], ALL_STRATEGIES)).toEqual(["1m", "15m", "1h", "4h", "1d"]);
-    expect(hubTimeframesFor([{ assetClass: "crypto" }, { assetClass: "meme" }], ALL_STRATEGIES)).toEqual(["1m", "5m", "15m", "1h", "4h", "1d"]);
+  it("live の発注先は gmo だけ: VENUES に ccxt があれば拒否 (gmo・synthetic の判定は別)", () => {
+    expect(() => assertLiveVenues(["gmo"])).not.toThrow();
+    expect(() => assertLiveVenues(["gmo", "ccxt"])).toThrow(/live の発注は GMOコイン \(VENUES=gmo\) だけ.*ccxt を外して/);
+    expect(() => assertLiveVenues(["ccxt:bitbank"])).toThrow(/ccxt:bitbank/);
+  });
+
+  it("hub の時間足 = 資産クラスに合う戦略の時間足の和集合 + 1m (中長期の戦略の廃止で 1d は取らない)", () => {
+    expect(hubTimeframesFor([{ assetClass: "meme" }], ALL_STRATEGIES)).toEqual(["1m"]);
+    expect(hubTimeframesFor([{ assetClass: "fx" }], ALL_STRATEGIES)).toEqual(["1m", "15m", "1h"]);
+    expect(hubTimeframesFor([{ assetClass: "crypto" }, { assetClass: "meme" }], ALL_STRATEGIES)).toEqual(["1m", "5m", "15m", "1h", "4h"]);
   });
 
   it("転換で決済 (REVERSAL_EXIT_TF=lower) の判定用に、対象の戦略の主時間足の 1 つ下の時間足も取得する", () => {
     const only = (id: string) => ALL_STRATEGIES.filter((s) => s.id === id);
     const lower = { ...DEFAULT_REVERSAL_SETTINGS };
-    // long_momentum (1d) → 4h、mid_trend_follow (4h) → 1h
-    expect(hubTimeframesFor([{ assetClass: "crypto" }], only("long_momentum"), lower)).toEqual(["1m", "4h", "1d"]);
-    expect(hubTimeframesFor([{ assetClass: "crypto" }], only("mid_trend_follow"), lower)).toEqual(["1m", "1h", "4h"]);
+    // short_breakout (1h) → 15m、short_ema_trend (15m) → 5m
+    expect(hubTimeframesFor([{ assetClass: "crypto" }], only("short_breakout"), lower)).toEqual(["1m", "15m", "1h"]);
+    expect(hubTimeframesFor([{ assetClass: "crypto" }], only("short_ema_trend"), lower)).toEqual(["1m", "5m", "15m"]);
     // fx: 15m の戦略 → 5m も加わる
-    expect(hubTimeframesFor([{ assetClass: "fx" }], ALL_STRATEGIES, lower)).toEqual(["1m", "5m", "15m", "1h", "4h", "1d"]);
+    expect(hubTimeframesFor([{ assetClass: "fx" }], ALL_STRATEGIES, lower)).toEqual(["1m", "5m", "15m", "1h"]);
     // same・無効・対象外なら従来どおり
-    expect(hubTimeframesFor([{ assetClass: "crypto" }], only("long_momentum"), { ...lower, timeframe: "same" })).toEqual(["1m", "1d"]);
-    expect(hubTimeframesFor([{ assetClass: "crypto" }], only("long_momentum"), REVERSAL_DISABLED)).toEqual(["1m", "1d"]);
-    expect(hubTimeframesFor([{ assetClass: "crypto" }], only("long_momentum"), { ...lower, strategies: ["other"] })).toEqual(["1m", "1d"]);
+    expect(hubTimeframesFor([{ assetClass: "crypto" }], only("short_breakout"), { ...lower, timeframe: "same" })).toEqual(["1m", "1h"]);
+    expect(hubTimeframesFor([{ assetClass: "crypto" }], only("short_breakout"), REVERSAL_DISABLED)).toEqual(["1m", "1h"]);
+    expect(hubTimeframesFor([{ assetClass: "crypto" }], only("short_breakout"), { ...lower, strategies: ["other"] })).toEqual(["1m", "1h"]);
   });
 });
 
@@ -90,25 +100,26 @@ describe("buildRuntime", () => {
     expect(rt.instruments.map((i) => i.symbol)).toEqual(["BTC/USDT", "PEPE/USDT"]);
     expect(rt.feeds).toHaveLength(1);
     expect(rt.feeds[0]).toBeInstanceOf(ClosedCandleCacheFeed);
-    expect(rt.timeframes).toEqual(["1m", "5m", "15m", "1h", "4h", "1d"]);
+    expect(rt.timeframes).toEqual(["1m", "5m", "15m", "1h", "4h"]);
     expect(rt.brokerSet.paper).toBeInstanceOf(PaperBroker);
     expect(rt.ai).toBeUndefined();
   });
 
-  it("ccxt: 注入した exchange (モック) から WATCHLIST の銘柄を作る。venue は ccxt:<id>", async () => {
+  it("ccxt: 注入した exchange (モック) から WATCHLIST の銘柄を作る。venue は ccxt:<id>。meme は WATCHLIST で明示したときだけ", async () => {
     const markets = JSON.parse(readFileSync(new URL("./fixtures/market/ccxt_markets.json", import.meta.url), "utf8"));
     const ex: CcxtLike = {
       id: "mockex", precisionMode: PRECISION.TICK_SIZE,
       loadMarkets: vi.fn(async () => markets), fetchOHLCV: vi.fn(async () => []), fetchTicker: vi.fn(), fetchOrderBook: vi.fn(), fetchTrades: vi.fn(async () => []),
     };
     const create = vi.fn(() => new CcxtFeed(ex, { venue: "ccxt:mockex" }));
-    const rt = await buildRuntime(cfg({ VENUES: "ccxt", CCXT_EXCHANGE: "mockex", WATCHLIST: "ccxt|BTC/USDT|crypto,ccxt|PEPE/USDT|meme" }), {
+    const rt = await buildRuntime(cfg({ VENUES: "ccxt", CCXT_EXCHANGE: "mockex", WATCHLIST: "ccxt|BTC/USDT|crypto,ccxt|PEPE/USDT" }), {
       clock: mkClock(), store: new MemoryStore(), intelSources: [], ai: null, createCcxtFeed: create,
     });
     expect(create).toHaveBeenCalledWith("mockex");
     expect(rt.instruments.map((i) => [i.symbol, i.venue, i.assetClass])).toEqual([
       ["BTC/USDT", "ccxt:mockex", "crypto"],
-      ["PEPE/USDT", "ccxt:mockex", "meme"],
+      // PEPE などは自動では meme に分けない (crypto の戦略で取引する。meme にするなら WATCHLIST の 3 つ目で明示する)
+      ["PEPE/USDT", "ccxt:mockex", "crypto"],
     ]);
     // paper では実口座アダプターを作らない
     expect(rt.brokerSet.mode).toBe("paper");
@@ -116,10 +127,38 @@ describe("buildRuntime", () => {
     expect(ex.fetchTicker).not.toHaveBeenCalled();
   });
 
-  it("oanda / alpaca はキーが必要。監視銘柄が無ければエラー", async () => {
-    await expect(buildRuntime(cfg({ VENUES: "oanda" }), { store: new MemoryStore(), intelSources: [] })).rejects.toThrow(/OANDA_API_TOKEN/);
-    await expect(buildRuntime(cfg({ VENUES: "alpaca" }), { store: new MemoryStore(), intelSources: [] })).rejects.toThrow(/ALPACA_KEY_ID/);
-    await expect(buildRuntime(cfg({ VENUES: "dex" }), { store: new MemoryStore(), intelSources: [] })).rejects.toThrow(/監視銘柄がありません/);
+  it("古い .env: 廃止した取引先 (VENUES・WATCHLIST)・戦略 id は警告して無視し、残りの設定で起動する", async () => {
+    const warns: string[] = [];
+    const logger = { debug() {}, info() {}, warn(m: string, d?: unknown) { warns.push(d ? `${m} ${JSON.stringify(d)}` : m); }, error() {} };
+    const rt = await buildRuntime(
+      cfg({
+        VENUES: "synthetic,oanda,alpaca,dex",
+        WATCHLIST: "synthetic|BTC/USDT|crypto,oanda|USD/JPY|fx,alpaca|AAPL,dex|solana:PAIR|meme",
+        OANDA_API_TOKEN: "t", AUTO_MEME_WATCH: "true",
+        OBSERVE_ONLY_STRATEGIES: "scalp_rebound,mid_trend_follow,long_momentum",
+        STRUCTURE_STRATEGIES: "scalp_micro,mid_trend_follow,meme_momentum",
+        REVERSAL_EXIT_STRATEGIES: "short_breakout,long_momentum",
+      }),
+      { clock: mkClock(), store: new MemoryStore(), intelSources: [], ai: null, syntheticHistoryMs: 86_400_000, logger },
+    );
+    expect(rt.venues).toEqual(["synthetic"]);
+    expect(rt.instruments.map((i) => i.symbol)).toEqual(["BTC/USDT"]);
+    expect(warns.some((w) => w.startsWith("VENUES の oanda, alpaca, dex は廃止した取引先のため無視します"))).toBe(true);
+    expect(warns.filter((w) => w.startsWith("廃止した取引先の WATCHLIST の銘柄を無視します"))).toHaveLength(3);
+    expect(warns).toContain("OBSERVE_ONLY_STRATEGIES に廃止した戦略 id があります (無視されます): mid_trend_follow, long_momentum");
+    expect(warns).toContain("STRUCTURE_STRATEGIES に廃止した戦略 id があります (無視されます): mid_trend_follow, meme_momentum");
+    expect(warns).toContain("REVERSAL_EXIT_STRATEGIES に廃止した戦略 id があります (再起動前に建てたその戦略の建玉にだけ効きます): long_momentum");
+    // 廃止した取引先だけなら監視銘柄が無いのでエラー
+    await expect(buildRuntime(cfg({ VENUES: "oanda,dex" }), { store: new MemoryStore(), intelSources: [], logger })).rejects.toThrow(/監視銘柄がありません/);
+  });
+
+  it("live で VENUES に ccxt があれば起動を拒否する (相場の取得の前に。paper は従来どおり)", async () => {
+    const create = vi.fn();
+    const live = { ...cfg({ VENUES: "gmo,ccxt" }), mode: "live" as const };
+    await expect(buildRuntime(live, { store: new MemoryStore(), intelSources: [], ai: null, createCcxtFeed: create, createGmoFeed: create })).rejects.toThrow(
+      /live の発注は GMOコイン \(VENUES=gmo\) だけ/,
+    );
+    expect(create).not.toHaveBeenCalled();
   });
 });
 

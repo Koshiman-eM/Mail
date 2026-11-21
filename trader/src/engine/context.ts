@@ -1,6 +1,6 @@
-/** エンジンの判断に使う純粋関数群 (情報バイアス・流動性・ブラックアウト・自動監視の候補選定) */
+/** エンジンの判断に使う純粋関数群 (情報バイアス・流動性・ブラックアウト) */
 import {
-  TIMEFRAME_MS, type AssetClass, type Candle, type Instrument, type IntelBias, type IntelItem, type MarketBrief, type MarketView,
+  TIMEFRAME_MS, type AssetClass, type Candle, type Instrument, type IntelBias, type MarketBrief, type MarketView,
   type StrategyPlan, type Timeframe,
 } from "../core/types";
 import { biasForInstrument } from "../intel/planner";
@@ -81,16 +81,11 @@ export function volume24h(candles: MarketView["candles"], now: number): { volume
 export const MIN_VOLUME_COVERAGE_MS = 3_600_000;
 
 /**
- * ミーム銘柄の流動性 (USD)。不明なら undefined (RiskManager が見送る)。
- * - DEX 銘柄: instrument.meta.liquidityUsd (プールの流動性)
- * - CEX 銘柄: 板の厚みを直接取れないため、直近 24 時間の出来高 × 価格を USD 換算した値を代理指標にする。
- *   足が 24 時間分ない場合は 1 時間以上あれば 24 時間へ線形に引き延ばす。
+ * ミーム銘柄 (資産クラス meme。WATCHLIST で明示したもの) の流動性 (USD)。不明なら undefined (RiskManager が見送る)。
+ * 板の厚みを直接取れないため、直近 24 時間の出来高 × 価格を USD 換算した値を代理指標にする。
+ * 足が 24 時間分ない場合は 1 時間以上あれば 24 時間へ線形に引き延ばす。
  */
 export function liquidityUsdFor(inst: Instrument, view: Pick<MarketView, "candles" | "quote" | "now">, toUsd: (ccy: string) => number): number | undefined {
-  if (inst.venue.startsWith("dex")) {
-    const v = Number(inst.meta?.liquidityUsd);
-    return Number.isFinite(v) && v >= 0 ? v : undefined;
-  }
   const vol = volume24h(view.candles, view.now);
   if (!vol || vol.coveredMs < MIN_VOLUME_COVERAGE_MS) return undefined;
   const q = view.quote;
@@ -115,62 +110,4 @@ export function planRegimeTimeframe(tfs: readonly Timeframe[]): Timeframe {
 /** 見送り理由の集計キー (数値を # に置き換えて種類ごとにまとめる) */
 export function normalizeReason(reason: string): string {
   return reason.replace(/\d[\d.,:]*/g, "#").slice(0, 80);
-}
-
-// ───────── 自動ミーム監視 ─────────
-
-export interface AutoMemeCandidate {
-  key: string;
-  chainId: string;
-  pairAddress: string;
-  symbol: string;
-  liquidityUsd: number;
-  rugRisk: number;
-  pairAgeHours: number;
-  inWatchlist: boolean;
-}
-
-const DEX_URL_RE = /^https:\/\/dexscreener\.com\/([a-z0-9_-]+)\/([a-z0-9]+)\/?(?:[?#].*)?$/i;
-
-/** URL (https://dexscreener.com/<chain>/<pair>) からチェーンとペアアドレス */
-export function parseDexScreenerUrl(url: string | undefined): { chainId: string; pairAddress: string } | undefined {
-  const m = url ? DEX_URL_RE.exec(url.trim()) : null;
-  return m ? { chainId: m[1].toLowerCase(), pairAddress: m[2] } : undefined;
-}
-
-/**
- * DexScreener 由来のトレンドから自動監視の候補を選ぶ (純粋関数)。
- * 条件: 流動性 ≥ minLiquidityUsd、rugRisk < 0.5、ペア作成から 24 時間以上。
- * brief.watchlist に載っているものを優先し、次に流動性の大きい順。
- */
-export function selectAutoMemeCandidates(
-  items: IntelItem[],
-  o: { minLiquidityUsd: number; watchlist?: string[]; exclude?: Set<string>; max?: number; source?: string },
-): AutoMemeCandidate[] {
-  const wl = new Set((o.watchlist ?? []).map((s) => s.toUpperCase()));
-  const seen = new Map<string, AutoMemeCandidate>();
-  for (const it of items) {
-    if (it.kind !== "trending" || it.source !== (o.source ?? "dexscreener")) continue;
-    const loc = parseDexScreenerUrl(it.url);
-    if (!loc) continue;
-    const m = it.metrics ?? {};
-    const liq = m.liquidityUsd;
-    const rug = m.rugRisk;
-    const age = m.pairAgeHours;
-    if (!(Number.isFinite(liq) && liq >= o.minLiquidityUsd)) continue;
-    if (!(Number.isFinite(rug) && rug < 0.5)) continue;
-    if (!(Number.isFinite(age) && age >= 24)) continue;
-    const key = `${loc.chainId}:${loc.pairAddress}`;
-    if (o.exclude?.has(key)) continue;
-    const symbol = (it.assets.find((a) => a !== "MEME") ?? "").toUpperCase();
-    const cand: AutoMemeCandidate = {
-      key, ...loc, symbol, liquidityUsd: liq, rugRisk: rug, pairAgeHours: age,
-      inWatchlist: wl.has(symbol) || [...wl].some((w) => w.split("/")[0] === symbol),
-    };
-    const prev = seen.get(key);
-    if (!prev || cand.liquidityUsd > prev.liquidityUsd) seen.set(key, cand);
-  }
-  return [...seen.values()]
-    .sort((a, b) => Number(b.inWatchlist) - Number(a.inWatchlist) || b.liquidityUsd - a.liquidityUsd)
-    .slice(0, o.max ?? 5);
 }

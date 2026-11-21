@@ -1,14 +1,17 @@
 /**
  * 戦略・時間軸・腕のキーの「表示名」 (人間向けの表示専用)。
  *
- * 戦略 id (long_momentum / short_breakout など) の long / short は「長期 / 短期」の時間軸であって、
+ * 戦略 id (short_breakout など) と時間軸 (Horizon) の short / long は「短期 / 長期」の意味であって、
  * 売買の向き (買い / 売り) ではない。紛らわしいので、画面・レポートでは日本語の表示名を使う。
  * id・kv キー・env の値・ジャーナルの項目・腕のキーは一切変えない (学習データの互換性のため)。
  * 表示名に long / short / ロング / ショート を入れない (テストで検査する)。
  */
 import type { RegimeLabel } from "../core/types";
 
-/** 戦略 id → 表示名 (ラッパー (相場構造フィルター) は id を変えないので、同じ表示名が使える) */
+/**
+ * 戦略 id → 表示名 (ラッパー (相場構造フィルター) は id を変えないので、同じ表示名が使える)。
+ * 登録している戦略だけ (ダッシュボードの戦略の一覧もこの表から作る)。廃止した戦略の古い記録は id のまま表示する
+ */
 export const STRATEGY_LABELS: Record<string, string> = {
   scalp_obi: "超短期・板の偏り",
   scalp_vwap_revert: "超短期・VWAP への回帰",
@@ -21,9 +24,6 @@ export const STRATEGY_LABELS: Record<string, string> = {
   short_breakout: "短期・ブレイクアウト (1 時間足)",
   pullback_5m: "短期・押し目買い / 戻り売り (5 分足)",
   pullback_15m: "短期・押し目買い / 戻り売り (15 分足)",
-  mid_trend_follow: "中期・トレンドフォロー (4 時間足)",
-  long_momentum: "長期・モメンタム (日足)",
-  meme_momentum: "ミームコイン・勢い",
 };
 
 /** 戦略の表示名。未知の id は id そのまま */
@@ -31,12 +31,12 @@ export function strategyLabel(id: string): string {
   return STRATEGY_LABELS[id] ?? id;
 }
 
-/** 表示名と id を並べる (環境変数の設定は id で書くので、設定に関わる表示で使う)。例: 長期・モメンタム (日足) [long_momentum] */
+/** 表示名と id を並べる (環境変数の設定は id で書くので、設定に関わる表示で使う)。例: 短期・ブレイクアウト (1 時間足) [short_breakout] */
 export function strategyLabelWithId(id: string): string {
   return id in STRATEGY_LABELS ? `${STRATEGY_LABELS[id]} [${id}]` : id;
 }
 
-/** 時間軸 (Horizon) の表示名 */
+/** 時間軸 (Horizon) の表示名 (中期・長期の戦略は廃止したが、古い記録の表示のために残す) */
 export const HORIZON_LABELS: Record<string, string> = { scalp: "超短期", short: "短期", mid: "中期", long: "長期" };
 
 /** 時間軸の表示名。未知の値はそのまま */

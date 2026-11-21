@@ -249,11 +249,12 @@ describe("setup: VENUES=gmo (paper)", () => {
     expect(liveAllowed.audits[0].data).toMatchObject({ mode: "live" });
   });
 
-  it("live で GMO 以外の発注先を併用すると、GMO の新規エントリーは RiskManager が拒否する", async () => {
+  it("古い .env の廃止した取引先 (oanda / dex) は無視し、GMO の新規エントリーは通常どおり RiskManager の判定を受ける", async () => {
     const { fetchImpl } = createGmoMock({ "GET /v1/symbols": SYMBOLS_DATA });
     const liveSet = { mode: "live" as const, brokers: new Map(), brokerFor: () => { throw new Error("no broker"); } };
     const mk = async (venues: string) => {
       const rt = await buildRuntime(loadConfig({ VENUES: venues, GMO_SYMBOLS: "BTC_JPY", OANDA_API_TOKEN: "t", OANDA_ACCOUNT_ID: "a" }), {
+        logger: { debug() {}, info() {}, warn() {}, error() {} },
         store: new MemoryStore(), intelSources: [], ai: null, fetchImpl, clock: { now: () => now }, brokerSet: liveSet,
       });
       const inst = rt.instruments.find((i) => i.venue === "gmo")!;
@@ -261,10 +262,11 @@ describe("setup: VENUES=gmo (paper)", () => {
         signal: { strategyId: "s", horizon: "short", symbol: inst.symbol, direction: "long", confidence: 1, expectedEdgeBps: 500, entry: { type: "market" }, stopLoss: 9_900, maxHoldMs: 1, reason: "", features: {} },
         instrument: inst, quote: { ts: now, bid: 9_999, ask: 10_001 }, equity: 1_000_000, available: 1_000_000, positions: [], riskMultiplier: 1, now,
       });
+      expect(rt.venues).toEqual(["gmo"]);
       rt.close();
       return d;
     };
-    expect(await mk("gmo,oanda")).toMatchObject({ ok: false, reason: expect.stringContaining("GMO 以外の発注先 (oanda)") });
+    expect((await mk("gmo,oanda")).ok).toBe(true);
     expect((await mk("gmo,dex")).ok).toBe(true);
   });
 

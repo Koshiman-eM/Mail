@@ -15,7 +15,6 @@ import type { PaperSnapshot } from "../execution/paper";
 import type { IntelService } from "../intel/service";
 import { biasForInstrument, buildBaselinePlan, buildStrategyPlan, MAX_RISK_MULTIPLIER } from "../intel/planner";
 import { estimateSentiment } from "../intel/sentiment";
-import { DEX_SOURCE } from "../intel/sources/dexscreener";
 import { atrLast } from "../indicators/series";
 import { armKey } from "../learning/allocator";
 import { ForecastTracker, type ForecastOptions, type ForecastStatusView } from "../learning/forecast";
@@ -24,14 +23,14 @@ import type { NewsMarketInfo } from "../learning/newsCheck";
 import { ShadowTracker, type PriceRange, type ShadowOptions } from "../learning/shadow";
 import { TradeJournal } from "../learning/journal";
 import type { LearningService, PeriodicResult } from "../learning/service";
-import type { DexScreenerFeed } from "../market/feeds/dexscreener";
 import type { MarketHub } from "../market/hub";
 import { detectRegime, regimeOptionsFor } from "../regime/detect";
 import { clearResumeRequest, peekResumeRequest } from "../risk/resumeRequest";
 import { costBps, type RiskManager, type RiskPosition } from "../risk/manager";
 import { ALL_STRATEGIES, resolveParams } from "../strategies/registry";
+import { RETIRED_STRATEGIES } from "../strategies/retired";
 import {
-  activeBlackout, emptyBrief, intelBiasFor, liquidityUsdFor, normalizeReason, planRegimeTimeframe, selectAutoMemeCandidates,
+  activeBlackout, emptyBrief, intelBiasFor, liquidityUsdFor, normalizeReason, planRegimeTimeframe,
 } from "./context";
 import { runGrouped, withDeadline } from "./deadline";
 import { createFxConverter, fxApproxReason, normalizeCurrency, type FxConverter } from "./fx";
@@ -50,7 +49,6 @@ import { effectiveLimitTakeProfit } from "./limitOrders";
 import { quoteMid } from "../core/util";
 
 export const PAPER_SNAPSHOT_KEY = "paper:snapshot";
-export const AUTO_MEME_KEY = "engine:autoMemeWatch";
 /** レジーム判定に必要な最低本数 (未満なら「レジーム不明」) */
 const MIN_REGIME_BARS = 30;
 
@@ -65,8 +63,6 @@ export interface EngineOptions {
   intelEveryMs?: number;
   /** 学習ループ間隔 (既定 LEARN_LOOP_MS) */
   learnEveryMs?: number;
-  /** 自動ミーム監視の最大件数 (既定 5) */
-  autoMemeMax?: number;
   /** PaperBroker の snapshot に残す注文結果の件数 (冪等性の確認用, 既定 500) */
   snapshotResultsKeep?: number;
   /** live モードで口座情報を取り直す間隔 (既定 10 秒) */
@@ -123,8 +119,6 @@ export interface EngineDeps {
   fx?: FxConverter;
   /** 腕の探索に使う乱数 (シミュレーションでは固定シード) */
   rng?: () => number;
-  /** AUTO_MEME_WATCH 用 */
-  dexFeed?: DexScreenerFeed;
   /** hub が保持する時間足 (計画用レジームの時間足を選ぶのに使う) */
   timeframes?: Timeframe[];
   options?: EngineOptions;
@@ -398,7 +392,6 @@ export class TradingEngine {
   private readonly ai?: AiOptions;
   private readonly log: Logger;
   private readonly rng: () => number;
-  private readonly dexFeed?: DexScreenerFeed;
   private readonly timeframes?: Timeframe[];
   /** 観測専用の戦略 id (OBSERVE_ONLY_STRATEGIES)。新規エントリーは発注せず仮想トレード (reason "observe_only") としてだけ記録する */
   private readonly observeOnly: ReadonlySet<string>;
@@ -471,7 +464,6 @@ export class TradingEngine {
     this.ai = deps.ai;
     this.log = deps.logger ?? createLogger("engine");
     this.rng = deps.rng ?? Math.random;
-    this.dexFeed = deps.dexFeed;
     this.timeframes = deps.timeframes;
     // 手組みの設定 (テスト) で未設定なら config の既定値と同じ扱い
     this.observeOnly = new Set(deps.config.env.OBSERVE_ONLY_STRATEGIES ?? DEFAULT_OBSERVE_ONLY_STRATEGIES.split(","));
@@ -493,7 +485,6 @@ export class TradingEngine {
       tickMs: o.tickMs ?? env.SCALP_LOOP_MS,
       intelEveryMs: o.intelEveryMs ?? env.INTEL_LOOP_MS,
       learnEveryMs: o.learnEveryMs ?? env.LEARN_LOOP_MS,
-      autoMemeMax: o.autoMemeMax ?? 5,
       snapshotResultsKeep: o.snapshotResultsKeep ?? 500,
       liveAccountCacheMs: o.liveAccountCacheMs ?? 10_000,
       pollTimeoutMs: o.pollTimeoutMs ?? Math.max(1_000, o.tickMs ?? env.SCALP_LOOP_MS),
@@ -676,7 +667,6 @@ export class TradingEngine {
       this.log.warn("LIMIT_TAKE_PROFIT=true は live では無視します (利確の指値は板に置かず、エンジン側の成行で利確します)。paper 専用の設定です");
       this.store.audit({ ts: now, type: "limit.tp_live_ignored", data: { mode: this.mode, LIMIT_TAKE_PROFIT: true } });
     }
-    if (this.config.env.AUTO_MEME_WATCH && this.dexFeed) await this.restoreAutoMeme();
     // エンジン停止中に書かれた解消の要求 (CLI `orders resolve`) を適用する
     await this.applyResolveRequests(now);
     // 板に置いた利確の指値の約定を先に反映する (建玉の突き合わせで外部の決済と誤認しない)
@@ -1196,7 +1186,7 @@ export class TradingEngine {
       if (!this.shadow || !sh || !inst) continue;
       try {
         const sim = isSimulatedShort(inst, this.mode, sh.signal.direction);
-        const ptf = (this.strategies.find((x) => x.id === sh.signal.strategyId) ?? ALL_STRATEGIES.find((x) => x.id === sh.signal.strategyId))?.primaryTimeframe;
+        const ptf = this.primaryTimeframeOf(sh.signal.strategyId);
         const tf = ptf ? reversalTimeframeFor(this.reversal, ptf) : undefined;
         this.shadow.record({
           instrument: inst, quote: sh.quote, signal: sh.signal, regime: sh.regime, reason: "limit_unfilled", now: sh.signalTs,
@@ -1993,6 +1983,15 @@ export class TradingEngine {
   }
 
   /**
+   * 戦略の主時間足。登録している戦略 (この engine の一覧 → ALL_STRATEGIES) に無ければ、廃止した戦略の値 (RETIRED_STRATEGIES)。
+   * 再起動前に建てた廃止した戦略の建玉も、転換で決済を同じ時間足で判定できるようにする。どれにも無ければ undefined
+   */
+  private primaryTimeframeOf(strategyId: string): Timeframe | undefined {
+    const s = this.strategies.find((x) => x.id === strategyId) ?? ALL_STRATEGIES.find((x) => x.id === strategyId);
+    return s?.primaryTimeframe ?? (Object.hasOwn(RETIRED_STRATEGIES, strategyId) ? RETIRED_STRATEGIES[strategyId].primaryTimeframe : undefined);
+  }
+
+  /**
    * 転換で決済 (REVERSAL_EXIT。src/engine/reversalExit.ts)。保有中の建玉を、REVERSAL_EXIT_TF の時間足
    * (lower (既定) = 持ち主の戦略の主時間足の 1 つ下、same = 主時間足。hub がその足を持たなければ主時間足) の新しい確定足ごとに 1 回判定する。
    * エントリー後に確定したスイングが無ければ、REVERSAL_EXIT_FALLBACK=true のときだけエントリーした足の安値 (買い) / 高値 (売り) を水準にする (監査ログに fallback: true)。
@@ -2011,11 +2010,12 @@ export class TradingEngine {
    */
   private async reversalExit(inst: Instrument, view: MarketView, pos: OpenTrade, ctx: TickCtx, signalTried: boolean): Promise<void> {
     if (!reversalAppliesTo(this.reversal, pos.strategyId)) return;
-    const s = this.strategies.find((x) => x.id === pos.strategyId) ?? ALL_STRATEGIES.find((x) => x.id === pos.strategyId);
-    if (!s) return;
+    // 持ち主の戦略の主時間足 (廃止した戦略の建玉は src/strategies/retired.ts の値)。分からなければ判定しない
+    const primaryTf = this.primaryTimeframeOf(pos.strategyId);
+    if (!primaryTf) return;
     // 判定の時間足 (REVERSAL_EXIT_TF。lower = 主時間足の 1 つ下)。hub がその足を持たなければ主時間足で判定する
-    const want = reversalTimeframeFor(this.reversal, s.primaryTimeframe);
-    const tf = view.candles[want]?.length ? want : s.primaryTimeframe;
+    const want = reversalTimeframeFor(this.reversal, primaryTf);
+    const tf = view.candles[want]?.length ? want : primaryTf;
     const tfMs = TIMEFRAME_MS[tf];
     const c = view.candles[tf];
     const lastBar = c && c.length ? c[c.length - 1] : undefined;
@@ -2047,7 +2047,7 @@ export class TradingEngine {
     const risk = Math.abs(pos.entryPrice - pos.initialStop);
     const data = {
       tradeId: pos.id, symbol: inst.symbol, strategyId: pos.strategyId, direction: pos.direction, detail: reversalDetailLabel(pos.direction),
-      timeframe: tf, primaryTimeframe: s.primaryTimeframe, pivotN: this.reversal.pivotN, bufferAtr: this.reversal.bufferAtr,
+      timeframe: tf, primaryTimeframe: primaryTf, pivotN: this.reversal.pivotN, bufferAtr: this.reversal.bufferAtr,
       level: r.level, pivotTs: r.pivotTs, ...(r.fallback ? { fallback: true } : {}), close: r.close, barTs: r.barTs,
       ...(Number.isFinite(r.atr) ? { atr: r.atr } : {}), threshold: r.threshold, entryPrice: pos.entryPrice, entryTs: pos.entryTs,
       initialStop: pos.initialStop, ...(pos.takeProfit !== undefined ? { takeProfit: pos.takeProfit } : {}), intendedPrice: intended,
@@ -2155,8 +2155,8 @@ export class TradingEngine {
             tif: "GTC",
             ...(postOnly ? { postOnly: true } : {}),
             strategyId: c.strategy.id,
-            // 取引所側の保護ストップ (成行と同じく渡す。OANDA は stopLossOnFill = 約定で開いたトレードに付くので約定前には発動しない。
-            // GMO・ccxt・Alpaca は付けない。損切りの判定はエンジン側でも続ける)
+            // 取引所側の保護ストップ (成行と同じく渡す。対応するアダプターだけが付ける。いまの発注先 (paper・GMO) は付けない。
+            // 損切りの判定はエンジン側で続ける)
             protectiveStop: sig.stopLoss,
           }
         : {
@@ -2358,7 +2358,6 @@ export class TradingEngine {
       this.store.savePlan(plan);
       const active = Object.values(plan.perSymbol).filter((p) => p.enabledStrategies.length > 0).length;
       this.store.audit({ ts: now, type: "engine.plan", data: { activeSymbols: active, blackouts: plan.blackouts.length, riskOn: brief.riskOn, stubBrief: brief.stub } });
-      if (this.config.env.AUTO_MEME_WATCH) await this.autoMemeWatch(brief, now);
       return plan;
     } catch (e) {
       const msg = redactedErrMsg(e);
@@ -2406,55 +2405,6 @@ export class TradingEngine {
       if (!this.stopped) this.store.audit({ ts: now, type: "engine.learning_error", data: { error: msg } });
       return undefined;
     }
-  }
-
-  // ───────── 自動ミーム監視 (AUTO_MEME_WATCH) ─────────
-
-  private watchInstrument(inst: Instrument): boolean {
-    if (this.hub.instrument(inst.symbol)) return false;
-    this.hub.watch(inst, this.dexFeed);
-    this.brokerSet.paper?.addInstrument(inst);
-    return true;
-  }
-
-  private async restoreAutoMeme(): Promise<void> {
-    for (const key of this.store.kvGet<string[]>(AUTO_MEME_KEY) ?? []) {
-      const [chainId, pairAddress] = key.split(":");
-      try {
-        this.watchInstrument(await this.dexFeed!.trackPair(chainId, pairAddress));
-      } catch (e) {
-        this.log.warn("自動監視ミームの復元に失敗", { key, error: redactedErrMsg(e) });
-      }
-    }
-  }
-
-  /** DexScreener のトレンドから条件を満たすミームを最大 autoMemeMax 件まで監視に追加 */
-  async autoMemeWatch(brief: MarketBrief, now: number): Promise<string[]> {
-    if (!this.dexFeed) return [];
-    const added = this.store.kvGet<string[]>(AUTO_MEME_KEY) ?? [];
-    if (added.length >= this.opt.autoMemeMax) return [];
-    const items = this.store.listIntel({ since: now - 6 * 3_600_000, kinds: ["trending"], limit: 1000 });
-    const cands = selectAutoMemeCandidates(items, {
-      minLiquidityUsd: this.config.risk.memeMinLiquidityUsd,
-      watchlist: brief.watchlist,
-      exclude: new Set(added),
-      max: this.opt.autoMemeMax - added.length,
-      source: DEX_SOURCE,
-    });
-    const symbols: string[] = [];
-    for (const c of cands) {
-      try {
-        const inst = await this.dexFeed.trackPair(c.chainId, c.pairAddress);
-        added.push(c.key);
-        if (!this.watchInstrument(inst)) continue;
-        symbols.push(inst.symbol);
-        this.store.audit({ ts: now, type: "engine.auto_meme_watch", data: { ...c, symbol: inst.symbol, trendingSymbol: c.symbol } });
-      } catch (e) {
-        this.log.warn("ミームの自動監視に失敗", { key: c.key, error: redactedErrMsg(e) });
-      }
-    }
-    this.store.kvSet(AUTO_MEME_KEY, added);
-    return symbols;
   }
 
   // ───────── シミュレーション・実時間ループ ─────────

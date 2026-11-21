@@ -1,9 +1,0 @@
-[
- {"chainId":"solana","pairAddress":"PairGood","url":"https://dexscreener.example/good","baseToken":{"address":"AddrGood111","symbol":"GOOD"},"priceUsd":"0.0123",
-  "txns":{"h1":{"buys":400,"sells":350},"h24":{"buys":5000,"sells":4800}},"volume":{"m5":10000,"h1":200000,"h24":3000000},
-  "priceChange":{"m5":1.2,"h1":8.5,"h24":30},"liquidity":{"usd":2500000},"pairCreatedAt":1761000000000},
- {"chainId":"solana","pairAddress":"PairGoodSmall","baseToken":{"address":"AddrGood111","symbol":"GOOD"},"liquidity":{"usd":1000},"volume":{"h24":10},"pairCreatedAt":1761000000000},
- {"chainId":"solana","pairAddress":"PairRug","baseToken":{"address":"AddrRug222","symbol":"RUGGY"},"priceUsd":"0.0000001",
-  "txns":{"h1":{"buys":200,"sells":3},"h24":{"buys":200,"sells":3}},"volume":{"m5":500,"h1":9000,"h24":9000},
-  "priceChange":{"m5":40,"h1":300,"h24":300},"liquidity":{"usd":3000},"pairCreatedAt":1762127000000}
-]

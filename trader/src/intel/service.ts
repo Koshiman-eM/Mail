@@ -8,7 +8,6 @@ import type { TagOptions } from "./assetTagger";
 import { createCoinGeckoSource } from "./sources/coingecko";
 import type { FetchJsonFn, FetchTextFn, IntelSource } from "./sources/common";
 import { createCryptoPanicSource } from "./sources/cryptopanic";
-import { createDexScreenerSource } from "./sources/dexscreener";
 import { createEconCalendarSource } from "./sources/econCalendar";
 import { createFearGreedSource } from "./sources/fearGreed";
 import { createRssSources } from "./sources/rss";
@@ -125,7 +124,6 @@ export function createDefaultSources(
     ...createRssSources({ env: env.NEWS_RSS_FEEDS, fetchText: opts.fetchText, tag: opts.tag }),
     createFearGreedSource({ fetchJson: opts.fetchJson }),
     createCryptoPanicSource({ token: env.CRYPTOPANIC_TOKEN, fetchJson: opts.fetchJson }),
-    createDexScreenerSource({ fetchJson: opts.fetchJson }),
     createCoinGeckoSource({ fetchJson: opts.fetchJson }),
     createEconCalendarSource({ fetchJson: opts.fetchJson }),
   ];

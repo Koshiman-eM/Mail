@@ -9,7 +9,7 @@ import { createGmoMock, fakeTime, gmoErr, type RecordedRequest, type RouteValue 
 
 /**
  * GMOコインの実口座アダプター (すべてモック。実 API へは送信しない)。
- * アダプターは NODE_ENV=test では生成できないので、各テストの間だけ production にする (既存のアダプターのテストと同じ)。
+ * アダプターは NODE_ENV=test では生成できないので、各テストの間だけ production にする。
  */
 let origEnv: string | undefined;
 beforeEach(() => {

@@ -313,9 +313,9 @@ describe("withStructure: 戦略の属性", () => {
     // useMTF=false なら上位足を加えない
     expect(withStructure(inner, { useMTF: false }).timeframes).toEqual(["15m"]);
     // 1d の上位足 1w は hub に取りに行かず 1d から集約する
-    const long = withStructure(getStrategy("long_momentum")!, {});
-    expect(long.timeframes).toEqual(["1d"]);
-    expect(long.warmup).toBe(structureWarmupBars(6) * 7);
+    const daily = withStructure({ ...inner, id: "daily_test", primaryTimeframe: "1d", timeframes: ["1d"], warmup: 1 }, {});
+    expect(daily.timeframes).toEqual(["1d"]);
+    expect(daily.warmup).toBe(structureWarmupBars(6) * 7);
   });
 });
 
@@ -328,7 +328,7 @@ describe("設定と一覧への適用", () => {
     const list = configuredStrategies(structureSettingsFromEnv(env));
     const wrapped = list.filter(isStructureWrapped).map((s) => s.id).sort();
     expect(wrapped).toEqual(
-      ["long_momentum", "meme_momentum", "mid_trend_follow", "scalp_micro", "scalp_momentum_burst", "short_breakout", "short_ema_trend"].sort(),
+      ["scalp_micro", "scalp_momentum_burst", "short_breakout", "short_ema_trend"].sort(),
     );
     for (const id of ["scalp_obi", "scalp_vwap_revert", "short_rsi_revert", "scalp_rebound"]) {
       expect(list.find((s) => s.id === id)).toBe(getStrategy(id));
@@ -377,7 +377,7 @@ describe("組み立て (buildRuntime)", () => {
     const on = await buildRuntime(loadConfig(base), {
       clock, store: new MemoryStore(), intelSources: [], ai: null, seed: 3, syntheticHistoryMs: 2 * 86_400_000,
     });
-    expect(on.engine.strategies.filter(isStructureWrapped).length).toBe(7);
+    expect(on.engine.strategies.filter(isStructureWrapped).length).toBe(4);
     // hub の時間足は上位足を含む (従来と同じ一覧に収まる)
     expect(on.timeframes).toEqual(rt.timeframes);
   });

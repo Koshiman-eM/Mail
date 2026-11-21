@@ -59,13 +59,12 @@ describe("analyzeIntelDetailed (AI 無効)", () => {
     expect(hi.stub).toBe(true);
     expect(hi.biases.BTC.sentiment).toBeGreaterThan(lo.biases.BTC.sentiment);
   });
-  it("ミーム監視候補はラグプル危険の低い DEX 銘柄のみ", async () => {
-    const dex = (id: string, sym: string, rug: number): IntelItem => ({
-      id, source: "dexscreener", kind: "trending", title: sym, publishedAt: NOW, fetchedAt: NOW, assets: [sym, "MEME"],
-      sentiment: 0.3, importance: 0.8 - rug * 0.5, metrics: { rugRisk: rug },
+  it("AI 無効なら注目銘柄 (watchlist) は作らない (ルールベースの候補は廃止した DexScreener のトレンドだけだった)", async () => {
+    const trending = (id: string, sym: string): IntelItem => ({
+      id, source: "coingecko", kind: "trending", title: sym, publishedAt: NOW, fetchedAt: NOW, assets: [sym], sentiment: 0.3, importance: 0.8,
     });
-    const brief = await analyzeIntel([dex("d1", "GOOD", 0.1), dex("d2", "RUGGY", 0.9)], { now: NOW, reliability: {}, lessons: [], events: [] });
-    expect(brief.watchlist).toEqual(["GOOD"]);
+    const brief = await analyzeIntel([trending("t1", "GOOD"), item("1", "Bitcoin surges to record high")], { now: NOW, reliability: {}, lessons: [], events: [] });
+    expect(brief.watchlist).toEqual([]);
   });
 });
 

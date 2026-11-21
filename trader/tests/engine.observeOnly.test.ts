@@ -87,21 +87,21 @@ describe("エンジン: 観測専用の戦略", () => {
     expect(await run(START, START + 3 * MIN)).toBeGreaterThanOrEqual(1);
   });
 
-  it("既定 (未設定) では scalp_rebound・mid_trend_follow・long_momentum が観測専用", async () => {
-    for (const id of ["scalp_rebound", "mid_trend_follow", "long_momentum"]) {
-      const { rt, run } = await setup([buyer(id)], {});
-      expect(await run(START, START + 3 * MIN), id).toBe(0);
-      const open = rt.engine.shadow!.list();
-      expect(open, id).toHaveLength(1);
-      expect(open[0].reason).toBe("observe_only");
+  it("既定 (未設定) では scalp_rebound だけが観測専用", async () => {
+    const { rt, run } = await setup([buyer("scalp_rebound")], {});
+    expect(await run(START, START + 3 * MIN)).toBe(0);
+    const open = rt.engine.shadow!.list();
+    expect(open).toHaveLength(1);
+    expect(open[0].reason).toBe("observe_only");
+    // 観測専用でない戦略は通常どおり発注する (廃止した中長期の戦略の id も既定では特別扱いしない)
+    for (const id of ["short_ema_trend", "mid_trend_follow"]) {
+      const { run: r } = await setup([buyer(id)], {});
+      expect(await r(START, START + 3 * MIN), id).toBeGreaterThanOrEqual(1);
     }
-    // 観測専用でない戦略は通常どおり発注する
-    const { run } = await setup([buyer("short_ema_trend")], {});
-    expect(await run(START, START + 3 * MIN)).toBeGreaterThanOrEqual(1);
   });
 
-  it("起動時: OBSERVE_ONLY_STRATEGIES が中長期の戦略を含まなければ警告をログに出す (既定なら出さない)", async () => {
-    for (const [env, expected] of [[{ OBSERVE_ONLY_STRATEGIES: "scalp_rebound" }, true], [{}, false]] as const) {
+  it("起動時: OBSERVE_ONLY_STRATEGIES に廃止した戦略 id があれば警告をログに出して無視する (既定なら出さない)", async () => {
+    for (const [env, expected] of [[{ OBSERVE_ONLY_STRATEGIES: "scalp_rebound,mid_trend_follow,long_momentum" }, true], [{}, false]] as const) {
       const logs: string[] = [];
       const base = createLogger("test");
       const logger = { ...base, warn: (m: string) => void logs.push(m) };
@@ -109,22 +109,22 @@ describe("エンジン: 観測専用の戦略", () => {
         loadConfig({ NODE_ENV: "test", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "JPY", ...env }),
         { clock: { now: () => START }, store: new MemoryStore(), intelSources: [], ai: null, seed: 3, syntheticHistoryMs: 86_400_000, strategies: [], logger },
       );
-      expect(logs.some((l) => l.startsWith("中長期戦略 (mid_trend_follow / long_momentum) が新規エントリー可能です。既定は観測専用です")), JSON.stringify(env)).toBe(expected);
+      expect(logs.includes("OBSERVE_ONLY_STRATEGIES に廃止した戦略 id があります (無視されます): mid_trend_follow, long_momentum"), JSON.stringify(env)).toBe(expected);
       rt.close();
     }
   });
 
   it("観測専用にした戦略の保有中の建玉は、従来どおり管理・決済する (新規だけ止める)", async () => {
     const store = new MemoryStore();
-    // 観測専用でないときに建てた mid_trend_follow の建玉 (損切り・利確 ±5%・最大保有 2 分)
-    const first = await setup([buyer("mid_trend_follow", 0.05, 2)], { OBSERVE_ONLY_STRATEGIES: "" }, undefined, { store });
+    // 観測専用でないときに建てた scalp_rebound の建玉 (損切り・利確 ±5%・最大保有 2 分)
+    const first = await setup([buyer("scalp_rebound", 0.05, 2)], { OBSERVE_ONLY_STRATEGIES: "" }, undefined, { store });
     let t = START;
     for (; t <= START + 3 * MIN && first.rt.engine.positions.list().length === 0; t += 15_000) await first.run(t, t);
     const held = first.rt.engine.positions.list();
     expect(held).toHaveLength(1);
     await first.rt.engine.stop();
-    // 既定 (mid_trend_follow は観測専用) で再起動: 建玉を復元して管理し、損切り・利確・時間切れのどれかで決済する
-    const second = await setup([buyer("mid_trend_follow", 0.05, 2)], {}, undefined, { store, start: t });
+    // 既定 (scalp_rebound は観測専用) で再起動: 建玉を復元して管理し、損切り・利確・時間切れのどれかで決済する
+    const second = await setup([buyer("scalp_rebound", 0.05, 2)], {}, undefined, { store, start: t });
     await second.rt.engine.init();
     expect(second.rt.engine.positions.list().map((p) => p.id)).toEqual([held[0].id]);
     expect(await second.run(t, t + 8 * MIN)).toBe(0);

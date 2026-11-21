@@ -35,7 +35,7 @@ async function deps(items: IntelItem[] = []): Promise<DashboardDeps> {
   const clock = { t: START, now() { return this.t; } };
   const store = new MemoryStore();
   if (items.length) store.saveIntel(items);
-  const rt = await buildRuntime(loadConfig({ NODE_ENV: "test", LIMIT_ENTRY: "false", LIMIT_TAKE_PROFIT: "false", VENUES: "synthetic", DB_PATH: "memory" }), {
+  const rt = await buildRuntime(loadConfig({ NODE_ENV: "test", LIMIT_ENTRY: "false", LIMIT_TAKE_PROFIT: "false", VENUES: "synthetic", DB_PATH: "memory", WATCHLIST: "synthetic|BTC/USDT,synthetic|ETH/USDT,synthetic|USD/JPY,synthetic|AAPL" }), {
     clock, store, intelSources: [], ai: null, seed: 2, syntheticHistoryMs: 86_400_000, strategies: [flipper], rng: mulberry32(1),
   });
   await rt.engine.tick(START);
@@ -103,7 +103,7 @@ describe("ダッシュボード (listen せずにハンドラーを呼ぶ)", () 
     expect(s.equity.current).toBeGreaterThan(0);
     expect(s.risk.halted).toBe(false);
     expect(s.positions.map((p: { symbol: string }) => p.symbol).sort()).toEqual(["BTC/USDT", "ETH/USDT"]);
-    expect(s.plan.symbols.length).toBe(5);
+    expect(s.plan.symbols.length).toBe(4);
     expect(s.brief.stub).toBe(true);
     expect(s.brief.itemCount).toBe(0);
     expect(s.brief.items).toEqual([]);

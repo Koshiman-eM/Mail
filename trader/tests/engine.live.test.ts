@@ -441,7 +441,8 @@ describe("paper と live の分離", () => {
     const store = new MemoryStore();
     // paper で BTC / ETH を保有 (評価額 100 万 JPY 基準のリスク状態)
     const paperClock = mkClock();
-    const paper = await buildRuntime(loadConfig({ NODE_ENV: "test", LIMIT_ENTRY: "false", LIMIT_TAKE_PROFIT: "false", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "JPY" }), {
+    // PEPE/USDT は crypto なので除く (この試験は BTC・ETH の 2 銘柄の建玉を見る)
+    const paper = await buildRuntime(loadConfig({ NODE_ENV: "test", LIMIT_ENTRY: "false", LIMIT_TAKE_PROFIT: "false", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "JPY", WATCHLIST: "synthetic|BTC/USDT,synthetic|ETH/USDT,synthetic|USD/JPY,synthetic|AAPL" }), {
       clock: paperClock, store, intelSources: [], ai: null, seed: 3, syntheticHistoryMs: 2 * 86_400_000, rng: mulberry32(7), strategies: [alwaysLong()],
     });
     await paper.engine.tick(START);

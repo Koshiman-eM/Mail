@@ -11,8 +11,15 @@
 
 // ───────────────────────── 基本列挙 ─────────────────────────
 
+/**
+ * 資産クラス。meme は自動では分類しない (WATCHLIST で "venue|symbol|meme" と明示した銘柄だけ。専用の戦略は無い)。
+ * 学習データ (腕のキー・予想・振り返り) とダッシュボードのリスク設定に meme が残っているので、クラスとしては残す
+ */
 export type AssetClass = "crypto" | "meme" | "fx" | "stock";
-/** トレードの時間軸。scalp と short をメインに据える */
+/**
+ * トレードの時間軸。登録している戦略は scalp と short だけ。mid / long の戦略は廃止したが、
+ * 古い取引・仮想トレードの記録と MAX_HOLD_MINUTES の規則 (isHoldLimitedHorizon) のために残す
+ */
 export type Horizon = "scalp" | "short" | "mid" | "long";
 export type Side = "buy" | "sell";
 /** flat はポジション解消 (エグジット) シグナル */
@@ -34,9 +41,9 @@ export const TIMEFRAME_MS: Record<Timeframe, number> = {
 // ───────────────────────── 銘柄・市場データ ─────────────────────────
 
 export interface Instrument {
-  /** 統一シンボル。例: "BTC/USDT", "USD/JPY", "AAPL", "BONK/SOL" */
+  /** 統一シンボル。例: "BTC/USDT", "BTC/JPY", "USD/JPY", "AAPL" */
   symbol: string;
-  /** 取引先。例: "paper", "ccxt:bitflyer", "oanda", "alpaca", "dex:solana" */
+  /** 取引先。例: "paper", "ccxt:bitbank", "gmo" (古い paper のスナップショットには廃止した "oanda" / "dex:solana" などが残りうる) */
   venue: string;
   assetClass: AssetClass;
   baseCurrency: string;
@@ -59,7 +66,7 @@ export interface Instrument {
   simulatedShort?: boolean;
   /** 1 単位あたりの契約サイズ (FX/先物用。現物は 1) */
   contractSize?: number;
-  /** 取引先固有の情報 (DEX のペアアドレス、流動性 USD など) */
+  /** 取引先固有の情報 (GMO の建玉の持ち越し手数料の日率 holdingFeeDaily など) */
   meta?: Record<string, string | number>;
 }
 
@@ -133,7 +140,7 @@ export type IntelKind = "news" | "social" | "metric" | "calendar" | "trending";
 export interface IntelItem {
   /** 安定 ID (source + URL/ID のハッシュ等)。重複排除に使う */
   id: string;
-  /** 情報源 ID。例: "rss:coindesk", "fng:alternative.me", "dexscreener", "calendar:ff" */
+  /** 情報源 ID。例: "rss:coindesk", "fng:alternative.me", "coingecko", "calendar:ff" */
   source: string;
   kind: IntelKind;
   title: string;
@@ -355,7 +362,7 @@ export interface OrderRequest {
   strategyId: string;
   /**
    * 取引所側に置く保護用ストップ価格 (対応アダプターのみ。エンジン側の損切りが主で、これはプロセス停止時の保険)。
-   * 決済時に取引所側で自動的に取り消されることが保証できるアダプターだけが付ける。
+   * 決済時に取引所側で自動的に取り消されることが保証できるアダプターだけが付ける (いまの発注先の paper・GMO は付けない)。
    */
   protectiveStop?: number;
 }
@@ -480,7 +487,7 @@ export interface RiskLimits {
    * 設定が下限より低ければ設定のまま (締めも緩めもしない)
    */
   tempoMinEdgeToCost?: number;
-  /** ミームコインの最低流動性 (USD) */
+  /** 資産クラス meme (WATCHLIST で明示した銘柄) の最低流動性 (USD。24 時間の出来高から推定) */
   memeMinLiquidityUsd: number;
 }
 

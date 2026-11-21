@@ -32,8 +32,8 @@ export interface BacktestCommandOptions {
   /** 指値 (maker) の前提 (実運用の LIMIT_ENTRY / LIMIT_TAKE_PROFIT / LIMIT_ENTRY_TIMEOUT_MS に合わせる。省略時は従来の成行) */
   limitOrders?: BacktestOptions["limitOrders"];
   /**
-   * 最大保有 (分。実運用の MAX_HOLD_MINUTES に合わせる。0・省略で無効)。中期・長期以外の戦略はシグナルの最大保有を縮める。
-   * 中期・長期は縮めずに計算し、運用では新規エントリーしない旨を備考に出す
+   * 最大保有 (分。実運用の MAX_HOLD_MINUTES に合わせる。0・省略で無効)。シグナルの最大保有を縮める。
+   * 時間軸が中期・長期の戦略 (いまは登録なし) は縮めずに計算し、運用では新規エントリーしない旨を備考に出す
    */
   maxHoldMinutes?: number;
   /** 読みの管理 (実運用の THESIS_* に合わせる。省略で従来の時間切れ) */
@@ -128,11 +128,7 @@ export async function createBacktestDataLoader(o: Pick<BacktestCommandOptions, "
         const candles = cache.get(key) ?? generateCandles({ seed: o.seed, bars, timeframe: base, vol: syntheticVolFor(base), startTs: BACKTEST_SYNTHETIC_START });
         cache.set(key, candles);
         const cls = s.assetClasses.includes("crypto") ? "crypto" : s.assetClasses[0];
-        const instrument = syntheticInstrument({
-          symbol: o.symbol ?? "SYN/USDT",
-          assetClass: cls,
-          ...(cls === "meme" ? { allowShort: false, meta: { liquidityUsd: 1_000_000 } } : {}),
-        });
+        const instrument = syntheticInstrument({ symbol: o.symbol ?? "SYN/USDT", assetClass: cls });
         return { base, candles, instrument, tradeFromTs: BACKTEST_SYNTHETIC_START + warmupMs };
       }
       const until = Math.floor(now / baseMs) * baseMs;

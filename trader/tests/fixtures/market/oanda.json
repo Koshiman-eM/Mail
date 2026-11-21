@@ -1,9 +1,0 @@
-{
-  "instruments": {"instruments":[
-    {"name":"USD_JPY","type":"CURRENCY","displayPrecision":3,"tradeUnitsPrecision":0,"minimumTradeSize":"1"},
-    {"name":"XAU_USD","type":"METAL","displayPrecision":2,"tradeUnitsPrecision":0,"minimumTradeSize":"1"}]},
-  "candles": {"instrument":"USD_JPY","granularity":"M1","candles":[
-    {"complete":true,"volume":120,"time":"2025-01-01T00:00:00.000000000Z","bid":{"o":"149.99","h":"150.02","l":"149.98","c":"150.00"},"mid":{"o":"150.000","h":"150.030","l":"149.990","c":"150.010"},"ask":{"o":"150.01","h":"150.04","l":"150.00","c":"150.02"}},
-    {"complete":false,"volume":10,"time":"2025-01-01T00:01:00.000000000Z","mid":{"o":"150.010","h":"150.020","l":"150.000","c":"150.015"}}]},
-  "pricing": {"prices":[{"instrument":"USD_JPY","time":"2025-01-01T00:01:05.123456789Z","bids":[{"price":"150.010","liquidity":1000000}],"asks":[{"price":"150.020","liquidity":2000000}]}]}
-}

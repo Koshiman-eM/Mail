@@ -120,36 +120,17 @@ const idList = (def: string) =>
   str(def).transform((v) => [...new Set(v.split(",").map((x) => x.trim()).filter(Boolean))]);
 
 /**
- * 観測専用 (発注せず仮想トレードだけ記録する) 戦略の既定値。
- * scalp_rebound (効果の測定中) と、中長期の mid_trend_follow・long_momentum (中長期の新規エントリーはしない方針)。
+ * 観測専用 (発注せず仮想トレードだけ記録する) 戦略の既定値。scalp_rebound (効果の測定中)。
  * 観測専用でも保有中の建玉は従来どおり管理・決済する (止めるのは新規エントリーだけ)
  */
-export const DEFAULT_OBSERVE_ONLY_STRATEGIES = "scalp_rebound,mid_trend_follow,long_momentum";
-
-/** 既定で観測専用にしている中長期の戦略 (新規エントリーはしない方針) */
-export const MID_LONG_OBSERVE_ONLY_IDS: readonly string[] = ["mid_trend_follow", "long_momentum"];
-
-/**
- * OBSERVE_ONLY_STRATEGIES の警告 (起動時にログへ出す)。既定は中長期の戦略を含むので、含まない = 明示的に設定している。
- * 古い .env (.env.example から写した OBSERVE_ONLY_STRATEGIES=scalp_rebound など) では新しい既定が効かないため知らせる
- */
-export function observeOnlyConfigWarnings(observeOnly: readonly string[] | undefined): string[] {
-  if (observeOnly === undefined) return [];
-  const missing = MID_LONG_OBSERVE_ONLY_IDS.filter((id) => !observeOnly.includes(id));
-  if (missing.length === 0) return [];
-  return [
-    `中長期戦略 (${missing.join(" / ")}) が新規エントリー可能です。既定は観測専用です ` +
-      `(OBSERVE_ONLY_STRATEGIES=${observeOnly.join(",")}。新規を止めるなら ${DEFAULT_OBSERVE_ONLY_STRATEGIES} のように含めてください)`,
-  ];
-}
+export const DEFAULT_OBSERVE_ONLY_STRATEGIES = "scalp_rebound";
 
 /**
  * 相場構造 (ダウ理論) のフィルターを掛ける戦略の既定値 (トレンド・ブレイク系だけ)。
  * 逆張り (scalp_vwap_revert, short_rsi_revert)・板 (scalp_obi)・下降中の反発買い (scalp_rebound) は、
  * 目線と逆向きに入ること自体が設計なので対象外 (src/structure/settings.ts)
  */
-export const DEFAULT_STRUCTURE_STRATEGIES =
-  "scalp_momentum_burst,scalp_micro,short_ema_trend,short_breakout,mid_trend_follow,long_momentum,meme_momentum";
+export const DEFAULT_STRUCTURE_STRATEGIES = "scalp_momentum_burst,scalp_micro,short_ema_trend,short_breakout";
 
 /** 列挙値の環境変数 (大文字小文字は問わない)。未設定・空は def。それ以外は起動を止める */
 const choice = <T extends string>(key: string, values: readonly T[], def: T) =>
@@ -189,14 +170,17 @@ const EnvSchema = z.object({
   NODE_ENV: str("development"),
   TRADING_MODE: str("paper"),
   LIVE_TRADING_CONFIRM: str(),
-  /** 使う取引先 (カンマ区切り): synthetic, ccxt, gmo, oanda, alpaca, dex */
+  /**
+   * 使う取引先 (カンマ区切り): synthetic, ccxt, gmo。live の発注は gmo だけ (ccxt は相場の取得と paper 用)。
+   * 廃止した oanda / alpaca / dex は起動時に警告して無視する (src/engine/setup.ts の parseVenues)
+   */
   VENUES: str("synthetic"),
   /** 監視銘柄 (カンマ区切り、"venue|symbol|assetClass")。空なら既定のデモ銘柄 */
   WATCHLIST: str(),
   BASE_CURRENCY: str("JPY"),
   PAPER_INITIAL_EQUITY: num(1_000_000),
   /**
-   * paper で、取引所では空売りできない現物の暗号資産 (allowShort=false。meme・DEX は対象外) の空売りを再現して学習する (既定 true)。
+   * paper で、取引所では空売りできない現物の暗号資産 (allowShort=false。meme は対象外) の空売りを再現して学習する (既定 true)。
    * live では常に無効 (src/core/short.ts の canShort)
    */
   PAPER_SIMULATE_SHORT: bool("PAPER_SIMULATE_SHORT", true),
@@ -212,11 +196,8 @@ const EnvSchema = z.object({
   ANTHROPIC_API_KEY: str(),
   ANTHROPIC_MODEL: str("claude-opus-5-5"),
 
-  // 暗号資産取引所 (ccxt)
+  // 暗号資産取引所 (ccxt。相場の取得と paper 用で、発注はしない)
   CCXT_EXCHANGE: str("bitbank"),
-  CCXT_API_KEY: str(),
-  CCXT_SECRET: str(),
-  CCXT_PASSWORD: str(),
   // GMOコイン (取引所 レバレッジ取引)。キーは live の発注と `gmo check` の非公開 API (読み取り) だけに使う
   GMO_API_KEY: str(),
   GMO_API_SECRET: str(),
@@ -241,14 +222,6 @@ const EnvSchema = z.object({
    * paper では常に許可 (警告と監査ログ gmo.spot_candles を残す)。live ではこれが true のときだけ許可し、false なら例外
    */
   GMO_ALLOW_SPOT_CANDLES: bool("GMO_ALLOW_SPOT_CANDLES", false),
-  // FX (OANDA v20)
-  OANDA_API_TOKEN: str(),
-  OANDA_ACCOUNT_ID: str(),
-  OANDA_ENV: str("practice"),
-  // 株式 (Alpaca)
-  ALPACA_KEY_ID: str(),
-  ALPACA_SECRET_KEY: str(),
-  ALPACA_PAPER: str("true"),
   // 情報収集
   CRYPTOPANIC_TOKEN: str(),
   NEWS_RSS_FEEDS: str(),
@@ -266,11 +239,15 @@ const EnvSchema = z.object({
   MAX_EXPOSURE_MEME: riskEnv("maxExposureMeme"),
   MAX_EXPOSURE_FX: riskEnv("maxExposureFx"),
   MAX_EXPOSURE_STOCK: riskEnv("maxExposureStock"),
+  /**
+   * 資産クラス meme (WATCHLIST で明示した銘柄だけ。自動の分類はしない) の新規エントリーに求める 24 時間の流動性 (USD)。
+   * RiskManager の判定 (未満・不明なら拒否)
+   */
   MEME_MIN_LIQUIDITY_USD: num(250_000),
   /**
    * 観測専用の戦略 id (カンマ区切り)。評価とシグナルの生成は通常どおり行うが、新規エントリーは発注せず
-   * 仮想トレード (reason "observe_only") としてだけ記録する。既定は scalp_rebound,mid_trend_follow,long_momentum。
-   * 保有中の建玉は従来どおり管理・決済する。空文字なら観測専用なし
+   * 仮想トレード (reason "observe_only") としてだけ記録する。既定は scalp_rebound。
+   * 保有中の建玉は従来どおり管理・決済する。空文字なら観測専用なし。未登録 (廃止した戦略を含む) の id は起動時に警告して無視する
    */
   OBSERVE_ONLY_STRATEGIES: idList(DEFAULT_OBSERVE_ONLY_STRATEGIES),
 
@@ -310,8 +287,9 @@ const EnvSchema = z.object({
   ),
   /**
    * 新規エントリーの最大保有時間 (分)。0 (既定) = 無効、それ以外は 5〜1440。
-   * 有効なら、時間軸が中期・長期 (mid / long) の戦略は新規エントリーを発注せず仮想トレード (hold_limit) としてだけ記録し、
-   * ほかの戦略はシグナルの最大保有時間をこの分数までに縮める (保有中の建玉は変えない)
+   * 有効なら、シグナルの最大保有時間をこの分数までに縮める (保有中の建玉は変えない)。
+   * 時間軸が中期・長期 (mid / long) の戦略は新規エントリーを発注せず仮想トレード (hold_limit) としてだけ記録する
+   * (いまの登録戦略に中期・長期は無いが、時間軸による規則として残している。src/engine/tempo.ts の isHoldLimitedHorizon)
    */
   MAX_HOLD_MINUTES: checkedNum(
     "MAX_HOLD_MINUTES", 0, (x) => x === 0 || (x >= 5 && x <= 1440),
@@ -438,11 +416,6 @@ const EnvSchema = z.object({
    * 未設定 (または 16 文字未満) ならループバック以外からは書き込めない。ループバック待ち受けでは不要
    */
   DASHBOARD_WRITE_TOKEN: str(),
-  /** DexScreener のトレンドから条件を満たすミームを自動で監視に追加する (既定 false) */
-  AUTO_MEME_WATCH: z
-    .string()
-    .optional()
-    .transform((v) => ["1", "true", "yes", "on"].includes((v ?? "").trim().toLowerCase())),
 });
 
 export type Env = z.infer<typeof EnvSchema>;

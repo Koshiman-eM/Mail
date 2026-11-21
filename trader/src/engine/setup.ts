@@ -1,7 +1,7 @@
 /** 設定 (VENUES / WATCHLIST) から実行に必要な部品一式を組み立てる */
 import { basename, dirname, extname, join } from "node:path";
 import type { AiOptions } from "../core/ai";
-import { observeOnlyConfigWarnings, type AppConfig } from "../core/config";
+import type { AppConfig } from "../core/config";
 import { createLogger, type Logger } from "../core/logger";
 import { withSimulatedShort } from "../core/short";
 import {
@@ -11,17 +11,15 @@ import { createBrokers, type BrokerSet } from "../execution/router";
 import { createDefaultSources, IntelService } from "../intel/service";
 import type { IntelSource } from "../intel/sources/common";
 import { LearningService, type LearningServiceDeps } from "../learning/service";
-import { AlpacaFeed } from "../market/feeds/alpaca";
 import { CcxtFeed } from "../market/feeds/ccxt";
-import { DexScreenerFeed } from "../market/feeds/dexscreener";
 import { GmoFeed } from "../market/feeds/gmo";
 import { gmoToUnified, parseGmoSymbols, unifiedToGmo } from "../market/gmo/client";
-import { OandaFeed } from "../market/feeds/oanda";
 import { SyntheticFeed } from "../market/feeds/synthetic";
 import { MarketHub } from "../market/hub";
 import { RiskManager } from "../risk/manager";
 import { createStore } from "../storage";
 import { ALL_STRATEGIES, configuredStrategies } from "../strategies/registry";
+import { strategyIdListWarnings } from "../strategies/retired";
 import { structureConfigWarnings, structureSettingsFromEnv } from "../structure/settings";
 import { TradingEngine, type EngineOptions } from "./engine";
 import { ClosedCandleCacheFeed } from "./feedCache";
@@ -34,16 +32,19 @@ import {
 } from "./reversalExit";
 
 const ASSET_CLASSES: AssetClass[] = ["crypto", "meme", "fx", "stock"];
-export const KNOWN_VENUES = ["synthetic", "ccxt", "gmo", "oanda", "alpaca", "dex"] as const;
+export const KNOWN_VENUES = ["synthetic", "ccxt", "gmo"] as const;
+/**
+ * 廃止した取引先 (OANDA・Alpaca・DEX)。VENUES / WATCHLIST に残っていても起動を止めず、警告して無視する
+ * (古い .env のままサーバーを再起動しても落ちないように)
+ */
+const REMOVED_VENUES = ["oanda", "alpaca", "dex"] as const;
 /** ccxt で WATCHLIST が空のときに探す既定銘柄 (存在するものを最大 3 つ) */
 export const DEFAULT_CCXT_SYMBOLS = ["BTC/JPY", "ETH/JPY", "BTC/USDT", "ETH/USDT", "SOL/USDT", "DOGE/USDT"];
-export const DEFAULT_OANDA_SYMBOLS = ["USD/JPY", "EUR/USD"];
-export const DEFAULT_ALPACA_SYMBOLS = ["AAPL", "MSFT"];
-/** 合成フィードの履歴 (中期戦略の 4h 足 80 本が揃う長さ) */
+/** 合成フィードの履歴 (上位足の 4h 足 (pullback_15m・構造フィルターの MTF) が十分に揃う長さ) */
 export const DEFAULT_SYNTHETIC_HISTORY_MS = 15 * 86_400_000;
 
 export interface WatchEntry {
-  /** synthetic / ccxt / ccxt:<id> / gmo / oanda / alpaca / dex */
+  /** synthetic / ccxt / ccxt:<id> / gmo */
   venue: string;
   symbol: string;
   assetClass?: AssetClass;
@@ -61,14 +62,37 @@ export function parseWatchlist(s: string): WatchEntry[] {
   return out;
 }
 
-/** VENUES を解析する (ccxt:<id> も可) */
-export function parseVenues(s: string): string[] {
+const isRemovedVenue = (v: string) => (REMOVED_VENUES as readonly string[]).includes(v.split(":")[0]);
+
+/**
+ * VENUES を解析する (ccxt:<id> も可)。廃止した取引先 (oanda / alpaca / dex) は warn に知らせて一覧から除く (起動は止めない)。
+ * それ以外の未知の値は書き間違いとして起動を止める
+ */
+export function parseVenues(s: string, warn?: (message: string) => void): string[] {
   const list = [...new Set(s.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean))];
+  const removed = list.filter(isRemovedVenue);
   for (const v of list) {
     const kind = v.split(":")[0];
-    if (!(KNOWN_VENUES as readonly string[]).includes(kind)) throw new Error(`未知の VENUES: ${v} (${KNOWN_VENUES.join(", ")})`);
+    if (!isRemovedVenue(v) && !(KNOWN_VENUES as readonly string[]).includes(kind)) throw new Error(`未知の VENUES: ${v} (${KNOWN_VENUES.join(", ")})`);
   }
-  return list;
+  if (removed.length > 0) {
+    warn?.(`VENUES の ${removed.join(", ")} は廃止した取引先のため無視します (使える取引先: ${KNOWN_VENUES.join(", ")}。.env から外してください)`);
+  }
+  return list.filter((v) => !isRemovedVenue(v));
+}
+
+/**
+ * live で発注できる取引先は GMOコイン (gmo) だけ。ccxt は相場の取得と paper 用 (発注のアダプターは無い)。
+ * live で VENUES に ccxt があれば起動を止める (fail-closed。発注先の無い銘柄を監視したまま live で動かさない)
+ */
+export function assertLiveVenues(venues: readonly string[]): void {
+  const ccxt = venues.filter((v) => v.split(":")[0] === "ccxt");
+  if (ccxt.length > 0) {
+    throw new Error(
+      `live の発注は GMOコイン (VENUES=gmo) だけに対応しています。VENUES から ${ccxt.join(", ")} を外してください ` +
+        "(ccxt は相場の取得と paper 用で、live の発注はできません)",
+    );
+  }
 }
 
 /**
@@ -104,11 +128,6 @@ export function resolveDbPath(config: Pick<AppConfig, "env">): string {
   const venues = config.env.VENUES.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
   const syntheticOnly = venues.length > 0 && venues.every((v) => v === "synthetic");
   return syntheticOnly ? syntheticDbPath(config.env.DB_PATH) : config.env.DB_PATH;
-}
-
-/** createBrokers 用に VENUES を instrument.venue の表記へそろえる (ccxt → ccxt:<CCXT_EXCHANGE>) */
-export function brokerVenues(venues: string[], ccxtExchange: string): string {
-  return venues.map((v) => (v === "ccxt" ? `ccxt:${ccxtExchange}` : v)).join(",");
 }
 
 export interface RuntimeOptions {
@@ -159,7 +178,6 @@ export interface Runtime {
   engine: TradingEngine;
   fx: FxConverter;
   ai?: AiOptions;
-  dexFeed?: DexScreenerFeed;
   /** store を閉じる (エンジンは先に stop すること) */
   close(): void;
 }
@@ -179,12 +197,19 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
   const reversalSettings = reversalSettingsFromEnv(env);
   const knownIds = [...new Set([...ALL_STRATEGIES.map((x) => x.id), ...(opts.strategies ?? []).map((x) => x.id)])];
   for (const w of reversalConfigWarnings(reversalSettings, knownIds, env.STRUCTURE_EXIT_ON_REVERSAL === true)) log.warn(w);
-  // 観測専用 (OBSERVE_ONLY_STRATEGIES): 明示的な設定が中長期の戦略を含まない (古い .env では新しい既定が効かない) と警告する
-  for (const w of observeOnlyConfigWarnings(env.OBSERVE_ONLY_STRATEGIES)) log.warn(w);
+  // 観測専用 (OBSERVE_ONLY_STRATEGIES): 廃止した戦略・未登録の id は警告する (集合の判定なので、残っていても何も起きない)
+  for (const w of strategyIdListWarnings("OBSERVE_ONLY_STRATEGIES", env.OBSERVE_ONLY_STRATEGIES, knownIds)) log.warn(w);
   const strategies = opts.strategies ?? configuredStrategies(structureSettings);
-  const venues = parseVenues(env.VENUES);
-  const watch = parseWatchlist(env.WATCHLIST);
-  if (config.mode === "live" && !opts.markets && venues.includes("synthetic")) throw new Error("synthetic は paper 専用です (live では使えません)");
+  const venues = parseVenues(env.VENUES, (m) => log.warn(m));
+  const watch = parseWatchlist(env.WATCHLIST).filter((w) => {
+    if (!isRemovedVenue(w.venue)) return true;
+    log.warn("廃止した取引先の WATCHLIST の銘柄を無視します", { venue: w.venue, symbol: w.symbol });
+    return false;
+  });
+  if (config.mode === "live" && !opts.markets) {
+    if (venues.includes("synthetic")) throw new Error("synthetic は paper 専用です (live では使えません)");
+    assertLiveVenues(venues);
+  }
 
   const feeds: MarketDataFeed[] = [];
   const pairs: { inst: Instrument; feed: MarketDataFeed }[] = [];
@@ -200,9 +225,6 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
   // GMO の feed が使う取引 mode と監査ログの書き込み先 (store は後で作るので、作った後に差し込む)
   const gmoTradeMode = opts.brokerSet?.mode ?? config.mode;
   let auditSink: Store["audit"] | undefined;
-  let dexFeed: DexScreenerFeed | undefined;
-  const allTfs: Timeframe[] = ["1m", "5m", "15m", "1h", "4h", "1d"];
-  const getDex = () => (dexFeed ??= new DexScreenerFeed({ clock, timeframes: allTfs, ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}) }));
 
   for (const m of opts.markets ?? []) for (const inst of m.instruments) add(inst, m.feed);
 
@@ -265,47 +287,7 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
       } catch (e) {
         log.warn("GMO の初期化に失敗したためスキップします", { error: e instanceof Error ? e.message : String(e) });
       }
-    } else if (kind === "oanda") {
-      if (!env.OANDA_API_TOKEN || !env.OANDA_ACCOUNT_ID) throw new Error("oanda: OANDA_API_TOKEN / OANDA_ACCOUNT_ID が必要です");
-      const entries = entriesFor((x) => x === "oanda");
-      const symbols = entries.length ? entries.map((e) => e.symbol) : DEFAULT_OANDA_SYMBOLS;
-      try {
-        const feed = new OandaFeed({
-          token: env.OANDA_API_TOKEN, accountId: env.OANDA_ACCOUNT_ID, env: env.OANDA_ENV === "live" ? "live" : "practice", symbols,
-          ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
-        });
-        for (const inst of await feed.listInstruments()) add(withClass(inst, entries.find((e) => e.symbol === inst.symbol)?.assetClass), feed);
-      } catch (e) {
-        log.warn("OANDA の初期化に失敗したためスキップします", { error: e instanceof Error ? e.message : String(e) });
-      }
-    } else if (kind === "alpaca") {
-      if (!env.ALPACA_KEY_ID || !env.ALPACA_SECRET_KEY) throw new Error("alpaca: ALPACA_KEY_ID / ALPACA_SECRET_KEY が必要です");
-      const entries = entriesFor((x) => x === "alpaca");
-      const symbols = entries.length ? entries.map((e) => e.symbol) : DEFAULT_ALPACA_SYMBOLS;
-      const feed = new AlpacaFeed({
-        keyId: env.ALPACA_KEY_ID, secretKey: env.ALPACA_SECRET_KEY, symbols, clock,
-        ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
-      });
-      for (const inst of await feed.listInstruments()) add(withClass(inst, entries.find((e) => e.symbol === inst.symbol)?.assetClass), feed);
-    } else if (kind === "dex") {
-      const feed = getDex();
-      for (const e of entriesFor((x) => x === "dex")) {
-        const [chainId, pairAddress] = e.symbol.split(":");
-        if (!chainId || !pairAddress) {
-          log.warn("dex の銘柄は dex|<chainId>:<pairAddress>|meme の形式で指定してください", { symbol: e.symbol });
-          continue;
-        }
-        try {
-          add(withClass(await feed.trackPair(chainId, pairAddress), e.assetClass), feed);
-        } catch (err) {
-          log.warn("DEX ペアの登録に失敗", { symbol: e.symbol, error: err instanceof Error ? err.message : String(err) });
-        }
-      }
     }
-  }
-  if (env.AUTO_MEME_WATCH) {
-    const feed = getDex();
-    if (!feeds.includes(feed)) feeds.push(feed);
   }
   // paper の空売りの再現: 発注先の mode が paper で PAPER_SIMULATE_SHORT=true のときだけ、空売り不可の現物暗号資産に
   // simulatedShort を付ける (allowShort は書き換えない。live では付けず、付いていても canShort が live では無視する)
@@ -319,8 +301,8 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
   for (const p of pairs) hub.watch(p.inst, p.feed);
 
   const fx = createFxConverter({ baseCurrency: env.BASE_CURRENCY, getQuote: (s) => hub.latestQuote(s) });
-  // mode は config (resolveMode の結果) のまま。VENUES の表記だけ instrument.venue にそろえる
-  const brokerConfig: AppConfig = { ...config, env: { ...env, VENUES: brokerVenues(venues, env.CCXT_EXCHANGE) } };
+  // mode は config (resolveMode の結果) のまま。live の発注先は gmo だけ (上の assertLiveVenues。createBrokers も gmo 以外を拒否する)
+  const brokerConfig: AppConfig = { ...config, env: { ...env, VENUES: venues.join(",") } };
   const brokerSet =
     opts.brokerSet ??
     createBrokers(brokerConfig, instruments, {
@@ -333,15 +315,11 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
   const store = opts.store ?? createStore(resolveDbPath(config));
   // リスク状態は実際の発注先の mode ごとに分ける (paper の基準で live の kill switch を誤作動させない)
   auditSink = (e) => store.audit(e);
-  // GMO の実効レバレッジの基準は GMO 口座の評価額。エンジンが渡す評価額は全発注先の合計なので、live で GMO 以外の
-  // 発注先 (dex・synthetic は発注しないので除く) を併用しているときは GMO の新規エントリーを拒否させる
-  const gmoOtherOrderVenues = brokerVenues(venues, env.CCXT_EXCHANGE)
-    .split(",")
-    .filter((v) => v && v !== "gmo" && !v.startsWith("dex") && v !== "synthetic");
+  // GMO の実効レバレッジの基準は GMO 口座の評価額。live の発注先は GMO だけ (assertLiveVenues) なので、
+  // エンジンが渡す評価額 (全発注先の合計) は GMO 口座の評価額と同じになる
   const risk = new RiskManager(config.risk, store, {
     mode: brokerSet.mode,
     gmoMaxEffectiveLeverage: env.GMO_MAX_EFFECTIVE_LEVERAGE,
-    ...(venues.includes("gmo") && gmoOtherOrderVenues.length ? { gmoOtherOrderVenues } : {}),
   });
   const ai = opts.ai === null ? undefined : (opts.ai ?? (config.ai.enabled ? { apiKey: config.ai.apiKey, model: config.ai.model } : undefined));
   // 学習状態は実際の発注先の mode ごとに分ける (paper の理想的な約定で学んだ内容を live に持ち込まない)。
@@ -352,12 +330,12 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
     mode: brokerSet.mode,
     getStrategy: (id) => strategies.find((s) => s.id === id),
     // 検証は feed から長い履歴を取得して行う (hub の直近の足だけでは短すぎる)。
-    // 合成フィードはキャッシュ層 (直近 2000 本まで) を通さず内側から取る。DEX は履歴を持たないので検証に使わない
+    // 合成フィードはキャッシュ層 (直近 2000 本まで) を通さず内側から取る
     validate: createParamValidator({
       hub, strategies, clock,
       feedFor: (inst) => {
         const f = pairs.find((p) => p.inst.symbol === inst.symbol)?.feed;
-        if (!f || f instanceof DexScreenerFeed) return undefined;
+        if (!f) return undefined;
         return f instanceof ClosedCandleCacheFeed ? f.inner : f;
       },
       briefsBetween: (since, until) => store.listBriefs?.({ since, until }) ?? [],
@@ -390,13 +368,11 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
     config, store, hub, brokerSet, risk, intel, learning, strategies, clock, fx, timeframes,
     ...(ai ? { ai } : {}),
     ...(opts.rng ? { rng: opts.rng } : {}),
-    ...(dexFeed ? { dexFeed } : {}),
     ...(opts.engine ? { options: opts.engine } : {}),
   });
   return {
     config, clock, store, hub, feeds, instruments, timeframes, venues, brokerSet, risk, intel, learning, engine, fx,
     ...(ai ? { ai } : {}),
-    ...(dexFeed ? { dexFeed } : {}),
     close: () => store.close(),
   };
 }

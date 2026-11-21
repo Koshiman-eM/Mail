@@ -49,11 +49,11 @@ describe("RiskManager: GMO の実効レバレッジの上限", () => {
     expect(new RiskManager(limits, undefined, { mode: "live", gmoMaxEffectiveLeverage: 0.6 }).evaluateEntry(params({ positions: pos })).ok).toBe(false);
   });
 
-  it("GMO 以外の建玉は数えない。GMO 以外の銘柄は従来どおり (この判定を通らない)", () => {
-    const rm = new RiskManager(limits, undefined, { mode: "live", gmoMaxEffectiveLeverage: 0.5 });
-    const usdjpy: Instrument = { ...PAPER_BTC, symbol: "USD/JPY", venue: "oanda", assetClass: "fx", baseCurrency: "USD" };
+  it("paper: GMO 以外の建玉は数えない。GMO 以外の銘柄は従来どおり (この判定を通らない)", () => {
+    const rm = new RiskManager(limits, undefined, { mode: "paper", gmoMaxEffectiveLeverage: 0.5 });
+    const usdjpy: Instrument = { ...PAPER_BTC, symbol: "USD/JPY", venue: "synthetic", assetClass: "fx", baseCurrency: "USD" };
     const inst = new Map([[BTC.symbol, BTC], [ETH.symbol, ETH], [usdjpy.symbol, usdjpy]]);
-    // OANDA の建玉 900,000 円は数えない → 500,000 / 10,001 = 49.99
+    // GMO 以外の建玉 900,000 円は数えない → 500,000 / 10,001 = 49.99
     const d = rm.evaluateEntry(params({ positions: [{ symbol: "USD/JPY", qty: 6000, avgPrice: 150, price: 150 }], instruments: inst }));
     expect(d.ok && Number(d.qty)).toBeCloseTo(49.99, 6);
     // ccxt の銘柄: GMO の建玉が上限を超えていても実効レバレッジの判定は無い (従来どおり)
@@ -62,11 +62,14 @@ describe("RiskManager: GMO の実効レバレッジの上限", () => {
     if (nonGmo.ok) expect(nonGmo.notes.join(" ")).not.toContain("GMO");
   });
 
-  it("live で GMO 以外の発注先があれば GMO の新規は拒否 (GMO 口座の評価額を基準にできない)。paper・GMO 以外の銘柄は従来どおり", () => {
-    const live = new RiskManager(limits, undefined, { mode: "live", gmoOtherOrderVenues: ["ccxt:bitbank"] });
-    expect(live.evaluateEntry(params())).toMatchObject({ ok: false, reason: expect.stringContaining("GMO 以外の発注先 (ccxt:bitbank)") });
-    expect(live.evaluateEntry(params({ instrument: PAPER_BTC })).ok).toBe(true);
-    expect(new RiskManager(limits, undefined, { mode: "paper", gmoOtherOrderVenues: ["ccxt:bitbank"] }).evaluateEntry(params()).ok).toBe(true);
+  it("live に GMO 以外の建玉があれば GMO の新規は拒否 (live の発注先は GMO だけ。GMO 口座の評価額を基準にできない)。paper は数えないだけ", () => {
+    const pos = [{ symbol: PAPER_BTC.symbol, qty: 1, avgPrice: 10_000, price: 10_000 }];
+    const inst = new Map([[BTC.symbol, BTC], [ETH.symbol, ETH], ["BTC/USDT", { ...PAPER_BTC, symbol: "BTC/USDT" }]]);
+    const p = params({ positions: [{ ...pos[0], symbol: "BTC/USDT" }], instruments: inst });
+    expect(new RiskManager(limits, undefined, { mode: "live" }).evaluateEntry(p)).toMatchObject({
+      ok: false, reason: expect.stringContaining("live に GMO 以外の建玉 (BTC/USDT, ccxt:bitbank)"),
+    });
+    expect(new RiskManager(limits, undefined, { mode: "paper" }).evaluateEntry(p).ok).toBe(true);
     expect(new RiskManager(limits, undefined, { mode: "live" }).evaluateEntry(params()).ok).toBe(true);
   });
 

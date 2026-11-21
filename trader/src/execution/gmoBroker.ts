@@ -54,7 +54,7 @@ export interface GmoBrokerOptions extends LiveGuard {
 /** 一覧 API のページ数の上限 (100 件 × 5 ページ)。超えたら照会をあきらめて例外 (曖昧なまま採用しない) */
 const MAX_PAGES = 5;
 const PAGE_SIZE = 100;
-/** hint の時刻窓 (注文の時刻は発注時刻の 10 秒前〜120 秒後。ccxtBroker と同じ) */
+/** hint の時刻窓 (注文の時刻は発注時刻の 10 秒前〜120 秒後) */
 const HINT_BEFORE_MS = 10_000;
 const HINT_AFTER_MS = 120_000;
 /** hint 照会で約定から候補にする時刻窓の後ろ側 (発注時刻 + 5 分)。これより後の約定は見ない */

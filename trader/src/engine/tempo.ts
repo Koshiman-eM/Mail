@@ -62,7 +62,8 @@ export function tempoNetEdgeFloor(minNetEdgeBps: number, tempo: number | undefin
 
 /**
  * 最大保有 (MAX_HOLD_MINUTES) で新規エントリーしない時間軸か (中期・長期)。
- * エンジンは観測専用と同じ扱い (仮想トレード hold_limit) にし、バックテストでは最大保有を縮めない (運用で入らないため)
+ * エンジンは観測専用と同じ扱い (仮想トレード hold_limit) にし、バックテストでは最大保有を縮めない (運用で入らないため)。
+ * いま登録している戦略に中期・長期は無い (廃止した) が、時間軸による一般の規則として残している
  */
 export function isHoldLimitedHorizon(horizon: string | undefined): boolean {
   return horizon === "mid" || horizon === "long";

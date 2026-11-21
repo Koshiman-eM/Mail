@@ -4,12 +4,12 @@ import { scalpMicro } from "./scalpMicro";
 import { scalpRebound } from "./scalpRebound";
 import { pullback15m, pullback5m, scalpPullback } from "./scalpPullback";
 import { shortBreakout, shortEmaTrend, shortRsiRevert } from "./short";
-import { midTrendFollow } from "./mid";
-import { longMomentum } from "./long";
-import { memeMomentum } from "./meme";
 import { applyStructure, type StructureSettings } from "../structure/settings";
 
-/** 全戦略 (登録順 = スキャルピング → 短期 → 中期 → 長期 → ミーム) */
+/**
+ * 全戦略 (登録順 = スキャルピング → 短期)。廃止した戦略 (中期・長期・ミーム) は src/strategies/retired.ts
+ * (保有中の建玉・学習データ・古い .env の互換のための情報だけ)
+ */
 export const ALL_STRATEGIES: readonly Strategy[] = [
   scalpObi,
   scalpVwapRevert,
@@ -22,9 +22,6 @@ export const ALL_STRATEGIES: readonly Strategy[] = [
   shortBreakout,
   pullback5m,
   pullback15m,
-  midTrendFollow,
-  longMomentum,
-  memeMomentum,
 ];
 
 /**

@@ -14,6 +14,7 @@ import {
   clampMaxHoldMs, formatTempoLine, isHoldLimitedHorizon, TempoController, tempoSeedTimestamps, tempoStatusView,
 } from "../src/engine/tempo";
 import { MemoryStore } from "../src/storage/memory";
+import { getStrategy } from "../src/strategies/registry";
 
 const M = 60_000;
 const T0 = Date.UTC(2024, 0, 1);
@@ -70,8 +71,10 @@ describe("バックテスト: maxHoldMinutes", () => {
     expect(off.trades[0].exitTs - off.trades[0].entryTs).toBe(60 * M);
   });
 
-  it("backtest コマンド: 中期・長期は縮めず、運用では発注しない旨を備考に出す", async () => {
-    const rows = await runBacktestCommand({ strategy: "mid_trend_follow", days: 30, source: "synthetic", seed: 1, maxHoldMinutes: 30 });
+  it("backtest コマンド: 時間軸が中期・長期の戦略は縮めず、運用では発注しない旨を備考に出す", async () => {
+    // 登録している戦略に中期・長期は無い (廃止した) ので、時間軸だけを mid にした戦略で確かめる
+    const mid = { ...getStrategy("short_ema_trend")!, id: "mid_test", horizon: "mid" as const };
+    const rows = await runBacktestCommand({ strategy: "mid_test", days: 3, source: "synthetic", seed: 1, maxHoldMinutes: 30, strategies: [mid] });
     expect(rows).toHaveLength(1);
     expect(rows[0].note).toContain("最大保有 30 分のため運用では発注しない");
     const scalp = await runBacktestCommand({ strategy: "scalp_micro", days: 1, source: "synthetic", seed: 1, maxHoldMinutes: 30 });

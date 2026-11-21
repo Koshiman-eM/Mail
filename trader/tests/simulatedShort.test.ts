@@ -338,7 +338,11 @@ async function paperRuntime(env: Record<string, string> = {}, holdMin = 60) {
 
 describe("エンジン統合 (paper)", () => {
   it("現物の暗号資産の売りシグナルが約定し、借入コストが手数料に入り、TradeRecord と腕が方向別になる。meme は対象外", async () => {
-    const { rt, store, run } = await paperRuntime({ PAPER_SHORT_BORROW_RATE_DAILY: "0.01" }, 30);
+    // PEPE/USDT は WATCHLIST で meme にする (合成データの既定は crypto)
+    const { rt, store, run } = await paperRuntime({
+      PAPER_SHORT_BORROW_RATE_DAILY: "0.01",
+      WATCHLIST: "synthetic|BTC/USDT,synthetic|ETH/USDT,synthetic|PEPE/USDT|meme,synthetic|USD/JPY,synthetic|AAPL",
+    }, 30);
     const btc = rt.hub.instrument("BTC/USDT")!;
     expect(btc).toMatchObject({ allowShort: false, simulatedShort: true });
     expect(rt.hub.instrument("PEPE/USDT")!.simulatedShort).toBeUndefined();

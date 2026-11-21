@@ -75,10 +75,6 @@ export function ema(values: readonly number[], period: number): number[] {
   return out;
 }
 
-export function emaLast(values: readonly number[], period: number): number {
-  return last(ema(values, period));
-}
-
 // ───────────────────────── オシレーター ─────────────────────────
 
 /** RSI (Wilder の平滑化)。最初の値は index = period */
@@ -109,22 +105,6 @@ export function rsi(values: readonly number[], period = 14): number[] {
 
 export function rsiLast(values: readonly number[], period = 14): number {
   return last(rsi(values, period));
-}
-
-export interface MacdResult {
-  macd: number[];
-  signal: number[];
-  hist: number[];
-}
-
-/** MACD。シグナル線は MACD 線の有効区間に対する EMA */
-export function macd(values: readonly number[], fast = 12, slow = 26, signal = 9): MacdResult {
-  const ef = ema(values, fast);
-  const es = ema(values, slow);
-  const line = values.map((_, i) => ef[i] - es[i]);
-  const sig = ema(line, signal);
-  const hist = line.map((m, i) => m - sig[i]);
-  return { macd: line, signal: sig, hist };
 }
 
 // ───────────────────────── ボラティリティ・レンジ ─────────────────────────

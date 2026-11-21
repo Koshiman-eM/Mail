@@ -1,6 +1,7 @@
 /** 環境変数 (STRUCTURE_*) → 相場構造のラッパーの設定と、戦略の一覧への適用 */
 import { DEFAULT_STRUCTURE_STRATEGIES, type Env } from "../core/config";
 import type { Strategy } from "../core/types";
+import { strategyIdListWarnings } from "../strategies/retired";
 import { DEFAULT_PERFECT_ORDER } from "./types";
 import { DEFAULT_STRUCTURE_FILTER_CONFIG, resolveStructureFilterConfig, withStructure, type StructureFilterConfig } from "./wrap";
 
@@ -17,8 +18,6 @@ export interface StructureSettings {
  * 既定の対象 (トレンド・ブレイク系)。目線の方向に乗ること自体が前提なので、目線と逆向きのシグナルを除くフィルターと噛み合う。
  * - scalp_momentum_burst / scalp_micro: 1m の勢い・ブレイクに乗る
  * - short_ema_trend / short_breakout: EMA の順張り・チャネルのブレイク
- * - mid_trend_follow / long_momentum: 中長期の順張り
- * - meme_momentum: 急騰の勢いに乗る
  */
 export const DEFAULT_STRUCTURE_TARGETS: readonly string[] = DEFAULT_STRUCTURE_STRATEGIES.split(",");
 
@@ -82,15 +81,13 @@ export function applyStructure<T extends readonly Strategy[]>(strategies: T, set
 
 /**
  * 設定の警告 (起動時にログへ出す。害はないが意図どおりに効かない組み合わせ)。
- * - STRUCTURE_STRATEGIES に、戦略の一覧 (knownIds) に無い id がある (綴り違いなど。その id は何もラップしない)
+ * - STRUCTURE_STRATEGIES に、戦略の一覧 (knownIds) に無い id がある (廃止した戦略・綴り違いなど。その id は何もラップしない)
  * - STRUCTURE_EXIT_ON_WEAKENING=true なのに STRUCTURE_REVERSAL_MODE=purist (weakening は conservative にしか無いので効かない)
  */
 export function structureConfigWarnings(settings: StructureSettings, knownIds: readonly string[]): string[] {
   const out: string[] = [];
   if (settings.mode === "off") return out;
-  const known = new Set(knownIds);
-  const unknown = settings.strategies.filter((id) => !known.has(id));
-  if (unknown.length > 0) out.push(`STRUCTURE_STRATEGIES に未登録の戦略 id があります (無視されます): ${unknown.join(", ")}`);
+  out.push(...strategyIdListWarnings("STRUCTURE_STRATEGIES", settings.strategies, knownIds));
   if (settings.config.exitOnWeakening && settings.config.reversalMode === "purist") {
     out.push("STRUCTURE_EXIT_ON_WEAKENING=true は STRUCTURE_REVERSAL_MODE=conservative のときだけ効きます (purist では何もしません)");
   }

@@ -25,6 +25,7 @@ import type { Env } from "../core/config";
 import { TIMEFRAME_MS, type Candle, type Timeframe } from "../core/types";
 import { atrLast } from "../indicators/series";
 import { confirmedPivots, detectPivots, normalizePivotN } from "../structure/pivots";
+import { strategyIdListWarnings } from "../strategies/retired";
 
 export interface ReversalSettings {
   /** 転換で決済を使うか (REVERSAL_EXIT。false なら従来と同一) */
@@ -121,15 +122,15 @@ export function formatReversalSettings(s: ReversalSettings): string {
 
 /**
  * 設定の警告 (起動時にログへ出す。害はないが意図どおりに効かない組み合わせ)。
- * - REVERSAL_EXIT_STRATEGIES に戦略の一覧 (knownIds) に無い id がある (綴り違いなど。その id は何も対象にしない)
+ * - REVERSAL_EXIT_STRATEGIES に戦略の一覧 (knownIds) に無い id がある (綴り違いなど。その id は何も対象にしない。
+ *   廃止した戦略の id は、再起動前に建てたその戦略の建玉にだけ効く)
  * - STRUCTURE_EXIT_ON_REVERSAL=true と併用している (ラップした戦略の目線の転換での決済と重なる。どちらか一方で十分)
  */
 export function reversalConfigWarnings(s: ReversalSettings, knownIds: readonly string[], structureExitOnReversal = false): string[] {
   const out: string[] = [];
   if (!s.enabled) return out;
-  const known = new Set(knownIds);
-  const unknown = s.strategies.filter((id) => !known.has(id));
-  if (unknown.length > 0) out.push(`REVERSAL_EXIT_STRATEGIES に未登録の戦略 id があります (無視されます): ${unknown.join(", ")}`);
+  // 廃止した戦略の id は一覧から外さない (外すと一覧が空 = すべての戦略、に変わりうる)。再起動前に建てた建玉にだけ効く
+  out.push(...strategyIdListWarnings("REVERSAL_EXIT_STRATEGIES", s.strategies, knownIds, "再起動前に建てたその戦略の建玉にだけ効きます"));
   if (structureExitOnReversal) {
     out.push(
       "STRUCTURE_EXIT_ON_REVERSAL=true と REVERSAL_EXIT=true を併用しています。どちらも転換で決済するので重複です (REVERSAL_EXIT は全戦略・建玉に対する押し安値割れ / 戻り高値超え)",

@@ -626,7 +626,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
   }
   function set(id, html) { var el = $(id); if (el.__h !== html) { el.__h = html; el.innerHTML = html; } }
   function baseOf(sym) { return String(sym).split(/[/:|-]/)[0].toUpperCase(); }
-  function horizonOf(id) { var k = String(id).split("_")[0]; return k === "meme" ? "ミーム" : HLAB[k] || "戦略"; }
+  function horizonOf(id) { var k = String(id).split("_")[0]; return HLAB[k] || "戦略"; }
   function acctPnl(x) { return x.netPnlAccount != null ? x.netPnlAccount : x.netPnl; }
   function toneOf(x) { return x >= 0.3 ? ["強気", "bull"] : x >= 0.1 ? ["やや強気", "bull"] : x <= -0.3 ? ["弱気", "bear"] : x <= -0.1 ? ["やや弱気", "bear"] : ["中立", ""]; }
 

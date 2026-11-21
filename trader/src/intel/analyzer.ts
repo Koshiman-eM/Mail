@@ -72,15 +72,6 @@ function fallbackRiskOn(biases: MarketBrief["biases"]): number {
   return clamp(xs.reduce((s, b) => s + b.sentiment, 0) / xs.length, -1, 1);
 }
 
-function fallbackWatchlist(items: IntelItem[]): string[] {
-  return items
-    .filter((i) => i.source === "dexscreener" && (i.metrics?.rugRisk ?? 1) < 0.5)
-    .sort((a, b) => (b.importance ?? 0) - (a.importance ?? 0))
-    .slice(0, 5)
-    .map((i) => i.assets[0])
-    .filter(Boolean);
-}
-
 export async function analyzeIntelDetailed(rawItems: IntelItem[], ctx: AnalyzeContext): Promise<AnalyzeResult> {
   const items = dedupeItems(rawItems);
   const byId = new Map(items.map((i) => [i.id, { ...i }]));
@@ -123,9 +114,10 @@ export async function analyzeIntelDetailed(rawItems: IntelItem[], ctx: AnalyzeCo
   });
   const usedAi = aiOut !== undefined;
   const riskOn = usedAi && Number.isFinite(aiOut!.riskOn) ? clamp(aiOut!.riskOn, -1, 1) : fallbackRiskOn(biases);
+  // 注目銘柄は AI の分析結果だけ (ルールベースでは作らない)
   const watchlist = usedAi
     ? [...new Set(aiOut!.watchlist.map((s) => s.trim().toUpperCase()).filter((s) => /^[A-Z0-9/]{1,20}$/.test(s)))].slice(0, 5)
-    : fallbackWatchlist(analyzed);
+    : [];
   const summary =
     usedAi && aiOut!.summary.trim()
       ? aiOut!.summary.trim()

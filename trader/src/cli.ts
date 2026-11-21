@@ -26,7 +26,7 @@ import {
   peekResolveRequests, PendingOrders, readLimitStats, requestResolve, RestingTakeProfits, type PendingOrder, type ResolveRequest,
 } from "./engine/orders";
 import { acquireEngineLock, releaseEngineLock, startEngineLockHeartbeat, type LockOwner } from "./engine/lock";
-import { buildRuntime, parseVenues, resolveDbPath, type Runtime } from "./engine/setup";
+import { assertLiveVenues, buildRuntime, parseVenues, resolveDbPath, type Runtime } from "./engine/setup";
 import { effectiveLimitTakeProfit, limitOrdersFromEnv } from "./engine/limitOrders";
 import { formatSimulationReport, runSimulation } from "./engine/simulate";
 import { formatTempoLine, TempoController, tempoSeedTimestamps, tempoStatusView } from "./engine/tempo";
@@ -48,6 +48,7 @@ import { structureSettingsFromEnv } from "./structure/settings";
 import { unifiedToGmo } from "./market/gmo/client";
 import { TIMEFRAME_MS, type ExitReason, type Timeframe } from "./core/types";
 import { horizonLabel, strategyLabel, strategyLabelWithId } from "./strategies/labels";
+import { strategyIdListWarnings } from "./strategies/retired";
 import {
   assertPaperOnly, equitySinceReset, executeWalletReset, formatWalletResetPlan, isDbBusyError, latestPaperReset, paperEngineRunning, performanceTrades,
   planWalletReset, validateResetEquity, WalletResetError,
@@ -260,6 +261,23 @@ function modeLines(c: AppConfig): { out: string[]; warn: string[] } {
   if (c.liveBlockedReason) warn.push(`警告: ${c.liveBlockedReason}`);
   if (c.mode === "live") warn.push("警告: 実弾モードです。実際の資金で発注します。");
   return { out, warn };
+}
+
+/**
+ * status 用: 廃止した取引先 (oanda / alpaca / dex)・戦略の id が .env に残っていれば知らせる
+ * (エンジンは起動時に同じ内容をログに警告して無視する)。live で VENUES に ccxt があればエンジンが起動しない旨も出す
+ */
+export function configCompatWarnings(c: AppConfig): string[] {
+  const warn: string[] = [];
+  try {
+    const venues = parseVenues(c.env.VENUES, (m) => warn.push(`警告: ${m}`));
+    if (c.mode === "live") assertLiveVenues(venues);
+  } catch (e) {
+    warn.push(`警告: ${e instanceof Error ? e.message : String(e)} (このままではエンジンが起動しません)`);
+  }
+  const ids = ALL_STRATEGIES.map((x) => x.id);
+  for (const w of strategyIdListWarnings("OBSERVE_ONLY_STRATEGIES", c.env.OBSERVE_ONLY_STRATEGIES ?? [], ids)) warn.push(`警告: ${w}`);
+  return warn;
 }
 
 function riskLines(c: AppConfig): string[] {
@@ -956,6 +974,7 @@ function cmdStatus(io: Io): number {
   const m = modeLines(config);
   m.out.forEach((l) => io.out(l));
   m.warn.forEach((l) => io.err(l));
+  configCompatWarnings(config).forEach((l) => io.err(l));
   io.out(venuesLine(config));
   io.out(`監視銘柄 (WATCHLIST): ${config.env.WATCHLIST || "(既定)"}`);
   strategyStatusLines(config).forEach((l) => io.out(l));

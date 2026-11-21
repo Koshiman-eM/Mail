@@ -85,23 +85,21 @@ describe("registry", () => {
       "short_breakout",
       "pullback_5m",
       "pullback_15m",
-      "mid_trend_follow",
-      "long_momentum",
-      "meme_momentum",
     ]);
+    // 廃止した戦略は登録しない
+    for (const id of ["mid_trend_follow", "long_momentum", "meme_momentum"]) expect(getStrategy(id)).toBeUndefined();
     for (const id of ids) expect(getStrategy(id)?.id).toBe(id);
     expect(getStrategy("nope")).toBeUndefined();
   });
 
   it("資産クラス・時間軸の割り当て (登録順)", () => {
-    const meme = strategiesFor("meme").map((s) => s.id);
-    expect(meme).toContain("meme_momentum");
-    expect(meme).not.toContain("scalp_obi");
+    // meme (WATCHLIST で明示した銘柄) に掛かるのは scalp_momentum_burst だけ (専用の戦略は廃止)
+    expect(strategiesFor("meme").map((s) => s.id)).toEqual(["scalp_momentum_burst"]);
     expect(strategiesFor("crypto", "scalp").map((s) => s.id)).toEqual(["scalp_obi", "scalp_vwap_revert", "scalp_momentum_burst", "scalp_micro", "scalp_rebound", "scalp_pullback"]);
     expect(strategiesFor("fx", "short").length).toBe(3);
     // 押し目買い・戻り売りの 5 分足・15 分足は crypto の短期だけ
     expect(strategiesFor("crypto", "short").map((s) => s.id)).toEqual(["short_ema_trend", "short_rsi_revert", "short_breakout", "pullback_5m", "pullback_15m"]);
-    expect(strategiesFor("crypto").map((s) => s.id)).not.toContain("meme_momentum");
+    expect(ALL_STRATEGIES.filter((s) => s.horizon === "mid" || s.horizon === "long")).toEqual([]);
   });
 
   it("resolveParams は既定値に合成し範囲へクランプする", () => {

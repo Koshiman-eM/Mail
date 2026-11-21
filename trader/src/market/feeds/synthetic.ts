@@ -57,7 +57,8 @@ export function defaultSyntheticSpecs(venue = "paper"): SymbolSpec[] {
   return [
     mk("BTC/USDT", "crypto", "BTC", "USDT", 0.01, 0.0001, 5, 0.001, false, 65_000, annualToSecSigma(0.6), 1.5, 0.05),
     mk("ETH/USDT", "crypto", "ETH", "USDT", 0.01, 0.001, 5, 0.001, false, 3_200, annualToSecSigma(0.75), 2, 0.8),
-    mk("PEPE/USDT", "meme", "PEPE", "USDT", 1e-9, 1, 5, 0.001, false, 0.000012, annualToSecSigma(1.6), 12, 5_000_000, { meta: { liquidityUsd: 2_000_000 } }),
+    // PEPE は値動きの大きい暗号資産として crypto に分類する (ミーム専用の戦略・自動の meme 分類は廃止)
+    mk("PEPE/USDT", "crypto", "PEPE", "USDT", 1e-9, 1, 5, 0.001, false, 0.000012, annualToSecSigma(1.6), 12, 5_000_000),
     mk("USD/JPY", "fx", "USD", "JPY", 0.001, 1, undefined, 0, true, 150, annualToSecSigma(0.1), 0.7, 1_000, { contractSize: 1 }),
     mk("AAPL", "stock", "AAPL", "USD", 0.01, 1, undefined, 0, true, 190, annualToSecSigma(0.3), 2, 100),
   ];

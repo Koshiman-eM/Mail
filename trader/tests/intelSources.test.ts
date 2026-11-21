@@ -1,6 +1,5 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { assessRugRisk, parseBoostTokens, parseDexPairs, createDexScreenerSource } from "../src/intel/sources/dexscreener";
 import { parseCoinGeckoTrending } from "../src/intel/sources/coingecko";
 import { createCryptoPanicSource, parseCryptoPanic, votesToSentiment } from "../src/intel/sources/cryptopanic";
 import { econEventsToItems, parseEconEvents } from "../src/intel/sources/econCalendar";
@@ -78,42 +77,6 @@ describe("cryptopanic", () => {
     })!;
     await expect(src.fetch(NOW)).rejects.toThrow(/\*\*\*/);
     await expect(src.fetch(NOW)).rejects.not.toThrow(/SECRET123/);
-  });
-});
-
-describe("dexscreener", () => {
-  it("ラグプル危険度の判定", () => {
-    expect(assessRugRisk({ liquidityUsd: 5_000_000, ageMs: 30 * 86_400_000, buysH1: 100, sellsH1: 90 })).toBe(0);
-    expect(assessRugRisk({ liquidityUsd: 3_000, ageMs: 1000, buysH1: 200, sellsH1: 3 })).toBe(1);
-    expect(assessRugRisk({ ageMs: 2 * 3_600_000 })).toBeGreaterThan(0.7);
-  });
-  it("ペアをパースし、危険銘柄の importance を下げる", () => {
-    const tokens = parseBoostTokens(fj("dex_boosts.json"), fj("dex_boosts.json"));
-    expect(tokens).toHaveLength(3);
-    const items = parseDexPairs(fj("dex_pairs.json"), NOW);
-    expect(items).toHaveLength(2); // GOOD の 2 ペアは流動性最大を採用
-    const good = items.find((i) => i.assets[0] === "GOOD")!;
-    const rug = items.find((i) => i.assets[0] === "RUGGY")!;
-    expect(good.metrics!.liquidityUsd).toBe(2_500_000);
-    expect(good.assets).toEqual(["GOOD", "MEME"]);
-    expect(good.metrics!.rugRisk).toBeLessThan(0.2);
-    expect(rug.metrics!.rugRisk).toBeGreaterThanOrEqual(0.8);
-    expect(rug.importance!).toBeLessThan(good.importance!);
-    expect(rug.sentiment!).toBeLessThan(good.sentiment!);
-    expect(good.metrics!.volumeH1).toBe(200000);
-  });
-  it("fetch フロー (注入)", async () => {
-    const urls: string[] = [];
-    const src = createDexScreenerSource({
-      fetchJson: async (u) => {
-        urls.push(u);
-        if (u.includes("token-boosts")) return fj("dex_boosts.json");
-        return fj("dex_pairs.json");
-      },
-    });
-    const items = await src.fetch(NOW);
-    expect(items.length).toBeGreaterThan(0);
-    expect(urls.some((u) => u.includes("/tokens/v1/solana/AddrGood111,AddrRug222"))).toBe(true);
   });
 });
 

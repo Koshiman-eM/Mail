@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import type { Candle, Instrument, IntelBias, IntelItem, Quote } from "../src/core/types";
+import type { Candle, Instrument, IntelBias, Quote } from "../src/core/types";
 import {
-  activeBlackout, intelBiasFor, liquidityUsdFor, normalizeReason, parseDexScreenerUrl, planRegimeTimeframe, selectAutoMemeCandidates, volume24h,
+  activeBlackout, intelBiasFor, liquidityUsdFor, normalizeReason, planRegimeTimeframe, volume24h,
 } from "../src/engine/context";
 
 const H = 3_600_000;
@@ -31,12 +31,6 @@ describe("ミームの流動性", () => {
     expect(liquidityUsdFor(meme("ccxt:binance"), { now: NOW, quote, candles: { "1m": m1 } }, () => 1)).toBeUndefined();
     expect(liquidityUsdFor(meme("ccxt:binance"), { now: NOW, quote, candles: {} }, () => 1)).toBeUndefined();
     expect(liquidityUsdFor(meme("ccxt:binance"), six, () => NaN)).toBeUndefined();
-  });
-
-  it("DEX: meta.liquidityUsd を使い、無ければ不明 (出来高からは推定しない)", () => {
-    const view = { now: NOW, quote, candles: { "1h": hourly(48, 1e9) } };
-    expect(liquidityUsdFor(meme("dex:solana", { meta: { liquidityUsd: 750_000 } }), view, () => 1)).toBe(750_000);
-    expect(liquidityUsdFor(meme("dex:solana"), view, () => 1)).toBeUndefined();
   });
 
   it("volume24h は最も長くカバーできる時間足を選ぶ", () => {
@@ -85,26 +79,5 @@ describe("その他の判定", () => {
     expect(planRegimeTimeframe(["1m", "5m", "15m", "1h"])).toBe("15m");
     expect(planRegimeTimeframe(["1m", "5m"])).toBe("5m");
     expect(normalizeReason("期待値幅 12.3bps < コスト 4.0bps × 2")).toBe("期待値幅 #bps < コスト #bps × #");
-  });
-
-  it("DexScreener の URL とトレンドからの自動監視候補", () => {
-    expect(parseDexScreenerUrl("https://dexscreener.com/solana/AbC123")).toEqual({ chainId: "solana", pairAddress: "AbC123" });
-    expect(parseDexScreenerUrl("https://example.com/solana/x")).toBeUndefined();
-    const item = (id: string, url: string, metrics: Record<string, number>, sym = "WIF"): IntelItem => ({
-      id, source: "dexscreener", kind: "trending", title: id, url, publishedAt: NOW, fetchedAt: NOW, assets: [sym, "MEME"], metrics,
-    });
-    const ok = { liquidityUsd: 900_000, rugRisk: 0.1, pairAgeHours: 100 };
-    const items = [
-      item("a", "https://dexscreener.com/solana/p1", ok),
-      item("b", "https://dexscreener.com/solana/p2", { ...ok, liquidityUsd: 100_000 }), // 流動性不足
-      item("c", "https://dexscreener.com/solana/p3", { ...ok, rugRisk: 0.6 }), // ラグ危険
-      item("d", "https://dexscreener.com/solana/p4", { ...ok, pairAgeHours: 3 }), // 新しすぎ
-      item("e", "https://dexscreener.com/base/p5", { ...ok, liquidityUsd: 2_000_000 }, "BRETT"),
-      item("f", "https://dexscreener.com/solana/p6", { liquidityUsd: 900_000, rugRisk: 0.1 }), // 作成時刻不明
-      item("g", "https://dexscreener.com/solana/p7", { ...ok, liquidityUsd: 300_000 }, "BONK"),
-    ];
-    const c = selectAutoMemeCandidates(items, { minLiquidityUsd: 250_000, watchlist: ["BONK"] });
-    expect(c.map((x) => x.key)).toEqual(["solana:p7", "base:p5", "solana:p1"]);
-    expect(selectAutoMemeCandidates(items, { minLiquidityUsd: 250_000, exclude: new Set(["base:p5"]), max: 1 }).map((x) => x.key)).toEqual(["solana:p1"]);
   });
 });

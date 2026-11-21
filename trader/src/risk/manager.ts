@@ -190,11 +190,6 @@ export class RiskManager {
   private limitsCache?: { at: number; limits: RiskLimits; updatedAt: number };
   /** GMO の建玉の合計 (絶対値の口座通貨換算) の上限 (評価額の倍率) */
   private readonly gmoMaxLeverage: number = DEFAULT_GMO_MAX_EFFECTIVE_LEVERAGE;
-  /**
-   * GMO 以外の発注先 (live で併用しているもの)。エンジンが渡す評価額は全発注先の合計で、GMO 口座の評価額 (actualProfitLoss) を
-   * 基準にできないので、空でなければ live の GMO の新規エントリーを拒否する
-   */
-  private readonly gmoOtherOrderVenues: readonly string[] = [];
 
   /**
    * 状態は kv `risk:state:<mode>` に保存する (既定 paper)。paper は旧キー `risk:state` からも引き継ぐ。
@@ -207,7 +202,7 @@ export class RiskManager {
   constructor(
     private readonly envLimits: RiskLimits,
     private readonly store?: Store,
-    keyOrOpts: string | { mode?: TradingMode; overrideCacheMs?: number; gmoMaxEffectiveLeverage?: number; gmoOtherOrderVenues?: readonly string[] } = {},
+    keyOrOpts: string | { mode?: TradingMode; overrideCacheMs?: number; gmoMaxEffectiveLeverage?: number } = {},
   ) {
     let saved: InternalState | undefined;
     this.overrideCacheMs = RISK_OVERRIDE_CACHE_MS;
@@ -215,7 +210,6 @@ export class RiskManager {
       const lev = keyOrOpts.gmoMaxEffectiveLeverage;
       // 不正な値 (非有限・0 以下) は既定値 (1 倍) を使う。上限 2 倍は config の検証と同じ
       if (lev !== undefined && Number.isFinite(lev) && lev > 0) this.gmoMaxLeverage = Math.min(lev, 2);
-      if (keyOrOpts.gmoOtherOrderVenues?.length) this.gmoOtherOrderVenues = [...keyOrOpts.gmoOtherOrderVenues];
     }
     if (typeof keyOrOpts === "string") {
       this.key = keyOrOpts;
@@ -526,21 +520,22 @@ export class RiskManager {
     cap(`${inst.assetClass} エクスポージャー上限`, classRoom.div(perUnitNotional));
 
     // GMOコイン: 建玉の合計 (絶対値の口座通貨換算) が評価額 × GMO_MAX_EFFECTIVE_LEVERAGE を超えないようにする。
-    // 評価額は GMO 口座の評価額 (actualProfitLoss) を前提とする: live は GMO 単独のときだけ通す (上の gmoOtherOrderVenues)。
+    // 評価額は GMO 口座の評価額 (actualProfitLoss) を前提とする: live の発注先は GMO だけ (起動時に setup.ts の assertLiveVenues と
+    // execution/router.ts の createBrokers が gmo 以外を拒否する) なので、エンジンが渡す評価額は GMO 口座の評価額。
     // paper は単一の PaperBroker の評価額 (全銘柄の合計) を使う
     // (GMO は証拠金の 2 倍まで建てられるが、このツールでは既定 1 倍まで。上の判定に追加で効く = 緩めない)
     if (inst.venue === GMO_VENUE) {
-      if (this.tradeMode === "live" && this.gmoOtherOrderVenues.length) {
-        return {
-          ok: false,
-          reason: `VENUES に GMO 以外の発注先 (${this.gmoOtherOrderVenues.join(", ")}) があり、GMO 口座の評価額で実効レバレッジを確認できないため拒否 (live の GMO は単独で使ってください)`,
-        };
-      }
       let gmoExposure = D(0);
       for (const x of open) {
         const xi = x.symbol === inst.symbol ? inst : lookup(p.instruments, x.symbol);
         if (!xi) return { ok: false, reason: `取引先の分からない建玉 (${x.symbol}) があるため GMO の実効レバレッジを確認できず拒否` };
-        if (xi.venue !== GMO_VENUE) continue;
+        if (xi.venue !== GMO_VENUE) {
+          // live に GMO 以外の建玉があるのは想定外 (起動時に拒否している)。評価額が GMO 口座だけの値でないので拒否する
+          if (this.tradeMode === "live") {
+            return { ok: false, reason: `live に GMO 以外の建玉 (${x.symbol}, ${xi.venue}) があり、GMO 口座の評価額で実効レバレッジを確認できないため拒否` };
+          }
+          continue;
+        }
         const px = x.price ?? p.prices?.[x.symbol] ?? x.avgPrice;
         let rate = NaN;
         try {

@@ -144,7 +144,7 @@ export function intelTimeline(
  * - 履歴は銘柄・時間足ごとにキャッシュ (既定 6 時間) し、現行と候補の比較で同じデータを使う (dataKey で確認)。
  * - 取得に失敗した・足りない銘柄は使わない。使える銘柄が無ければ undefined (調整しない。hub の短い足で代用しない)。
  * - 板が必須の戦略は履歴で再現できないので undefined。
- * - その時点で記録済みのブリーフがあれば、エンジンと同じ規則のバイアスを時刻順に渡す (meme_momentum は sentiment > 0 が必須)。
+ * - その時点で記録済みのブリーフがあれば、エンジンと同じ規則のバイアスを時刻順に渡す。
  */
 export function createParamValidator(o: ValidatorOptions): ParamValidator {
   const cache = o.cache ?? new HistoryCache({ ttlMs: 6 * 3_600_000, failureTtlMs: 30 * 60_000 });

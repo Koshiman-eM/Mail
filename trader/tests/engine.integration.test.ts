@@ -1,7 +1,6 @@
-import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { LIVE_CONFIRM_PHRASE, loadConfig } from "../src/core/config";
-import type { AssetClass, Clock, IntelItem, MarketDataFeed, Signal, Strategy, StrategyContext, StrategyPlan } from "../src/core/types";
+import type { AssetClass, Clock, MarketDataFeed, Signal, Strategy, StrategyContext, StrategyPlan } from "../src/core/types";
 import { PAPER_SNAPSHOT_KEY } from "../src/engine/engine";
 import { buildRuntime, type RuntimeOptions } from "../src/engine/setup";
 import { PaperBroker } from "../src/execution/paper";
@@ -14,8 +13,13 @@ const HOUR = 3_600_000;
 const START = Date.UTC(2026, 0, 5);
 
 const mkClock = (t = START): Clock & { t: number } => ({ t, now() { return this.t; } });
+/** 既定の監視銘柄は PEPE/USDT を除く 4 銘柄 (PEPE は crypto に分類したので、crypto の試験の銘柄数を変えないため。使う試験は WATCHLIST で指定する) */
+const DEFAULT_TEST_WATCHLIST = "synthetic|BTC/USDT,synthetic|ETH/USDT,synthetic|USD/JPY,synthetic|AAPL";
 const testConfig = (env: Record<string, string> = {}) =>
-  loadConfig({ NODE_ENV: "test", LIMIT_ENTRY: "false", LIMIT_TAKE_PROFIT: "false", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "JPY", ...env });
+  loadConfig({
+    NODE_ENV: "test", LIMIT_ENTRY: "false", LIMIT_TAKE_PROFIT: "false", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "JPY",
+    WATCHLIST: DEFAULT_TEST_WATCHLIST, ...env,
+  });
 
 /** 常に同じ方向のシグナルを出すテスト用戦略 (保有中は何もしない) */
 function fixedStrategy(id: string, o: { classes: AssetClass[]; direction?: "long" | "short"; confidence?: number; edge?: number; stopPct?: number; flatWhenHolding?: boolean }): Strategy {
@@ -223,9 +227,9 @@ describe("TradingEngine 統合 (合成データ + 仮想時計 + MemoryStore)", 
     expect(rt.engine.positions.get("AAPL")!.entryContext.riskMultiplier).toBe(1);
   });
 
-  it("CEX のミームは 24 時間出来高 × 価格 (USD) を流動性の代理指標にしてエントリーする", async () => {
+  it("WATCHLIST で meme にした銘柄は 24 時間出来高 × 価格 (USD) を流動性の代理指標にしてエントリーする", async () => {
     const s = fixedStrategy("meme_long", { classes: ["meme"], stopPct: 0.03, edge: 300 });
-    const { rt, store } = await runtime({}, { strategies: [s] });
+    const { rt, store } = await runtime({ WATCHLIST: "synthetic|PEPE/USDT|meme" }, { strategies: [s] });
     const pepe = rt.hub.instrument("PEPE/USDT")!;
     expect(pepe.venue).toBe("paper");
     await rt.engine.tick(START);
@@ -236,15 +240,16 @@ describe("TradingEngine 統合 (合成データ + 仮想時計 + MemoryStore)", 
     expect(liq).toBeLessThan(10_000_000);
   });
 
-  it("流動性が不明なミーム (DEX で liquidityUsd 無し) は見送る", async () => {
+  it("流動性が不明なミーム (出来高の履歴が 1 時間未満) は見送る", async () => {
     const clock = mkClock();
-    const specs = defaultSyntheticSpecs("dex:solana")
-      .filter((x) => x.instrument.assetClass === "meme")
-      .map((x) => ({ ...x, instrument: { ...x.instrument, meta: undefined } }));
-    const feed: MarketDataFeed = new SyntheticFeed({ clock, seed: 3, specs, historyMs: 86_400_000, venue: "dex:solana" });
+    const specs = defaultSyntheticSpecs()
+      .filter((x) => x.instrument.symbol === "PEPE/USDT")
+      .map((x) => ({ ...x, instrument: { ...x.instrument, assetClass: "meme" as const } }));
+    const feed: MarketDataFeed = new SyntheticFeed({ clock, seed: 3, specs, historyMs: 30 * MIN });
     const instruments = await feed.listInstruments();
-    expect(instruments[0].venue).toBe("dex:solana");
-    const s = fixedStrategy("meme_long", { classes: ["meme"], stopPct: 0.03, edge: 300 });
+    expect(instruments[0].assetClass).toBe("meme");
+    // 1m 足だけ (30 本 = 30 分) にする (1h 足があると 1 時間ぶんの出来高として扱われる)
+    const s: Strategy = { ...fixedStrategy("meme_long", { classes: ["meme"], stopPct: 0.03, edge: 300 }), timeframes: ["1m"] };
     const { rt, store } = await runtime({}, { clock, strategies: [s], markets: [{ feed, instruments }] });
     await rt.engine.tick(START);
     expect(store.listAudit({ type: "engine.entry" })).toHaveLength(0);
@@ -283,27 +288,6 @@ describe("TradingEngine 統合 (合成データ + 仮想時計 + MemoryStore)", 
     await expect(rt.engine.tick(START + MIN)).resolves.toBeDefined();
   });
 
-  it("AUTO_MEME_WATCH: 条件を満たす DexScreener のトレンドを監視に追加する", async () => {
-    const pair = JSON.parse(readFileSync(new URL("./fixtures/market/dex_pair.json", import.meta.url), "utf8"));
-    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(pair), { status: 200 })) as unknown as typeof fetch;
-    const { rt, store } = await runtime({ AUTO_MEME_WATCH: "true" }, { fetchImpl });
-    expect(rt.config.env.AUTO_MEME_WATCH).toBe(true);
-    const item = (id: string, url: string, m: Record<string, number>): IntelItem => ({
-      id, source: "dexscreener", kind: "trending", title: id, url, publishedAt: START, fetchedAt: START, assets: ["BONK", "MEME"], metrics: m,
-    });
-    store.saveIntel([
-      item("ok", "https://dexscreener.com/solana/PAIR123", { liquidityUsd: 850_000, rugRisk: 0.1, pairAgeHours: 200 }),
-      item("young", "https://dexscreener.com/solana/NEW", { liquidityUsd: 850_000, rugRisk: 0.1, pairAgeHours: 2 }),
-    ]);
-    const added = await rt.engine.autoMemeWatch({ generatedAt: START, riskOn: 0, summary: "", biases: {}, watchlist: ["BONK"], events: [], stub: true }, START);
-    expect(added).toEqual(["BONK/SOL"]);
-    expect(rt.hub.instrument("BONK/SOL")?.venue).toBe("dex:solana");
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
-    expect(store.listAudit({ type: "engine.auto_meme_watch" })).toHaveLength(1);
-    // 2 回目は追加しない
-    expect(await rt.engine.autoMemeWatch({ generatedAt: START, riskOn: 0, summary: "", biases: {}, watchlist: [], events: [], stub: true }, START)).toEqual([]);
-  });
-
   it("status: ダッシュボード用の状態", async () => {
     const s = fixedStrategy("always_long", { classes: ["crypto"] });
     const { rt } = await runtime({}, { strategies: [s] });
@@ -315,7 +299,7 @@ describe("TradingEngine 統合 (合成データ + 仮想時計 + MemoryStore)", 
     expect(st.positions).toHaveLength(2);
     expect(st.positions[0].unrealizedPnlAccount).toBeDefined();
     expect(st.watched.map((w) => w.symbol)).toContain("USD/JPY");
-    expect(st.plan?.symbols.length).toBe(5);
+    expect(st.plan?.symbols.length).toBe(4);
     expect(st.brief?.stub).toBe(true);
     expect(st.equityHistory.length).toBeGreaterThan(0);
     expect(st.risk.limits.maxDrawdown).toBe(rt.config.risk.maxDrawdown);

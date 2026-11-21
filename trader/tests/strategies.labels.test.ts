@@ -16,9 +16,8 @@ describe("戦略の表示名 (表示専用。id は変えない)", () => {
     }
   });
 
-  it("表示名の先頭は時間軸の表示名 (ミームを除く)", () => {
+  it("表示名の先頭は時間軸の表示名", () => {
     for (const s of ALL_STRATEGIES) {
-      if (s.id.startsWith("meme_")) continue;
       expect(STRATEGY_LABELS[s.id].startsWith(HORIZON_LABELS[s.horizon]), s.id).toBe(true);
     }
   });
@@ -44,7 +43,14 @@ describe("戦略の表示名 (表示専用。id は変えない)", () => {
   it("未知の id はそのまま、id 併記は [id] を付ける", () => {
     expect(strategyLabel("unknown_x")).toBe("unknown_x");
     expect(strategyLabelWithId("unknown_x")).toBe("unknown_x");
-    expect(strategyLabelWithId("long_momentum")).toBe("長期・モメンタム (日足) [long_momentum]");
+    expect(strategyLabelWithId("short_breakout")).toBe("短期・ブレイクアウト (1 時間足) [short_breakout]");
+    // 廃止した戦略 (古い記録の腕・取引) は id のまま表示する
+    for (const id of ["mid_trend_follow", "long_momentum", "meme_momentum"]) {
+      expect(strategyLabel(id)).toBe(id);
+      expect(strategyLabelWithId(id)).toBe(id);
+    }
+    expect(armLabel("long_momentum|trend_up|crypto")).toBe("long_momentum / 上昇トレンド / crypto");
+    expect(Object.keys(STRATEGY_LABELS).sort()).toEqual(ALL_STRATEGIES.map((s) => s.id).sort());
   });
 
   it("腕のキーを日本語にし、末尾の |short は「空売り (paper 再現)」にする", () => {

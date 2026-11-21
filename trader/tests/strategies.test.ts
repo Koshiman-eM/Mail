@@ -13,10 +13,7 @@ import type {
   TradePrint,
 } from "../src/core/types";
 import { TIMEFRAME_MS } from "../src/core/types";
-import { ema, macd } from "../src/indicators/series";
-import { longMomentum } from "../src/strategies/long";
-import { memeMomentum } from "../src/strategies/meme";
-import { midTrendFollow } from "../src/strategies/mid";
+import { ema } from "../src/indicators/series";
 import { scalpMomentumBurst, scalpObi, scalpVwapRevert } from "../src/strategies/scalp";
 import { shortBreakout, shortEmaTrend, shortRsiRevert } from "../src/strategies/short";
 import { createRng, syntheticInstrument } from "../src/backtest/synthetic";
@@ -82,15 +79,6 @@ function makeCtx(o: CtxOpts): StrategyContext {
   };
 }
 
-const intel = (sentiment: number, extra: Partial<IntelBias> = {}): IntelBias => ({
-  asset: "SYN",
-  sentiment,
-  confidence: 1,
-  eventRisk: 0,
-  sourceIds: [],
-  sourceContrib: {},
-  ...extra,
-});
 
 const pos = (qty: number, price = 100): PositionView => ({
   symbol: "SYN/USDT",
@@ -388,134 +376,10 @@ describe("short_breakout", () => {
   });
 });
 
-// ───────────────────────── mid_trend_follow ─────────────────────────
-
-describe("mid_trend_follow", () => {
-  /** 上昇トレンド → 調整 (MACD ヒスト負) → 再上昇でヒストが正へ転換した足で終える */
-  function resume(sign: 1 | -1): Candle[] {
-    const cs: Candle[] = [];
-    let price = 100;
-    const add = (d: number) => {
-      const c = price + d;
-      push(cs, "4h", price, Math.max(price, c) + 0.3, Math.min(price, c) - 0.3, c);
-      price = c;
-    };
-    for (let i = 0; i < 100; i++) add(sign * 0.6);
-    for (let i = 0; i < 8; i++) add(-sign * 0.3);
-    for (let i = 0; i < 30; i++) {
-      add(sign * 0.9);
-      const h = macd(cs.map((x) => x.close)).hist;
-      if (sign * h[h.length - 1] > 0 && sign * h[h.length - 2] <= 0) break;
-    }
-    return cs;
-  }
-
-  it("EMA20>EMA50 で MACD ヒストが正に転換した足でロング", () => {
-    const ctx = makeCtx({ strategy: midTrendFollow, candles: { "4h": resume(1) } });
-    const s = expectEntry(midTrendFollow.evaluate(ctx), midTrendFollow, "long");
-    expect(s.trailingStopPct).toBeGreaterThan(0);
-    expect(s.features.sepAtr).toBeGreaterThan(0.3);
-    expectPure(midTrendFollow, ctx);
-  });
-
-  it("下降版はショート", () => {
-    expectEntry(midTrendFollow.evaluate(makeCtx({ strategy: midTrendFollow, candles: { "4h": resume(-1) } })), midTrendFollow, "short");
-  });
-
-  it("トレンド継続中 (転換なし) は null、保有ロングで EMA 逆転なら flat", () => {
-    const up: Candle[] = [];
-    for (let i = 0; i < 120; i++) push(up, "4h", 100 + i * 0.5, 100 + i * 0.5 + 0.8, 100 + i * 0.5 - 0.3, 100 + i * 0.5 + 0.5);
-    expect(midTrendFollow.evaluate(makeCtx({ strategy: midTrendFollow, candles: { "4h": up } }))).toBeNull();
-    expect(midTrendFollow.evaluate(makeCtx({ strategy: midTrendFollow, candles: { "4h": resume(-1) }, position: pos(1) }))?.direction).toBe("flat");
-  });
-});
-
-// ───────────────────────── long_momentum ─────────────────────────
-
-describe("long_momentum", () => {
-  const geo = (g: number, n = 260) => {
-    const cs: Candle[] = [];
-    for (let i = 0; i < n; i++) {
-      const c = 100 * Math.pow(1 + g, i);
-      push(cs, "1d", c / (1 + g), c * 1.01, (c / (1 + g)) * 0.99, c);
-    }
-    return cs;
-  };
-
-  it("90 日モメンタム正 + SMA200 上でロング", () => {
-    const ctx = makeCtx({ strategy: longMomentum, candles: { "1d": geo(0.002) } });
-    const s = expectEntry(longMomentum.evaluate(ctx), longMomentum, "long");
-    expect(s.features.momentum).toBeGreaterThan(0.1);
-    expectPure(longMomentum, ctx);
-  });
-
-  it("ショートは閾値の 2 倍の下落が必要、allowShort=false なら出さない", () => {
-    expect(longMomentum.evaluate(makeCtx({ strategy: longMomentum, candles: { "1d": geo(-0.0015) } }))).toBeNull(); // 約 -13%
-    expectEntry(longMomentum.evaluate(makeCtx({ strategy: longMomentum, candles: { "1d": geo(-0.003) } })), longMomentum, "short"); // 約 -24%
-    expect(longMomentum.evaluate(makeCtx({ strategy: longMomentum, candles: { "1d": geo(-0.003) }, instrument: { allowShort: false } }))).toBeNull();
-  });
-
-  it("200 本未満のデータでは null", () => {
-    expect(longMomentum.evaluate(makeCtx({ strategy: longMomentum, candles: { "1d": geo(0.002, 150) } }))).toBeNull();
-  });
-
-  it("ロング保有中に SMA200 割れなら flat", () => {
-    expect(longMomentum.evaluate(makeCtx({ strategy: longMomentum, candles: { "1d": geo(-0.003) }, position: pos(1) }))?.direction).toBe("flat");
-  });
-});
-
-// ───────────────────────── meme_momentum ─────────────────────────
-
-describe("meme_momentum", () => {
-  const memeInst: Partial<Instrument> = { assetClass: "meme", allowShort: false, symbol: "BONK/SOL" };
-  function pump(volume: number): Candle[] {
-    const cs = flat("1m", 80, 1, 0.001, 0.002);
-    let prev = cs[cs.length - 1].close;
-    for (const c of [1.01, 1.02, 1.03]) {
-      push(cs, "1m", prev, c + 0.002, prev - 0.001, c, volume);
-      prev = c;
-    }
-    return cs;
-  }
-
-  it("出来高急増 + VWAP 上 + 正のセンチメントでロング (損切り近め・保有短め)", () => {
-    const ctx = makeCtx({ strategy: memeMomentum, candles: { "1m": pump(1000) }, intel: intel(0.5), instrument: memeInst });
-    const s = expectEntry(memeMomentum.evaluate(ctx), memeMomentum, "long");
-    expect(s.features.volRatio).toBeGreaterThan(3);
-    expect(s.maxHoldMs).toBeLessThanOrEqual(60 * 60_000);
-    expectPure(memeMomentum, ctx);
-  });
-
-  it("インテルが無い・センチメントが負なら null", () => {
-    expect(memeMomentum.evaluate(makeCtx({ strategy: memeMomentum, candles: { "1m": pump(1000) }, instrument: memeInst }))).toBeNull();
-    expect(memeMomentum.evaluate(makeCtx({ strategy: memeMomentum, candles: { "1m": pump(1000) }, intel: intel(-0.4), instrument: memeInst }))).toBeNull();
-  });
-
-  it("ブラックアウト中は null", () => {
-    const ctx = makeCtx({ strategy: memeMomentum, candles: { "1m": pump(1000) }, instrument: memeInst, intel: intel(0.5) });
-    ctx.intel = { ...ctx.intel!, blackoutUntil: ctx.market.now + 60_000 };
-    expect(memeMomentum.evaluate(ctx)).toBeNull();
-  });
-
-  it("出来高が伴わなければ null、5m 足が EMA9 の下なら null", () => {
-    expect(memeMomentum.evaluate(makeCtx({ strategy: memeMomentum, candles: { "1m": pump(150) }, intel: intel(0.5), instrument: memeInst }))).toBeNull();
-    const down5: Candle[] = [];
-    for (let i = 0; i < 20; i++) push(down5, "5m", 2 - i * 0.02, 2 - i * 0.02 + 0.01, 2 - i * 0.02 - 0.03, 2 - i * 0.02 - 0.02);
-    expect(
-      memeMomentum.evaluate(makeCtx({ strategy: memeMomentum, candles: { "1m": pump(1000), "5m": down5 }, intel: intel(0.5), instrument: memeInst })),
-    ).toBeNull();
-  });
-
-  it("保有中にセンチメントが大きく悪化したら flat", () => {
-    const s = memeMomentum.evaluate(makeCtx({ strategy: memeMomentum, candles: { "1m": pump(1000) }, intel: intel(-0.5), instrument: memeInst, position: pos(1, 1) }));
-    expect(s?.direction).toBe("flat");
-  });
-});
-
 // ───────────────────────── 共通 ─────────────────────────
 
 describe("全戦略共通", () => {
-  const all = [scalpObi, scalpVwapRevert, scalpMomentumBurst, shortEmaTrend, shortRsiRevert, shortBreakout, midTrendFollow, longMomentum, memeMomentum];
+  const all = [scalpObi, scalpVwapRevert, scalpMomentumBurst, shortEmaTrend, shortRsiRevert, shortBreakout];
 
   it("データが空・不足なら null (例外を出さない)", () => {
     for (const s of all) {

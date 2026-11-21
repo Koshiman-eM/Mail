@@ -142,7 +142,6 @@ export function simulationConfig(env: Record<string, string | undefined>, db: st
     VENUES: "synthetic",
     WATCHLIST: "",
     ANTHROPIC_API_KEY: "",
-    AUTO_MEME_WATCH: "false",
     DB_PATH: db,
   });
 }

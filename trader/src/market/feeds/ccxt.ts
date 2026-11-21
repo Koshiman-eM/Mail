@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import type { AssetClass, Candle, Instrument, MarketDataFeed, OrderBook, Quote, Timeframe, TradePrint } from "../../core/types";
+import type { Candle, Instrument, MarketDataFeed, OrderBook, Quote, Timeframe, TradePrint } from "../../core/types";
 import { fetchBitbankCandles, type BitbankBoundary } from "./bitbankCandles";
 import { fileCandleRefreshIntervalMs } from "../fileCandles";
 
@@ -21,15 +21,9 @@ export interface CcxtLike {
 /** ccxt の precisionMode 定数 */
 export const PRECISION = { DECIMAL_PLACES: 2, SIGNIFICANT_DIGITS: 3, TICK_SIZE: 4 } as const;
 
-export const DEFAULT_MEME_BASES = [
-  "DOGE", "SHIB", "PEPE", "WIF", "BONK", "FLOKI", "BOME", "MEME", "TRUMP", "MOG", "POPCAT", "BRETT", "NEIRO", "PNUT", "MEW",
-];
-
 export interface CcxtFeedOptions {
   /** venue 名。既定 "ccxt:<exchange.id>" */
   venue?: string;
-  /** ミームコインのベース通貨 (既定一覧に追加) */
-  extraMemeBases?: string[];
   /** 手数料が market に無いときの既定値 */
   defaultTakerFee?: number;
   defaultMakerFee?: number;
@@ -55,11 +49,14 @@ export function precisionToStep(value: unknown, mode: number | undefined): numbe
   return Number(`1e-${Math.max(0, Math.round(n))}`);
 }
 
+/**
+ * ccxt の market → Instrument。資産クラスは常に crypto (DOGE・SHIB・PEPE なども自動では meme に分けない。
+ * meme として扱いたい銘柄は WATCHLIST で "ccxt|DOGE/JPY|meme" のように明示する)
+ */
 export function marketToInstrument(
   m: any,
   precisionMode: number | undefined,
   venue: string,
-  memeBases: Set<string>,
   defaults: { taker: number; maker: number },
 ): Instrument | undefined {
   if (!m || m.active === false || !m.symbol || !m.base || !m.quote) return undefined;
@@ -69,11 +66,10 @@ export function marketToInstrument(
   const minQty = toNumber(m.limits?.amount?.min) ?? lotSize;
   const minNotional = toNumber(m.limits?.cost?.min);
   const contractSize = toNumber(m.contractSize);
-  const assetClass: AssetClass = memeBases.has(String(m.base).toUpperCase()) ? "meme" : "crypto";
   return {
     symbol: m.symbol,
     venue,
-    assetClass,
+    assetClass: "crypto",
     baseCurrency: m.base,
     quoteCurrency: m.quote,
     tickSize,
@@ -95,7 +91,6 @@ export class CcxtFeed implements MarketDataFeed {
   readonly venue: string;
   readonly minIntervalMs: number;
   private instruments?: Instrument[];
-  private readonly memeBases: Set<string>;
   /** bitbank のローソク足ファイルの日付境界 (取得データから判定できたら保持) */
   private readonly bitbankBoundary: Partial<Record<"day" | "year", BitbankBoundary>> = {};
 
@@ -105,7 +100,6 @@ export class CcxtFeed implements MarketDataFeed {
   ) {
     this.venue = opts.venue ?? `ccxt:${exchange.id}`;
     this.minIntervalMs = exchange.rateLimit ?? 200;
-    this.memeBases = new Set([...DEFAULT_MEME_BASES, ...(opts.extraMemeBases ?? [])].map((s) => s.toUpperCase()));
   }
 
   /** 公開 API のみ (キー不要) の exchange を生成して Feed を作る。ccxt は CJS 同梱のため同期 require */
@@ -122,7 +116,7 @@ export class CcxtFeed implements MarketDataFeed {
     const defaults = { taker: this.opts.defaultTakerFee ?? 0.001, maker: this.opts.defaultMakerFee ?? 0.001 };
     const out: Instrument[] = [];
     for (const m of Object.values(markets)) {
-      const inst = marketToInstrument(m, this.exchange.precisionMode, this.venue, this.memeBases, defaults);
+      const inst = marketToInstrument(m, this.exchange.precisionMode, this.venue, defaults);
       if (!inst) continue;
       if (this.opts.quoteFilter?.length && !this.opts.quoteFilter.includes(inst.quoteCurrency)) continue;
       out.push(inst);

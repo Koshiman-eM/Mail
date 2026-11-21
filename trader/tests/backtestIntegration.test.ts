@@ -67,7 +67,7 @@ describe("全戦略のバックテスト (合成データ)", () => {
   for (const strategy of ALL_STRATEGIES) {
     it(`${strategy.id}: 会計が整合し、TradeRecord が正しく埋まる`, () => {
       const { candles, base } = dataFor(strategy.primaryTimeframe, 21);
-      const instrument = syntheticInstrument(strategy.assetClasses.includes("meme") && strategy.assetClasses.length === 1 ? { assetClass: "meme", allowShort: false } : {});
+      const instrument = syntheticInstrument();
       const rng = createRng(4);
       const book = (): OrderBook => {
         const skew = rng.next() * 2 - 1;
@@ -113,7 +113,7 @@ describe("全戦略のバックテスト (合成データ)", () => {
   }
 
   it("主要戦略は合成データで実際に取引する", () => {
-    for (const id of ["scalp_momentum_burst", "short_ema_trend", "short_breakout", "mid_trend_follow", "scalp_obi"]) {
+    for (const id of ["scalp_momentum_burst", "short_ema_trend", "short_breakout", "scalp_obi"]) {
       const s = getStrategy(id)!;
       const { candles, base } = dataFor(s.primaryTimeframe, 21);
       const r = runBacktest({

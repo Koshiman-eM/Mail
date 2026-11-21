@@ -32,7 +32,7 @@ describe("synthetic feed", () => {
   it("既定銘柄・板・約定", async () => {
     const f = new SyntheticFeed({ clock: mkClock(), historyMs: 3_600_000 });
     const list = await f.listInstruments();
-    expect(list.map((i) => i.assetClass)).toEqual(["crypto", "crypto", "meme", "fx", "stock"]);
+    expect(list.map((i) => i.assetClass)).toEqual(["crypto", "crypto", "crypto", "fx", "stock"]);
     const q = await f.fetchQuote("USD/JPY");
     expect(q.ask).toBeGreaterThan(q.bid);
     const ob = await f.fetchOrderBook("PEPE/USDT", 5);
