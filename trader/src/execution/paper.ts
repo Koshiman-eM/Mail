@@ -2,6 +2,7 @@ import { D, floorToStep, roundToStep, Decimal } from "../core/decimal";
 import { ASSET_CLASS_PROFILES, enabledAssetClasses } from "../core/assetClasses";
 import { TerminalMap, isTerminalOrder } from "../core/sweep";
 import { fixedFeeOf } from "../core/fees";
+import { simulatedShortBorrowModel, type HoldingCostModel } from "../core/holdingCost";
 import { createLogger } from "../core/logger";
 import { canShort, DEFAULT_SHORT_BORROW_RATE_DAILY } from "../core/short";
 import {
@@ -31,6 +32,11 @@ export interface PaperBrokerOptions {
    * 建玉代金 (平均建値 × 数量) × 日率 × 経過日数 (日割り) を、買い戻しの約定の手数料に加えて計上する
    */
   shortBorrowRateDaily?: number;
+  /**
+   * 建玉の保有コストのモデル (src/core/holdingCost.ts)。既定は shortBorrowRateDaily の再現した空売りの借入コスト。
+   * FX のスワップ・株式の信用の金利などはアプリのモデルを渡す (決済の約定の手数料にまとめて計上する)
+   */
+  holdingCost?: HoldingCostModel;
   /**
    * 成行の約定価格を外部の見積もりで決める (Jupiter: swap/v1/quote、取れなければ代わりのスリッページのモデル。
    * src/execution/jupiterFill.ts)。undefined を返した銘柄は従来どおり 気配 ± slippageBps で約定する
@@ -125,6 +131,8 @@ export class PaperBroker implements Broker {
   private readonly warned = new Set<string>();
   private listeners: ((f: Fill, symbol: string, side: "buy" | "sell") => void)[] = [];
   private readonly borrowRate: Decimal;
+  /** 建玉の保有コストのモデル (既定: 再現した空売りの借入コスト) */
+  private readonly holdingCost: HoldingCostModel;
 
   constructor(private readonly o: PaperBrokerOptions) {
     for (const i of o.instruments) this.inst.set(i.symbol, i);
@@ -136,6 +144,7 @@ export class PaperBroker implements Broker {
     this.lev = { ...defaultLeverage(), ...(o.leverage ?? {}) };
     const br = o.shortBorrowRateDaily;
     this.borrowRate = D(br !== undefined && Number.isFinite(br) && br >= 0 ? br : DEFAULT_SHORT_BORROW_RATE_DAILY);
+    this.holdingCost = o.holdingCost ?? simulatedShortBorrowModel(this.borrowRate);
     this.capabilities = {
       postOnly: true,
       restingTakeProfit: true,
@@ -161,10 +170,8 @@ export class PaperBroker implements Broker {
   private borrowOwed(p: Pos, inst: Instrument, now: number): Decimal {
     if (p.borrowFrom === undefined) return D(0);
     const accrued = p.borrowAccrued ?? D(0);
-    if (!p.qty.isNegative()) return accrued;
-    const notional = p.avg.mul(p.qty.abs()).mul(this.cs(inst));
-    const days = D(Math.max(0, now - p.borrowFrom)).div(DAY_MS);
-    return accrued.plus(notional.mul(this.borrowRate).mul(days));
+    // 保有コストのモデル (既定: 再現した空売りの借入コスト。買いの建玉には新たに積まない)
+    return accrued.plus(this.holdingCost.accrue({ inst, qty: p.qty, avgPrice: p.avg, from: p.borrowFrom, to: now, mode: "paper" }));
   }
 
   addInstrument(i: Instrument): void {
@@ -402,8 +409,8 @@ export class PaperBroker implements Broker {
     let realizedQuote = D(0);
     /** 保有コスト (決済した分。クオート通貨建て) */
     let borrowFee = D(0);
-    // 保有コストを積む建玉: 取引所で空売りできない銘柄の負の建玉 (= paper で再現した空売り) だけ
-    const simulated = (q: Decimal) => q.isNegative() && !inst.allowShort;
+    // 保有コストを積む建玉 (保有コストのモデルの appliesTo。既定: 取引所で空売りできない銘柄の負の建玉 = paper で再現した空売り)
+    const simulated = (q: Decimal) => this.holdingCost.appliesTo(inst, q);
 
     if (!pos || cur.isZero() || cur.isPositive() === signed.isPositive()) {
       const newQty = cur.plus(signed);

@@ -560,7 +560,8 @@ export class TradingEngine {
         store: deps.store,
         mode: deps.brokerSet.mode,
         // 仮想トレードも実際の建玉と同じ読みの管理・転換で決済で決済する (腕の学習をそろえるため)
-        options: { thesis: this.thesis, reversal: this.reversal, ...shadowOpts },
+        // 保有コストのモデル (shadow.holdingCost。省略時は再現の空売りの借入コストだけ) には実際の発注先の mode を渡す
+        options: { thesis: this.thesis, reversal: this.reversal, holdingCostMode: deps.brokerSet.mode, ...shadowOpts },
         onClosed: (t) => this.onShadowClosed(t),
         onError: (where, e) => this.warnThrottled(where, this.clock.now(), "仮想トレードの処理に失敗 (取引は継続)", { error: redactedErrMsg(e) }),
       });

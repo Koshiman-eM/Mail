@@ -37,6 +37,8 @@ import { costFeeRate } from "../core/fees";
 import {
   advancePeak, decideThesis, resolveThesisMs, thesisGrossR, thesisOutcomeOf, thesisTrailStop, tighterStop, type ThesisSettings,
 } from "../engine/thesis";
+import { D } from "../core/decimal";
+import type { HoldingCostModel } from "../core/holdingCost";
 import { checkReversal, reversalAppliesTo, type ReversalSettings } from "../engine/reversalExit";
 import {
   TIMEFRAME_MS, type AssetClass, type Candle, type Horizon, type Instrument, type Quote, type RegimeLabel, type ShadowExitReason, type ShadowTradeRecord,
@@ -59,6 +61,13 @@ export interface ShadowOptions {
   thesis?: ThesisSettings;
   /** 転換で決済 (省略・無効なら判定しない = 従来どおり) */
   reversal?: ReversalSettings;
+  /**
+   * 建玉の保有コストのモデル (src/core/holdingCost.ts。FX のスワップ・株式の信用の金利など)。
+   * 省略時は従来どおり、記録した再現の空売りの借入コスト (simulatedShort・borrowRateDaily) だけ
+   */
+  holdingCost?: HoldingCostModel;
+  /** 保有コストのモデルに渡す mode (既定 paper) */
+  holdingCostMode?: TradingMode;
 }
 
 export const DEFAULT_SHADOW_OPTIONS: ShadowOptions = {
@@ -576,13 +585,25 @@ export class ShadowTracker {
    * 決済したときの R (shadowR + 再現した空売りの借入コスト)。
    * 廃止した GMOコインの持ち越し手数料 (古い記録の holdingFeeDaily) は計上しない (記録は書き換えない)
    */
+  /** アプリの保有コストのモデルでの 1 単位あたりの保有コスト (R)。計算できなければ 0 */
+  private holdingCostR(o: ShadowOpen, now: number): number {
+    const model = this.opts.holdingCost;
+    if (!model || !finite(o.entryMid) || !(o.risk > 0)) return 0;
+    const qty = D(o.direction === "short" ? -1 : 1);
+    const inst = { symbol: o.symbol, assetClass: o.assetClass, allowShort: o.simulatedShort !== true };
+    const cost = model.accrue({ inst, qty, avgPrice: D(o.entryMid), from: o.entryTs, to: now, mode: this.opts.holdingCostMode ?? "paper" }).toNumber();
+    return finite(cost) ? cost / o.risk : 0;
+  }
+
   private closeR(o: ShadowOpen, exit: ShadowExitFill, now: number): { grossR: number; costR: number; netR: number } {
     const r = shadowR(o, exit);
-    // 再現した空売りの借入コスト (PaperBroker と同じ: 建玉代金 × 日率 × 保有日数。ここでは 1 単位あたりを R に換算)
-    const borrow = o.simulatedShort && finite(o.borrowRateDaily) && o.borrowRateDaily > 0
-      ? (o.entryMid * o.borrowRateDaily * Math.max(0, now - o.entryTs)) / 86_400_000 / o.risk
-      : 0;
-    if (borrow > 0) {
+    // 保有コスト (1 単位あたりを R に換算)。既定は再現した空売りの借入コスト (PaperBroker と同じ: 建玉代金 × 日率 × 保有日数)
+    const borrow = this.opts.holdingCost
+      ? this.holdingCostR(o, now)
+      : o.simulatedShort && finite(o.borrowRateDaily) && o.borrowRateDaily > 0
+        ? (o.entryMid * o.borrowRateDaily * Math.max(0, now - o.entryTs)) / 86_400_000 / o.risk
+        : 0;
+    if (borrow !== 0 && Number.isFinite(borrow)) {
       r.netR -= borrow;
       r.costR += borrow;
     }
