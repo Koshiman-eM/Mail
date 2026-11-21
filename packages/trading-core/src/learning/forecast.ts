@@ -96,7 +96,7 @@ export interface ForecastOptions {
   minSamples: number;
   /** 片側検定の臨界値 (1.645 = 片側 95%)。LIVE の判定ではこれを有意水準とみなし、グループ数で Bonferroni 補正する */
   zCritical: number;
-  /** 多重検定の補正に使うグループ数 (0 以下なら 予想時間の数 × 資産クラスの数 4) */
+  /** 多重検定の補正に使うグループ数 (0 以下なら 予想時間の数 × 資産クラスの数 4 = FORECAST_ASSET_CLASS_COUNT)。アプリは明示して固定する (trader は 12) */
   liveGroups: number;
   /** LIVE を止める閾値 = 入る閾値 − liveHysteresisZ */
   liveHysteresisZ: number;

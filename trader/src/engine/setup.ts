@@ -21,6 +21,7 @@ import { PAPER_SNAPSHOT_KEY, type PeriodicTask, type TradingEngine } from "./eng
 import { FX_RATE_REFRESH_MS, UsdJpyRateSource } from "./fxRate";
 import { JupiterWatchManager, jupiterSettingsFromEnv, resolveFixedTokens, type JupiterSettings } from "./jupiterWatch";
 import { ClosedCandleCacheFeed } from "./feedCache";
+import { FORECAST_ASSET_CLASS_COUNT } from "../learning/forecast";
 import { assembleRuntime, type AssembleOptions, type Runtime as CoreRuntime } from "./runtime";
 
 /** hub の時間足 (コアの src/engine/runtime.ts。従来の import 先のために再輸出) */
@@ -181,6 +182,13 @@ export interface Runtime extends CoreRuntime<AppConfig> {
   fxRate?: UsdJpyRateSource;
 }
 
+/**
+ * 値動きの予想の LIVE の判定の Bonferroni のグループ数 (予想時間 3 × FORECAST_ASSET_CLASS_COUNT 4 = 12)。
+ * trader が使う資産クラスは crypto・meme の 2 つだが、保存済みの予想の LIVE の状態はこの 12 グループ (入る z ≥ 2.638) で
+ * 判定してきたので固定する (6 グループに減らすと入る z ≈ 2.39 に緩む)。変えないこと
+ */
+export const TRADER_FORECAST_LIVE_GROUPS = 3 * FORECAST_ASSET_CLASS_COUNT;
+
 const withClass = (inst: Instrument, cls?: AssetClass): Instrument => (cls && cls !== inst.assetClass ? { ...inst, assetClass: cls } : inst);
 
 /**
@@ -278,6 +286,8 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
   }
   const j = jupiter;
   const { markets: _m, createCcxtFeed: _c, jupiter: _j, fxRate: _f, seed: _s, syntheticHistoryMs: _h, ...assembleOpts } = opts;
+  // 値動きの予想の多重検定 (Bonferroni) のグループ数は 12 に固定する (予想時間 3 × 資産クラス 4。TRADER_FORECAST_LIVE_GROUPS)
+  const engineOpts = { ...(opts.engine ?? {}), forecast: { liveGroups: TRADER_FORECAST_LIVE_GROUPS, ...(opts.engine?.forecast ?? {}) } };
   const core = await assembleRuntime(
     config,
     {
@@ -314,7 +324,7 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
       validationFeed: (_inst, f) => (f instanceof JupiterFeed ? undefined : f instanceof ClosedCandleCacheFeed ? f.inner : f),
       ...(periodic.length ? { periodic } : {}),
     },
-    { ...assembleOpts, clock, store },
+    { ...assembleOpts, clock, store, engine: engineOpts },
   );
   engineRef = core.engine;
   return {
