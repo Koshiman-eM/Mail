@@ -1,5 +1,6 @@
 /** MarketBrief + レジーム + 戦略一覧 → StrategyPlan (決定論ベースライン + 任意の AI 調整) */
 import { z } from "zod";
+import { enabledAssetClasses, enabledProfile } from "../core/assetClasses";
 import { askStructured, aiEnabled, type AiOptions } from "../core/ai";
 import { createLogger } from "../core/logger";
 import type {
@@ -54,24 +55,41 @@ export interface PlanInput {
   mode?: TradingMode;
 }
 
-/** 資産クラスの擬似資産 (情報バイアスのキー)。未知のクラス (廃止した fx / stock の古い銘柄定義) は擬似資産なし */
-const CLASS_PSEUDO: Record<AssetClass, string> = { crypto: "CRYPTO", meme: "MEME" };
+/**
+ * 資産クラスの擬似資産 (情報バイアスのキー。プロファイルの intelPseudoAsset: CRYPTO / MEME / FX / STOCKS)。
+ * 使わないクラス・未知のクラス (trader の古い fx / stock の銘柄定義) は擬似資産なし
+ */
+export const classPseudoAsset = (cls: string): string | undefined => enabledProfile(cls)?.intelPseudoAsset;
 
-/** 銘柄に対応するバイアス (個別 → クラス擬似資産の順) */
+/** 基準通貨 − クオート通貨でバイアスを作る資産クラスか (プロファイルの intelBiasMode = pair。FX) */
+export const isPairBiasClass = (cls: string): boolean => enabledProfile(cls)?.intelBiasMode === "pair";
+
+/** 銘柄に対応するバイアス (個別 → クラス擬似資産の順。pair のクラス (FX) は base − quote) */
 export function biasForInstrument(
   inst: Instrument,
   biases: Record<string, IntelBias>,
 ): { sentiment: number; confidence: number; eventRisk: number; found: boolean } {
-  const pseudo = biases[CLASS_PSEUDO[inst.assetClass]];
+  const pseudoKey = classPseudoAsset(inst.assetClass);
+  const pseudo = pseudoKey !== undefined ? biases[pseudoKey] : undefined;
   let sentiment = 0;
   let confidence = 0;
   let found = false;
-  const own = biases[inst.baseCurrency] ?? biases[inst.symbol.split("/")[0]];
-  const src = own ?? pseudo;
-  if (src) {
-    sentiment = src.sentiment;
-    confidence = src.confidence;
-    found = true;
+  if (isPairBiasClass(inst.assetClass)) {
+    const b = biases[inst.baseCurrency];
+    const q = biases[inst.quoteCurrency];
+    if (b || q) {
+      sentiment = clamp((b?.sentiment ?? 0) - (q?.sentiment ?? 0), -1, 1);
+      confidence = Math.min(b?.confidence ?? 0, q?.confidence ?? 0) || Math.max(b?.confidence ?? 0, q?.confidence ?? 0) * 0.5;
+      found = true;
+    }
+  } else {
+    const own = biases[inst.baseCurrency] ?? biases[inst.symbol.split("/")[0]];
+    const src = own ?? pseudo;
+    if (src) {
+      sentiment = src.sentiment;
+      confidence = src.confidence;
+      found = true;
+    }
   }
   // eventRisk: 関連する全資産の最大 (クオート通貨の経済指標を含む)
   const ev = [biases[inst.baseCurrency], biases[inst.quoteCurrency], pseudo]
@@ -133,7 +151,8 @@ export function buildBaselinePlan(input: PlanInput): StrategyPlan {
           if (regime.label === "high_vol") mult *= 0.7;
           if (regime.volatilityPercentile > 0.9) mult *= 0.8;
         }
-        if (inst.assetClass === "meme") mult *= 0.7;
+        // 資産クラスの係数 (プロファイルの planRiskMultiplier。meme 0.7)
+        mult *= enabledProfile(inst.assetClass)?.planRiskMultiplier ?? 1;
         if (bias.eventRisk >= 0.5) notes.push(`指標イベント接近 (eventRisk ${bias.eventRisk.toFixed(2)})`);
       }
     }
@@ -172,7 +191,8 @@ export function buildBaselinePlan(input: PlanInput): StrategyPlan {
   return { generatedAt: now, validUntil, perSymbol, blackouts, rationale };
 }
 
-const AiPlanSchema = z.object({
+/** AI の調整案の形。資産クラスはアプリが使うクラスだけ (呼ぶときに作る) */
+const aiPlanSchema = () => z.object({
   rationale: z.string(),
   adjustments: z.array(
     z.object({
@@ -187,12 +207,12 @@ const AiPlanSchema = z.object({
     z.object({
       start: z.number(),
       end: z.number(),
-      assetClasses: z.array(z.enum(["crypto", "meme"])),
+      assetClasses: z.array(z.enum(enabledAssetClasses() as [AssetClass, ...AssetClass[]])),
       reason: z.string(),
     }),
   ),
 });
-export type AiPlan = z.infer<typeof AiPlanSchema>;
+export type AiPlan = z.infer<ReturnType<typeof aiPlanSchema>>;
 
 /** AI の調整案を制約内でマージ (純粋関数)。ベースラインのブラックアウトは削除不可 */
 export function mergeAiPlan(base: StrategyPlan, ai: AiPlan, instruments: Instrument[], now: number, mode?: TradingMode): StrategyPlan {
@@ -241,7 +261,7 @@ export async function buildStrategyPlan(input: PlanInput): Promise<StrategyPlan>
       formatLessons(input.lessons, isPlannerScope),
       new Date(input.now).toISOString(),
     );
-    const ai = await askStructured(input.ai!, AiPlanSchema, PLANNER_SYSTEM, prompt, "low");
+    const ai = await askStructured(input.ai!, aiPlanSchema(), PLANNER_SYSTEM, prompt, "low");
     return mergeAiPlan(base, ai, input.instruments, input.now, input.mode);
   } catch (e) {
     log.warn("AI 計画調整に失敗したためベースラインを使用", { error: e instanceof Error ? e.message : String(e) });

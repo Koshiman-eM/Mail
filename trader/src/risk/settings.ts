@@ -12,7 +12,8 @@
  * このモジュールは RiskManager (manager.ts) から読まれるので、manager.ts を import しない (循環を避ける)。
  */
 import { z } from "zod";
-import { RISK_SETTING_KEYS, RISK_SETTING_SPECS, type RiskSettingKey } from "../core/config";
+import { ASSET_CLASS_PROFILES, ASSET_CLASSES, enabledAssetClasses, isEnabledAssetClass } from "../core/assetClasses";
+import { exposureSettingKey, riskSettingKeys, RISK_SETTING_SPECS, type BaseRiskSettingKey, type ExposureSettingKey, type RiskSettingKey } from "../core/config";
 import { createLogger } from "../core/logger";
 import type { RiskLimits, Store, TradingMode } from "../core/types";
 
@@ -23,51 +24,65 @@ export const riskLimitsKey = (mode: TradingMode) => `risk:limits:${mode}`;
 export const RISK_RAISE_CONFIRM = "リスクを上げる";
 export const RISK_LIMITS_AUDIT = "risk.limits_changed";
 
-export type RiskValues = Record<RiskSettingKey, number>;
+/** 項目ごとの値。資産クラスの上限はアプリが使うクラスの分だけ入る */
+export type RiskValues = Record<BaseRiskSettingKey, number> & Partial<Record<ExposureSettingKey, number>>;
 export type RiskPresetId = "conservative" | "standard" | "aggressive";
 /** プリセットで変える項目 (発注数の上限は安全装置なので含めない) */
 export type RiskPresetKey = Exclude<RiskSettingKey, "maxOrdersPerMinute">;
-export const RISK_PRESET_KEYS: readonly RiskPresetKey[] = RISK_SETTING_KEYS.filter((k): k is RiskPresetKey => k !== "maxOrdersPerMinute");
+type PresetValues = Record<Exclude<BaseRiskSettingKey, "maxOrdersPerMinute">, number> & Partial<Record<ExposureSettingKey, number>>;
+/** プリセットで変える項目 (アプリが使う資産クラスの上限を含む) */
+export function riskPresetKeys(): RiskPresetKey[] {
+  return riskSettingKeys().filter((k): k is RiskPresetKey => k !== "maxOrdersPerMinute");
+}
 /** .env の値より上げられない (下げる方向だけ許可) 項目 */
 export const LOWER_ONLY_KEYS: readonly RiskSettingKey[] = ["maxOrdersPerMinute"];
 
 /**
- * 廃止した項目 (FX・株式の資産クラスの上限)。kv `risk:limits:<mode>` に残っていても読まない (実効値に使わない) が、
- * ダッシュボードから保存し直すときも消さずに引き継ぐ (ユーザーが保存した値を消さない)。変更要求に含まれていても無視する
+ * アプリが使わない資産クラスの上限の項目 (trader では maxExposureFx / maxExposureStock)。kv `risk:limits:<mode>` に残っていても
+ * 読まない (実効値に使わない) が、ダッシュボードから保存し直すときも消さずに引き継ぐ (ユーザーが保存した値を消さない)。
+ * 変更要求に含まれていても無視する
  */
-const RETIRED_RISK_KEYS = ["maxExposureFx", "maxExposureStock"] as const;
+const retiredRiskKeys = (): ExposureSettingKey[] => ASSET_CLASSES.filter((c) => !isEnabledAssetClass(c)).map(exposureSettingKey);
 
-/** kv の上書き値のうち廃止した項目 (値はそのまま。読まない) */
+/** kv の上書き値のうち使わない項目 (値はそのまま。読まない) */
 function retiredRiskValues(store: Store, mode: TradingMode): Record<string, unknown> {
   const raw = store.kvGet<unknown>(riskLimitsKey(mode));
   const src = raw && typeof raw === "object" ? (raw as { values?: unknown }).values : undefined;
   if (!src || typeof src !== "object") return {};
   const out: Record<string, unknown> = {};
-  for (const k of RETIRED_RISK_KEYS) if ((src as Record<string, unknown>)[k] !== undefined) out[k] = (src as Record<string, unknown>)[k];
+  for (const k of retiredRiskKeys()) if ((src as Record<string, unknown>)[k] !== undefined) out[k] = (src as Record<string, unknown>)[k];
   return out;
 }
 
-const standardValues = Object.fromEntries(RISK_PRESET_KEYS.map((k) => [k, RISK_SETTING_SPECS[k].def])) as Record<RiskPresetKey, number>;
-
-/** プリセット。標準 = config の既定値 (RISK_SETTING_SPECS.def)。範囲内であることはテストで確認する */
-export const RISK_PRESETS: Readonly<Record<RiskPresetId, { label: string; values: Readonly<Record<RiskPresetKey, number>> }>> = {
-  conservative: {
-    label: "保守的",
-    values: {
-      riskPerTrade: 0.0025, maxDailyLoss: 0.015, maxDrawdown: 0.08, maxPositionPct: 0.1,
-      maxExposureCrypto: 0.3, maxExposureMeme: 0.02, maxOpenPositions: 4,
-    },
+/** 資産クラスによらない項目のプリセット (標準 = RISK_SETTING_SPECS.def) */
+const BASE_PRESETS: Record<RiskPresetId, Record<Exclude<BaseRiskSettingKey, "maxOrdersPerMinute">, number>> = {
+  conservative: { riskPerTrade: 0.0025, maxDailyLoss: 0.015, maxDrawdown: 0.08, maxPositionPct: 0.1, maxOpenPositions: 4 },
+  standard: {
+    riskPerTrade: RISK_SETTING_SPECS.riskPerTrade.def, maxDailyLoss: RISK_SETTING_SPECS.maxDailyLoss.def, maxDrawdown: RISK_SETTING_SPECS.maxDrawdown.def,
+    maxPositionPct: RISK_SETTING_SPECS.maxPositionPct.def, maxOpenPositions: RISK_SETTING_SPECS.maxOpenPositions.def,
   },
-  standard: { label: "標準", values: standardValues },
-  aggressive: {
-    label: "積極的",
-    values: {
-      riskPerTrade: 0.01, maxDailyLoss: 0.05, maxDrawdown: 0.25, maxPositionPct: 0.3,
-      maxExposureCrypto: 0.8, maxExposureMeme: 0.1, maxOpenPositions: 12,
-    },
-  },
+  aggressive: { riskPerTrade: 0.01, maxDailyLoss: 0.05, maxDrawdown: 0.25, maxPositionPct: 0.3, maxOpenPositions: 12 },
 };
+const PRESET_LABELS: Record<RiskPresetId, string> = { conservative: "保守的", standard: "標準", aggressive: "積極的" };
+
+/**
+ * プリセット (アプリが使う資産クラスの上限はプロファイルの exposurePresets)。標準 = config の既定値 (RISK_SETTING_SPECS.def)。
+ * 範囲内であることはテストで確認する
+ */
+export function riskPresets(): Readonly<Record<RiskPresetId, { label: string; values: Readonly<PresetValues> }>> {
+  const build = (id: RiskPresetId) => {
+    const exposure = Object.fromEntries(enabledAssetClasses().map((c) => [exposureSettingKey(c), ASSET_CLASS_PROFILES[c].exposurePresets[id]]));
+    // 項目の順は画面の順 (riskSettingKeys) に揃える
+    const all: Record<string, number> = { ...BASE_PRESETS[id], ...exposure };
+    const values = Object.fromEntries(riskPresetKeys().map((k) => [k, all[k]])) as PresetValues;
+    return { label: PRESET_LABELS[id], values };
+  };
+  return { conservative: build("conservative"), standard: build("standard"), aggressive: build("aggressive") };
+}
 export const RISK_PRESET_IDS: readonly RiskPresetId[] = ["conservative", "standard", "aggressive"];
+/** このアプリのプリセットと項目 (読み込み時の資産クラスで作る。コアへ移すときはアプリの設定側に置く) */
+export const RISK_PRESETS = riskPresets();
+export const RISK_PRESET_KEYS: readonly RiskPresetKey[] = riskPresetKeys();
 
 export interface RiskLimitsOverride {
   values: Partial<RiskValues>;
@@ -82,13 +97,15 @@ const EPS = 1e-12;
 
 /** RiskLimits → 項目ごとの値 */
 export function riskValuesOf(l: RiskLimits): RiskValues {
+  const exposure = Object.fromEntries(
+    enabledAssetClasses().filter((c) => l.maxExposureByClass[c] !== undefined).map((c) => [exposureSettingKey(c), l.maxExposureByClass[c] as number]),
+  ) as Partial<Record<ExposureSettingKey, number>>;
   return {
     riskPerTrade: l.riskPerTrade,
     maxDailyLoss: l.maxDailyLoss,
     maxDrawdown: l.maxDrawdown,
     maxPositionPct: l.maxPositionPct,
-    maxExposureCrypto: l.maxExposureByClass.crypto,
-    maxExposureMeme: l.maxExposureByClass.meme,
+    ...exposure,
     maxOpenPositions: l.maxOpenPositions,
     maxOrdersPerMinute: l.maxOrdersPerMinute,
   };
@@ -96,7 +113,7 @@ export function riskValuesOf(l: RiskLimits): RiskValues {
 
 /** base に項目ごとの値を重ねた RiskLimits (base は変更しない) */
 export function applyRiskValues(base: RiskLimits, v: Partial<RiskValues>): RiskLimits {
-  const pick = (k: RiskSettingKey, cur: number) => (v[k] !== undefined ? (v[k] as number) : cur);
+  const pick = <T extends number | undefined>(k: RiskSettingKey, cur: T): T | number => (v[k] !== undefined ? (v[k] as number) : cur);
   return {
     ...base,
     riskPerTrade: pick("riskPerTrade", base.riskPerTrade),
@@ -105,10 +122,7 @@ export function applyRiskValues(base: RiskLimits, v: Partial<RiskValues>): RiskL
     maxPositionPct: pick("maxPositionPct", base.maxPositionPct),
     maxOpenPositions: pick("maxOpenPositions", base.maxOpenPositions),
     maxOrdersPerMinute: pick("maxOrdersPerMinute", base.maxOrdersPerMinute),
-    maxExposureByClass: {
-      crypto: pick("maxExposureCrypto", base.maxExposureByClass.crypto),
-      meme: pick("maxExposureMeme", base.maxExposureByClass.meme),
-    },
+    maxExposureByClass: Object.fromEntries(enabledAssetClasses().map((c) => [c, pick(exposureSettingKey(c), base.maxExposureByClass[c])])),
   };
 }
 
@@ -141,11 +155,11 @@ export function readRiskOverride(store: Store, mode: TradingMode, envLimits: Ris
   const env = riskValuesOf(envLimits);
   const values: Partial<RiskValues> = {};
   const src = r.values && typeof r.values === "object" ? (r.values as Record<string, unknown>) : {};
-  for (const k of RISK_SETTING_KEYS) {
+  for (const k of riskSettingKeys()) {
     const v = src[k];
     if (v === undefined) continue;
     if (LOWER_ONLY_KEYS.includes(k) && typeof v === "number" && checkRiskValue(k, v) === undefined) {
-      values[k] = Math.min(v, env[k]);
+      values[k] = Math.min(v, env[k] as number);
       continue;
     }
     const err = checkRiskValue(k, v, env[k]);
@@ -181,30 +195,35 @@ export interface RiskChange {
 
 export function diffRiskValues(before: RiskValues, after: RiskValues): RiskChange[] {
   const out: RiskChange[] = [];
-  for (const k of RISK_SETTING_KEYS) {
-    if (Math.abs(before[k] - after[k]) <= EPS) continue;
-    out.push({ key: k, from: before[k], to: after[k], raised: isRaise(before[k], after[k]) });
+  for (const k of riskSettingKeys()) {
+    const from = before[k] as number;
+    const to = after[k] as number;
+    if (Math.abs(from - to) <= EPS) continue;
+    out.push({ key: k, from, to, raised: isRaise(from, to) });
   }
   return out;
 }
 
 /** values (プリセット対象の項目) がプリセットと一致するもの */
 export function matchingPreset(v: RiskValues): RiskPresetId | undefined {
-  return RISK_PRESET_IDS.find((id) => RISK_PRESET_KEYS.every((k) => Math.abs(RISK_PRESETS[id].values[k] - v[k]) <= EPS));
+  const presets = riskPresets();
+  return RISK_PRESET_IDS.find((id) => riskPresetKeys().every((k) => Math.abs((presets[id].values[k] ?? NaN) - (v[k] ?? NaN)) <= EPS));
 }
 
 // ───────── 変更要求 (ダッシュボードの POST) ─────────
 
-// 廃止した項目 (RETIRED_RISK_KEYS) は古い画面から送られても拒否せず無視する (それ以外の未知の項目は書き間違いとして拒否)
-const valuesSchema = z.strictObject({
-  ...(Object.fromEntries(RISK_SETTING_KEYS.map((k) => [k, z.number().optional()])) as Record<RiskSettingKey, z.ZodOptional<z.ZodNumber>>),
-  ...(Object.fromEntries(RETIRED_RISK_KEYS.map((k) => [k, z.unknown().optional()])) as Record<(typeof RETIRED_RISK_KEYS)[number], z.ZodOptional<z.ZodUnknown>>),
-});
+// 使わない項目 (retiredRiskKeys) は古い画面から送られても拒否せず無視する (それ以外の未知の項目は書き間違いとして拒否)
+const valuesSchema = () =>
+  z.strictObject({
+    ...(Object.fromEntries(riskSettingKeys().map((k) => [k, z.number().optional()])) as Record<RiskSettingKey, z.ZodOptional<z.ZodNumber>>),
+    ...(Object.fromEntries(retiredRiskKeys().map((k) => [k, z.unknown().optional()])) as Record<ExposureSettingKey, z.ZodOptional<z.ZodUnknown>>),
+  });
 
-export const RiskSettingsRequestSchema = z.discriminatedUnion("action", [
+/** ダッシュボードの変更要求の形 (項目はアプリが使う資産クラスで決まるので、検証のときに作る) */
+export const riskSettingsRequestSchema = () => z.discriminatedUnion("action", [
   z.strictObject({
     action: z.literal("set"),
-    values: valuesSchema,
+    values: valuesSchema(),
     preset: z.enum(["conservative", "standard", "aggressive"]).optional(),
     confirm: z.string().max(100).optional(),
     acknowledgeDrawdown: z.boolean().optional(),
@@ -215,7 +234,7 @@ export const RiskSettingsRequestSchema = z.discriminatedUnion("action", [
     acknowledgeDrawdown: z.boolean().optional(),
   }),
 ]);
-export type RiskSettingsRequest = z.infer<typeof RiskSettingsRequestSchema>;
+export type RiskSettingsRequest = z.infer<ReturnType<typeof riskSettingsRequestSchema>>;
 
 /** 現在のリスク状態 (判定用)。不明な値は undefined */
 export interface RiskMetrics {
@@ -253,7 +272,7 @@ export function applyRiskSettingsChange(opts: {
   source?: "dashboard";
 }): RiskSettingsResult {
   const { store, mode, envLimits, now } = opts;
-  const parsed = RiskSettingsRequestSchema.safeParse(opts.request);
+  const parsed = riskSettingsRequestSchema().safeParse(opts.request);
   if (!parsed.success) {
     return { ok: false, status: 400, error: `要求の形式が不正です: ${parsed.error.issues.map((i) => `${i.path.join(".") || "(本文)"} ${i.message}`).join(" / ").slice(0, 300)}` };
   }
@@ -265,8 +284,8 @@ export function applyRiskSettingsChange(opts: {
   let newValues: Partial<RiskValues> = {};
   if (req.action === "set") {
     const fieldErrors: Partial<Record<RiskSettingKey, string>> = {};
-    for (const k of RISK_SETTING_KEYS) {
-      const v = req.values[k];
+    for (const k of riskSettingKeys()) {
+      const v = req.values[k] as number | undefined;
       if (v === undefined) continue;
       const err = checkRiskValue(k, v, env[k]);
       if (err) fieldErrors[k] = err;
@@ -333,7 +352,7 @@ export function applyRiskSettingsChange(opts: {
 }
 
 function sameOverride(a: Partial<RiskValues>, b: Partial<RiskValues>): boolean {
-  return RISK_SETTING_KEYS.every((k) => (a[k] === undefined) === (b[k] === undefined) && (a[k] === undefined || Math.abs((a[k] as number) - (b[k] as number)) <= EPS));
+  return riskSettingKeys().every((k) => (a[k] === undefined) === (b[k] === undefined) && (a[k] === undefined || Math.abs((a[k] as number) - (b[k] as number)) <= EPS));
 }
 
 /** GET /api/risk-settings 用の表示データ (秘密情報は含めない) */
@@ -346,11 +365,11 @@ export function riskSettingsView(opts: { store: Store; mode: TradingMode; envLim
     effective,
     env,
     override: override ? { values: override.values, preset: override.preset ?? null, updatedAt: override.updatedAt, source: override.source } : null,
-    sources: Object.fromEntries(RISK_SETTING_KEYS.map((k) => [k, override?.values[k] !== undefined ? "dashboard" : "env"])) as Record<RiskSettingKey, "env" | "dashboard">,
-    presets: RISK_PRESET_IDS.map((id) => ({ id, label: RISK_PRESETS[id].label, values: RISK_PRESETS[id].values })),
-    fields: RISK_SETTING_KEYS.map((k) => {
+    sources: Object.fromEntries(riskSettingKeys().map((k) => [k, override?.values[k] !== undefined ? "dashboard" : "env"])) as Record<RiskSettingKey, "env" | "dashboard">,
+    presets: RISK_PRESET_IDS.map((id) => ({ id, label: riskPresets()[id].label, values: riskPresets()[id].values })),
+    fields: riskSettingKeys().map((k) => {
       const s = RISK_SETTING_SPECS[k];
-      return { key: k, label: s.label, env: s.env, kind: s.kind, min: s.min, max: s.max, inPreset: (RISK_PRESET_KEYS as readonly string[]).includes(k), lowerOnly: LOWER_ONLY_KEYS.includes(k) };
+      return { key: k, label: s.label, env: s.env, kind: s.kind, min: s.min, max: s.max, inPreset: (riskPresetKeys() as readonly string[]).includes(k), lowerOnly: LOWER_ONLY_KEYS.includes(k) };
     }),
     current: opts.metrics,
     confirmPhrase: RISK_RAISE_CONFIRM,
@@ -365,11 +384,11 @@ export function riskOverrideLines(store: Store, mode: TradingMode, envLimits: Ri
   const env = riskValuesOf(envLimits);
   const fmt = (k: RiskSettingKey, v: number) => (RISK_SETTING_SPECS[k].kind === "ratio" ? pctText(v) : String(v));
   const lines = [
-    `リスク上限の上書き (${mode}): あり (ダッシュボードで ${fmtTime(override.updatedAt)} に変更${override.preset ? `、プリセット ${RISK_PRESETS[override.preset].label}` : ""})`,
+    `リスク上限の上書き (${mode}): あり (ダッシュボードで ${fmtTime(override.updatedAt)} に変更${override.preset ? `、プリセット ${riskPresets()[override.preset].label}` : ""})`,
   ];
-  for (const k of RISK_SETTING_KEYS) {
+  for (const k of riskSettingKeys()) {
     if (override.values[k] === undefined) continue;
-    lines.push(`  ${RISK_SETTING_SPECS[k].label}: 実効 ${fmt(k, eff[k])} (.env ${fmt(k, env[k])})`);
+    lines.push(`  ${RISK_SETTING_SPECS[k].label}: 実効 ${fmt(k, eff[k] as number)} (.env ${fmt(k, env[k] as number)})`);
   }
   return lines;
 }

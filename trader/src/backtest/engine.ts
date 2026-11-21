@@ -17,6 +17,7 @@ import type {
 } from "../core/types";
 import { TIMEFRAME_MS } from "../core/types";
 import { costFeeRate, fixedFeeOf } from "../core/fees";
+import { profileOrDefault } from "../core/assetClasses";
 import { D, Decimal, floorToStep } from "../core/decimal";
 import { DEFAULT_RISK } from "../core/config";
 import { resample } from "../indicators/resample";
@@ -69,15 +70,12 @@ import type { BacktestOptions, BacktestResult, BacktestStats, IntelSource, Sizer
  *   - 足は判定の時間足の確定足 (その時点で見えている分) をエントリーした足の N 本前から渡す (戦略へ渡す historyBars の制限は受けない)。
  */
 
-/** 資産クラス別の既定スプレッド (bps, 全幅) とスリッページ (bps, 片道) */
-const DEFAULT_COSTS: Record<AssetClass, { spreadBps: number; slippageBps: number }> = {
-  crypto: { spreadBps: 2, slippageBps: 1 },
-  meme: { spreadBps: 60, slippageBps: 20 },
-};
-
-/** 資産クラスの既定コスト。未知のクラス (廃止した fx / stock の古い記録など) は crypto の値 */
+/**
+ * 資産クラスの既定コスト (スプレッドは全幅 bps、スリッページは片道 bps。src/core/assetClasses.ts のプロファイル)。
+ * 使わないクラス・未知のクラス (trader の古い fx / stock の記録など) は最初に選んだクラス (crypto) の値
+ */
 export function defaultCosts(assetClass: AssetClass): { spreadBps: number; slippageBps: number } {
-  return { ...(DEFAULT_COSTS[assetClass] ?? DEFAULT_COSTS.crypto) };
+  return { ...profileOrDefault(assetClass).defaultCosts };
 }
 
 /**

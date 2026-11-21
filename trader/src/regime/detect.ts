@@ -1,4 +1,5 @@
 import type { AssetClass, Candle, Quote, RegimeFeatures } from "../core/types";
+import { profileOrDefault } from "../core/assetClasses";
 import { adx, atr, ema } from "../indicators/series";
 import { percentileRank } from "../indicators/series";
 import { spreadBps as calcSpreadBps } from "../indicators/microstructure";
@@ -37,9 +38,8 @@ export const DEFAULT_REGIME_OPTIONS: RegimeOptions = {
 
 /** 資産クラス別の既定値 (主にスプレッド閾値) */
 export function regimeOptionsFor(assetClass: AssetClass, overrides: Partial<RegimeOptions> = {}): RegimeOptions {
-  // 未知のクラス (廃止した fx / stock の古い銘柄定義など) は crypto の値
-  const spread: Record<AssetClass, number> = { crypto: 30, meme: 150 };
-  return { ...DEFAULT_REGIME_OPTIONS, maxSpreadBps: spread[assetClass] ?? spread.crypto, ...overrides };
+  // プロファイルの regimeMaxSpreadBps (crypto 30 / meme 150)。使わないクラス (trader の古い fx / stock の銘柄定義など) は最初に選んだクラスの値
+  return { ...DEFAULT_REGIME_OPTIONS, maxSpreadBps: profileOrDefault(assetClass).regimeMaxSpreadBps, ...overrides };
 }
 
 /** パーセンタイル計算に必要な最小サンプル数 (未満なら 0.5 = 不明) */

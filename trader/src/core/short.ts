@@ -12,6 +12,7 @@
  *   古い "dex:*") は、流動性が薄く実際には借りられない (貸株・信用の対象にならない) ため再現しない。
  *   Jupiter はスワップだけ (現物) なので SOL・JUP (crypto) でも空売りしない。
  */
+import { enabledProfile } from "./assetClasses";
 import type { Instrument, TradingMode } from "./types";
 
 /** PAPER_SHORT_BORROW_RATE_DAILY の既定値 (0.04%/日。bitbank の信用取引の手数料・金利を想定した仮の値) */
@@ -24,10 +25,14 @@ type ShortInfo = Pick<Instrument, "allowShort" | "assetClass" | "venue"> & { sim
 /** DEX の取引先 (空売りを再現しない)。Jupiter と、廃止した dex:* の古い銘柄 */
 const NO_SHORT_VENUES = ["jupiter"] as const;
 
-/** paper で空売りを再現してよい銘柄か (allowShort=false の暗号資産。meme と DEX (jupiter・dex:*) は対象外) */
+/**
+ * paper で空売りを再現してよい銘柄か (allowShort=false で、資産クラスのプロファイルが再現を許すもの (crypto・stock)。
+ * meme・fx と DEX (jupiter・dex:*) は対象外)
+ */
 export function simulatedShortEligible(inst: ShortInfo): boolean {
   if (inst.allowShort) return false;
-  if (inst.assetClass !== "crypto") return false;
+  // プロファイルの paperSimulatedShort (crypto・stock)。使わないクラス・meme・fx は再現しない
+  if (enabledProfile(inst.assetClass)?.paperSimulatedShort !== true) return false;
   // WATCHLIST で dex のペアを crypto と指定しても、DEX の銘柄は借りられないので再現しない
   if (typeof inst.venue === "string") {
     const v = inst.venue.toLowerCase();

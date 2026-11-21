@@ -17,7 +17,8 @@
  * fx / stock は廃止した。DB の古い記録 (取引・仮想トレード・腕・パラメータ・振り返り・予想の集計) には "fx" / "stock" が残りうるので、
  * 記録の assetClass を読むコードは未知のクラスでも例外にしない (クラス別の表を引くときは既定値に落とす)
  */
-export type AssetClass = "crypto" | "meme";
+export type { AssetClass } from "./assetClasses";
+import type { AssetClass } from "./assetClasses";
 /**
  * トレードの時間軸。登録している戦略は scalp と short だけ。mid / long の戦略は廃止したが、
  * 古い取引・仮想トレードの記録と MAX_HOLD_MINUTES の規則 (isHoldLimitedHorizon) のために残す
@@ -499,7 +500,8 @@ export interface RiskLimits {
   maxDrawdown: number;
   maxOpenPositions: number;
   /** 資産クラス別の最大エクスポージャー (評価額比) */
-  maxExposureByClass: Record<AssetClass, number>;
+  /** 使う資産クラス (アプリが選んだクラス) ごとの上限。キーの無いクラスの新規エントリーは拒否する */
+  maxExposureByClass: Partial<Record<AssetClass, number>>;
   /** 1 銘柄あたりの最大ポジション (評価額比) */
   maxPositionPct: number;
   /** 1 分あたりの最大発注数 */

@@ -1,4 +1,5 @@
 import { D, floorToStep, roundToStep, Decimal } from "../core/decimal";
+import { ASSET_CLASS_PROFILES, enabledAssetClasses } from "../core/assetClasses";
 import { TerminalMap, isTerminalOrder } from "../core/sweep";
 import { fixedFeeOf } from "../core/fees";
 import { createLogger } from "../core/logger";
@@ -20,7 +21,7 @@ export interface PaperBrokerOptions {
    * 換算できない通貨は NaN を返す: その銘柄の新規発注は拒否し、評価には最後に分かったレートを使う。
    */
   toAccount?: (ccy: string) => number;
-  /** 資産クラス別レバレッジ (証拠金計算)。既定: crypto/meme 1 (現物。未知のクラスも 1) */
+  /** 資産クラス別レバレッジ (証拠金計算)。既定: プロファイルの paperLeverage (crypto/meme 1 = 現物。使わないクラス・未知のクラスは 1) */
   leverage?: Partial<Record<Instrument["assetClass"], number>>;
   clock?: Clock;
   /** quote が未受信のときの取得元 */
@@ -90,7 +91,9 @@ export interface PaperSnapshot {
   fxRates?: Record<string, string>;
 }
 
-const DEFAULT_LEVERAGE = { crypto: 1, meme: 1 };
+/** 使う資産クラスのレバレッジ (src/core/assetClasses.ts のプロファイル。使わないクラスは 1) */
+const defaultLeverage = (): Partial<Record<Instrument["assetClass"], number>> =>
+  Object.fromEntries(enabledAssetClasses().map((c) => [c, ASSET_CLASS_PROFILES[c].paperLeverage]));
 const log = createLogger("paper");
 
 /**
@@ -130,7 +133,7 @@ export class PaperBroker implements Broker {
     this.slip = D(o.slippageBps ?? 2).div(10_000);
     this.toAcct = o.toAccount ?? (() => 1);
     this.clock = o.clock ?? systemClock;
-    this.lev = { ...DEFAULT_LEVERAGE, ...(o.leverage ?? {}) };
+    this.lev = { ...defaultLeverage(), ...(o.leverage ?? {}) };
     const br = o.shortBorrowRateDaily;
     this.borrowRate = D(br !== undefined && Number.isFinite(br) && br >= 0 ? br : DEFAULT_SHORT_BORROW_RATE_DAILY);
     this.capabilities = {

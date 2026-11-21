@@ -1,3 +1,4 @@
+import { enabledAssetClasses, enabledProfile } from "../core/assetClasses";
 import { D, floorToStep, Decimal } from "../core/decimal";
 import { costFeeRate } from "../core/fees";
 import { createLogger } from "../core/logger";
@@ -127,9 +128,10 @@ const finiteNum = (v: unknown): v is number => typeof v === "number" && Number.i
 export interface ClassExposure {
   /**
    * 資産クラス別の建玉額。換算できない建玉があるクラスは、換算できた分だけの合計。
-   * 廃止したクラス (fx / stock) の古い建玉があればそのクラスのキーにも積む (例外にしない)
+   * 使うクラス (アプリが選んだクラス) は 0 から始める。使わないクラス (trader の古い fx / stock の建玉など) があれば
+   * そのクラスのキーにも積む (例外にしない)
    */
-  exposure: Record<AssetClass, Decimal> & Partial<Record<string, Decimal>>;
+  exposure: Partial<Record<string, Decimal>>;
   /** 換算できない (価格・数量・為替が非有限) 建玉があり、合計が不明な資産クラスと銘柄 */
   unknown: Partial<Record<string, string[]>>;
 }
@@ -145,7 +147,7 @@ export function classExposure(
   instruments?: EntryParams["instruments"],
   toAccount: (ccy: string) => number = () => 1,
 ): ClassExposure {
-  const exposure: ClassExposure["exposure"] = { crypto: D(0), meme: D(0) };
+  const exposure: ClassExposure["exposure"] = Object.fromEntries(enabledAssetClasses().map((c) => [c, D(0)]));
   const unknown: ClassExposure["unknown"] = {};
   const markUnknown = (cls: string, sym: string) => {
     (unknown[cls] ??= []).push(sym);
@@ -558,7 +560,8 @@ export class RiskManager {
       sizedCost = c;
     }
 
-    if (inst.assetClass === "meme") {
+    // 流動性の確認が要る資産クラス (プロファイルの requiresLiquidityCheck。meme)
+    if (enabledProfile(inst.assetClass)?.requiresLiquidityCheck) {
       const liq = p.liquidityUsd;
       if (liq === undefined || !Number.isFinite(liq)) return { ok: false, reason: "ミームコインの流動性が不明のため拒否" };
       if (liq < L.memeMinLiquidityUsd) return { ok: false, reason: `流動性 $${Math.round(liq)} < 最低 $${L.memeMinLiquidityUsd}` };

@@ -3,11 +3,9 @@ import {
   TIMEFRAME_MS, type AssetClass, type Candle, type Instrument, type IntelBias, type MarketBrief, type MarketView,
   type StrategyPlan, type Timeframe,
 } from "../core/types";
-import { biasForInstrument } from "../intel/planner";
+import { biasForInstrument, classPseudoAsset, isPairBiasClass } from "../intel/planner";
 import { clampOrZero } from "../core/util";
 
-/** 資産クラスの擬似資産 (情報バイアスのキー。src/intel/planner.ts と同じ)。未知のクラスは擬似資産なし */
-const CLASS_PSEUDO: Record<AssetClass, string> = { crypto: "CRYPTO", meme: "MEME" };
 const DAY_MS = 86_400_000;
 
 /** 情報収集がまだ無いときの空のブリーフ */
@@ -24,14 +22,24 @@ export function intelBiasFor(inst: Instrument, biases: Record<string, IntelBias>
   const b = biasForInstrument(inst, biases);
   if (!b.found) return undefined;
   const k = Number.isFinite(influence) ? Math.max(0, influence) : 1;
-  const pseudo = biases[CLASS_PSEUDO[inst.assetClass]];
-  const used = biases[inst.baseCurrency] ?? biases[inst.symbol.split("/")[0]] ?? pseudo;
+  const pseudoKey = classPseudoAsset(inst.assetClass);
+  const pseudo = pseudoKey !== undefined ? biases[pseudoKey] : undefined;
+  const pair = isPairBiasClass(inst.assetClass);
+  // 使ったバイアスと符号 (pair のクラス (FX) はクオート通貨側を反転)
+  const used: [IntelBias, number][] = [];
+  if (pair) {
+    if (biases[inst.baseCurrency]) used.push([biases[inst.baseCurrency], 1]);
+    if (biases[inst.quoteCurrency]) used.push([biases[inst.quoteCurrency], -1]);
+  } else {
+    const src = biases[inst.baseCurrency] ?? biases[inst.symbol.split("/")[0]] ?? pseudo;
+    if (src) used.push([src, 1]);
+  }
   const sourceContrib: Record<string, number> = {};
   const sourceIds = new Set<string>();
-  if (used) {
-    for (const id of used.sourceIds ?? []) sourceIds.add(id);
-    for (const [src, v] of Object.entries(used.sourceContrib ?? {})) {
-      if (Number.isFinite(v)) sourceContrib[src] = clampOrZero((sourceContrib[src] ?? 0) + v, -1, 1);
+  for (const [bias, sign] of used) {
+    for (const id of bias.sourceIds ?? []) sourceIds.add(id);
+    for (const [src, v] of Object.entries(bias.sourceContrib ?? {})) {
+      if (Number.isFinite(v)) sourceContrib[src] = clampOrZero((sourceContrib[src] ?? 0) + sign * v, -1, 1);
     }
   }
   // ブラックアウト期限は関連する全資産の最大 (eventRisk と同じ範囲。クオート通貨の経済指標を含む)
@@ -41,7 +49,7 @@ export function intelBiasFor(inst: Instrument, biases: Record<string, IntelBias>
     undefined,
   );
   return {
-    asset: used?.asset ?? inst.baseCurrency,
+    asset: pair ? inst.symbol : (used[0]?.[0].asset ?? inst.baseCurrency),
     sentiment: clampOrZero(b.sentiment * k, -1, 1),
     confidence: clampOrZero(b.confidence * k, 0, 1),
     eventRisk: clampOrZero(b.eventRisk, 0, 1),

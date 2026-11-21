@@ -1,6 +1,10 @@
 import { z } from "zod";
+import { ASSET_CLASS_PROFILES, ASSET_CLASSES, classKeySuffix, enabledAssetClasses, isEnabledAssetClass, setEnabledAssetClasses, type AssetClass } from "./assetClasses";
 import { DEFAULT_SHORT_BORROW_RATE_DAILY, MAX_SHORT_BORROW_RATE_DAILY } from "./short";
-import type { AssetClass, RiskLimits } from "./types";
+import type { RiskLimits } from "./types";
+
+/** このアプリ (暗号資産のボット) が使う資産クラス */
+export const TRADER_ASSET_CLASSES = setEnabledAssetClasses(["crypto", "meme"]);
 
 /**
  * 環境変数からの設定読み込み。シークレットは必ず環境変数 (.env.local) 経由。
@@ -50,10 +54,20 @@ const count = (key: string, def: number, max: number) =>
  * 環境変数の検証 (EnvSchema) とダッシュボードの上書き値の検証 (src/risk/settings.ts) の両方がこの 1 か所を参照する
  * (範囲を二重に定義しない)。ratio は 0 < x ≤ max、count は 1 ≤ x ≤ max の整数。
  */
-export type RiskSettingKey =
-  | "riskPerTrade" | "maxDailyLoss" | "maxDrawdown" | "maxPositionPct"
-  | "maxExposureCrypto" | "maxExposureMeme"
-  | "maxOpenPositions" | "maxOrdersPerMinute";
+export type BaseRiskSettingKey = "riskPerTrade" | "maxDailyLoss" | "maxDrawdown" | "maxPositionPct" | "maxOpenPositions" | "maxOrdersPerMinute";
+/** 資産クラスのエクスポージャー上限の項目 (maxExposureCrypto / maxExposureMeme / maxExposureFx / maxExposureStock) */
+export type ExposureSettingKey = `maxExposure${Capitalize<AssetClass>}`;
+export type RiskSettingKey = BaseRiskSettingKey | ExposureSettingKey;
+
+/** 資産クラスの上限の項目名 (crypto → maxExposureCrypto。kv risk:limits:<mode> の values のキー) */
+export const exposureSettingKey = (c: AssetClass): ExposureSettingKey => `maxExposure${classKeySuffix(c)}` as ExposureSettingKey;
+/** 資産クラスの上限の環境変数名 (crypto → MAX_EXPOSURE_CRYPTO) */
+export const exposureEnvKey = (c: AssetClass): string => `MAX_EXPOSURE_${c.toUpperCase()}`;
+/** 表示名 (暗号資産の上限 / FX の上限)。英字で終わる名前は空白を挟む */
+const exposureLabel = (c: AssetClass) => {
+  const l = ASSET_CLASS_PROFILES[c].label;
+  return /[A-Za-z0-9]$/.test(l) ? `${l} の上限` : `${l}の上限`;
+};
 
 export interface RiskSettingSpec {
   env: string;
@@ -66,23 +80,36 @@ export interface RiskSettingSpec {
   label: string;
 }
 
+/**
+ * 全項目の定義 (資産クラスの上限は語彙の全クラスぶん。既定値はプロファイルの exposurePresets.standard)。
+ * アプリが使う項目は riskSettingKeys() (使うクラスの上限だけ)
+ */
 export const RISK_SETTING_SPECS: Readonly<Record<RiskSettingKey, RiskSettingSpec>> = {
   riskPerTrade: { env: "RISK_PER_TRADE", kind: "ratio", min: 0, max: 0.05, def: 0.005, label: "1 トレードのリスク" },
   maxDailyLoss: { env: "MAX_DAILY_LOSS", kind: "ratio", min: 0, max: 0.2, def: 0.03, label: "日次損失の上限" },
   maxDrawdown: { env: "MAX_DRAWDOWN", kind: "ratio", min: 0, max: 0.5, def: 0.15, label: "最大ドローダウン" },
   maxPositionPct: { env: "MAX_POSITION_PCT", kind: "ratio", min: 0, max: 1, def: 0.2, label: "1 銘柄の上限" },
-  maxExposureCrypto: { env: "MAX_EXPOSURE_CRYPTO", kind: "ratio", min: 0, max: 1, def: 0.6, label: "暗号資産の上限" },
-  maxExposureMeme: { env: "MAX_EXPOSURE_MEME", kind: "ratio", min: 0, max: 1, def: 0.05, label: "ミームの上限" },
+  ...(Object.fromEntries(
+    ASSET_CLASSES.map((c) => [
+      exposureSettingKey(c),
+      { env: exposureEnvKey(c), kind: "ratio", min: 0, max: 1, def: ASSET_CLASS_PROFILES[c].exposurePresets.standard, label: exposureLabel(c) },
+    ]),
+  ) as Record<ExposureSettingKey, RiskSettingSpec>),
   maxOpenPositions: { env: "MAX_OPEN_POSITIONS", kind: "count", min: 1, max: 100, def: 8, label: "最大保有数" },
   maxOrdersPerMinute: { env: "MAX_ORDERS_PER_MINUTE", kind: "count", min: 1, max: 1000, def: 30, label: "1 分あたりの発注数" },
 };
 
-/** 画面・CLI に出す順 */
-export const RISK_SETTING_KEYS: readonly RiskSettingKey[] = [
-  "riskPerTrade", "maxDailyLoss", "maxDrawdown", "maxPositionPct",
-  "maxExposureCrypto", "maxExposureMeme",
-  "maxOpenPositions", "maxOrdersPerMinute",
-];
+/** アプリが使う項目 (画面・CLI に出す順)。資産クラスの上限は使うクラスだけ */
+export function riskSettingKeys(classes: readonly AssetClass[] = enabledAssetClasses()): RiskSettingKey[] {
+  return [
+    "riskPerTrade", "maxDailyLoss", "maxDrawdown", "maxPositionPct",
+    ...classes.map(exposureSettingKey),
+    "maxOpenPositions", "maxOrdersPerMinute",
+  ];
+}
+
+/** このアプリの項目 (画面・CLI に出す順) */
+export const RISK_SETTING_KEYS: readonly RiskSettingKey[] = riskSettingKeys();
 
 /** 定義から環境変数の検証を作る */
 const riskEnv = (k: RiskSettingKey) => {
@@ -270,8 +297,8 @@ const EnvSchema = z.object({
   MAX_POSITION_PCT: riskEnv("maxPositionPct"),
   MAX_ORDERS_PER_MINUTE: riskEnv("maxOrdersPerMinute"),
   MIN_EDGE_TO_COST: num(2),
-  MAX_EXPOSURE_CRYPTO: riskEnv("maxExposureCrypto"),
-  MAX_EXPOSURE_MEME: riskEnv("maxExposureMeme"),
+  // 資産クラスのエクスポージャー上限 (MAX_EXPOSURE_<CLASS>。使うクラスの分だけ)
+  ...(Object.fromEntries(enabledAssetClasses().map((c) => [exposureEnvKey(c), riskEnv(exposureSettingKey(c))])) as Record<string, ReturnType<typeof riskEnv>>),
   /**
    * 資産クラス meme の新規エントリーに求める流動性 (USD)。Jupiter の銘柄はトークン情報の liquidity (1 時間ごとに取り直す)、
    * WATCHLIST で |meme を付けた ccxt などの銘柄は 24 時間の出来高からの推定。RiskManager の判定 (未満・不明なら拒否)
@@ -482,10 +509,9 @@ export function loadConfig(source: Record<string, string | undefined> = process.
   }
   const env = parsed.data;
   const { mode, liveBlockedReason } = resolveMode(env);
-  const exposure: Record<AssetClass, number> = {
-    crypto: env.MAX_EXPOSURE_CRYPTO,
-    meme: env.MAX_EXPOSURE_MEME,
-  };
+  const exposure: Partial<Record<AssetClass, number>> = Object.fromEntries(
+    enabledAssetClasses().map((c) => [c, (env as Record<string, unknown>)[exposureEnvKey(c)] as number]),
+  );
   return {
     env,
     mode,
@@ -514,13 +540,14 @@ export const DEFAULT_RISK: RiskLimits = loadConfig({}).risk;
  * GMO_*: GMOコインの取引先 (廃止)。MAX_EXPOSURE_FX / MAX_EXPOSURE_STOCK: FX・株式の資産クラス (廃止)
  */
 const REMOVED_ENV_PREFIXES = ["GMO_"] as const;
-const REMOVED_ENV_KEYS = ["MAX_EXPOSURE_FX", "MAX_EXPOSURE_STOCK"] as const;
+/** 使わない資産クラスの上限 (trader では MAX_EXPOSURE_FX / MAX_EXPOSURE_STOCK) */
+const REMOVED_ENV_KEYS: readonly string[] = ASSET_CLASSES.filter((c) => !isEnabledAssetClass(c)).map(exposureEnvKey);
 
 /** 値の入った廃止した環境変数があれば警告文を返す (値は表示しない) */
 export function removedEnvWarnings(source: Record<string, string | undefined>): string[] {
   const keys = Object.keys(source)
     .filter((k) => (source[k] ?? "").trim() !== "")
-    .filter((k) => REMOVED_ENV_PREFIXES.some((p) => k.startsWith(p)) || (REMOVED_ENV_KEYS as readonly string[]).includes(k))
+    .filter((k) => REMOVED_ENV_PREFIXES.some((p) => k.startsWith(p)) || REMOVED_ENV_KEYS.includes(k))
     .sort();
   return keys.length ? [`.env の ${keys.join(", ")} は廃止した設定のため読みません (GMOコイン・FX・株式は廃止。.env から外してください)`] : [];
 }

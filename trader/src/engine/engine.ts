@@ -1,3 +1,4 @@
+import { enabledProfile } from "../core/assetClasses";
 import type { AiOptions } from "../core/ai";
 import { DEFAULT_OBSERVE_ONLY_STRATEGIES, type AppConfig } from "../core/config";
 import { equitySinceReset, latestPaperReset } from "../paper/walletReset";
@@ -2154,7 +2155,7 @@ export class TradingEngine {
       return this.skip("no_broker", redactedErrMsg(e));
     }
     // ミームの流動性: Jupiter の銘柄はトークン情報の liquidity (定期的に取り直す)、それ以外は 24 時間の出来高からの推定
-    const liquidityUsd = inst.assetClass !== "meme"
+    const liquidityUsd = !enabledProfile(inst.assetClass)?.requiresLiquidityCheck
       ? undefined
       : this.marketExtras?.venues.includes(inst.venue)
         ? this.marketExtras.liquidityUsd(sym)

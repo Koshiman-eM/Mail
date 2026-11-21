@@ -1,5 +1,6 @@
 import type { AiOptions } from "../core/ai";
 import { createLogger } from "../core/logger";
+import { enabledAssetClasses } from "../core/assetClasses";
 import type {
   AssetClass,
   CauseCode,
@@ -99,7 +100,7 @@ export interface LearningSnapshot {
   lessons: Lesson[];
   adjustments: ParamAdjustment[];
   sources: Record<string, SourceReliability>;
-  intelInfluence: Record<AssetClass, number>;
+  intelInfluence: Partial<Record<AssetClass, number>>;
   causes: CauseSummary;
   /** 見送ったシグナルの答え合わせ (仮想トレード) */
   shadow: ShadowSummary;
@@ -109,8 +110,10 @@ export interface LearningSnapshot {
   forecast: ForecastSummary;
 }
 
-/** 情報の効き具合を表示・計画に使う資産クラス (廃止した fx / stock の kv intelInfluence:<mode>:fx などは残し、読まないだけ) */
-const ASSET_CLASSES: AssetClass[] = ["crypto", "meme"];
+/**
+ * 情報の効き具合を表示・計画に使う資産クラスは、アプリが使うクラス (enabledAssetClasses)。
+ * 使わないクラスの kv (trader の intelInfluence:<mode>:fx など) は残し、読まないだけ
+ */
 const MODES = ["paper", "live"] as const;
 
 /**
@@ -400,8 +403,8 @@ export class LearningService {
   }
 
   /** 全資産クラスの情報の効き具合 (計画の片側バイアスの補正に使う) */
-  intelInfluences(): Record<AssetClass, number> {
-    return Object.fromEntries(ASSET_CLASSES.map((c) => [c, this.reliability.intelInfluence(c)])) as Record<AssetClass, number>;
+  intelInfluences(): Partial<Record<AssetClass, number>> {
+    return Object.fromEntries(enabledAssetClasses().map((c) => [c, this.reliability.intelInfluence(c)])) as Partial<Record<AssetClass, number>>;
   }
 
   sourceReliability(): Record<string, SourceReliability> {
@@ -433,7 +436,7 @@ export class LearningService {
       lessons: this.store.listLessons({ status: "active", limit: opts.lessonLimit ?? 20 }),
       adjustments: this.store.listAdjustments({ mode: this.mode, limit: opts.adjustmentLimit ?? 20 }),
       sources: this.reliability.all(),
-      intelInfluence: Object.fromEntries(ASSET_CLASSES.map((c) => [c, this.reliability.intelInfluence(c)])) as Record<AssetClass, number>,
+      intelInfluence: Object.fromEntries(enabledAssetClasses().map((c) => [c, this.reliability.intelInfluence(c)])) as Partial<Record<AssetClass, number>>,
       causes: this.causeSummary(now - (opts.causeWindowMs ?? 30 * 86_400_000)),
       shadow: this.shadowSummary({ now, windowMs: opts.shadowWindowMs }),
       news: this.newsSummary(),

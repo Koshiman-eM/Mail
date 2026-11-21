@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
+import { enabledAssetClasses } from "../core/assetClasses";
 import { aiEnabled, askStructured, type AiOptions } from "../core/ai";
 import { createLogger } from "../core/logger";
 import type {
@@ -43,8 +44,9 @@ export const REFLECTION_RULES = {
 
 const STANDARD_PARAMS = ["stopAtr", "tpAtr", "trailAtr", "entryThreshold", "maxHoldBars"];
 /** 振り返りの提案・教訓の scope に使える資産クラス (廃止した fx / stock の古い教訓は DB に残し、読むときも例外にしない) */
-const ASSET_CLASSES = ["crypto", "meme"] as const;
-const SCOPE_RE = /^(global|strategy:[\w.\-:]+|assetClass:(crypto|meme)|source:\S+|regime:(trend_up|trend_down|range|high_vol|low_liquidity))$/;
+/** 教訓の scope の形 (資産クラスはアプリが使うクラスだけ。呼ぶときに作る) */
+const scopeRe = () =>
+  new RegExp(`^(global|strategy:[\\w.\\-:]+|assetClass:(${enabledAssetClasses().join("|")})|source:\\S+|regime:(trend_up|trend_down|range|high_vol|low_liquidity))$`);
 
 /** 要因ごとの対処の目安 (ルールベースの教訓文に使う) */
 const CAUSE_ADVICE: Record<CauseCode, string> = {
@@ -131,12 +133,13 @@ export interface ReflectionResult {
   origin: "llm" | "rule" | "none";
 }
 
-const ReflectionSchema = z.object({
+/** 振り返りの LLM の出力の形 (資産クラスはアプリが使うクラスだけ。呼ぶときに作る) */
+const reflectionSchema = () => z.object({
   lessons: z.array(z.object({ scope: z.string(), text: z.string(), evidence: z.string() })),
   proposals: z.array(
     z.object({
       strategyId: z.string(),
-      assetClass: z.enum(ASSET_CLASSES),
+      assetClass: z.enum(enabledAssetClasses() as [AssetClass, ...AssetClass[]]),
       param: z.string(),
       direction: z.enum(["up", "down"]),
       reason: z.string(),
@@ -144,7 +147,7 @@ const ReflectionSchema = z.object({
   ),
   sourceNotes: z.array(z.object({ source: z.string(), note: z.string(), stance: z.enum(["trust", "neutral", "distrust"]) })),
 });
-type ReflectionOutput = z.infer<typeof ReflectionSchema>;
+type ReflectionOutput = z.infer<ReturnType<typeof reflectionSchema>>;
 
 const trunc = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 const rStr = (r: number) => `${r >= 0 ? "+" : "−"}${Math.abs(r).toFixed(2)}R`;
@@ -257,13 +260,15 @@ export function computeReflectionStats(opts: ReflectOptions): ReflectionStats {
       };
     });
 
-  const tot = total.stats("total", "*", "range", "crypto");
+  // 全体・戦略別の行の資産クラスは表示用の仮の値 (アプリが最初に選んだクラス)
+  const anyClass = enabledAssetClasses()[0];
+  const tot = total.stats("total", "*", "range", anyClass);
   return {
     from,
     to: now,
     total: { n: tot.n, wins: tot.wins, losses: tot.losses, winRate: tot.winRate, avgR: tot.avgR, totalPnl: tot.totalPnl },
     groups: [...groups.entries()].map(([k, g]) => g.acc.stats(k, g.s, g.r, g.a)).sort((a, b) => b.n - a.n),
-    byStrategy: [...byStrategy.entries()].map(([s, acc]) => acc.stats(`strategy:${s}`, s, "range", "crypto")),
+    byStrategy: [...byStrategy.entries()].map(([s, acc]) => acc.stats(`strategy:${s}`, s, "range", anyClass)),
     byAssetClass: [...byClass.entries()].map(([c, acc]) => acc.stats(`assetClass:${c}`, "*", "range", c)),
     causes: total.causes,
     lossSamples,
@@ -373,7 +378,7 @@ function sanitize(
     .slice(0, R.maxLessons)
     .map((l) => {
       const scope = l.scope.trim();
-      return lesson(now, SCOPE_RE.test(scope) ? scope : "global", trunc(l.text.trim(), 400), trunc(l.evidence.trim(), 600), "llm");
+      return lesson(now, scopeRe().test(scope) ? scope : "global", trunc(l.text.trim(), 400), trunc(l.evidence.trim(), 600), "llm");
     });
   const seen = new Set<string>();
   const proposals: ParamProposal[] = [];
@@ -439,7 +444,7 @@ export async function reflect(opts: ReflectOptions): Promise<ReflectionResult> {
         })),
         activeLessons: store.listLessons({ status: "active", limit: 20 }).map((l) => ({ scope: l.scope, text: l.text })),
       });
-      const out = await askStructured(opts.ai!, ReflectionSchema, REFLECTION_SYSTEM, prompt, "medium");
+      const out = await askStructured(opts.ai!, reflectionSchema(), REFLECTION_SYSTEM, prompt, "medium");
       const s = sanitize(out, now, known);
       result = { ...s, lessons: s.lessons.length ? s.lessons : ruleLessons(stats, now), origin: "llm" };
     } catch (e) {

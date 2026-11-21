@@ -1,4 +1,5 @@
 /** LLM プロンプト定数・ビルダー */
+import { isAssetClass, isEnabledAssetClass } from "../core/assetClasses";
 import type { Lesson } from "../core/types";
 
 export const ANALYZER_SYSTEM = `あなたは自動売買システムの市場情報アナリストです。
@@ -29,10 +30,15 @@ export function formatLessons(lessons: Lesson[], scopes: (s: string) => boolean)
 }
 
 export const isIntelScope = (scope: string) => scope === "global" || scope === "intel" || scope.startsWith("intel:");
-/** 計画に渡す教訓の scope。廃止した資産クラス (fx / stock) の古い教訓は DB に残すが、計画には渡さない */
+/**
+ * 計画に渡す教訓の scope。アプリが使わない資産クラス (trader の古い fx / stock) の教訓は DB に残すが、計画には渡さない
+ */
 export const isPlannerScope = (scope: string) =>
   scope === "global" || scope === "plan" || scope === "intel" || scope.startsWith("strategy:") ||
-  (scope.startsWith("assetClass:") && scope !== "assetClass:fx" && scope !== "assetClass:stock");
+  (scope.startsWith("assetClass:") && !isDisabledVocabularyClass(scope.slice("assetClass:".length)));
+
+/** 語彙の資産クラスのうちアプリが使わないもの */
+const isDisabledVocabularyClass = (c: string) => isAssetClass(c) && !isEnabledAssetClass(c);
 
 export function buildAnalyzerPrompt(
   articles: { id: string; source: string; kind: string; title: string; summary?: string; assets: string[]; metrics?: Record<string, number> }[],

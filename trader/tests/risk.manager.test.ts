@@ -116,7 +116,7 @@ describe("RiskManager.evaluateEntry", () => {
     const old = { ...btc, symbol: "USD/JPY", assetClass: "fx", quoteCurrency: "JPY", allowShort: true } as unknown as Instrument;
     // 古い fx の建玉は crypto の上限に数えない (別のクラスのキーに積む)
     const ex = classExposure([{ symbol: "USD/JPY", qty: 10, avgPrice: 150, assetClass: "fx" as never }, { symbol: "BTC/USDT", qty: 1, avgPrice: 100, assetClass: "crypto" }], {}, { "USD/JPY": old });
-    expect(ex.exposure.crypto.toNumber()).toBe(100);
+    expect(ex.exposure.crypto!.toNumber()).toBe(100);
     expect(ex.exposure.fx?.toNumber()).toBe(1500);
     // BTC の新規は従来どおり判定できる (fx の建玉があっても落ちない)
     const positions = [{ symbol: "USD/JPY", qty: 10, avgPrice: 150, assetClass: "fx" as never, quoteCurrency: "USDT" }];
@@ -242,8 +242,8 @@ describe("classExposure", () => {
       [{ symbol: "BTC/USDT", qty: 2, avgPrice: 100 }, { symbol: "ETH/USDT:USDT", qty: -100, avgPrice: 10 }, { symbol: "PEPE", qty: 1, avgPrice: 1, assetClass: "meme" }, { symbol: "X", qty: 1, avgPrice: 1 }],
       { "BTC/USDT": 110 }, m, (c) => (c === "USDT" ? 2 : 1),
     );
-    expect(e.crypto.toNumber()).toBeCloseTo(2 * 110 * 2 + 100 * 10 * 0.01 * 2, 6);
-    expect(e.meme.toNumber()).toBe(1);
+    expect(e.crypto!.toNumber()).toBeCloseTo(2 * 110 * 2 + 100 * 10 * 0.01 * 2, 6);
+    expect(e.meme!.toNumber()).toBe(1);
     expect(unknown.crypto).toBeUndefined();
   });
 });
@@ -257,9 +257,9 @@ describe("為替・非有限値で上限判定を素通りさせない", () => {
   it("換算できない建玉があるクラスは「不明」(NaN を合計に混ぜない)", () => {
     const pos = [{ symbol: "BTC/USDT", qty: 1, avgPrice: 100 }, { symbol: "ETH/BTC", qty: 10, avgPrice: 0.05 }];
     const d = classExposure(pos, {}, insts, toAccount);
-    expect(d.exposure.crypto.toNumber()).toBe(100);
+    expect(d.exposure.crypto!.toNumber()).toBe(100);
     expect(d.unknown.crypto).toEqual(["ETH/BTC"]);
-    expect(d.exposure.meme.toNumber()).toBe(0);
+    expect(d.exposure.meme!.toNumber()).toBe(0);
     expect(d.unknown.meme).toBeUndefined();
     // 価格が NaN の建玉も不明
     expect(classExposure([{ symbol: "BTC/USDT", qty: 1, avgPrice: NaN }], {}, insts).unknown.crypto).toEqual(["BTC/USDT"]);
