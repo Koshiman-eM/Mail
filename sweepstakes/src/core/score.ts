@@ -19,6 +19,7 @@ export const FLAG_PENALTY: Readonly<Record<string, number>> = {
   requires_payment: 0.3,
   excessive_personal_info: 0.6,
   unknown_organizer: 0.7,
+  entry_url_unverified: 0.5,
 };
 const DEFAULT_PENALTY = 0.7;
 
@@ -31,7 +32,11 @@ export const FLAG_LABELS: Readonly<Record<string, string>> = {
   requires_payment: "支払いが必要",
   excessive_personal_info: "過剰な個人情報要求",
   unknown_organizer: "主催者不明",
+  entry_url_unverified: "応募先 URL 未確認 (収集元の掲載ページのまま。要確認)",
 };
+
+/** 応募先 URL が確認できていない (自動応募の対象にしない) */
+export const NEEDS_REVIEW_FLAG = "entry_url_unverified";
 
 // ---------------------------------------------------------------------------
 // 採点

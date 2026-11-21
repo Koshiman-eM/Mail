@@ -21,21 +21,23 @@ export interface Collector {
 // </article>
 // ---------------------------------------------------------------------------
 
-function decodeEntities(s: string): string {
+export function decodeEntities(s: string): string {
   return s
+    .replace(/&nbsp;/g, " ")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
     .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCodePoint(parseInt(n, 16)))
     .replace(/&amp;/g, "&");
 }
 
-function stripTags(s: string): string {
+export function stripTags(s: string): string {
   return decodeEntities(s.replace(/<br\s*\/?>/gi, "\n").replace(/<[^>]+>/g, "")).replace(/[ \t]+/g, " ").replace(/\n\s*/g, "\n").trim();
 }
 
-function attrs(tag: string): Record<string, string> {
+export function attrs(tag: string): Record<string, string> {
   const out: Record<string, string> = {};
   for (const m of tag.matchAll(/([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*("([^"]*)"|'([^']*)')/g)) {
     out[m[1]!.toLowerCase()] = decodeEntities(m[3] ?? m[4] ?? "");

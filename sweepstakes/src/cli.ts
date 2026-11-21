@@ -4,7 +4,9 @@ import { parseArgs } from "node:util";
 import {
   CAMPAIGN_KINDS,
   collect,
+  COLLECTOR_SOURCES,
   createContext,
+  createSourceCollector,
   enter,
   FixtureHtmlCollector,
   FLAG_LABELS,
@@ -23,8 +25,11 @@ const USAGE = `懸賞自動応募ツール
 
 使い方: sweep <コマンド> [オプション]
 
+  collect --source <収集元> [--pages <n>] [--max-details <n>]
+                       実在サイトから収集して採点・保存 (収集元: ${COLLECTOR_SOURCES.join(" | ")})
+                       robots.txt を確認し、3〜6 秒間隔で取得。403/429 を受けたら中止
   collect --html <file> [--html <file> ...]
-                       懸賞情報を収集して採点・保存 (現在は例示用 HTML パーサーのみ)
+                       ローカルの HTML (例示用フォーマット) から収集
   list [--kind <種別>]  キャンペーン一覧 (種別: ${CAMPAIGN_KINDS.join(" | ")})
   enter <id> [--submit] Webフォームに入力。既定は dry-run (送信直前で停止しスクリーンショット保存)
   run [--submit]        応募可能な Webフォーム懸賞を一括処理 (ガード適用)
@@ -85,6 +90,9 @@ async function main(argv: string[]): Promise<number> {
       submit: { type: "boolean", default: false },
       kind: { type: "string" },
       html: { type: "string", multiple: true },
+      source: { type: "string", multiple: true },
+      pages: { type: "string" },
+      "max-details": { type: "string" },
       note: { type: "string" },
       limit: { type: "string" },
     },
@@ -94,13 +102,29 @@ async function main(argv: string[]): Promise<number> {
     switch (cmd) {
       case "collect": {
         const files = values.html ?? [];
-        if (!files.length) {
-          console.log("収集元が指定されていません。例: sweep collect --html tests/fixtures/campaign_list.html");
-          console.log("(実在サイト用の Collector は未実装です。src/core/collector.ts の Collector インターフェースで追加してください)");
+        const sources = values.source ?? [];
+        if (!files.length && !sources.length) {
+          console.log("収集元が指定されていません。例: sweep collect --source koubo --pages 1");
+          console.log("                                 sweep collect --html tests/fixtures/campaign_list.html");
           return 1;
         }
-        const collectors: Collector[] = files.map((f) => new FixtureHtmlCollector(f, `html:${f}`));
+        const optInt = (v: string | undefined, name: string): number | undefined => {
+          if (v === undefined) return undefined;
+          const n = Number(v);
+          if (!Number.isInteger(n) || n < 0) throw new Error(`${name} は 0 以上の整数で指定してください`);
+          return n;
+        };
+        const pages = optInt(values.pages, "--pages");
+        const maxDetails = optInt(values["max-details"], "--max-details");
+        const collectors: Collector[] = [
+          ...sources.map((src) => createSourceCollector(ctx, src, { pages, maxDetails })),
+          ...files.map((f) => new FixtureHtmlCollector(f, `html:${f}`)),
+        ];
         const s = await collect(ctx, collectors);
+        for (const col of collectors) {
+          const st = (col as { lastStats?: Record<string, number> | null }).lastStats;
+          if (st) console.log(`  ${col.name}: ${Object.entries(st).map(([k, v]) => `${k}=${v}`).join(" ")}`);
+        }
         console.log(`収集完了: ${s.total} 件 (新規 ${s.added} / 更新 ${s.updated} / 除外 ${s.excluded} / 締切切れ ${s.expired})`);
         for (const e of s.errors) console.log(`  エラー: ${e}`);
         return s.errors.length ? 1 : 0;

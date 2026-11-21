@@ -1,12 +1,14 @@
 // コア機能の公開 API。CLI や将来の MCP サーバーはこの関数群を呼ぶだけにする。
 import { chromium, type Browser } from "playwright";
+import { KouboCollector } from "../collectors/koubo.js";
+import type { FetchLike } from "../collectors/http.js";
 import type { Collector } from "./collector.js";
 import { loadConfig, type Config } from "./config.js";
 import { Store } from "./db.js";
 import { attemptEntry, type AttemptResult, type FilledField } from "./formFiller.js";
 import { duplicateGuard, rateLimitGuard, startOfLocalDay } from "./guards.js";
 import { loadProfile } from "./profile.js";
-import { evaluateCampaign, isExpired } from "./score.js";
+import { evaluateCampaign, isExpired, NEEDS_REVIEW_FLAG } from "./score.js";
 import { buildTodoList, type TodoItem } from "./todo.js";
 import type { Campaign, CampaignKind, Entry, EntryStatus, Profile } from "./types.js";
 
@@ -77,6 +79,45 @@ export async function collect(ctx: SweepContext, collectors: Collector[]): Promi
     }
   }
   return sum;
+}
+
+/** 実在サイトの収集元 */
+export const COLLECTOR_SOURCES = ["koubo"] as const;
+export type CollectorSource = (typeof COLLECTOR_SOURCES)[number];
+
+export interface SourceCollectorOptions {
+  /** 一覧の最大ページ数 */
+  pages?: number;
+  /** 詳細ページ取得の上限 */
+  maxDetails?: number;
+  /** テスト用に fetch を差し替える */
+  fetch?: FetchLike;
+}
+
+/** 収集元名から Collector を作る (待機・乱数・時刻はコンテキストのものを使う) */
+export function createSourceCollector(ctx: SweepContext, source: string, opts: SourceCollectorOptions = {}): Collector {
+  switch (source) {
+    case "koubo":
+      return new KouboCollector({
+        maxPages: opts.pages,
+        maxDetails: opts.maxDetails,
+        fetch: opts.fetch,
+        sleep: ctx.sleep,
+        random: ctx.random,
+        now: ctx.now,
+        log: ctx.log,
+      });
+    default:
+      throw new Error(`不明な収集元です: ${source} (${COLLECTOR_SOURCES.join(" / ")})`);
+  }
+}
+
+/** 実在サイトから収集する (CLI / 将来の MCP から利用) */
+export function collectFromSources(ctx: SweepContext, sources: string[], opts: SourceCollectorOptions = {}): Promise<CollectSummary> {
+  return collect(
+    ctx,
+    sources.map((s) => createSourceCollector(ctx, s, opts)),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +193,10 @@ export async function enter(ctx: SweepContext, campaignId: number, opts: EnterOp
   if (c.kind !== "web_form") {
     return { ...base, status: "skipped", reason: `${c.kind} は自動応募の対象外です (todo で手順を確認し、完了後に mark してください)`, recorded: false };
   }
+  // 応募先 URL 未確認 (収集元の掲載ページのまま) は自動応募しない
+  if (c.riskFlags.includes(NEEDS_REVIEW_FLAG)) {
+    return { ...base, status: "skipped", reason: "応募先 URL が未確認です (収集元の掲載ページで応募先を確認してください)", recorded: false };
+  }
   // 重複応募
   const dup = duplicateGuard(ctx.store.listEntries({ campaignId }));
   if (!dup.ok) return { ...base, status: "skipped", reason: dup.reason!, recorded: false };
@@ -202,6 +247,7 @@ export async function runAll(ctx: SweepContext, opts: { submit?: boolean } = {})
   const candidates = ctx.store
     .listCampaigns({ kind: "web_form", status: "active" })
     .filter((c) => !isExpired(c.deadline, now))
+    .filter((c) => !c.riskFlags.includes(NEEDS_REVIEW_FLAG))
     // 何らかの記録 (送信済み・要手動・規約で見送り・失敗) があるものは一括実行の対象外。個別に enter で再試行する
     .filter((c) => ctx.store.listEntries({ campaignId: c.id, limit: 1 }).length === 0);
   const results: EnterResult[] = [];

@@ -32,6 +32,10 @@ export interface Conditions {
   /** 応募規約・注意書き (自動応募禁止の検出に使う) */
   terms?: string;
   notes?: string;
+  /** 収集元でのタグ (例: 「クイズ」「食品」「WEB応募可」) */
+  tags?: string[];
+  /** 収集元の掲載ページ URL (url は応募先。両者が異なる場合に保存) */
+  sourceUrl?: string;
 }
 
 export interface Campaign {
