@@ -1,7 +1,7 @@
 import type { Signal, Strategy, StrategyContext } from "../core/types";
 import { atrLast, closesOf, rsiLast, stdevLast, vwapLast } from "../indicators/series";
 import { microprice, orderBookImbalance, spreadBps, tradeFlowImbalance } from "../indicators/microstructure";
-import { buildEntrySignal, candlesOf, clamp, entryBlocked, exitSignal, period, positionSide } from "./common";
+import { buildEntrySignal, candlesOf, clamp, entryBlocked, exitSignal, period, positionSide, volumeUnknown } from "./common";
 
 /**
  * スキャルピング戦略 (主時間足 1m)。
@@ -216,14 +216,16 @@ export const scalpMomentumBurst: Strategy = {
     const down = cur.close < ll && cur.close < cur.open;
     const th = p.entryThreshold;
     const features = { volRatio, breakHigh: hh, breakLow: ll, bodyPct: (cur.close - cur.open) / cur.open };
+    // 出来高が不明な足 (Jupiter の価格のポーリングの足) が判定の窓にあれば、出来高の条件は満たさない (fail-closed)
+    const volOk = !volumeUnknown(c, n - 1 - vb, n - 1) && volRatio >= th;
 
     const side = positionSide(ctx);
     if (side) {
-      if (side === "long" && down && volRatio >= th) return exitSignal(ctx, scalpMomentumBurst, 0.6, "出来高を伴う下方ブレイク (反転)", features);
-      if (side === "short" && up && volRatio >= th) return exitSignal(ctx, scalpMomentumBurst, 0.6, "出来高を伴う上方ブレイク (反転)", features);
+      if (side === "long" && down && volOk) return exitSignal(ctx, scalpMomentumBurst, 0.6, "出来高を伴う下方ブレイク (反転)", features);
+      if (side === "short" && up && volOk) return exitSignal(ctx, scalpMomentumBurst, 0.6, "出来高を伴う上方ブレイク (反転)", features);
       return null;
     }
-    if (entryBlocked(ctx) || volRatio < th || (!up && !down)) return null;
+    if (entryBlocked(ctx) || !volOk || (!up && !down)) return null;
     const direction = up ? "long" : "short";
     const breakDist = up ? cur.close - hh : ll - cur.close;
     const confidence = 0.4 + 0.3 * clamp((volRatio - th) / th) + 0.3 * clamp(atr > 0 ? breakDist / atr : 0);

@@ -2,7 +2,7 @@ import type { Candle, Params, Signal, Strategy, StrategyContext } from "../core/
 import { TIMEFRAME_MS } from "../core/types";
 import { atrLast } from "../indicators/series";
 import { orderBookImbalance, tradeFlowImbalance } from "../indicators/microstructure";
-import { buildEntrySignal, candlesOf, clamp, entryBlocked, exitSignal, period, positionSide, refPrice } from "./common";
+import { buildEntrySignal, candlesOf, clamp, entryBlocked, exitSignal, period, positionSide, refPrice, volumeUnknown } from "./common";
 import { relaxToward, TEMPO_COST_MULT_FLOOR } from "../engine/tempo";
 import { DEFAULT_WIN_EDGE_MAX, netEdgeEntry } from "./netEdge";
 
@@ -98,7 +98,8 @@ export function detectBurst(c: readonly Candle[], p: Params): Burst | null {
   for (let i = n - 1 - vb; i < n - 1; i++) vsum += c[i].volume;
   const volAvg = vsum / vb;
   const volRatio = volAvg > 0 ? cur.volume / volAvg : 0;
-  if (!(volRatio >= p.volMult)) return null;
+  // 出来高が不明な足 (Jupiter の価格のポーリングの足) が窓にあれば、出来高のバーストとはみなさない (fail-closed)
+  if (volumeUnknown(c, n - 1 - vb, n - 1) || !(volRatio >= p.volMult)) return null;
   const atr = atrLast(c, ATR_PERIOD);
   if (!(atr > 0) || !Number.isFinite(atr)) return null;
   const momentum = (cur.close - c[n - 1 - lb].close) / atr;

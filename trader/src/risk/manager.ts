@@ -1,4 +1,5 @@
 import { D, floorToStep, Decimal } from "../core/decimal";
+import { costFeeRate } from "../core/fees";
 import { createLogger } from "../core/logger";
 import { canShort } from "../core/short";
 import { sweepOld } from "../core/sweep";
@@ -16,11 +17,17 @@ export const riskStateKey = (mode: TradingMode) => `${LEGACY_RISK_STATE_KEY}:${m
 /** 損切りと決済側の価格 (ロング: bid / ショート: ask) の距離の下限 (スプレッドの倍数) */
 export const MIN_STOP_DISTANCE_SPREADS = 2;
 
-/** 往復の想定コスト (bps) = 往復 taker 手数料 + スプレッド */
-export function costBps(instrument: Pick<Instrument, "takerFeeRate">, quote: Pick<Quote, "bid" | "ask">): number {
+/**
+ * 往復の想定コスト (bps) = 往復の手数料 (taker + 約定ごとの固定手数料の率換算。src/core/fees.ts) + スプレッド。
+ * 固定手数料の無い銘柄は従来どおり 往復 taker 手数料 + スプレッド
+ */
+export function costBps(
+  instrument: Pick<Instrument, "takerFeeRate"> & Partial<Pick<Instrument, "fixedFeePerOrder" | "costModel">>,
+  quote: Pick<Quote, "bid" | "ask">,
+): number {
   const mid = (quote.bid + quote.ask) / 2;
   const spreadBps = mid > 0 ? ((quote.ask - quote.bid) / mid) * 10_000 : 0;
-  return instrument.takerFeeRate * 2 * 10_000 + Math.max(0, spreadBps);
+  return costFeeRate(instrument) * 2 * 10_000 + Math.max(0, spreadBps);
 }
 
 /** リスク計算に使うポジション。assetClass 等が無ければ instruments から解決する */

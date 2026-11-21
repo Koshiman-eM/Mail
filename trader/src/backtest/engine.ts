@@ -5,6 +5,7 @@ import type {
   EquityPoint,
   ExitReason,
   IntelBias,
+  Instrument,
   MarketView,
   PositionView,
   Quote,
@@ -15,6 +16,7 @@ import type {
   TradeRecord,
 } from "../core/types";
 import { TIMEFRAME_MS } from "../core/types";
+import { costFeeRate, fixedFeeOf } from "../core/fees";
 import { D, Decimal, floorToStep } from "../core/decimal";
 import { DEFAULT_RISK } from "../core/config";
 import { resample } from "../indicators/resample";
@@ -76,6 +78,18 @@ const DEFAULT_COSTS: Record<AssetClass, { spreadBps: number; slippageBps: number
 /** 資産クラスの既定コスト。未知のクラス (廃止した fx / stock の古い記録など) は crypto の値 */
 export function defaultCosts(assetClass: AssetClass): { spreadBps: number; slippageBps: number } {
   return { ...(DEFAULT_COSTS[assetClass] ?? DEFAULT_COSTS.crypto) };
+}
+
+/**
+ * 銘柄のコストの前提。銘柄が costModel (Jupiter: 代わりのスリッページのモデルを代表的な約定代金で評価した値) を持てばそれ、
+ * 無ければ資産クラスの既定値 (従来どおり)
+ */
+function instrumentCosts(inst: Pick<Instrument, "assetClass"> & Partial<Pick<Instrument, "costModel">>): { spreadBps: number; slippageBps: number } {
+  const m = inst.costModel;
+  if (m && Number.isFinite(m.spreadBps) && m.spreadBps >= 0 && Number.isFinite(m.slippageBps) && m.slippageBps >= 0) {
+    return { spreadBps: m.spreadBps, slippageBps: m.slippageBps };
+  }
+  return defaultCosts(inst.assetClass);
 }
 
 /** 足の間隔から時間足を推定する */
@@ -174,13 +188,15 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
   const revMs = TIMEFRAME_MS[revTf];
   const seriesTfs = tfs.includes(revTf) ? tfs : [...tfs, revTf];
 
-  const costs = defaultCosts(instrument.assetClass);
+  const costs = instrumentCosts(instrument);
   const spreadBps = opts.spreadBps ?? costs.spreadBps;
   const slippageBps = opts.slippageBps ?? costs.slippageBps;
   const hs = spreadBps / 2 / 1e4;
   const slip = slippageBps / 1e4;
   const feeRate = D(instrument.takerFeeRate);
   const makerRate = D(Number.isFinite(instrument.makerFeeRate) ? instrument.makerFeeRate : instrument.takerFeeRate);
+  /** 約定ごとの固定手数料 (Jupiter のネットワーク手数料。クオート通貨建て。無ければ 0 = 従来どおり) */
+  const fixedFee = D(fixedFeeOf(instrument));
   const limitOpts = opts.limitOrders;
   // 最大保有 (ライブの MAX_HOLD_MINUTES と同じ前提)。無効なら undefined (シグナルのまま)
   const holdLimitMs = opts.maxHoldMinutes !== undefined && Number.isFinite(opts.maxHoldMinutes) && opts.maxHoldMinutes > 0
@@ -206,7 +222,7 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
   const riskMultiplier = opts.riskMultiplier ?? 1;
   const maxPositionPct = opts.maxPositionPct ?? DEFAULT_RISK.maxPositionPct;
   const sizer = opts.sizer ?? riskBasedSizer;
-  const costBps = 2 * instrument.takerFeeRate * 1e4 + spreadBps + 2 * slippageBps;
+  const costBps = 2 * costFeeRate(instrument) * 1e4 + spreadBps + 2 * slippageBps;
   const minEdgeRatio = opts.minEdgeToCostRatio ?? 0;
   const historyBars = opts.historyBars ?? Math.max(300, strategy.warmup + 100);
   const regimeOpts = regimeOptionsFor(instrument.assetClass, opts.regime);
@@ -245,7 +261,7 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
       entryPrice: p.entryPrice,
       risk: initialRiskPerUnit(p.entryPrice, p.initialStop),
       entryFeePerUnit: units > 0 ? p.entryFee.toNumber() / units : 0,
-      takerFeeRate: instrument.takerFeeRate,
+      takerFeeRate: costFeeRate(instrument),
     };
   };
   /**
@@ -293,7 +309,7 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
   /** byThesis: 延長後の保護ストップでの決済 (TradeRecord.thesisStopExit) */
   const closePosition = (i: number, px: number, ts: number, reason: ExitReason, intended: number, liq: "maker" | "taker" = "taker", byThesis = false) => {
     const p = pos!;
-    const exitFee = D(px).mul(p.qty).mul(csD).mul(liq === "maker" ? makerRate : feeRate);
+    const exitFee = D(px).mul(p.qty).mul(csD).mul(liq === "maker" ? makerRate : feeRate).plus(fixedFee);
     const gross = D(px).minus(p.entryPrice).mul(p.qty).mul(csD).mul(p.dir);
     cash = cash.plus(gross).minus(exitFee);
     const fees = p.entryFee.plus(exitFee);
@@ -415,7 +431,7 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
       } else if (pd.kind === "entry" && !pos) {
         const dir: 1 | -1 = pd.signal.direction === "long" ? 1 : -1;
         const px = marketFill(bar.open, dir === 1);
-        const entryFee = D(px).mul(pd.qty).mul(csD).mul(feeRate);
+        const entryFee = D(px).mul(pd.qty).mul(csD).mul(feeRate).plus(fixedFee);
         cash = cash.minus(entryFee);
         pos = {
           dir,
@@ -444,7 +460,7 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
         const dir: 1 | -1 = pd.signal.direction === "long" ? 1 : -1;
         const crossed = dir === 1 ? bar.low < pd.price : bar.high > pd.price;
         if (crossed) {
-          const entryFee = D(pd.price).mul(pd.qty).mul(csD).mul(makerRate);
+          const entryFee = D(pd.price).mul(pd.qty).mul(csD).mul(makerRate).plus(fixedFee);
           cash = cash.minus(entryFee);
           pos = {
             dir,

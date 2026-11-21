@@ -73,7 +73,8 @@ describe("設定の解析", () => {
   });
 
   it("hub の時間足 = 資産クラスに合う戦略の時間足の和集合 + 1m (中長期の戦略の廃止で 1d は取らない)", () => {
-    expect(hubTimeframesFor([{ assetClass: "meme" }], ALL_STRATEGIES)).toEqual(["1m"]);
+    // meme (Jupiter のミームコイン): scalp_momentum_burst・scalp_pullback (1m/15m)・pullback_5m (5m/1h)・pullback_15m (15m/4h)・short_ema_trend・short_rsi_revert (15m)
+    expect(hubTimeframesFor([{ assetClass: "meme" }], ALL_STRATEGIES)).toEqual(["1m", "5m", "15m", "1h", "4h"]);
     expect(hubTimeframesFor([{ assetClass: "crypto" }], ALL_STRATEGIES)).toEqual(["1m", "5m", "15m", "1h", "4h"]);
     expect(hubTimeframesFor([{ assetClass: "crypto" }, { assetClass: "meme" }], ALL_STRATEGIES)).toEqual(["1m", "5m", "15m", "1h", "4h"]);
     // 廃止したクラス (古い銘柄定義) に合う戦略は無い
@@ -86,8 +87,9 @@ describe("設定の解析", () => {
     // short_breakout (1h) → 15m、short_ema_trend (15m) → 5m
     expect(hubTimeframesFor([{ assetClass: "crypto" }], only("short_breakout"), lower)).toEqual(["1m", "15m", "1h"]);
     expect(hubTimeframesFor([{ assetClass: "crypto" }], only("short_ema_trend"), lower)).toEqual(["1m", "5m", "15m"]);
-    // meme: scalp_momentum_burst (1m) → 1m のまま
-    expect(hubTimeframesFor([{ assetClass: "meme" }], ALL_STRATEGIES, lower)).toEqual(["1m"]);
+    // meme: scalp_momentum_burst (1m) → 1m のまま。押し目の 3 戦略・short の 2 戦略も meme に掛かる
+    expect(hubTimeframesFor([{ assetClass: "meme" }], only("scalp_momentum_burst"), lower)).toEqual(["1m"]);
+    expect(hubTimeframesFor([{ assetClass: "meme" }], ALL_STRATEGIES, lower)).toEqual(["1m", "5m", "15m", "1h", "4h"]);
     // same・無効・対象外なら従来どおり
     expect(hubTimeframesFor([{ assetClass: "crypto" }], only("short_breakout"), { ...lower, timeframe: "same" })).toEqual(["1m", "1h"]);
     expect(hubTimeframesFor([{ assetClass: "crypto" }], only("short_breakout"), REVERSAL_DISABLED)).toEqual(["1m", "1h"]);

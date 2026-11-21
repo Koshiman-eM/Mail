@@ -48,6 +48,19 @@ interface RefreshThrottledFeed {
   candleRefreshIntervalMs?(tf: Timeframe): number;
 }
 
+/**
+ * feed が任意で実装する: 足を feed 自身が保持・組み立てている (Jupiter: ポーリングした価格の 1m 足と GeckoTerminal の履歴)。
+ * true の feed は fetchCandles が手元の足を返すだけ (外部 API を呼ばない) なので、hub は
+ * - 履歴の取得で空でも集約・気配からの組み立てに切り替えず (後から裏の取得で足が増える)、
+ * - 毎回の更新で時間足ごとに全体 (最大 LOCAL_CANDLES_MAX 本) を取り直して置き換える
+ *   (feed が後から埋めた出来高 (volumeKnown) も反映する。確定足の値を変えない約束は feed 側が守る)。
+ */
+interface LocalCandleFeed {
+  readonly candlesAreLocal?: boolean;
+}
+const LOCAL_CANDLES_MAX = 2000;
+const isLocalCandleFeed = (f: MarketDataFeed) => (f as LocalCandleFeed).candlesAreLocal === true;
+
 /** 足の境界をまたいだ後、この時間内に取得した足は確定値でない可能性があるので取り直す */
 const BOUNDARY_GRACE_MS = 10_000;
 
@@ -113,6 +126,17 @@ export class MarketHub {
     });
   }
 
+  /**
+   * 監視から外す (Jupiter の自動探索で期限切れになった銘柄など)。外したら true。
+   * 建玉・保留中の注文のある銘柄を外さないのは呼び出し側 (エンジン) の責任
+   */
+  unwatch(symbol: string): boolean {
+    if (!this.symbols.delete(symbol)) return false;
+    this.aggregated.delete(symbol);
+    for (const k of [...this.lastCandleFetch.keys()]) if (k.startsWith(`${symbol}|`)) this.lastCandleFetch.delete(k);
+    return true;
+  }
+
   watched(): Instrument[] {
     return [...this.symbols.values()].map((s) => s.instrument);
   }
@@ -125,6 +149,12 @@ export class MarketHub {
   private async load(s: SymbolState): Promise<void> {
     const sym = s.instrument.symbol;
     const msOf = (tf: Timeframe) => TIMEFRAME_MS[tf];
+    if (isLocalCandleFeed(s.feed)) {
+      // 手元の足を持つ feed: 空でも集約・組み立てに切り替えない (裏の取得で後から足が増える)
+      for (const tf of this.tfs) s.candles[tf] = await s.feed.fetchCandles(sym, tf, LOCAL_CANDLES_MAX);
+      s.loaded = true;
+      return;
+    }
     for (const tf of [...this.tfs].sort((a, b) => msOf(a) - msOf(b))) {
       try {
         await this.gate(s.feed);
@@ -172,6 +202,12 @@ export class MarketHub {
         await this.gate(s.feed);
         const incoming = await s.feed.fetchPrints(symbol, 100);
         s.prints = mergePrints(s.prints, incoming, this.printsLimit);
+      }
+      if (isLocalCandleFeed(s.feed)) {
+        // 手元の足を持つ feed: 全体を取り直して置き換える (外部 API は呼ばない)
+        for (const tf of this.tfs) s.candles[tf] = await s.feed.fetchCandles(symbol, tf, LOCAL_CANDLES_MAX);
+        s.lastError = undefined;
+        return;
       }
       // feed から取得する足は直近数本を更新 (未確定足の確定を取り込む)
       for (const tf of this.tfs) {
@@ -260,7 +296,8 @@ export class MarketHub {
       let p = this.inflight.get(feed);
       if (!p) {
         const run = (async () => {
-          for (const symbol of symbols) await this.pollSymbol(symbol);
+          // 取得中に監視から外した銘柄 (unwatch) は飛ばす
+          for (const symbol of symbols) if (this.symbols.has(symbol)) await this.pollSymbol(symbol);
         })().catch((e) => log.warn("poll 失敗", { venue: feed.venue, error: e instanceof Error ? e.message : String(e) }));
         p = run.finally(() => {
           if (this.inflight.get(feed) === p) this.inflight.delete(feed);

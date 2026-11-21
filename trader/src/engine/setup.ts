@@ -6,8 +6,16 @@ import { createLogger, type Logger } from "../core/logger";
 import { withSimulatedShort } from "../core/short";
 import {
   systemClock, TIMEFRAME_MS, type AssetClass, type Clock, type Instrument, type MarketDataFeed, type Store, type Strategy, type Timeframe,
+  type TradingMode,
 } from "../core/types";
 import { createBrokers, LIVE_UNSUPPORTED_MESSAGE, type BrokerSet } from "../execution/router";
+import { createJupiterFillPricer } from "../execution/jupiterFill";
+import type { PaperSnapshot } from "../execution/paper";
+import { TradeJournal } from "../learning/journal";
+import { JupiterFeed, JUPITER_VENUE, type JupiterTokenSpec } from "../market/feeds/jupiter";
+import { JupiterClient } from "../market/jupiter/client";
+import { GeckoTerminalClient } from "../market/jupiter/gecko";
+import { JupiterSwapQuoteProvider } from "../market/jupiter/quote";
 import { createDefaultSources, IntelService } from "../intel/service";
 import type { IntelSource } from "../intel/sources/common";
 import { LearningService, type LearningServiceDeps } from "../learning/service";
@@ -19,7 +27,9 @@ import { createStore } from "../storage";
 import { ALL_STRATEGIES, configuredStrategies } from "../strategies/registry";
 import { strategyIdListWarnings } from "../strategies/retired";
 import { structureConfigWarnings, structureSettingsFromEnv } from "../structure/settings";
-import { TradingEngine, type EngineOptions } from "./engine";
+import { PAPER_SNAPSHOT_KEY, TradingEngine, type EngineOptions, type PeriodicTask } from "./engine";
+import { FX_RATE_REFRESH_MS, UsdJpyRateSource } from "./fxRate";
+import { JupiterWatchManager, jupiterSettingsFromEnv, resolveFixedTokens, type JupiterSettings } from "./jupiterWatch";
 import { ClosedCandleCacheFeed } from "./feedCache";
 import { createFxConverter, type FxConverter } from "./fx";
 import { createParamValidator, createPriceAt, type ValidatorOptions } from "./learningHooks";
@@ -32,7 +42,7 @@ import {
 const ASSET_CLASSES: AssetClass[] = ["crypto", "meme"];
 /** 廃止した資産クラス (FX・株式)。WATCHLIST に残っていても起動を止めず、警告してその銘柄を無視する */
 const REMOVED_ASSET_CLASSES = ["fx", "stock"] as const;
-export const KNOWN_VENUES = ["synthetic", "ccxt"] as const;
+export const KNOWN_VENUES = ["jupiter", "synthetic", "ccxt"] as const;
 /**
  * 廃止した取引先 (GMOコイン・OANDA・Alpaca・DEX)。VENUES / WATCHLIST に残っていても起動を止めず、警告して無視する
  * (古い .env のままサーバーを再起動しても落ちないように)
@@ -44,7 +54,7 @@ export const DEFAULT_CCXT_SYMBOLS = ["BTC/JPY", "ETH/JPY", "BTC/USDT", "ETH/USDT
 export const DEFAULT_SYNTHETIC_HISTORY_MS = 15 * 86_400_000;
 
 export interface WatchEntry {
-  /** synthetic / ccxt / ccxt:<id> */
+  /** synthetic / ccxt / ccxt:<id> (jupiter の銘柄は WATCHLIST ではなく JUPITER_TOKENS と自動探索) */
   venue: string;
   symbol: string;
   assetClass?: AssetClass;
@@ -168,6 +178,24 @@ export interface RuntimeOptions {
   markets?: { feed: MarketDataFeed; instruments: Instrument[] }[];
   strategies?: readonly Strategy[];
   learning?: Partial<Omit<LearningServiceDeps, "store" | "getStrategy" | "validate" | "priceAt" | "ai">>;
+  /**
+   * Jupiter (VENUES=jupiter) の部品の差し替え (テスト: fetch のモック・時計・待ち)。client / gecko を渡せばそれを使う
+   * (gecko: null で GeckoTerminal なし)
+   */
+  jupiter?: {
+    fetchImpl?: typeof fetch;
+    sleep?: (ms: number) => Promise<void>;
+    client?: JupiterClient;
+    gecko?: GeckoTerminalClient | null;
+    /** GeckoTerminal の 1 分あたりの上限の上書き (既定 GECKO_CALLS_PER_MIN) */
+    geckoCallsPerMinute?: number;
+    geckoBurst?: number;
+  };
+  /**
+   * USD/JPY の日次のレート (frankfurter.app)。null で使わない (概算表)。省略時は VENUES に jupiter があるときだけ作る
+   * (fetch は opts.jupiter.fetchImpl)
+   */
+  fxRate?: UsdJpyRateSource | null;
   /** パラメータ検証の設定の上書き (区間数・履歴の長さ・feed の差し替えなど) */
   validation?: Partial<Omit<ValidatorOptions, "hub" | "strategies" | "clock">>;
   engine?: EngineOptions;
@@ -190,6 +218,10 @@ export interface Runtime {
   engine: TradingEngine;
   fx: FxConverter;
   ai?: AiOptions;
+  /** Jupiter の部品 (VENUES に jupiter があるとき) */
+  jupiter?: { feed: JupiterFeed; watch: JupiterWatchManager; client: JupiterClient; gecko?: GeckoTerminalClient; settings: JupiterSettings };
+  /** USD/JPY の日次のレート */
+  fxRate?: UsdJpyRateSource;
   /** store を閉じる (エンジンは先に stop すること) */
   close(): void;
 }
@@ -223,6 +255,12 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
   });
   if (config.mode === "live" && !opts.markets && venues.includes("synthetic")) throw new Error("synthetic は paper 専用です (live では使えません)");
 
+  // 状態 (kv) を読む部品 (Jupiter の監視銘柄の復元・USD/JPY のレートのキャッシュ) のため、store は先に開く
+  const store = opts.store ?? createStore(resolveDbPath(config));
+  const tradeMode = opts.brokerSet?.mode ?? config.mode;
+  let engineRef: TradingEngine | undefined;
+  let jupiter: Runtime["jupiter"];
+
   const feeds: MarketDataFeed[] = [];
   const pairs: { inst: Instrument; feed: MarketDataFeed }[] = [];
   const add = (inst: Instrument, feed: MarketDataFeed) => {
@@ -252,6 +290,9 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
         if (inst) add(withClass(inst, e.assetClass), feed);
         else log.warn("合成フィードに無い銘柄を無視します", { symbol: e.symbol, available: list.map((i) => i.symbol) });
       }
+    } else if (kind === "jupiter") {
+      jupiter = await setupJupiter(config, opts, store, tradeMode, clock, log, () => engineRef);
+      for (const inst of await jupiter.feed.listInstruments()) add(inst, jupiter.feed);
     } else if (kind === "ccxt") {
       const id = v.includes(":") ? v.slice(v.indexOf(":") + 1) : env.CCXT_EXCHANGE;
       try {
@@ -274,16 +315,32 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
   }
   // paper の空売りの再現: 発注先の mode が paper で PAPER_SIMULATE_SHORT=true のときだけ、空売り不可の現物暗号資産に
   // simulatedShort を付ける (allowShort は書き換えない。live では付けず、付いていても canShort が live では無視する)
-  const tradeMode = opts.brokerSet?.mode ?? config.mode;
   for (const p of pairs) p.inst = withSimulatedShort(p.inst, { mode: tradeMode, enabled: env.PAPER_SIMULATE_SHORT });
   const instruments = pairs.map((p) => p.inst);
   if (instruments.length === 0) throw new Error("監視銘柄がありません (VENUES / WATCHLIST を確認してください)");
 
-  const timeframes = hubTimeframesFor(instruments, strategies, reversalSettings);
+  // Jupiter は自動探索で後から crypto・meme の銘柄が増えるので、両方の資産クラスの時間足を取る
+  const tfInsts = jupiter ? [...instruments, { assetClass: "crypto" as const }, { assetClass: "meme" as const }] : instruments;
+  const timeframes = hubTimeframesFor(tfInsts, strategies, reversalSettings);
+  jupiter?.feed.setTimeframes(timeframes);
   const hub = new MarketHub({ feeds, clock, timeframes, historyLimit: 300 });
   for (const p of pairs) hub.watch(p.inst, p.feed);
 
-  const fx = createFxConverter({ baseCurrency: env.BASE_CURRENCY, getQuote: (s) => hub.latestQuote(s) });
+  // USD→JPY: 日次のレート (frankfurter.app。1 時間ごとに取り直し、kv にキャッシュ)。取れなければ概算表
+  const fxRate =
+    opts.fxRate === null
+      ? undefined
+      : (opts.fxRate ??
+        (jupiter && !opts.markets
+          ? new UsdJpyRateSource({
+              store,
+              now: () => clock.now(),
+              ...(opts.jupiter?.fetchImpl ? { fetchImpl: opts.jupiter.fetchImpl } : {}),
+              ...(opts.jupiter?.sleep ? { sleep: opts.jupiter.sleep } : {}),
+              onWarn: (m, d) => log.warn(m, d),
+            })
+          : undefined));
+  const fx = createFxConverter({ baseCurrency: env.BASE_CURRENCY, getQuote: (s) => hub.latestQuote(s) ?? fxRate?.quote(s) });
   // mode は config (resolveMode の結果) のまま。live の発注先は無い (上の assertLiveSupported。createBrokers も live を拒否する)
   const brokerSet =
     opts.brokerSet ??
@@ -291,9 +348,22 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
       clock,
       toAccount: (ccy) => fx.toAccount(ccy),
       quoteProvider: (s) => hub.latestQuote(s),
+      // Jupiter: 成行は見積もり (swap/v1/quote、取れなければ代わりのモデル) の実効価格で約定し、指値は使わない
+      ...(jupiter
+        ? {
+            paper: {
+              marketOnlyVenues: [JUPITER_VENUE],
+              marketPricer: createJupiterFillPricer({
+                provider: new JupiterSwapQuoteProvider(jupiter.client),
+                limiter: jupiter.client.limiter,
+                tokenOf: (sym) => jupiter!.feed.tokenOf(sym),
+                now: () => clock.now(),
+              }),
+            },
+          }
+        : {}),
     });
 
-  const store = opts.store ?? createStore(resolveDbPath(config));
   // リスク状態は実際の発注先の mode ごとに分ける (paper の基準で live の kill switch を誤作動させない)
   const risk = new RiskManager(config.risk, store, { mode: brokerSet.mode });
   const ai = opts.ai === null ? undefined : (opts.ai ?? (config.ai.enabled ? { apiKey: config.ai.apiKey, model: config.ai.model } : undefined));
@@ -310,7 +380,8 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
       hub, strategies, clock,
       feedFor: (inst) => {
         const f = pairs.find((p) => p.inst.symbol === inst.symbol)?.feed;
-        if (!f) return undefined;
+        // Jupiter は長い履歴を持たない (GeckoTerminal の枠では 14 日分の 1m を取れない)。検証できないので学習の変更は適用しない
+        if (!f || f instanceof JupiterFeed) return undefined;
         return f instanceof ClosedCandleCacheFeed ? f.inner : f;
       },
       briefsBetween: (since, until) => store.listBriefs?.({ since, until }) ?? [],
@@ -339,15 +410,112 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
     sources: opts.intelSources ?? createDefaultSources({ env: { NEWS_RSS_FEEDS: env.NEWS_RSS_FEEDS, CRYPTOPANIC_TOKEN: env.CRYPTOPANIC_TOKEN } }),
     ...(ai ? { ai } : {}),
   });
+  const periodic: PeriodicTask[] = [];
+  if (fxRate) periodic.push({ name: "fx.usdjpy", everyMs: FX_RATE_REFRESH_MS, run: () => fxRate.refresh(true) });
+  if (jupiter) {
+    const j = jupiter;
+    // 監視中の mint の流動性 (MEME_MIN_LIQUIDITY_USD の判定) を 1 時間ごとに取り直す
+    periodic.push({ name: "jupiter.tokens", everyMs: 3_600_000, run: () => j.feed.refreshTokenInfo() });
+    if (j.settings.discovery) periodic.push({ name: "jupiter.discovery", everyMs: j.settings.discoveryEveryMs, run: () => j.watch.run() });
+  }
   const engine = new TradingEngine({
     config, store, hub, brokerSet, risk, intel, learning, strategies, clock, fx, timeframes,
     ...(ai ? { ai } : {}),
     ...(opts.rng ? { rng: opts.rng } : {}),
     ...(opts.engine ? { options: opts.engine } : {}),
+    ...(periodic.length ? { periodic } : {}),
+    ...(jupiter
+      ? {
+          marketExtras: {
+            venues: [JUPITER_VENUE],
+            liquidityUsd: (sym: string) => jupiter!.feed.liquidityUsd(sym),
+            entryBlock: (sym: string) => jupiter!.feed.entryBlock(sym),
+          },
+        }
+      : {}),
   });
+  engineRef = engine;
   return {
     config, clock, store, hub, feeds, instruments, timeframes, venues, brokerSet, risk, intel, learning, engine, fx,
     ...(ai ? { ai } : {}),
-    close: () => store.close(),
+    ...(jupiter ? { jupiter } : {}),
+    ...(fxRate ? { fxRate } : {}),
+    close: () => {
+      jupiter?.feed.stop();
+      store.close();
+    },
   };
+}
+
+/**
+ * Jupiter の部品を組み立てる: 読み取り専用のクライアント (JUPITER_API_KEY・JUPITER_RPS)、GeckoTerminal (GECKO_CALLS_PER_MIN)、
+ * feed、固定の銘柄 (JUPITER_TOKENS) の解決、監視銘柄の復元 (kv jupiter:watch:<mode> と paper のスナップショットの建玉の銘柄)
+ */
+async function setupJupiter(
+  config: AppConfig,
+  opts: RuntimeOptions,
+  store: Store,
+  mode: TradingMode,
+  clock: Clock,
+  log: Logger,
+  engine: () => TradingEngine | undefined,
+): Promise<NonNullable<Runtime["jupiter"]>> {
+  const settings = jupiterSettingsFromEnv(config.env);
+  const j = opts.jupiter ?? {};
+  const now = () => clock.now();
+  const client =
+    j.client ??
+    new JupiterClient({
+      ...(settings.apiKey ? { apiKey: settings.apiKey } : {}),
+      ...(settings.ratePerSec !== undefined ? { ratePerSec: settings.ratePerSec } : {}),
+      now,
+      ...(j.fetchImpl ? { fetchImpl: j.fetchImpl } : {}),
+      ...(j.sleep ? { sleep: j.sleep } : {}),
+    });
+  const gecko =
+    j.gecko === null
+      ? undefined
+      : (j.gecko ??
+        new GeckoTerminalClient({
+          callsPerMinute: j.geckoCallsPerMinute ?? settings.geckoCallsPerMin,
+          ...(j.geckoBurst !== undefined ? { burst: j.geckoBurst } : {}),
+          now,
+          ...(j.fetchImpl ? { fetchImpl: j.fetchImpl } : {}),
+          ...(j.sleep ? { sleep: j.sleep } : {}),
+        }));
+  const feed = new JupiterFeed({
+    client,
+    ...(gecko ? { gecko } : {}),
+    now,
+    pollMs: settings.pollMs,
+    quoteSizeUsd: settings.quoteSizeUsd,
+    networkFeeUsd: settings.networkFeeUsd,
+    minNotionalUsd: settings.minNotionalUsd,
+    historyBars: 300,
+    onWarn: (m, d) => log.warn(m, d),
+  });
+  const fixed = await resolveFixedTokens(client, settings.tokens, (m, d) => log.warn(m, d));
+  // 保有中の銘柄 (外さない)。エンジンができるまでは journal から読む
+  const heldSymbols = () => engine()?.heldSymbols() ?? new TradeJournal({ store, mode }).list().map((p) => p.symbol);
+  const watch = new JupiterWatchManager({
+    client, feed, store, mode, settings, fixed, now,
+    onAdd: (inst) => void engine()?.watchInstrument(inst, feed),
+    onRemove: (sym) => engine()?.unwatchInstrument(sym) ?? true,
+    keepSymbols: heldSymbols,
+    log,
+  });
+  // paper のスナップショットに残る Jupiter の建玉の銘柄定義 (mint・decimals) から、一覧に無い保有中の銘柄も戻す
+  const held = new Set(heldSymbols());
+  const snap = mode === "paper" ? store.kvGet<PaperSnapshot>(PAPER_SNAPSHOT_KEY) : undefined;
+  const extraKeep: JupiterTokenSpec[] = [];
+  for (const i of snap?.instruments ?? []) {
+    if (i.venue !== JUPITER_VENUE || !held.has(i.symbol)) continue;
+    const mint = i.meta?.mint;
+    const decimals = Number(i.meta?.decimals);
+    if (typeof mint !== "string" || !Number.isInteger(decimals)) continue;
+    extraKeep.push({ mint, symbol: i.baseCurrency, decimals, assetClass: i.assetClass, source: "discovered" });
+  }
+  const insts = watch.restore(extraKeep);
+  log.info("Jupiter の監視銘柄", { symbols: insts.map((i) => `${i.symbol} (${i.assetClass})`), apiKey: client.hasApiKey ? "あり" : "なし", gecko: gecko ? "あり" : "なし" });
+  return { feed, watch, client, ...(gecko ? { gecko } : {}), settings };
 }

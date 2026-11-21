@@ -3,6 +3,7 @@
  * 往復コスト・勝率を仮定した期待値・コストの条件 (cost / spread / edge) の判定と、見送ったシグナルの観測用の通知。
  * 期待値の定義は src/strategies/scalpMicro.ts の説明を参照。
  */
+import { costFeeRate } from "../core/fees";
 import type { Signal, StrategyContext } from "../core/types";
 import { tempoNetEdgeFloor } from "../engine/tempo";
 import { clamp } from "./common";
@@ -10,7 +11,7 @@ import { clamp } from "./common";
 /** 既定の勝率の上乗せの上限 (ランダムウォークの勝率 p0 に対して) */
 export const DEFAULT_WIN_EDGE_MAX = 0.1;
 
-/** 往復コスト (bps)。気配が無効なら undefined */
+/** 往復コスト (bps)。takerFeeRate には固定手数料の率換算を含めた値 (costFeeRate) を渡す。気配が無効なら undefined */
 export function roundTripCostBps(takerFeeRate: number, bid: number, ask: number, slippageBps: number): number | undefined {
   if (!(bid > 0) || !(ask >= bid) || !Number.isFinite(ask)) return undefined;
   const mid = (bid + ask) / 2;
@@ -65,7 +66,7 @@ export function netEdgeEntry(a: NetEdgeEntryArgs): Signal | null {
 
   // コスト
   const q = ctx.market.quote;
-  const costBps = roundTripCostBps(ctx.market.instrument.takerFeeRate, q?.bid ?? NaN, q?.ask ?? NaN, p.slippageBps);
+  const costBps = roundTripCostBps(costFeeRate(ctx.market.instrument), q?.bid ?? NaN, q?.ask ?? NaN, p.slippageBps);
   if (costBps === undefined) return null;
   const spread = q.ask - q.bid;
   const tpDist = Math.abs(sig.takeProfit - price);

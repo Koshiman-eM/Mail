@@ -93,8 +93,9 @@ describe("registry", () => {
   });
 
   it("資産クラス・時間軸の割り当て (登録順)", () => {
-    // meme (WATCHLIST で明示した銘柄) に掛かるのは scalp_momentum_burst だけ (専用の戦略は廃止)
-    expect(strategiesFor("meme").map((s) => s.id)).toEqual(["scalp_momentum_burst"]);
+    // meme (Jupiter のミームコイン・WATCHLIST で明示した銘柄): 板・出来高を条件に使わない戦略と scalp_momentum_burst (出来高が不明なら入らない)。
+    // scalp_obi (板が必要)・scalp_vwap_revert・scalp_micro・scalp_rebound・short_breakout は crypto だけ
+    expect(strategiesFor("meme").map((s) => s.id)).toEqual(["scalp_momentum_burst", "scalp_pullback", "short_ema_trend", "short_rsi_revert", "pullback_5m", "pullback_15m"]);
     expect(strategiesFor("crypto", "scalp").map((s) => s.id)).toEqual(["scalp_obi", "scalp_vwap_revert", "scalp_momentum_burst", "scalp_micro", "scalp_rebound", "scalp_pullback"]);
     // FX・株式の資産クラスは廃止 (古い記録の名前で引いても空)
     expect(strategiesFor("fx" as never, "short")).toEqual([]);

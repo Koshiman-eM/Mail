@@ -7,7 +7,7 @@ import { createLogger, type Logger } from "../core/logger";
 import { DEFAULT_SHORT_BORROW_RATE_DAILY, isSimulatedShort } from "../core/short";
 import {
   systemClock, type Balance, type Broker, type BrokerPosition, type Clock, type EntryContext, type Instrument, type IntelBias, type MarketBrief,
-  type IntelItem, type MarketView, type OrderRequest, type Params, type Quote, type RegimeFeatures, type Signal, type Store, type Strategy,
+  type IntelItem, type MarketDataFeed, type MarketView, type OrderRequest, type Params, type Quote, type RegimeFeatures, type Signal, type Store, type Strategy,
   type ShadowTradeRecord, type StrategyContext, type StrategyPlan, type Timeframe, type TradeRecord, TIMEFRAME_MS, isLearningExcludedTrade,
 } from "../core/types";
 import type { BrokerSet } from "../execution/router";
@@ -102,6 +102,25 @@ const FORECAST_BRIEF_MAX_AGE_MS = 6 * 3_600_000;
 const SIGNAL_MEMORY_MS = 3_600_000;
 const SIGNAL_MEMORY_MAX = 50;
 
+/** 定期の処理 (USD/JPY のレートの取り直し・Jupiter の自動探索・トークン情報の取り直しなど)。失敗しても取引は止めない */
+export interface PeriodicTask {
+  name: string;
+  everyMs: number;
+  run(now: number): Promise<unknown>;
+}
+
+/**
+ * 取引先ごとの追加の情報 (Jupiter)。無い・undefined を返した銘柄は従来どおり
+ * - liquidityUsd: 資産クラス meme の流動性 (USD)。値を持つ取引先の銘柄はこれを使い、出来高からの推定は使わない (undefined なら拒否)
+ * - entryBlock: 新規エントリーを止める理由 (自動追加の銘柄が選別に落ちた等。保有中の建玉の管理は続ける)
+ */
+export interface MarketExtras {
+  /** この取引先の銘柄に liquidityUsd を使う */
+  venues: readonly string[];
+  liquidityUsd(symbol: string): number | undefined;
+  entryBlock?(symbol: string): string | undefined;
+}
+
 export interface EngineDeps {
   config: AppConfig;
   store: Store;
@@ -122,6 +141,10 @@ export interface EngineDeps {
   /** hub が保持する時間足 (計画用レジームの時間足を選ぶのに使う) */
   timeframes?: Timeframe[];
   options?: EngineOptions;
+  /** 定期の処理 (start でタイマー、advance で期限が来たら実行) */
+  periodic?: PeriodicTask[];
+  /** 取引先ごとの追加の情報 (Jupiter の流動性・選別に落ちた銘柄) */
+  marketExtras?: MarketExtras;
 }
 
 export interface TickResult {
@@ -450,6 +473,10 @@ export class TradingEngine {
   private tickCount = 0;
   /** ダッシュボード用の見出し (ブリーフが変わるまで再計算しない) */
   private headlineCache?: { key: number; value: BriefHeadlines };
+  private readonly periodic: PeriodicTask[];
+  private readonly periodicAt = new Map<string, number>();
+  private readonly periodicRunning = new Set<string>();
+  private readonly marketExtras?: MarketExtras;
 
   constructor(deps: EngineDeps) {
     this.config = deps.config;
@@ -465,6 +492,8 @@ export class TradingEngine {
     this.log = deps.logger ?? createLogger("engine");
     this.rng = deps.rng ?? Math.random;
     this.timeframes = deps.timeframes;
+    this.periodic = deps.periodic ?? [];
+    this.marketExtras = deps.marketExtras;
     // 手組みの設定 (テスト) で未設定なら config の既定値と同じ扱い
     this.observeOnly = new Set(deps.config.env.OBSERVE_ONLY_STRATEGIES ?? DEFAULT_OBSERVE_ONLY_STRATEGIES.split(","));
     const env = deps.config.env;
@@ -703,11 +732,30 @@ export class TradingEngine {
     this.entryPause(now);
     this.seedTempo(now);
     this.warnThesisLive(now);
+    this.warnUnwatchedPositions(now);
     this.store.audit({
       ts: now,
       type: "engine.start",
       data: { mode: this.mode, watched: this.hub.watched().map((i) => i.symbol), openPositions: this.journal.list().length, pendingOrders: pending.length },
     });
+  }
+
+  /**
+   * 監視していない銘柄の建玉 (VENUES を変えた後の古い取引先の建玉など。例: bitbank の BTC/JPY を持ったまま jupiter に切り替えた)。
+   * 価格が取れないので損切り・利確・決済が動かない。起動を止めずに警告と監査ログ engine.unwatched_positions を残す
+   * (建玉は消さない。`paper reset` で記帳上だけ閉じられる)
+   */
+  private warnUnwatchedPositions(now: number): void {
+    const watched = new Set(this.hub.watched().map((i) => i.symbol));
+    const orphan = this.positions.list().filter((p) => !watched.has(p.symbol));
+    if (orphan.length === 0) return;
+    const list = orphan.map((p) => `${p.symbol} (${p.venue ?? "?"})`);
+    this.log.warn(
+      `監視していない銘柄の建玉が ${orphan.length} 件あります (いまの VENUES / WATCHLIST に無い取引先・銘柄のため価格が取れず、損切り・決済が動きません)。` +
+        (this.mode === "paper" ? "paper なら `npm run trader -- paper reset --equity <円> --confirm` で口座を作り直すことを推奨します" : "取引所で確認してください"),
+      { positions: list },
+    );
+    this.store.audit({ ts: now, type: "engine.unwatched_positions", data: { positions: list } });
   }
 
   /**
@@ -1281,10 +1329,21 @@ export class TradingEngine {
   }
 
   /** 新規エントリーの注文の種類: シグナルの指値 (価格あり) → 戦略の entryOrder → 設定 LIMIT_ENTRY (既定 true) */
-  private entryOrderFor(s: Strategy, sig: Signal): "market" | "limit" {
+  private entryOrderFor(s: Strategy, sig: Signal, inst?: Instrument): "market" | "limit" {
+    // 成行 (スワップ) だけの取引先 (Jupiter) は常に成行 (LIMIT_ENTRY・シグナルの指値を使わない)
+    if (inst && this.marketOnly(inst)) return "market";
     if (sig.entry.type === "limit" && sig.entry.price !== undefined && sig.entry.price > 0) return "limit";
     if (s.entryOrder) return s.entryOrder;
     return (this.config.env.LIMIT_ENTRY ?? true) ? "limit" : "market";
+  }
+
+  /** 成行 (スワップ) だけの取引先の銘柄か (発注先の capabilities.marketOnlyVenues) */
+  private marketOnly(inst: Instrument): boolean {
+    try {
+      return this.brokerFor(inst.symbol).capabilities?.marketOnlyVenues?.includes(inst.venue) === true;
+    } catch {
+      return false;
+    }
   }
 
   /** 指値のエントリーの有効期限: LIMIT_ENTRY_TIMEOUT_MS、未設定なら主時間足の長さ (20 秒〜15 分) */
@@ -1378,6 +1437,8 @@ export class TradingEngine {
     if (ctx.entryBlock) return ctx.entryBlock;
     const err = this.hub.lastError(sym);
     if (err) return { key: "poll_failed", sample: `${sym}: ${redactSecrets(err)}` };
+    const screened = this.marketExtras?.entryBlock?.(sym);
+    if (screened) return { key: "screen_failed", sample: `${sym}: ${screened}` };
     if (ctx.timedOut.has(sym)) return { key: "poll_timeout", sample: `${sym}: 市場データの取得が時間内に終わりませんでした` };
     if (this.mode === "live") {
       // ブローカーに journal で追跡していない建玉がある銘柄には入らない (外部の建玉との不整合を避ける)
@@ -2090,7 +2151,12 @@ export class TradingEngine {
       this.shadowRecord("no_broker", inst, view, c.strategy, sig, c.regime, now);
       return this.skip("no_broker", redactedErrMsg(e));
     }
-    const liquidityUsd = inst.assetClass === "meme" ? liquidityUsdFor(inst, view, (ccy) => this.fx.toUsd(ccy)) : undefined;
+    // ミームの流動性: Jupiter の銘柄はトークン情報の liquidity (定期的に取り直す)、それ以外は 24 時間の出来高からの推定
+    const liquidityUsd = inst.assetClass !== "meme"
+      ? undefined
+      : this.marketExtras?.venues.includes(inst.venue)
+        ? this.marketExtras.liquidityUsd(sym)
+        : liquidityUsdFor(inst, view, (ccy) => this.fx.toUsd(ccy));
     const acct = ctx.account;
     // 値動きの予想: 実力が確かめられた (予想時間, 資産クラス) だけサイズを 0.7〜1.2 倍にする。
     // 上限は計画と同じ MAX_RISK_MULTIPLIER のまま。RiskManager の判定 (上限・停止) はそのまま通す
@@ -2102,7 +2168,7 @@ export class TradingEngine {
     const tempoExplore = ctx.tempo !== undefined && sig.edgeIsNet === true && sig.expectedEdgeBps <= 0;
     const riskMultiplier = tempoExplore ? forecastRiskMultiplier * this.tempoExploreSize : forecastRiskMultiplier;
     // 注文の種類 (指値なら価格を決め、RiskManager のサイズの計算にもその価格を使う)
-    const limitPrice = this.entryOrderFor(c.strategy, sig) === "limit" ? this.limitPriceFor(inst, sig, q) : undefined;
+    const limitPrice = this.entryOrderFor(c.strategy, sig, inst) === "limit" ? this.limitPriceFor(inst, sig, q) : undefined;
     const riskSignal: Signal = limitPrice !== undefined ? { ...sig, entry: { type: "limit", price: limitPrice } } : sig;
     const decision = this.risk.evaluateEntry({
       signal: riskSignal,
@@ -2407,6 +2473,67 @@ export class TradingEngine {
     }
   }
 
+  // ───────── 定期の処理・監視銘柄の追加と削除 ─────────
+
+  /** 定期の処理を 1 つ実行する (同じ処理の重複は避ける。失敗はログだけ) */
+  async runPeriodic(task: PeriodicTask, now: number = this.clock.now()): Promise<void> {
+    if (this.stopped || this.periodicRunning.has(task.name)) return;
+    this.periodicRunning.add(task.name);
+    this.periodicAt.set(task.name, now);
+    const p = (async () => {
+      try {
+        await task.run(now);
+      } catch (e) {
+        this.warnThrottled(`periodic:${task.name}`, now, `定期の処理 (${task.name}) に失敗 (取引は継続)`, { error: redactedErrMsg(e) });
+      }
+    })();
+    this.background.add(p);
+    try {
+      await p;
+    } finally {
+      this.background.delete(p);
+      this.periodicRunning.delete(task.name);
+    }
+  }
+
+  /** 期限が来た定期の処理を順に実行する (シミュレーション・テスト用。実時間は start のタイマー) */
+  async runDuePeriodic(now: number = this.clock.now()): Promise<void> {
+    for (const t of this.periodic) {
+      const last = this.periodicAt.get(t.name);
+      if (last === undefined || now - last >= t.everyMs) await this.runPeriodic(t, now);
+    }
+  }
+
+  /**
+   * 実行中に監視銘柄を加える (Jupiter の自動探索)。hub に feed つきで登録し、PaperBroker にも銘柄定義を渡す。
+   * 既にあれば false
+   */
+  watchInstrument(inst: Instrument, feed: MarketDataFeed): boolean {
+    if (this.hub.instrument(inst.symbol)) return false;
+    this.hub.watch(inst, feed);
+    this.brokerSet.paper?.addInstrument(inst);
+    this.store.audit({ ts: this.clock.now(), type: "engine.watch_add", data: { symbol: inst.symbol, venue: inst.venue, assetClass: inst.assetClass } });
+    return true;
+  }
+
+  /**
+   * 実行中に監視銘柄を外す。建玉・保留中の注文・利確の指値・仮想トレードの追跡中の銘柄は外さない (false)。
+   * PaperBroker の銘柄定義は残す (スナップショット・過去の約定の評価のため)
+   */
+  unwatchInstrument(symbol: string): boolean {
+    if (!this.hub.instrument(symbol)) return true;
+    if (this.positions.get(symbol) || this.positions.hasPending(symbol) || this.positions.hasOrphanTakeProfit(symbol)) return false;
+    if (!this.hub.unwatch(symbol)) return false;
+    for (const k of [...this.lastEval.keys()]) if (k.startsWith(`${symbol}|`)) this.lastEval.delete(k);
+    this.store.audit({ ts: this.clock.now(), type: "engine.watch_remove", data: { symbol } });
+    return true;
+  }
+
+  /** 保有中・保留中の注文のある銘柄 (自動探索で外さない) */
+  heldSymbols(): string[] {
+    return [...new Set([...this.positions.list().map((p) => p.symbol), ...this.positions.pendingOrders().map((o) => o.symbol)])];
+  }
+
   // ───────── シミュレーション・実時間ループ ─────────
 
   /** シミュレーション用: tick に加えて、期限が来た情報ループ・学習ループを順に実行する */
@@ -2415,6 +2542,7 @@ export class TradingEngine {
     if (this.lastIntelAt === undefined || now - this.lastIntelAt >= this.opt.intelEveryMs) await this.runIntel(now);
     if (this.lastLearnAt === undefined) this.lastLearnAt = now;
     else if (now - this.lastLearnAt >= this.opt.learnEveryMs) await this.runLearning(now);
+    await this.runDuePeriodic(now);
     return r;
   }
 
@@ -2446,6 +2574,10 @@ export class TradingEngine {
     this.timers.push(setInterval(() => void this.safeTick(), this.opt.tickMs));
     this.timers.push(setInterval(() => void this.runIntel(this.clock.now()), this.opt.intelEveryMs));
     this.timers.push(setInterval(() => void this.runLearning(this.clock.now()), this.opt.learnEveryMs));
+    for (const t of this.periodic) {
+      void this.runPeriodic(t, this.clock.now());
+      this.timers.push(setInterval(() => void this.runPeriodic(t, this.clock.now()), Math.max(1_000, t.everyMs)));
+    }
   }
 
   /**

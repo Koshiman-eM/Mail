@@ -137,7 +137,7 @@ describe("scalp_pullback: 定義と既定値", () => {
   it("scalp・crypto・1m (+15m)・売り買い両方のレジーム", () => {
     expect(scalpPullback.id).toBe("scalp_pullback");
     expect(scalpPullback.horizon).toBe("scalp");
-    expect(scalpPullback.assetClasses).toEqual(["crypto"]);
+    expect(scalpPullback.assetClasses).toEqual(["crypto", "meme"]);
     expect(scalpPullback.primaryTimeframe).toBe("1m");
     expect(scalpPullback.timeframes).toEqual(["1m", "15m"]);
     expect(scalpPullback.regimes).toEqual(["trend_up", "trend_down", "high_vol", "range"]);

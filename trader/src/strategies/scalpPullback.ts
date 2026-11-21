@@ -1,7 +1,7 @@
 import type { Candle, Horizon, Params, Signal, Strategy, StrategyContext, Timeframe } from "../core/types";
 import { TIMEFRAME_MS } from "../core/types";
 import { atr, closesOf, ema, rsi } from "../indicators/series";
-import { buildEntrySignal, candlesOf, clamp, entryBlocked, exitSignal, period, positionSide, refPrice } from "./common";
+import { buildEntrySignal, candlesOf, clamp, entryBlocked, exitSignal, period, positionSide, refPrice, volumeUnknown } from "./common";
 import { DEFAULT_WIN_EDGE_MAX, netEdgeEntry } from "./netEdge";
 import { clampTempo, relaxToward, TEMPO_COST_MULT_FLOOR } from "../engine/tempo";
 
@@ -276,7 +276,8 @@ export function detectPullback(c1: readonly Candle[], c15: readonly Candle[], p:
   let vsum = 0;
   for (let i = n - 1 - vb; i < n - 1; i++) vsum += c1[i].volume;
   const volAvg = vsum / vb;
-  const volRatio = volAvg > 0 ? cur.volume / volAvg : 0;
+  // 出来高が不明な足 (Jupiter の価格のポーリングの足) が窓にあれば 0 (確信度の加点なし。条件には使わない)
+  const volRatio = volAvg > 0 && !volumeUnknown(c1, n - 1 - vb, n - 1) ? cur.volume / volAvg : 0;
   return {
     direction: trend.direction,
     atr: a,
@@ -398,7 +399,8 @@ export function createPullback(cfg: PullbackConfig): Strategy {
   const strategy: Strategy = {
     id: cfg.id,
     horizon: cfg.horizon,
-    assetClasses: ["crypto"],
+    // meme: Jupiter のミームコイン (板・出来高を条件に使わない。出来高は確信度の加点だけで、不明なら 0 扱い。腕は資産クラスで分かれる)
+    assetClasses: ["crypto", "meme"],
     // 主時間足のレジームに依存しない (トレンドの向きは上位足で自前で判定)。low_liquidity は対象外
     regimes: ["trend_up", "trend_down", "high_vol", "range"],
     primaryTimeframe: execTf,

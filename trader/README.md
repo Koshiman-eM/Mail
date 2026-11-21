@@ -1,9 +1,10 @@
 # 自己学習型の仮想通貨自動売買ツール
 
-仮想通貨 (暗号資産) を自律的に売買するツールです。Solana のトークン・ミームコインを DEX アグリゲーター Jupiter で売買するボット (現物だけ。空売り・レバレッジなし) に移行中です。戦略はスキャルピングと短期売買だけです (中期・長期・ミームコイン専用の戦略は廃止しました)。
+仮想通貨 (暗号資産) を自律的に売買するツールです。Solana のトークン・ミームコインを DEX アグリゲーター Jupiter で売買するボット (現物だけ。空売り・レバレッジなし) です。戦略はスキャルピングと短期売買だけです (中期・長期・ミームコイン専用の戦略は廃止しました)。
 
+- **既定の取引先は Jupiter (`VENUES=jupiter`) で、paper (仮想売買) です。** SOL・JUP と、固定のミームコイン (BONK・WIF・POPCAT・MEW) に加え、自動探索で見つけたミームコインを期限つきで監視します (「Jupiter (Solana)」の節)。
 - **いまは live の発注先がありません。** `TRADING_MODE=live` にすると起動しません (「live の発注先は未対応です (Jupiter の実弾は次の段階で実装予定)」)。GMOコイン・FX・株式は廃止しました。
-- paper とバックテストの相場は、合成データ (`synthetic`) か ccxt (`CCXT_EXCHANGE`、既定 bitbank) です。
+- 合成データ (`synthetic`) と ccxt (`CCXT_EXCHANGE`、既定 bitbank) も paper・バックテスト用に使えます。
 
 インターネットから集めた情報で戦略を立てます。損益が出るたびに要因を分析し、その結果を次の判断に反映します (自己学習)。
 
@@ -54,19 +55,22 @@
 
 ### 戦略
 
-| 時間軸 | 戦略 ID | 表示名 | 内容 |
-|---|---|---|---|
-| スキャルピング (1 分足) | `scalp_obi` | 超短期・板の偏り | 板の厚みの偏り・microprice・約定フロー (板情報が必要) |
-| | `scalp_vwap_revert` | 超短期・VWAP への回帰 | VWAP からの乖離の逆張り (レンジ相場向け) |
-| | `scalp_momentum_burst` | 超短期・急な動きに追随 | 出来高急増を伴う直近高値・安値のブレイク |
-| | `scalp_micro` | 超短期・瞬間の勢い | 5〜10 分で利確・損切りする超短期のモメンタム (成行。コストの条件を満たすときだけ) |
-| | `scalp_rebound` | 超短期・下げの中の反発買い | 15 分足が下降トレンドのときの、1 分足の売られ過ぎからの反発を買う (買いのみ。**既定で観測専用**) |
-| | `scalp_pullback` | 超短期・押し目買い / 戻り売り | 15 分足 EMA20 の傾きで方向を決め、上昇中の 1 分足の押しを買い、下降中の戻りを売る (暗号資産。売りは空売りできるとき。損切りは押しの極値の外側、利確は損切り幅の 2 倍、保有 10〜30 分。コスト条件を満たすときだけ) |
-| 短期 (5 分〜1 時間足) | `short_ema_trend` | 短期・EMA トレンド (15 分足) | EMA9/21 + ADX、押し目でエントリー |
-| | `short_rsi_revert` | 短期・RSI 逆張り (15 分足) | RSI + ボリンジャーバンドの逆張り |
-| | `short_breakout` | 短期・ブレイクアウト (1 時間足) | ドンチャン・ブレイクアウト + 出来高確認 |
-| | `pullback_5m` | 短期・押し目買い / 戻り売り (5 分足) | `scalp_pullback` と同じ判定を 5 分足で (方向は 1 時間足 EMA20 の傾き。保有 30 分〜2 時間。コスト条件を満たすときだけ) |
-| | `pullback_15m` | 短期・押し目買い / 戻り売り (15 分足) | `scalp_pullback` と同じ判定を 15 分足で (方向は 4 時間足 EMA20 の傾き。保有 1〜4 時間。コスト条件を満たすときだけ) |
+| 時間軸 | 戦略 ID | 表示名 | 資産クラス | 内容 |
+|---|---|---|---|---|
+| スキャルピング (1 分足) | `scalp_obi` | 超短期・板の偏り | crypto | 板の厚みの偏り・microprice・約定フロー (板情報が必要。Jupiter には板が無いので入らない) |
+| | `scalp_vwap_revert` | 超短期・VWAP への回帰 | crypto | VWAP からの乖離の逆張り (レンジ相場向け) |
+| | `scalp_momentum_burst` | 超短期・急な動きに追随 | crypto・meme | 出来高急増を伴う直近高値・安値のブレイク (出来高が不明な足では入らない ※) |
+| | `scalp_micro` | 超短期・瞬間の勢い | crypto | 5〜10 分で利確・損切りする超短期のモメンタム (成行。コストの条件を満たすときだけ。出来高が不明な足では入らない ※) |
+| | `scalp_rebound` | 超短期・下げの中の反発買い | crypto | 15 分足が下降トレンドのときの、1 分足の売られ過ぎからの反発を買う (買いのみ。**既定で観測専用**) |
+| | `scalp_pullback` | 超短期・押し目買い / 戻り売り | crypto・meme | 15 分足 EMA20 の傾きで方向を決め、上昇中の 1 分足の押しを買い、下降中の戻りを売る (売りは空売りできるとき = Jupiter では買いだけ。損切りは押しの極値の外側、利確は損切り幅の 2 倍、保有 10〜30 分。コスト条件を満たすときだけ) |
+| 短期 (5 分〜1 時間足) | `short_ema_trend` | 短期・EMA トレンド (15 分足) | crypto・meme | EMA9/21 + ADX、押し目でエントリー |
+| | `short_rsi_revert` | 短期・RSI 逆張り (15 分足) | crypto・meme | RSI + ボリンジャーバンドの逆張り |
+| | `short_breakout` | 短期・ブレイクアウト (1 時間足) | crypto | ドンチャン・ブレイクアウト + 出来高確認 (出来高が不明な足では入らない ※) |
+| | `pullback_5m` | 短期・押し目買い / 戻り売り (5 分足) | crypto・meme | `scalp_pullback` と同じ判定を 5 分足で (方向は 1 時間足 EMA20 の傾き。保有 30 分〜2 時間。コスト条件を満たすときだけ) |
+| | `pullback_15m` | 短期・押し目買い / 戻り売り (15 分足) | crypto・meme | `scalp_pullback` と同じ判定を 15 分足で (方向は 4 時間足 EMA20 の傾き。保有 1〜4 時間。コスト条件を満たすときだけ) |
+
+- crypto = 暗号資産 (Jupiter の SOL・JUP、ccxt・合成データの銘柄)、meme = ミームコイン (Jupiter の SOL・JUP 以外の銘柄と自動探索の銘柄、`WATCHLIST` で `|meme` と明示した銘柄)。腕 (学習) のキーに資産クラスが入るので、ミームの学習は crypto と別です。
+- ※ Jupiter の足は価格のポーリングから作るので、直近の足の出来高は分かりません (`volumeKnown: false`)。出来高を条件に使う戦略は、出来高が不明な足があれば入りません (0 を「出来高が少ない」と読まない。fail-closed)。ccxt・合成データの足では従来どおりです。
 
 戦略 ID の `short` (と時間軸の `short` / `long`) は「短期 / 長期」の時間軸の意味で、売買の向き (買い / 売り) ではありません。ダッシュボードとレポートでは上の「表示名」(日本語) を表示します (ID は環境変数・保存データ・腕のキーにそのまま使うので変えません。対応表は `src/strategies/labels.ts`)。
 
@@ -305,6 +309,55 @@ TARGET_ENTRIES_PER_HOUR=6 MAX_HOLD_MINUTES=30 npm run simulate -- --days 2
 
 - `report` と `simulate` に「転換で決済」の表を出します: 件数・勝率・純損益・平均 R・含み益で決済した件数・勝った取引が利確までの距離のうちどれだけ取れたか (値動きの R ÷ 計画の利確の R)。`status` には設定を出します。
 
+## Jupiter (Solana)
+
+`VENUES=jupiter` (既定) では、Solana の DEX アグリゲーター Jupiter の価格で paper を動かします。スワップ (署名・送信) はしません (クライアントは読み取り専用)。
+
+- **銘柄**: 固定の銘柄 `JUPITER_TOKENS` (既定 `SOL,JUP,BONK,WIF,POPCAT,MEW`。mint か symbol) と、自動探索 (`JUPITER_DISCOVERY=true`) で見つけたミームコイン。シンボルは `SOL/USDC` の形 (クオートは USDC = USD とみなす。口座通貨は JPY のまま)。SOL・JUP は資産クラス `crypto`、それ以外は `meme`。数量の刻み・最小数量はトークンの decimals から、最小の約定代金は `JUPITER_MIN_NOTIONAL_USD` (既定 $5)。
+- **現物だけ**: 空売りしません (paper の空売りの再現 `PAPER_SIMULATE_SHORT` も Jupiter は対象外)。指値もありません (新規は常に成行。`LIMIT_ENTRY`・`LIMIT_TAKE_PROFIT` は Jupiter の銘柄には効きません)。
+- **価格と気配**: Price V3 で全銘柄を `JUPITER_POLL_MS` (既定 5 秒) ごとに 1 回で取ります。仲値 = 価格、買い・売り気配は「代わりのスリッページのモデル」(固定 bps + 2 × 代金 / 流動性。主要銘柄 5bps・ミーム 30bps) を代表的な代金 `JUPITER_QUOTE_SIZE_USD` (既定 $50) で評価した価格です。全部の取得に失敗したら新規エントリーを止め、一部の銘柄だけ取れないときはその銘柄の気配が古くなって新規を止めます。
+- **約定 (paper)**: 成行は見積もり (`swap/v1/quote`) の実効価格で約定します (15 秒・同じ金額の帯はキャッシュ。取れなければ代わりのモデル)。経路の手数料は見積もりの価格に含まれるので手数料率は 0、手数料は 1 回あたりのネットワーク手数料 `JUPITER_NETWORK_FEE_USD` (既定 $0.02) です。期待値とコストの比較・仮想トレード・バックテストも同じ前提 (代わりのモデル + ネットワーク手数料を代表的な代金で率にした値) です。
+- **足**: 価格から 1 分足を作り (出来高は不明)、上位足はその集約です。起動後に裏で GeckoTerminal (`GECKO_CALLS_PER_MIN`、既定 10 回/分) から履歴 (1 分足と、15 分・1 時間・4 時間・5 分足) を取ります。起動は待たせず、足が揃うまで戦略はシグナルを出しません (6 銘柄で 4 分ほど)。出来高は銘柄を順に回って GeckoTerminal から取り、確定から 3 分以上たった足にだけ入れます。一度出した足の始値・高値・安値・終値は書き換えません (先読み・リペイントをしない。変わるのは「出来高が不明 → 分かった」だけ)。
+- **ミームの流動性**: `MEME_MIN_LIQUIDITY_USD` の判定には Jupiter のトークン情報の流動性 (1 時間ごとに取り直す) を使います。`MAX_EXPOSURE_MEME` の上限も効きます。
+- **自動探索**: `JUPITER_DISCOVERY_MINUTES` (既定 20 分) ごとに、上位のトークン (toptrending・toporganicscore の 1 時間) を選別し (流動性・保有者数・上場からの日数・organicScore・ミント権限 / 凍結権限・上位保有者の比率・疑わしいトークン)、合格した銘柄を期限つき (`JUPITER_DISCOVERY_TTL_HOURS`、既定 6 時間) で監視に加えます。期限まで再合格しなければ外します (保有中・注文中の銘柄は外しません)。監視中の銘柄が後で選別に落ちたら、新規エントリーだけ止めます (建玉の管理は続けます)。一覧は DB の kv `jupiter:watch:<mode>` に保存し、追加・削除・不合格の理由は監査ログ (`jupiter.watch_add` / `jupiter.watch_remove` / `jupiter.discovery` / `jupiter.watch_screen_failed`) に残します。
+- **USD→JPY**: frankfurter.app の日次のレート (キー不要) を 1 時間ごとに取り直し、最後の値を DB にキャッシュします。取れなければ概算表 (1 USD = 150 JPY) です。
+- **学習によるパラメータ調整**: Jupiter の銘柄は長い履歴を取れない (GeckoTerminal の枠では 14 日分の 1 分足を取れない) ので検証できず、調整は適用されません (検証できない変更は適用しない規則のため)。
+- **確認**: `npm run trader -- jupiter check` で、各 API の応答の形・既定の銘柄の mint・USD/JPY のレートを確かめます (読み取りだけ。API キーは表示しません)。API の仕様は公式資料の記述に基づくもので、実際の応答とはまだ照合していません。初回は必ず実行してください。
+
+| 変数 | 既定 | 内容 |
+|---|---|---|
+| `JUPITER_API_KEY` | (空) | API キー (任意)。あればキーありの上限 (既定 1 回/秒) で呼びます。表示・ログには出しません |
+| `JUPITER_RPS` | (空) | 1 秒あたりの上限。空ならキーなし 0.5 / キーあり 1 |
+| `JUPITER_POLL_MS` | 5000 | 価格の取得間隔 (ミリ秒、1000〜60000) |
+| `GECKO_CALLS_PER_MIN` | 10 | GeckoTerminal の 1 分あたりの上限 (1〜30) |
+| `JUPITER_TOKENS` | `SOL,JUP,BONK,WIF,POPCAT,MEW` | 固定の銘柄 (mint か symbol) |
+| `JUPITER_DISCOVERY` | `true` | 自動探索 |
+| `JUPITER_DISCOVERY_MINUTES` | 20 | 自動探索の間隔 (分、5〜1440) |
+| `JUPITER_DISCOVERY_TTL_HOURS` | 6 | 自動追加の期限 (時間、1〜168) |
+| `JUPITER_DISCOVERY_MAX_TOKENS` | 10 | 自動追加の最大件数 |
+| `JUPITER_DISCOVERY_MIN_LIQUIDITY_USD` | 250000 | 選別: 最低の流動性 |
+| `JUPITER_DISCOVERY_MIN_HOLDERS` | 2000 | 選別: 最低の保有者数 |
+| `JUPITER_DISCOVERY_MIN_AGE_DAYS` | 3 | 選別: 最初のプールからの最低日数 |
+| `JUPITER_DISCOVERY_MIN_ORGANIC_SCORE` | 60 | 選別: 最低の organicScore (0〜100) |
+| `JUPITER_DISCOVERY_MAX_TOP_HOLDERS_PCT` | 35 | 選別: 上位保有者の比率の上限 (%) |
+| `JUPITER_DISCOVERY_VERIFIED_ONLY` | `false` | 選別: 検証済みのトークンだけ |
+| `JUPITER_NETWORK_FEE_USD` | 0.02 | 1 回のスワップのネットワーク手数料 (USD) |
+| `JUPITER_QUOTE_SIZE_USD` | 50 | 気配とコストの見積もりの代表的な代金 (USD) |
+| `JUPITER_MIN_NOTIONAL_USD` | 5 | 最小の約定代金 (USD) |
+
+API の呼び出しの目安 (1 分あたり): Jupiter は価格 12 回 (5 秒ごと。銘柄が 50 を超えると 2 倍) + 約定の見積もり (約定ごとに最大 1 回) + 自動探索 2 回 / 20 分 + トークン情報 1 回 / 時間 で、キーなしの上限 30 回/分に収まります。GeckoTerminal は起動時に 1 銘柄 6 回 (プール + 5 つの時間足) を `GECKO_CALLS_PER_MIN` の枠で順に取り、その後は残りの枠で出来高を銘柄ごとに最短 1 分おきに取ります。
+
+### サーバーを Jupiter に切り替える手順
+
+1. `sudo systemctl stop trader`
+2. `git pull` と `npm install`
+3. `.env.local` を `VENUES=jupiter` にし、API キーがあれば `JUPITER_API_KEY=...` を書く (`WATCHLIST` の `ccxt|...` は Jupiter では使いません)
+4. `npm run trader -- jupiter check` (応答の形・既定の銘柄の mint・USD/JPY を確認。NG があれば内容を確認)
+5. `npm run trader -- paper reset --equity 100000 --confirm` (推奨。以前の bitbank の建玉には価格が来ないため。学習データは残ります)
+6. `sudo systemctl start trader`
+
+5 を省いても起動はします。いまの `VENUES` に無い取引先の建玉は、起動時のログと `npm run status` に警告が出て、価格が取れないため損切り・決済が動きません (建玉は消しません)。
+
 ## セットアップ
 
 Node.js 22.13 以上が必要です。
@@ -327,6 +380,12 @@ npm run simulate -- --hours 12 --seed 7 --step 30 --db ./data/sim.db
 
 # バックテスト (全戦略の比較)
 npm run backtest -- --strategy all --days 30
+# Jupiter の銘柄のバックテスト (GeckoTerminal の足。--token は mint か symbol、既定 SOL。1 分足の 30 日分は約 44 回の呼び出し)
+npm run backtest -- --strategy all --source jupiter --token BONK --days 7
+
+# Jupiter・GeckoTerminal・USD/JPY の応答の確認 (読み取りだけ)
+npm run trader -- jupiter check
+
 # 取引所の実データでのバックテスト (CCXT_EXCHANGE の履歴を取得)
 npm run backtest -- --strategy short_ema_trend --symbol BTC/JPY --source ccxt --days 60
 # 合成データの乱数のシードを変える (既定 1)
@@ -392,6 +451,7 @@ npm run trader -- orders resolve <clientId> --filled --qty <数量> --price <価
 
 | VENUES の値 | 対象 | 必要な設定 |
 |---|---|---|
+| `jupiter` (既定) | Solana の DEX アグリゲーター Jupiter (SOL・JUP・ミームコイン)。**価格の取得と paper 専用** (スワップは実行しません)。上の「Jupiter (Solana)」 | `JUPITER_TOKENS` ほか (キーは任意) |
 | `synthetic` | 合成データ (デモ・動作確認用。暗号資産の BTC/USDT・ETH/USDT・PEPE/USDT) | なし |
 | `ccxt` | 暗号資産取引所 (bitbank, bitFlyer, Coincheck, Binance 等、ccxt 対応の取引所)。**価格の取得と paper・バックテスト専用** (live の発注はしません) | `CCXT_EXCHANGE` (キーは不要) |
 
@@ -400,7 +460,7 @@ npm run trader -- orders resolve <clientId> --filled --qty <数量> --price <価
   - `VENUES` が廃止した取引先だけ (例: `VENUES=gmo`) なら、警告して `ccxt` (`CCXT_EXCHANGE`、既定 bitbank) の相場で paper を動かします。`WATCHLIST` の `gmo|...` の銘柄は無視するので、bitbank の既定の銘柄 (`BTC/JPY`・`ETH/JPY` など、あるものを最大 3 つ) になります。銘柄を選ぶなら `WATCHLIST=ccxt|BTC/JPY,ccxt|ETH/JPY` のように書き直してください。
   - `WATCHLIST` で資産クラスを `fx` / `stock` にした銘柄も、警告して無視します。
   - `GMO_*` と `MAX_EXPOSURE_FX` / `MAX_EXPOSURE_STOCK` は読みません (値が不正でも起動は止めず、起動時と `npm run status` に警告だけ出します)。
-- USD 建ての銘柄 (`BTC/USDT` など) の円換算は、監視中に USD (USDT・USDC) と JPY のペアが無いため、固定の概算表 (1 USD = 150 JPY、`src/engine/fx.ts`) を使います (以前は合成データの `USD/JPY` の気配を使っていました)。paper はそのまま換算します。live は概算表のレートでは新規エントリーしません (Jupiter の実弾では、実際のレートの取得が必要です)。bitbank の JPY 建ての銘柄は換算しません。
+- USD 建ての銘柄 (`SOL/USDC`・`BTC/USDT` など) の円換算: `VENUES` に `jupiter` があれば frankfurter.app の日次の USD/JPY (1 時間ごとに取り直し、DB にキャッシュ) を使います。それ以外・取れないときは固定の概算表 (1 USD = 150 JPY、`src/engine/fx.ts`) です。paper はそのまま換算します。live は概算表・古い (5 分超の) レートでは新規エントリーしません (日次のレートは live には使えません。Jupiter の実弾では別のレートの取得元が必要です)。bitbank の JPY 建ての銘柄は換算しません。
 
 ### 取引所 (ccxt) の選び方
 
@@ -419,7 +479,9 @@ ccxt は価格の取得・paper・バックテスト (`--source ccxt`) 用です
 
 例: `ccxt|BTC/JPY|crypto,ccxt|ETH/JPY`
 
-資産クラス (3 つ目) は省略できます (取引所の情報から決めます)。使える資産クラスは `crypto` と `meme` だけです。ccxt の銘柄は DOGE・SHIB・PEPE なども `crypto` です (以前はミームコインを自動で `meme` に分けていました)。`meme` として扱いたい銘柄は `ccxt|DOGE/JPY|meme` のように明示します。`meme` の銘柄は資産クラス別の上限 (`MAX_EXPOSURE_MEME`) と最低流動性 (`MEME_MIN_LIQUIDITY_USD`) のリスク判定を受け、`scalp_momentum_burst` だけが取引します (専用の戦略はありません)。
+資産クラス (3 つ目) は省略できます (取引所の情報から決めます)。使える資産クラスは `crypto` と `meme` だけです。ccxt の銘柄は DOGE・SHIB・PEPE なども `crypto` です (以前はミームコインを自動で `meme` に分けていました)。`meme` として扱いたい銘柄は `ccxt|DOGE/JPY|meme` のように明示します。`meme` の銘柄は資産クラス別の上限 (`MAX_EXPOSURE_MEME`) と最低流動性 (`MEME_MIN_LIQUIDITY_USD`) のリスク判定を受け、戦略の表で資産クラスに meme のある戦略が取引します (専用の戦略はありません)。
+
+Jupiter の銘柄は `WATCHLIST` ではなく `JUPITER_TOKENS` と自動探索で決めます (「Jupiter (Solana)」)。
 
 `ANTHROPIC_API_KEY` を設定すると、ニュース分析・戦略計画・振り返りに Claude を使います。未設定でも、キーワード辞書とルールベースで動作します。
 
@@ -431,7 +493,7 @@ ccxt は価格の取得・paper・バックテスト (`--source ccxt`) 用です
 |---|---|
 | `NEWS_RSS_FEEDS` | RSS の URL をカンマ区切りで指定します。既定の 4 フィード (CoinDesk・Cointelegraph・CNBC・BBC Business) に**追加**します。先頭を `=` にすると既定を**置き換え**ます (例: `NEWS_RSS_FEEDS==https://example.com/a.xml`)。`http(s)://` で始まらないものは無視します |
 | `CRYPTOPANIC_TOKEN` | CryptoPanic の API トークン。空なら CryptoPanic は使いません |
-| `MEME_MIN_LIQUIDITY_USD` | 資産クラス `meme` (`WATCHLIST` で明示した銘柄) の新規エントリーに求める 24 時間の流動性 (USD。出来高 × 価格で推定)。既定 250000。不明・未満なら見送ります |
+| `MEME_MIN_LIQUIDITY_USD` | 資産クラス `meme` の新規エントリーに求める流動性 (USD)。Jupiter の銘柄は Jupiter のトークン情報の流動性 (1 時間ごとに取り直す)、`WATCHLIST` で `|meme` と明示した ccxt などの銘柄は 24 時間の出来高 × 価格からの推定。既定 250000。不明・未満なら見送ります |
 | `PAPER_SIMULATE_SHORT` | `true` (既定) / `false`。paper で、現物の暗号資産の空売りを再現して学習します (上の説明を参照)。live では常に空売りしません。`true`/`1`/`yes`/`on`・`false`/`0`/`no`/`off` 以外は起動時にエラーになります |
 | `PAPER_SHORT_BORROW_RATE_DAILY` | paper で再現する空売りの借入コストの日率 (0〜0.01)。既定 0.0004 (0.04%/日) は bitbank の信用取引を想定した仮の値です。実際の料率は取引所で確認してください |
 | `LOG_LEVEL` | `debug` / `info` / `warn` / `error`。既定は `info` (テスト中は `warn`) |
@@ -615,6 +677,8 @@ DB が大きくならないよう、学習ループ (1 時間に 1 回まで) �
 - **live は専用の口座 (サブアカウント) で動かしてください。** 評価額には口座の現金と、取引対象の通貨の保有がすべて含まれます。また、利用者が手で持っている建玉や現物がある銘柄には、新規エントリーしません。
 - 建玉との照合や `orders resolve` で確定させた約定は、価格が推定になるため学習には使いません。
 - ダッシュボードを `DASHBOARD_HOST=0.0.0.0` で公開すると、IP アドレスでのアクセスは拒否されます。その場合は `DASHBOARD_HOST` に実際のアドレスを設定してください。ただし、外部公開は推奨しません。
-- 実弾の発注には対応していません。ccxt の取引所 (bitbank など)・DEX (オンチェーン) での実際の発注はできません (GMOコイン・OANDA・Alpaca・DEX と ccxt の発注は廃止しました)。FX・株式は扱いません。
+- 実弾の発注には対応していません。ccxt の取引所 (bitbank など)・Jupiter (オンチェーン) での実際の発注はできません (GMOコイン・OANDA・Alpaca・DEX と ccxt の発注は廃止しました。Jupiter の実弾は次の段階)。FX・株式は扱いません。
+- Jupiter・GeckoTerminal・frankfurter の API は公式資料の記述に基づいて実装し、実際の応答とはまだ照合していません。`npm run trader -- jupiter check` で確認してください (キーなしの上限、Price V3 の 1 回の件数、priceImpactPct の単位、GeckoTerminal の無料枠と古い 1 分足をどこまで返すか、既定の銘柄の mint など)。
+- Jupiter の銘柄では、出来高を条件に使う戦略 (`scalp_momentum_burst`・`scalp_micro`・`short_breakout`) は入りません (直近の足の出来高が不明なため)。板を使う `scalp_obi` も入りません。
 - 市場データはポーリング (定期取得) です。ミリ秒単位の高頻度売買には向きません。WebSocket 対応は今後の拡張候補です。
 - 板情報が必要な `scalp_obi` は、板の履歴が無いためバックテストでは検証できません。そのため学習によるパラメータ調整の対象外です。

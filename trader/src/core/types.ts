@@ -12,8 +12,8 @@
 // ───────────────────────── 基本列挙 ─────────────────────────
 
 /**
- * 資産クラス (仮想通貨だけ)。meme は自動では分類しない (WATCHLIST で "venue|symbol|meme" と明示した銘柄だけ。専用の戦略は無い)。
- * meme は Solana のミームコインで再び使う予定で、学習データ (腕のキー・予想・振り返り) とダッシュボードのリスク設定にも残っている。
+ * 資産クラス (仮想通貨だけ)。meme は Jupiter のミームコイン (JUPITER_TOKENS の SOL・JUP 以外と自動探索の銘柄) と、
+ * WATCHLIST で "venue|symbol|meme" と明示した銘柄。ccxt の銘柄は自動では meme に分類しない。
  * fx / stock は廃止した。DB の古い記録 (取引・仮想トレード・腕・パラメータ・振り返り・予想の集計) には "fx" / "stock" が残りうるので、
  * 記録の assetClass を読むコードは未知のクラスでも例外にしない (クラス別の表を引くときは既定値に落とす)
  */
@@ -68,6 +68,18 @@ export interface Instrument {
   simulatedShort?: boolean;
   /** 1 単位あたりの契約サイズ (先物用。現物は 1) */
   contractSize?: number;
+  /**
+   * 約定ごとに掛かる固定の手数料 (クオート通貨建て。Jupiter: Solana のネットワーク手数料 JUPITER_NETWORK_FEE_USD)。
+   * takerFeeRate とは別に 1 回の約定ごとに掛かる。コストの見積もり (bps) では costRefNotional で率に直す (src/core/fees.ts)
+   */
+  fixedFeePerOrder?: number;
+  /**
+   * コストの見積もりの前提 (DEX の銘柄だけ。無ければ資産クラスの既定値):
+   * refNotional = 代表的な約定代金 (クオート通貨建て。固定手数料を bps に直すのに使う)、
+   * spreadBps = 全幅のスプレッド相当 (片道の価格影響 × 2)、slippageBps = 片道の約定ずれ (価格影響がスプレッドに含まれていれば 0)。
+   * バックテスト・パラメータ検証・仮想トレードのコストに使う
+   */
+  costModel?: { refNotional: number; spreadBps: number; slippageBps: number };
   /** 取引先固有の情報 (古いスナップショットには廃止した GMO の holdingFeeDaily が残りうる。読まない) */
   meta?: Record<string, string | number>;
 }
@@ -80,6 +92,11 @@ export interface Candle {
   low: number;
   close: number;
   volume: number;
+  /**
+   * false なら出来高が不明 (Jupiter の価格のポーリングで作った足。volume は 0 だが「出来高 0」ではない)。
+   * 省略 (undefined) は出来高が分かっている (ccxt・合成データの足)。出来高を使う戦略は不明なら条件を満たさない (fail-closed)
+   */
+  volumeKnown?: boolean;
 }
 
 export interface Quote {
@@ -427,6 +444,11 @@ export interface BrokerPosition {
 export interface BrokerCapabilities {
   postOnly?: boolean;
   restingTakeProfit?: boolean;
+  /**
+   * 成行 (スワップ) しか受け付けない取引先 (venue)。DEX (Jupiter) には板に置く指値が無いので、
+   * エンジンは新規エントリーを常に成行にし (LIMIT_ENTRY を無視)、利確の指値も置かない
+   */
+  marketOnlyVenues?: readonly string[];
 }
 
 /** 発注先。ペーパーと実口座で同じインターフェース */
@@ -489,7 +511,7 @@ export interface RiskLimits {
    * 設定が下限より低ければ設定のまま (締めも緩めもしない)
    */
   tempoMinEdgeToCost?: number;
-  /** 資産クラス meme (WATCHLIST で明示した銘柄) の最低流動性 (USD。24 時間の出来高から推定) */
+  /** 資産クラス meme の最低流動性 (USD。Jupiter はトークン情報の liquidity、ほかは 24 時間の出来高から推定) */
   memeMinLiquidityUsd: number;
 }
 

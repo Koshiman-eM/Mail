@@ -1,6 +1,6 @@
 import type { Signal, Strategy, StrategyContext } from "../core/types";
 import { adx, atr, bollinger, closesOf, donchian, ema, rsi, sma, volumesOf } from "../indicators/series";
-import { buildEntrySignal, candlesOf, clamp, entryBlocked, exitSignal, period, positionSide } from "./common";
+import { buildEntrySignal, candlesOf, clamp, entryBlocked, exitSignal, period, positionSide, volumeUnknown } from "./common";
 
 /** 短期戦略 (5m/15m/1h) */
 
@@ -10,7 +10,8 @@ import { buildEntrySignal, candlesOf, clamp, entryBlocked, exitSignal, period, p
 export const shortEmaTrend: Strategy = {
   id: "short_ema_trend",
   horizon: "short",
-  assetClasses: ["crypto"],
+  // meme: Jupiter のミームコイン (板・出来高を使わない戦略。腕のキーに資産クラスが入るので crypto と学習を分ける)
+  assetClasses: ["crypto", "meme"],
   regimes: ["trend_up", "trend_down"],
   primaryTimeframe: "15m",
   timeframes: ["15m"],
@@ -86,7 +87,8 @@ export const shortEmaTrend: Strategy = {
 export const shortRsiRevert: Strategy = {
   id: "short_rsi_revert",
   horizon: "short",
-  assetClasses: ["crypto"],
+  // meme: Jupiter のミームコイン (板・出来高を使わない戦略。腕のキーに資産クラスが入るので crypto と学習を分ける)
+  assetClasses: ["crypto", "meme"],
   regimes: ["range"],
   primaryTimeframe: "15m",
   timeframes: ["15m"],
@@ -209,7 +211,8 @@ export const shortBreakout: Strategy = {
       if (side === "short" && cur.close > exitCh.upper[n - 2]) return exitSignal(ctx, shortBreakout, 0.6, `直近 ${ex} 本の高値を上抜け`, features);
       return null;
     }
-    if (entryBlocked(ctx) || volRatio < p.entryThreshold) return null;
+    // 出来高の平均の窓 (直前の 20 本) か今の足に出来高が不明な足 (Jupiter の価格のポーリングの足) があれば入らない (fail-closed)
+    if (entryBlocked(ctx) || volumeUnknown(c, n - 21, n - 1) || volRatio < p.entryThreshold) return null;
     let direction: "long" | "short" | null = null;
     if (cur.close > upperPrev) direction = "long";
     else if (cur.close < lowerPrev) direction = "short";

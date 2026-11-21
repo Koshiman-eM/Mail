@@ -1,3 +1,4 @@
+import { costFeeRate } from "../core/fees";
 import { D, Decimal } from "../core/decimal";
 import { redactedErrMsg, redactSecrets } from "../core/http";
 import { sweepOld } from "../core/sweep";
@@ -178,7 +179,7 @@ export interface PositionManagerDeps {
   toAccount?: (ccy: string) => number;
   quoteCurrencyOf?: (symbol: string) => string | undefined;
   /** 銘柄情報 (手数料の通貨換算・端数の判定。takerFeeRate は読みの管理の純 R の見積り) */
-  instrumentOf?: (symbol: string) => (Pick<Instrument, "baseCurrency" | "quoteCurrency" | "minQty"> & Partial<Pick<Instrument, "takerFeeRate">>) | undefined;
+  instrumentOf?: (symbol: string) => (Pick<Instrument, "baseCurrency" | "quoteCurrency" | "minQty"> & Partial<Pick<Instrument, "takerFeeRate" | "fixedFeePerOrder" | "costModel" | "venue">>) | undefined;
   /** 通貨換算 (1 from = ? to)。換算できなければ NaN */
   fxRate?: (from: string, to: string) => number;
   /** 現在値 (建玉による確定の推定価格)。無ければ追跡中の最終価格 */
@@ -466,7 +467,9 @@ export class PositionManager {
   /** 純 R・建値の計算に使う値 (エントリー手数料は実際に払った額を 1 単位あたりにする。一部決済後も元の数量で割る) */
   private thesisPricing(p: OpenTrade, risk: number): ThesisPricing {
     const units = D(p.qty).plus(p.exitedQty ?? 0).mul(p.contractSize).toNumber();
-    const rate = this.deps.instrumentOf?.(p.symbol)?.takerFeeRate;
+    // 決済の手数料の見積り: taker 率 + 約定ごとの固定手数料の率換算 (Jupiter のネットワーク手数料。src/core/fees.ts)
+    const inst = this.deps.instrumentOf?.(p.symbol);
+    const rate = inst?.takerFeeRate !== undefined ? costFeeRate({ ...inst, takerFeeRate: inst.takerFeeRate }) : undefined;
     return {
       direction: p.direction,
       entryPrice: p.entryPrice,
@@ -938,6 +941,9 @@ export class PositionManager {
     if (this.deps.limitTakeProfit !== true || this.deps.journal.mode === "live") return undefined;
     try {
       const b = this.deps.brokerFor(symbol);
+      // 成行 (スワップ) だけの取引先 (Jupiter) には指値を置けない
+      const venue = this.deps.instrumentOf?.(symbol)?.venue;
+      if (venue !== undefined && b.capabilities?.marketOnlyVenues?.includes(venue)) return undefined;
       return b.capabilities?.restingTakeProfit === true ? b : undefined;
     } catch {
       return undefined;

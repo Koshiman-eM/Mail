@@ -150,13 +150,13 @@ describe("simulate / status", () => {
   it("status: REVERSAL_* の設定を出す", async () => {
     const dir = mkdtempSync(join(tmpdir(), "reversal-status-"));
     const dbPath = join(dir, "t.db");
-    // VENUES=synthetic (既定) では合成データ用の DB (<ベース名>-synthetic.db) を読む
+    // VENUES=synthetic では合成データ用の DB (<ベース名>-synthetic.db) を読む (既定の VENUES は jupiter)
     new SqliteStore(join(dir, "t-synthetic.db")).close();
     const keys = ["DB_PATH", "TRADING_MODE", "VENUES", "REVERSAL_EXIT", "REVERSAL_EXIT_PIVOT_N", "REVERSAL_EXIT_BUFFER_ATR", "REVERSAL_EXIT_STRATEGIES", "REVERSAL_EXIT_TF"];
     const old = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
     process.env.DB_PATH = dbPath;
     delete process.env.TRADING_MODE;
-    delete process.env.VENUES;
+    process.env.VENUES = "synthetic";
     process.env.REVERSAL_EXIT = "true";
     process.env.REVERSAL_EXIT_PIVOT_N = "4";
     process.env.REVERSAL_EXIT_BUFFER_ATR = "0.2";

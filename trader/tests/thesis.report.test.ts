@@ -152,7 +152,7 @@ describe("status: 読みの管理の設定と建玉の読みの期限", () => {
   it("設定の 1 行と、決済計画のある建玉の期限 (監視中 / 延長中) を出す", async () => {
     const dir = mkdtempSync(join(tmpdir(), "thesis-status-"));
     const dbPath = join(dir, "t.db");
-    // VENUES=synthetic (既定) では合成データ用の DB (<ベース名>-synthetic.db) を読む
+    // VENUES=synthetic では合成データ用の DB (<ベース名>-synthetic.db) を読む
     const store = new SqliteStore(join(dir, "t-synthetic.db"));
     const journal = new TradeJournal({ store, mode: "paper" });
     const p = journal.open({
@@ -169,7 +169,7 @@ describe("status: 読みの管理の設定と建玉の読みの期限", () => {
     process.env.DB_PATH = dbPath;
     delete process.env.TRADING_MODE;
     delete process.env.THESIS_EXIT;
-    delete process.env.VENUES;
+    process.env.VENUES = "synthetic";
     const out: string[] = [];
     const err: string[] = [];
     try {

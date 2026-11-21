@@ -17,6 +17,16 @@ export function tail<T>(arr: readonly T[] | undefined, n: number): T[] {
 }
 
 /** 指定時間足の確定足 (末尾 n 本まで) */
+/**
+ * 足 [from, to] (添字、両端を含む) に出来高が不明な足 (volumeKnown === false。Jupiter の価格のポーリングで作った足) があるか。
+ * 出来高を使う条件 (出来高の倍率など) は、不明な足があれば満たさない扱いにする (0 を「出来高が少ない」と誤読しない。fail-closed)。
+ * ccxt・合成データの足は volumeKnown を持たない (= 分かっている) ので常に false (従来どおり)
+ */
+export function volumeUnknown(c: readonly Candle[], from: number, to: number): boolean {
+  for (let i = Math.max(0, from); i <= Math.min(c.length - 1, to); i++) if (c[i].volumeKnown === false) return true;
+  return false;
+}
+
 export function candlesOf(ctx: StrategyContext, tf: Timeframe, n: number): Candle[] {
   return tail(ctx.market.candles[tf], n);
 }

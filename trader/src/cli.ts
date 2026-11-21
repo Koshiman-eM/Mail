@@ -1,5 +1,5 @@
 /**
- * CLI: run / simulate / backtest / intel / report / resume / status / orders
+ * CLI: run / simulate / backtest / intel / report / resume / status / orders / paper / jupiter
  * 依存なしの簡易引数解析。表示はすべて日本語。
  */
 import { randomUUID } from "node:crypto";
@@ -7,7 +7,7 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { loadConfig, removedEnvWarnings, type AppConfig } from "./core/config";
-import type { Store, TradeRecord } from "./core/types";
+import type { MarketDataFeed, Store, TradeRecord } from "./core/types";
 import { isLoopbackHost, startDashboard, type DashboardServer } from "./dashboard/server";
 import { formatBacktestRows, runBacktestCommand, type BacktestSource } from "./engine/backtestCommand";
 import { compareFootnotes, formatCompareRows, runStructureCompare } from "./engine/structureCompare";
@@ -35,6 +35,13 @@ import type { IntelSource } from "./intel/sources/common";
 import { TradeJournal } from "./learning/journal";
 import { LearningService } from "./learning/service";
 import { CcxtFeed } from "./market/feeds/ccxt";
+import { GeckoHistoryFeed } from "./market/feeds/geckoHistory";
+import { jupiterInstrument, JUPITER_VENUE } from "./market/feeds/jupiter";
+import { JupiterClient } from "./market/jupiter/client";
+import { runJupiterCheck } from "./market/jupiter/check";
+import { GeckoTerminalClient } from "./market/jupiter/gecko";
+import { formatJupiterSettings, jupiterSettingsFromEnv, resolveFixedTokens } from "./engine/jupiterWatch";
+import { UsdJpyRateSource } from "./engine/fxRate";
 import { RiskManager } from "./risk/manager";
 import { requestResume } from "./risk/resumeRequest";
 import { riskOverrideLines } from "./risk/settings";
@@ -158,6 +165,8 @@ export interface BacktestArgs {
   pivotSweep?: true;
   /** 比較の区間数 (既定 5) */
   folds?: number;
+  /** --source jupiter のトークン (mint か symbol。既定 SOL) */
+  token?: string;
 }
 
 export function parseBacktestArgs(flags: ParsedArgs["flags"]): BacktestArgs {
@@ -169,8 +178,11 @@ export function parseBacktestArgs(flags: ParsedArgs["flags"]): BacktestArgs {
   if (!strategy) throw new CliError("--strategy <戦略ID|all> を指定してください");
   if (strategy !== "all" && !getStrategy(strategy)) throw new CliError(`未知の戦略: ${strategy}`);
   const source = stringFlag(flags, "source", "synthetic");
-  if (source === "gmo") throw new CliError("--source gmo は廃止しました (GMOコインの取引先を廃止したため)。synthetic / ccxt のどちらかです");
-  if (source !== "synthetic" && source !== "ccxt") throw new CliError("--source は synthetic / ccxt のどちらかです");
+  if (source === "gmo") throw new CliError("--source gmo は廃止しました (GMOコインの取引先を廃止したため)。synthetic / ccxt / jupiter のどれかです");
+  if (source !== "synthetic" && source !== "ccxt" && source !== "jupiter") throw new CliError("--source は synthetic / ccxt / jupiter のどれかです");
+  if (flags.token !== undefined && source !== "jupiter") throw new CliError("--token は --source jupiter と一緒に指定してください");
+  const token = source === "jupiter" ? stringFlag(flags, "token", "SOL") : undefined;
+  if (source === "jupiter" && flags.symbol !== undefined) throw new CliError("--source jupiter では --symbol ではなく --token <mint|symbol> を指定してください");
   const symbol = flags.symbol === undefined ? undefined : stringFlag(flags, "symbol", "");
   return {
     strategy,
@@ -180,6 +192,7 @@ export function parseBacktestArgs(flags: ParsedArgs["flags"]): BacktestArgs {
     seed: numberFlag(flags, "seed", 1, { integer: true }),
     ...(compare ? { structureCompare: true as const, folds: numberFlag(flags, "folds", 5, { min: 2, max: 20, integer: true }) } : {}),
     ...(sweep ? { pivotSweep: true as const } : {}),
+    ...(token ? { token } : {}),
   };
 }
 
@@ -222,8 +235,9 @@ export const HELP = `自己学習型の仮想通貨自動売買ツール
   run                         実時間で起動 (既定は paper)。ダッシュボードも起動します
   simulate [--days 3] [--hours N] [--seed 1] [--db memory] [--step 15]
                               合成データ + 仮想時計で高速にペーパー運転 (ネット不要)
-  backtest --strategy <ID|all> [--symbol SYM] [--days 30] [--source synthetic|ccxt] [--seed 1]
-                              バックテスト (ccxt は CCXT_EXCHANGE の履歴を取得。STRUCTURE_* の構造フィルター込み)
+  backtest --strategy <ID|all> [--symbol SYM] [--days 30] [--source synthetic|ccxt|jupiter] [--token <mint|symbol>] [--seed 1]
+                              バックテスト (ccxt は CCXT_EXCHANGE の履歴、jupiter は GeckoTerminal の足 (--token、既定 SOL)。
+                              STRUCTURE_* の構造フィルター込み。jupiter は成行だけ・コストは代わりのスリッページ + ネットワーク手数料)
   backtest --structure-compare [--strategy <ID|all>] [--pivot-sweep] [--folds 5] [その他は backtest と同じ]
                               相場構造のフィルターの比較 (A: ラップなし 〜 G: conservative 版) を区間検証で表示
   regime --symbol SYM [--hours 3] [--tf 1m,15m,1h,4h] [--step 5]
@@ -232,7 +246,9 @@ export const HELP = `自己学習型の仮想通貨自動売買ツール
   report [--all]              評価額・戦略別成績・学習の状態を表示 (DB_PATH)。paper は最新の口座リセット以降の成績
                               (--all でリセット前を含む全期間)
   resume                      キルスイッチ・日次停止を解除 (監査ログに記録)
-  status                      設定と現在の状態を表示
+  status                      設定と現在の状態を表示 (Jupiter の設定、いまの VENUES に無い取引先の建玉の警告も)
+  jupiter check [--ultra]     Jupiter・GeckoTerminal・frankfurter (USD/JPY) の応答の形と既定の銘柄の mint を確かめる
+                              (読み取りだけ。スワップは呼ばない。API キーは表示しない)
   orders                      保留中の注文 (受付済み・未約定、状態不明) を一覧
   orders resolve <clientId> --none
                               状態不明の注文を「約定なし」として解消 (取引所で約定していないことを確認してから)
@@ -280,6 +296,30 @@ export function configCompatWarnings(c: AppConfig, rawEnv: Record<string, string
   const ids = ALL_STRATEGIES.map((x) => x.id);
   for (const w of strategyIdListWarnings("OBSERVE_ONLY_STRATEGIES", c.env.OBSERVE_ONLY_STRATEGIES ?? [], ids)) warn.push(`警告: ${w}`);
   return warn;
+}
+
+/**
+ * status・run 用: いまの VENUES に無い取引先の建玉 (例: VENUES を jupiter に切り替えた後に残った bitbank の BTC/JPY)。
+ * 価格が取れないので損切り・決済が動かない。エンジンは起動を止めず建玉も消さない (従来どおり) ので、paper なら口座のリセットを勧める
+ */
+export function unconfiguredVenuePositionWarnings(c: AppConfig, positions: readonly { symbol: string; venue: string }[]): string[] {
+  let kinds: Set<string>;
+  try {
+    kinds = new Set(effectiveVenues(c.env.VENUES).map((v) => v.split(":")[0]));
+  } catch {
+    return [];
+  }
+  // 合成データの銘柄の venue は "paper"
+  const kindOf = (v: string) => (v === "paper" ? "synthetic" : v.split(":")[0]);
+  const orphan = positions.filter((p) => !kinds.has(kindOf(p.venue)));
+  if (orphan.length === 0) return [];
+  return [
+    `警告: 保有中の建玉 ${orphan.map((p) => `${p.symbol} (${p.venue})`).join(", ")} は、いまの VENUES (${c.env.VENUES}) に無い取引先の銘柄です。` +
+      "価格が取れないため損切り・利確・決済が動きません (エンジンは起動し、建玉は消しません)。" +
+      (c.mode === "paper"
+        ? "`sudo systemctl stop trader` で止めてから `npm run trader -- paper reset --equity 100000 --confirm` で paper の口座を作り直すことを推奨します (学習データは残ります)"
+        : "取引所で建玉を確認してください"),
+  ];
 }
 
 function riskLines(c: AppConfig): string[] {
@@ -425,6 +465,8 @@ async function cmdRun(io: Io): Promise<number> {
   if (!prepared) return 1;
   const { rt, mode, heartbeat, releaseLock } = prepared;
   io.out(`銘柄: ${rt.instruments.map((i) => `${i.symbol} (${i.assetClass}, ${i.venue})`).join(", ")}`);
+  unconfiguredVenuePositionWarnings(config, rt.engine.journal.list()).forEach((l) => io.err(l));
+  if (rt.jupiter) formatJupiterSettings(rt.jupiter.settings).forEach((l) => io.out(l));
   io.out(`時間足: ${rt.timeframes.join(", ")} / 口座通貨: ${config.env.BASE_CURRENCY} / DB: ${resolveDbPath(config)}`);
   riskLines(config).forEach((l) => io.out(l));
   riskOverrideLines(rt.store, rt.engine.mode, config.risk, fmtTime).forEach((l) => io.out(l));
@@ -542,18 +584,25 @@ async function cmdSimulate(flags: ParsedArgs["flags"], io: Io): Promise<number> 
 async function cmdBacktest(flags: ParsedArgs["flags"], io: Io): Promise<number> {
   const a = parseBacktestArgs(flags);
   const config = loadConfig();
-  let feed;
+  let feed: MarketDataFeed | undefined;
+  let jupiterSymbol: string | undefined;
   if (a.source === "ccxt") {
     io.out(`ccxt (${config.env.CCXT_EXCHANGE}) から履歴を取得します...`);
     feed = CcxtFeed.create(config.env.CCXT_EXCHANGE);
+  } else if (a.source === "jupiter") {
+    const j = await jupiterBacktestFeed(config, a.token ?? "SOL", a.days, io);
+    feed = j.feed;
+    jupiterSymbol = j.symbol;
   }
   const symbol =
+    jupiterSymbol ??
     a.symbol ??
     (a.source === "ccxt"
       ? ["bitflyer", "bitbank", "coincheck", "zaif"].includes(config.env.CCXT_EXCHANGE) ? "BTC/JPY" : "BTC/USDT"
       : "SYN/USDT");
   const structure = structureSettingsFromEnv(config.env);
-  const sourceLabel = a.source === "synthetic" ? `合成データ (シード ${a.seed})` : `ccxt ${config.env.CCXT_EXCHANGE}`;
+  const sourceLabel =
+    a.source === "synthetic" ? `合成データ (シード ${a.seed})` : a.source === "jupiter" ? "Jupiter (GeckoTerminal の足)" : `ccxt ${config.env.CCXT_EXCHANGE}`;
   const common = {
     ...a,
     symbol,
@@ -561,8 +610,9 @@ async function cmdBacktest(flags: ParsedArgs["flags"], io: Io): Promise<number> 
     minEdgeToCostRatio: config.risk.minEdgeToCostRatio,
     riskPerTrade: config.risk.riskPerTrade,
     maxPositionPct: config.risk.maxPositionPct,
-    // 指値 (maker) の前提を実運用 (LIMIT_ENTRY / LIMIT_TAKE_PROFIT。利確の指値は現在の mode で有効なときだけ) に合わせる
-    limitOrders: limitOrdersFromEnv(config.env, config.mode),
+    // 指値 (maker) の前提を実運用 (LIMIT_ENTRY / LIMIT_TAKE_PROFIT。利確の指値は現在の mode で有効なときだけ) に合わせる。
+    // Jupiter は成行 (スワップ) だけなので指値なし
+    ...(a.source === "jupiter" ? {} : { limitOrders: limitOrdersFromEnv(config.env, config.mode) }),
   };
   if (a.structureCompare) {
     const folds = a.folds ?? 5;
@@ -589,6 +639,45 @@ async function cmdBacktest(flags: ParsedArgs["flags"], io: Io): Promise<number> 
   io.out(formatBacktestRows(rows));
   io.out("※ 損益はクオート通貨建て (初期評価額 1,000,000)。期間の前にウォームアップ用の足を付けています。");
   return 0;
+}
+
+/**
+ * backtest --source jupiter: トークン (mint か symbol) を解決し、GeckoTerminal の最良のプールの足を返す feed を作る。
+ * 銘柄定義は運用と同じ jupiterInstrument (コスト = 代わりのスリッページのモデル + ネットワーク手数料、指値なし)
+ */
+async function jupiterBacktestFeed(config: AppConfig, token: string, days: number, io: Io): Promise<{ feed: MarketDataFeed; symbol: string }> {
+  const js = jupiterSettingsFromEnv(config.env);
+  const client = new JupiterClient({ ...(js.apiKey ? { apiKey: js.apiKey } : {}), ...(js.ratePerSec !== undefined ? { ratePerSec: js.ratePerSec } : {}) });
+  const specs = await resolveFixedTokens(client, [token], (m, d) => io.err(`警告: ${m}${d ? ` ${JSON.stringify(d)}` : ""}`));
+  const spec = specs[0];
+  if (!spec) throw new CliError(`トークンが見つかりません: ${token}`);
+  const inst = jupiterInstrument({ ...spec, source: "fixed" }, { quoteSizeUsd: js.quoteSizeUsd, networkFeeUsd: js.networkFeeUsd, minNotionalUsd: js.minNotionalUsd });
+  const gecko = new GeckoTerminalClient({ callsPerMinute: js.geckoCallsPerMin });
+  const pool = await gecko.bestPoolFor(spec.mint);
+  if (!pool) throw new CliError(`GeckoTerminal に ${inst.symbol} (${spec.mint}) のプールが見つかりません`);
+  const pages = Math.ceil((days * 1440) / 1000) + 1;
+  io.out(
+    `Jupiter: ${inst.symbol} (${inst.assetClass}, mint ${spec.mint}) / プール ${pool.name ?? pool.address} / ` +
+      `GeckoTerminal から履歴を取得します (1m の基準足なら約 ${pages} 回、${js.geckoCallsPerMin} 回/分で約 ${Math.ceil(pages / js.geckoCallsPerMin)} 分)...`,
+  );
+  return { feed: new GeckoHistoryFeed(gecko, inst, pool.address), symbol: inst.symbol };
+}
+
+/** jupiter check: Jupiter・GeckoTerminal・frankfurter の応答の形を確かめる (読み取りだけ。キーは表示しない) */
+async function cmdJupiter(positionals: string[], flags: ParsedArgs["flags"], io: Io): Promise<number> {
+  const sub = positionals[0] ?? "check";
+  if (sub !== "check" || positionals.length > 1) throw new CliError("使い方: npm run trader -- jupiter check [--ultra]");
+  const config = loadConfig();
+  const js = jupiterSettingsFromEnv(config.env);
+  const client = new JupiterClient({ ...(js.apiKey ? { apiKey: js.apiKey } : {}), ...(js.ratePerSec !== undefined ? { ratePerSec: js.ratePerSec } : {}) });
+  const gecko = new GeckoTerminalClient({ callsPerMinute: js.geckoCallsPerMin });
+  const r = await runJupiterCheck(client, gecko, { out: (s) => io.out(s), includeUltra: flags.ultra === true });
+  // USD/JPY の日次のレート (frankfurter.app)
+  const fx = new UsdJpyRateSource();
+  const rate = await fx.refresh(true);
+  io.out(rate ? `  OK  frankfurter USD/JPY: ${rate.rate} (${rate.date})` : `  NG  frankfurter USD/JPY: ${fx.status().lastError ?? "取得できません"} (概算 1 USD = 150 JPY で換算します)`);
+  formatJupiterSettings(js).forEach((l) => io.out(l));
+  return r.ok && rate !== undefined ? 0 : 1;
 }
 
 async function cmdRegime(flags: ParsedArgs["flags"], io: Io): Promise<number> {
@@ -974,6 +1063,7 @@ function cmdStatus(io: Io): number {
   configCompatWarnings(config).forEach((l) => io.err(l));
   io.out(venuesLine(config));
   io.out(`監視銘柄 (WATCHLIST): ${config.env.WATCHLIST || "(既定)"}`);
+  if (config.env.VENUES.split(",").some((v) => v.trim().toLowerCase() === JUPITER_VENUE)) formatJupiterSettings(jupiterSettingsFromEnv(config.env)).forEach((l) => io.out(l));
   strategyStatusLines(config).forEach((l) => io.out(l));
   const dbPath = resolveDbPath(config);
   io.out(`口座通貨: ${config.env.BASE_CURRENCY} / DB: ${dbPath} / AI: ${config.ai.enabled ? config.ai.model : "無効"}`);
@@ -990,6 +1080,7 @@ function cmdStatus(io: Io): number {
     const eq = store.listEquity({ mode }).at(-1);
     io.out(`最新の評価額: ${eq ? `${fmtNum(eq.equity, 0)} ${config.env.BASE_CURRENCY} (${fmtTime(eq.ts)}, ${eq.mode})` : "(記録なし)"}`);
     const open = new TradeJournal({ store, mode }).list();
+    unconfiguredVenuePositionWarnings(config, open).forEach((l) => io.err(l));
     const thesis = thesisSettingsFromEnv(config.env);
     const plans = readExitPlans(store, mode);
     io.out(`保有ポジション (${mode}): ${open.length} 件`);
@@ -1123,7 +1214,7 @@ export async function main(argv: string[] = process.argv.slice(2), io: Io = cons
       return 0;
     }
     if (args.command === "gmo") throw new CliError("gmo コマンド (gmo check) は廃止しました (GMOコインの取引先を廃止したため)");
-    if (args.command !== "orders" && args.command !== "paper" && args.positionals.length > 0) {
+    if (args.command !== "orders" && args.command !== "paper" && args.command !== "jupiter" && args.positionals.length > 0) {
       throw new CliError(`余分な引数があります: ${args.positionals.join(" ")} (${args.command} は位置引数を取りません)`);
     }
     switch (args.command) {
@@ -1147,6 +1238,8 @@ export async function main(argv: string[] = process.argv.slice(2), io: Io = cons
         return cmdOrders(args.positionals, args.flags, io);
       case "paper":
         return cmdPaper(args.positionals, args.flags, io);
+      case "jupiter":
+        return await cmdJupiter(args.positionals, args.flags, io);
       default:
         io.err(`未知のコマンド: ${args.command}\n`);
         io.out(HELP);

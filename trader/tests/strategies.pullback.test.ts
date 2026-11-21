@@ -160,14 +160,14 @@ describe.each(CASES)("$name", (c) => {
     it(`short・crypto・${c.execTf} (+${c.trendTf})・売り買い両方のレジーム。registry から引ける`, () => {
       expect(S.id).toBe(c.name);
       expect(S.horizon).toBe("short");
-      expect(S.assetClasses).toEqual(["crypto"]);
+      // meme: Jupiter のミームコインにも掛ける (板・出来高を条件に使わない)
+      expect(S.assetClasses).toEqual(["crypto", "meme"]);
       expect(S.primaryTimeframe).toBe(c.execTf);
       expect(S.timeframes).toEqual([c.execTf, c.trendTf]);
       expect(S.regimes).toEqual(["trend_up", "trend_down", "high_vol", "range"]);
       expect(getStrategy(c.name)).toBe(S);
       expect(strategiesFor("crypto", "short").map((s) => s.id)).toContain(c.name);
-      expect(strategiesFor("meme").map((s) => s.id)).not.toContain(c.name);
-      expect(strategiesFor("meme").map((s) => s.id)).not.toContain(c.name);
+      expect(strategiesFor("meme").map((s) => s.id)).toContain(c.name);
     });
 
     it(`既定値は範囲内。保有は ${c.hold[0]}〜${c.hold[1]} 本、時間足に依存する値だけ scalp_pullback と違う`, () => {
@@ -208,7 +208,7 @@ describe.each(CASES)("$name", (c) => {
       expect(tfs).toContain(c.execTf);
       expect(tfs).toContain(c.trendTf);
       expect(hubTimeframesFor([{ assetClass: "crypto" }], [S])).toEqual(["1m", c.execTf, c.trendTf]);
-      expect(hubTimeframesFor([{ assetClass: "meme" }], [S])).toEqual(["1m"]);
+      expect(hubTimeframesFor([{ assetClass: "meme" }], [S])).toEqual(["1m", c.execTf, c.trendTf]);
     });
 
     it("相場構造のフィルター・観測専用の既定には入れない (自前の上位足のトレンドの条件がある)", () => {

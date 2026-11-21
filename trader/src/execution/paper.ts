@@ -1,5 +1,6 @@
 import { D, floorToStep, roundToStep, Decimal } from "../core/decimal";
 import { TerminalMap, isTerminalOrder } from "../core/sweep";
+import { fixedFeeOf } from "../core/fees";
 import { createLogger } from "../core/logger";
 import { canShort, DEFAULT_SHORT_BORROW_RATE_DAILY } from "../core/short";
 import {
@@ -29,7 +30,22 @@ export interface PaperBrokerOptions {
    * 建玉代金 (平均建値 × 数量) × 日率 × 経過日数 (日割り) を、買い戻しの約定の手数料に加えて計上する
    */
   shortBorrowRateDaily?: number;
+  /**
+   * 成行の約定価格を外部の見積もりで決める (Jupiter: swap/v1/quote、取れなければ代わりのスリッページのモデル。
+   * src/execution/jupiterFill.ts)。undefined を返した銘柄は従来どおり 気配 ± slippageBps で約定する
+   */
+  marketPricer?: MarketPricer;
+  /** 成行 (スワップ) だけの取引先 (DEX)。指値の注文は拒否する (capabilities.marketOnlyVenues) */
+  marketOnlyVenues?: readonly string[];
 }
+
+/** 成行の約定価格の見積もり (price はクオート通貨建て・1 単位あたり。source は監査・ログ用) */
+export type MarketPricer = (
+  inst: Instrument,
+  side: "buy" | "sell",
+  qty: Decimal,
+  quote: Quote,
+) => Promise<{ price: number; source: string } | undefined>;
 
 interface Pos {
   qty: Decimal;
@@ -83,7 +99,7 @@ const log = createLogger("paper");
 export class PaperBroker implements Broker {
   readonly venue = "paper";
   readonly mode = "paper" as const;
-  readonly capabilities: BrokerCapabilities = { postOnly: true, restingTakeProfit: true };
+  readonly capabilities: BrokerCapabilities;
 
   private readonly inst = new Map<string, Instrument>();
   private readonly base: string;
@@ -114,6 +130,16 @@ export class PaperBroker implements Broker {
     this.lev = { ...DEFAULT_LEVERAGE, ...(o.leverage ?? {}) };
     const br = o.shortBorrowRateDaily;
     this.borrowRate = D(br !== undefined && Number.isFinite(br) && br >= 0 ? br : DEFAULT_SHORT_BORROW_RATE_DAILY);
+    this.capabilities = {
+      postOnly: true,
+      restingTakeProfit: true,
+      ...(o.marketOnlyVenues?.length ? { marketOnlyVenues: [...o.marketOnlyVenues] } : {}),
+    };
+  }
+
+  /** 約定ごとの固定の手数料 (クオート通貨建て。Jupiter のネットワーク手数料) */
+  private fixedFee(inst: Instrument): Decimal {
+    return D(fixedFeeOf(inst));
   }
 
   /** 空売りできるか (取引所で可能、または paper で再現する銘柄)。PaperBroker は paper 専用なので mode は paper */
@@ -264,7 +290,7 @@ export class PaperBroker implements Broker {
     if (increase.lte(0)) return true;
     const lev = this.lev[inst.assetClass] ?? 1;
     const need = price.mul(increase).mul(this.cs(inst)).mul(fx).div(lev);
-    const fee = price.mul(qty).mul(this.cs(inst)).mul(fx).mul(inst.takerFeeRate);
+    const fee = price.mul(qty).mul(this.cs(inst)).mul(inst.takerFeeRate).plus(this.fixedFee(inst)).mul(fx);
     const equity = this.cash.plus(this.unrealized());
     return equity.minus(this.usedMargin()).gte(need.plus(fee));
   }
@@ -304,9 +330,26 @@ export class PaperBroker implements Broker {
     const isBuy = req.side === "buy";
 
     if (req.type === "market") {
-      const px = isBuy ? D(q.ask).mul(D(1).plus(this.slip)) : D(q.bid).mul(D(1).minus(this.slip));
+      // 外部の見積もり (Jupiter) があればその実効価格、無ければ 気配 ± slippageBps
+      let px: Decimal | undefined;
+      if (this.o.marketPricer) {
+        try {
+          const est = await this.o.marketPricer(inst, req.side, qty, q);
+          if (est && Number.isFinite(est.price) && est.price > 0) px = D(est.price);
+        } catch (e) {
+          this.warnOnce(`pricer:${inst.symbol}`, "成行の見積もりに失敗したため気配で約定します", { symbol: inst.symbol, error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+      // 見積もりを待つ間に同じ clientId の注文が確定していれば、その結果を返す (冪等)
+      const done = this.results.get(req.clientId);
+      if (done) return done;
+      px ??= isBuy ? D(q.ask).mul(D(1).plus(this.slip)) : D(q.bid).mul(D(1).minus(this.slip));
       const price = roundToStep(px, inst.tickSize);
+      if (!(price.gt(0))) return this.reject(req, "約定価格が 0 以下");
       return this.fillNow(req, orderId, inst, qty, price, "taker");
+    }
+    if ((this.o.marketOnlyVenues ?? []).includes(inst.venue)) {
+      return this.reject(req, `${inst.venue} は成行 (スワップ) だけです (指値は使えません)`);
     }
 
     if (req.limitPrice === undefined || !(req.limitPrice > 0)) return this.reject(req, "指値価格が必要");
@@ -388,7 +431,7 @@ export class PaperBroker implements Broker {
     }
 
     const rate = liq === "maker" ? inst.makerFeeRate : inst.takerFeeRate;
-    const feeQuote = price.mul(qty).mul(cs).mul(rate).plus(borrowFee);
+    const feeQuote = price.mul(qty).mul(cs).mul(rate).plus(borrowFee).plus(this.fixedFee(inst));
     this.cash = this.cash.plus(realizedQuote.mul(fx)).minus(feeQuote.mul(fx));
     this.realized = this.realized.plus(realizedQuote.mul(fx));
 

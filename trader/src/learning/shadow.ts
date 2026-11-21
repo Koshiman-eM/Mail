@@ -33,6 +33,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { defaultCosts } from "../backtest/engine";
+import { costFeeRate } from "../core/fees";
 import {
   advancePeak, decideThesis, resolveThesisMs, thesisGrossR, thesisOutcomeOf, thesisTrailStop, tighterStop, type ThesisSettings,
 } from "../engine/thesis";
@@ -99,7 +100,7 @@ export interface ShadowCounters {
 }
 
 export interface ShadowRecordInput {
-  instrument: Pick<Instrument, "symbol" | "assetClass" | "takerFeeRate">;
+  instrument: Pick<Instrument, "symbol" | "assetClass" | "takerFeeRate"> & Partial<Pick<Instrument, "fixedFeePerOrder" | "costModel">>;
   quote: Pick<Quote, "bid" | "ask">;
   signal: Pick<Signal, "strategyId" | "direction" | "confidence" | "expectedEdgeBps" | "stopLoss" | "takeProfit" | "maxHoldMs" | "expectedMs"> & { horizon?: Horizon };
   regime: RegimeLabel;
@@ -157,9 +158,13 @@ const finite = (x: unknown): x is number => typeof x === "number" && Number.isFi
 const dedupeKey = (symbol: string, strategyId: string, direction: string) => `${symbol}|${strategyId}|${direction}`;
 const MINUTE = 60_000;
 
-/** 仮想トレードの約定ずれ (片道, bps)。上書きが無ければバックテストと同じ資産クラス別の既定値 */
-export function shadowSlippageBps(assetClass: AssetClass, override?: number): number {
+/**
+ * 仮想トレードの約定ずれ (片道, bps)。上書きが無ければバックテストと同じ既定値
+ * (銘柄のコストの前提 costModel があればその値 (Jupiter は価格影響を気配のスプレッドに含めるので 0)、無ければ資産クラス別)
+ */
+export function shadowSlippageBps(assetClass: AssetClass, override?: number, costModel?: Instrument["costModel"]): number {
   if (finite(override) && override >= 0) return override;
+  if (costModel && finite(costModel.slippageBps) && costModel.slippageBps >= 0) return costModel.slippageBps;
   const c = defaultCosts(assetClass)?.slippageBps;
   return finite(c) && c >= 0 ? c : 2;
 }
@@ -324,8 +329,9 @@ export class ShadowTracker {
       ...(tpOk ? { takeProfit: sig.takeProfit } : {}),
       maxHoldMs: finite(sig.maxHoldMs) && sig.maxHoldMs > 0 ? sig.maxHoldMs : this.opts.defaultMaxHoldMs,
       ...(thesisMs !== undefined ? { thesisExpectedMs: thesisMs } : {}),
-      takerFeeRate: finite(inst.takerFeeRate) ? Math.max(0, inst.takerFeeRate) : 0,
-      slippageBps: shadowSlippageBps(inst.assetClass as AssetClass, this.opts.slippageBps),
+      // 手数料は taker 率 + 約定ごとの固定手数料の率換算 (Jupiter のネットワーク手数料。src/core/fees.ts)
+      takerFeeRate: finite(inst.takerFeeRate) ? costFeeRate(inst) : 0,
+      slippageBps: shadowSlippageBps(inst.assetClass as AssetClass, this.opts.slippageBps, inst.costModel),
       risk,
       mfeR: 0,
       maeR: 0,

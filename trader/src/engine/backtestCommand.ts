@@ -85,8 +85,8 @@ export async function fetchCandlesPaged(
   return out;
 }
 
-/** 足の取得元。ccxt は o.feed (CcxtFeed) から履歴を取る */
-export type BacktestSource = "synthetic" | "ccxt";
+/** 足の取得元。ccxt は o.feed (CcxtFeed)、jupiter は o.feed (GeckoHistoryFeed: GeckoTerminal のプールの OHLCV) から履歴を取る */
+export type BacktestSource = "synthetic" | "ccxt" | "jupiter";
 
 export interface BacktestData {
   base: Timeframe;

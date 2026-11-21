@@ -8,8 +8,9 @@
  * - instrument.allowShort (取引所の仕様) は書き換えない。再現する銘柄には simulatedShort: true を別に付ける。
  * - 実効の空売り可否は必ず canShort(inst, mode) で判定する。simulatedShort が効くのは mode === "paper" のときだけ
  *   (live・バックテスト・mode 不明では allowShort だけで判定する。live の経路は従来と同じ)。
- * - 対象は allowShort=false の暗号資産 (assetClass "crypto") だけ。ミーム (meme) と DEX の銘柄は、流動性が薄く
- *   実際には借りられない (貸株・信用の対象にならない) ため再現しない。
+ * - 対象は allowShort=false の暗号資産 (assetClass "crypto") だけ。ミーム (meme) と DEX の銘柄 (Jupiter の venue "jupiter"、
+ *   古い "dex:*") は、流動性が薄く実際には借りられない (貸株・信用の対象にならない) ため再現しない。
+ *   Jupiter はスワップだけ (現物) なので SOL・JUP (crypto) でも空売りしない。
  */
 import type { Instrument, TradingMode } from "./types";
 
@@ -20,12 +21,20 @@ export const MAX_SHORT_BORROW_RATE_DAILY = 0.01;
 
 type ShortInfo = Pick<Instrument, "allowShort" | "assetClass" | "venue"> & { simulatedShort?: boolean };
 
-/** paper で空売りを再現してよい銘柄か (allowShort=false の暗号資産。meme と DEX は対象外) */
+/** DEX の取引先 (空売りを再現しない)。Jupiter と、廃止した dex:* の古い銘柄 */
+const NO_SHORT_VENUES = ["jupiter"] as const;
+
+/** paper で空売りを再現してよい銘柄か (allowShort=false の暗号資産。meme と DEX (jupiter・dex:*) は対象外) */
 export function simulatedShortEligible(inst: ShortInfo): boolean {
   if (inst.allowShort) return false;
   if (inst.assetClass !== "crypto") return false;
   // WATCHLIST で dex のペアを crypto と指定しても、DEX の銘柄は借りられないので再現しない
-  if (typeof inst.venue === "string" && inst.venue.toLowerCase().startsWith("dex")) return false;
+  if (typeof inst.venue === "string") {
+    const v = inst.venue.toLowerCase();
+    if (v.startsWith("dex")) return false;
+    // Jupiter (Solana の DEX アグリゲーター) は現物のスワップだけ。SOL・JUP (crypto) でも空売りは再現しない
+    if ((NO_SHORT_VENUES as readonly string[]).includes(v.split(":")[0])) return false;
+  }
   return true;
 }
 
