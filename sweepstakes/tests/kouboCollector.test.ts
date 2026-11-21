@@ -15,6 +15,7 @@ import {
   KouboCollector,
   parseKouboDetail,
   parseKouboList,
+  parseListDeadline,
   resolveStreamedSegments,
   toCampaignInput,
 } from "../src/collectors/koubo.js";
@@ -23,10 +24,17 @@ import { collectFromSources, enter, listCampaigns, type SweepContext } from "../
 import { makeTestContext } from "./helpers/context.js";
 
 const FIX = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "koubo");
-const LIST_HTML = readFileSync(join(FIX, "list.html"), "utf8");
+const LIST_HTML = readFileSync(join(FIX, "present_all.html"), "utf8");
 const DETAIL_HTML = readFileSync(join(FIX, "detail_402340.html"), "utf8");
 const BASE = "https://koubo.jp";
-const LIST_URL = (p: number) => `${BASE}/contest/list?c=13&p=${p}`;
+const ALL_URL = `${BASE}/category/present/all`;
+const FOOD_URL = `${BASE}/category/present/food`;
+const PET_URL = `${BASE}/category/present/pet`;
+// サブカテゴリページ (food) の代わり: カード 1 件は all と重複、1 件は新規
+const FOOD_HTML = `<main>
+<a href="/contest/402340"><div><div><div><span>クイズ</span><span>食品</span><span>11/30 締切</span></div><div><div><h4> KURU KURAお散歩クイズ</h4></div></div></div></div></a>
+<a href="/contest/400001"><div><div><div><span>食品</span><span>12/9 締切</span></div><div><div><h4>合成テスト用 食品プレゼント</h4></div></div></div><div></div><div><div></div><div>合成テスト賞品</div></div></div></a>
+</main>`;
 const ALLOW_ALL = "User-agent: *\nAllow: /\n";
 // 実際の koubo.jp/robots.txt の構造 (Cloudflare 管理部分の後に別の User-Agent: * グループがある) を簡略化したもの
 const KOUBO_LIKE_ROBOTS = `User-agent: *
@@ -44,8 +52,11 @@ Sitemap: https://koubo.jp/sitemap/index.xml
 `;
 
 /** 詳細フィクスチャ (402340) を書き換えて別パターンを作る */
-function detailVariant(opts: { method?: string; removeWebTag?: boolean; noOrganizerSite?: boolean; deadline?: string; extraTerms?: string } = {}): string {
+function detailVariant(
+  opts: { method?: string; removeWebTag?: boolean; noOrganizerSite?: boolean; organizerUrl?: string; deadline?: string; extraTerms?: string } = {},
+): string {
   let h = DETAIL_HTML;
+  if (opts.organizerUrl) h = h.replace(/<a\b([^>]*)href="https:\/\/kurukura\.jp\/campaign\/#goog_rewarded"([^>]*)><span/g, `<a$1href="${opts.organizerUrl}"$2><span`);
   if (opts.method) h = h.replace(">主催者サイトの応募フォーム</dd>", `>${opts.method}</dd>`);
   if (opts.removeWebTag) h = h.replace(">WEB応募可</a>", ">プレゼント</a>");
   if (opts.noOrganizerSite) h = h.replace(/<a\b[^>]*><span[^>]*>主催者サイト<\/span><\/a>/g, "");
@@ -77,36 +88,56 @@ function mockSite(routes: Record<string, string | number>): MockSite {
 function defaultRoutes(): Record<string, string | number> {
   return {
     [`${BASE}/robots.txt`]: ALLOW_ALL,
-    [LIST_URL(0)]: LIST_HTML,
-    [LIST_URL(1)]: "<html><body><main><ul></ul></main></body></html>",
+    [ALL_URL]: LIST_HTML,
+    [FOOD_URL]: FOOD_HTML,
+    // PET_URL は 404 (その一覧だけ飛ばす)
     [`${BASE}/contest/402340`]: DETAIL_HTML,
-    [`${BASE}/contest/402766`]: detailVariant({ method: "X(旧Twitter)で公式アカウントをフォローし、対象投稿をリポスト", deadline: "2027年1月31日（日）" }),
+    [`${BASE}/contest/402766`]: detailVariant({
+      method: "X(旧Twitter)で公式アカウントをフォローし、対象投稿をリポスト",
+      organizerUrl: "https://x.com/example/status/1",
+      deadline: "2027年1月31日（日）",
+    }),
     [`${BASE}/contest/402997`]: detailVariant({ deadline: "2026年11月23日（月）" }),
+    [`${BASE}/contest/395119`]: detailVariant({ deadline: "2026年11月22日（日）" }),
     [`${BASE}/contest/409206`]: detailVariant({ method: "官製はがきに必要事項を記入して郵送", removeWebTag: true, deadline: "2026年11月25日（水）" }),
+    [`${BASE}/contest/397323`]: detailVariant({ noOrganizerSite: true, deadline: "2027年1月12日（火）" }),
+    [`${BASE}/contest/400001`]: detailVariant({ organizerUrl: "https://example.com/food-campaign", deadline: "2026年12月9日（水）" }),
   };
 }
 
-// 2026-11-24 時点: 402997 (11/23 締切) は締切切れ
+// 2026-11-24 時点: 402997 (11/23 締切)・395119 (11/22 締切) は締切切れ
 const NOW = new Date("2026-11-24T10:00:00+09:00");
+const LIST_PATHS = ["/category/present/all", "/category/present/food", "/category/present/pet"];
 
-describe("parseKouboList", () => {
-  it("一覧から id・タイトル・タグ・締切・応募方法を読み取る", () => {
-    const items = parseKouboList(LIST_HTML);
-    expect(items.map((i) => i.id)).toEqual(["402766", "402997", "402340", "409206"]);
+describe("parseKouboList (カテゴリページ)", () => {
+  it("カードから id・タイトル・タグ・締切・応募方法・賞品を読み取り、同じ id は統合する", () => {
+    const items = parseKouboList(LIST_HTML, { now: NOW });
+    // /contest/list?c=13 (もっと見る) や /article/ へのリンクは含まない
+    expect(items.map((i) => i.id)).toEqual(["402766", "402997", "395119", "402340", "409206", "397323"]);
     const quiz = items.find((i) => i.id === "402340")!;
-    expect(quiz).toMatchObject({
+    expect(quiz).toEqual({
+      id: "402340",
       detailUrl: "https://koubo.jp/contest/402340",
       title: "KURU KURAお散歩クイズ",
       tags: ["クイズ", "食品"],
       keywords: ["WEB応募可"],
       deadline: "2026-11-30",
-      // ストリーミングで後から差し込まれる賞品名も取れる
       prize: "アンド ザ フリット「MINI 12-PACK GIFT BOX」",
     });
-    expect(items[0]).toMatchObject({ title: "「フジッコ大感謝祭」Xフォロー＆リポストキャンペーン", tags: ["豪華賞品"], deadline: "2027-01-31", keywords: [] });
-    expect(items[1]!.tags).toEqual(["食品", "旅行券・チケット・招待券", "その他(懸賞)"]);
-    // &#x27; などのエンティティを復号
-    expect(items[3]!.title).toBe("AGE20'S「11月プレゼントキャンペーン」");
+    // 1 枠目 (賞品なし) と 2 枠目 (賞品あり) を統合
+    expect(items[0]).toMatchObject({ title: "「フジッコ大感謝祭」Xフォロー＆リポストキャンペーン", tags: ["豪華賞品"], deadline: "2027-01-31", keywords: [], prize: "周年記念純金カード" });
+    expect(items[2]).toMatchObject({ tags: ["金券・Amazonギフトカード・図書カード"], deadline: "2026-11-22", prize: "えらべるPay 1万円分" });
+    // &#x27; などのエンティティを復号。投稿日 (2026/11/19) は賞品にしない
+    expect(items[4]).toMatchObject({ title: "AGE20'S「11月プレゼントキャンペーン」", prize: "No.1美容液ファンデUVリップセット（豪華3点セット）" });
+    expect(items[5]!.deadline).toBe("2027-01-12");
+  });
+
+  it("年のない締切は now の年 (180 日以上前なら翌年) とみなす", () => {
+    expect(parseListDeadline("11/30 締切", NOW)).toBe("2026-11-30");
+    expect(parseListDeadline("11/22 締切", NOW)).toBe("2026-11-22");
+    expect(parseListDeadline("1/15 締切", NOW)).toBe("2027-01-15");
+    expect(parseListDeadline("2027/1/31 締切", NOW)).toBe("2027-01-31");
+    expect(parseListDeadline("2026/11/19", NOW)).toBeNull();
   });
 
   it("ストリーミング差し込みを解決する", () => {
@@ -130,6 +161,7 @@ describe("parseKouboDetail", () => {
       keywords: ["WEB応募可"],
     });
     expect(d.content).toContain("【賞品について】");
+    expect(d.summary).toContain("クイズに答えてプレゼントをゲットしよう");
     expect(d.fields.map((f) => f.label)).toEqual(expect.arrayContaining(["作品規定", "応募時の会員登録", "結果発表"]));
   });
 
@@ -158,7 +190,7 @@ describe("decideKouboKind", () => {
 });
 
 describe("toCampaignInput", () => {
-  const item = parseKouboList(LIST_HTML).find((i) => i.id === "402340")!;
+  const item = parseKouboList(LIST_HTML, { now: NOW }).find((i) => i.id === "402340")!;
 
   it("主催者サイトを url に、掲載ページを sourceUrl に保存。タグ・募集内容も保持", () => {
     const c = toCampaignInput(item, parseKouboDetail(DETAIL_HTML))!;
@@ -186,7 +218,7 @@ describe("toCampaignInput", () => {
 
   it("はがき・郵送のみは収集しない", () => {
     // 一覧側にも「WEB応募可」が付いていない項目 (409206) で確認する
-    const noWeb = parseKouboList(LIST_HTML).find((i) => i.id === "409206")!;
+    const noWeb = parseKouboList(LIST_HTML, { now: NOW }).find((i) => i.id === "409206")!;
     expect(noWeb.keywords).toEqual([]);
     expect(toCampaignInput(noWeb, parseKouboDetail(detailVariant({ method: "官製はがきで応募", removeWebTag: true })))).toBeNull();
   });
@@ -241,33 +273,45 @@ describe("PoliteFetcher", () => {
 });
 
 describe("KouboCollector", () => {
-  const instant = { sleep: async () => undefined, random: () => 0, now: () => NOW };
+  const instant = { sleep: async () => undefined, random: () => 0, now: () => NOW, listPaths: LIST_PATHS };
 
-  it("一覧 → 詳細を取得して変換。締切切れは詳細を取らずに除外、はがきのみは除外", async () => {
+  it("既定の一覧は /category/present/all → 各サブカテゴリ (クエリ付き URL は使わない)", () => {
+    const urls = new KouboCollector().listUrls();
+    expect(urls[0]).toBe(ALL_URL);
+    expect(urls).toHaveLength(10);
+    expect(urls.every((u) => u.startsWith(`${BASE}/category/present/`) && !u.includes("?"))).toBe(true);
+  });
+
+  it("all → サブカテゴリの順に一覧を取得し、id で重複排除して詳細を取得・変換する", async () => {
     const site = mockSite(defaultRoutes());
     const waits: number[] = [];
-    const col = new KouboCollector({ ...instant, sleep: async (ms) => void waits.push(ms), fetch: site.fetch, maxPages: 3 });
+    const col = new KouboCollector({ ...instant, sleep: async (ms) => void waits.push(ms), fetch: site.fetch });
     const items = await col.fetch();
-    // 402766 は 402340 のフィクスチャを書き換えて流用しているのでタイトルは同じ
-    expect(items.map((i) => [i.conditions.sourceUrl, i.kind, i.deadline])).toEqual([
-      ["https://koubo.jp/contest/402766", "x", "2027-01-31"],
-      ["https://koubo.jp/contest/402340", "web_form", "2026-11-30"],
+    expect(items.map((i) => [i.conditions.sourceUrl, i.kind, i.deadline, i.url, i.riskFlags ?? []])).toEqual([
+      ["https://koubo.jp/contest/402766", "x", "2027-01-31", "https://x.com/example/status/1", []],
+      ["https://koubo.jp/contest/402340", "web_form", "2026-11-30", "https://kurukura.jp/campaign/#goog_rewarded", []],
+      ["https://koubo.jp/contest/397323", "web_form", "2027-01-12", "https://koubo.jp/contest/397323", ["entry_url_unverified"]],
+      ["https://koubo.jp/contest/400001", "web_form", "2026-12-09", "https://example.com/food-campaign", []],
     ]);
-    // 402997 は締切切れなので詳細を取りに行かない。空ページで一覧の巡回を止める
+    // 一覧は all → food → pet (404 は飛ばす)。締切切れ (402997, 395119) は詳細を取りに行かない。402340 の詳細は 1 回だけ
+    expect(site.requested.filter((u) => u.includes("/category/"))).toEqual([ALL_URL, FOOD_URL, PET_URL]);
     expect(site.requested).not.toContain(`${BASE}/contest/402997`);
-    expect(site.requested).not.toContain(LIST_URL(2));
-    expect(col.lastStats).toMatchObject({ listPages: 2, listed: 4, expired: 1, postalOnly: 1, detailFetched: 3, returned: 2 });
-    // 最初の robots.txt 以外は毎回 3 秒以上 (random=0 → 3000ms) 待つ
+    expect(site.requested).not.toContain(`${BASE}/contest/395119`);
+    expect(site.requested.filter((u) => u === `${BASE}/contest/402340`)).toHaveLength(1);
+    expect(site.requested.some((u) => u.includes("/contest/list"))).toBe(false);
+    expect(col.lastStats).toMatchObject({ listPages: 2, listFailed: 1, listed: 7, expired: 2, postalOnly: 1, detailFetched: 5, returned: 4 });
+    // 最初の robots.txt 以外は毎回 3 秒 (random=0 → 下限) 待つ
     expect(waits).toHaveLength(site.requested.length - 1);
     expect(waits.every((w) => w === 3000)).toBe(true);
   });
 
-  it("詳細取得は maxDetails 件まで", async () => {
+  it("詳細取得は maxDetails 件まで。上限に達したら残りのサブカテゴリも取りに行かない", async () => {
     const site = mockSite(defaultRoutes());
     const col = new KouboCollector({ ...instant, fetch: site.fetch, maxDetails: 1 });
     const items = await col.fetch();
     expect(items).toHaveLength(1);
     expect(site.requested.filter((u) => /\/contest\/\d+$/.test(u))).toEqual([`${BASE}/contest/402766`]);
+    expect(site.requested).not.toContain(FOOD_URL);
   });
 
   it("403 を受けたらその回の収集を中止してエラー", async () => {
@@ -281,9 +325,24 @@ describe("KouboCollector", () => {
     expect(site.requested).not.toContain(`${BASE}/contest/409206`);
   });
 
-  it("robots.txt で一覧が Disallow なら一覧も取得せずに中止", async () => {
+  it("一覧で 429 を受けても中止", async () => {
+    const routes = defaultRoutes();
+    routes[FOOD_URL] = 429;
+    const site = mockSite(routes);
+    await expect(new KouboCollector({ ...instant, fetch: site.fetch }).fetch()).rejects.toBeInstanceOf(FetchBlockedError);
+    expect(site.requested.at(-1)).toBe(FOOD_URL);
+  });
+
+  it("実際の koubo.jp と同じ robots.txt ではカテゴリページ・詳細ページは許可される", async () => {
     const routes = defaultRoutes();
     routes[`${BASE}/robots.txt`] = KOUBO_LIKE_ROBOTS;
+    const items = await new KouboCollector({ ...instant, fetch: mockSite(routes).fetch }).fetch();
+    expect(items).toHaveLength(4);
+  });
+
+  it("robots.txt で一覧が Disallow なら一覧も取得せずに中止", async () => {
+    const routes = defaultRoutes();
+    routes[`${BASE}/robots.txt`] = "User-agent: *\nDisallow: /category/\n";
     const site = mockSite(routes);
     const col = new KouboCollector({ ...instant, fetch: site.fetch });
     await expect(col.fetch()).rejects.toBeInstanceOf(RobotsDisallowedError);
@@ -297,25 +356,22 @@ describe("collectFromSources (service)", () => {
 
   it("収集して保存。要確認は enter で自動応募しない。再収集は URL で重複排除", async () => {
     const routes = defaultRoutes();
-    routes[`${BASE}/contest/402766`] = detailVariant({ noOrganizerSite: true, deadline: "2027年1月31日（日）" });
-    const site = mockSite(routes);
     ctx = makeTestContext({}, { now: () => NOW });
-    const s = await collectFromSources(ctx, ["koubo"], { fetch: site.fetch });
-    expect(s).toMatchObject({ total: 2, added: 2, errors: [] });
-    const all = listCampaigns(ctx);
-    const review = all.find((c) => c.url === "https://koubo.jp/contest/402766")!;
+    const s = await collectFromSources(ctx, ["koubo"], { fetch: mockSite(routes).fetch, listPaths: LIST_PATHS });
+    expect(s).toMatchObject({ total: 4, added: 4, errors: [] });
+    const review = listCampaigns(ctx).find((c) => c.url === "https://koubo.jp/contest/397323")!;
     expect(review.riskFlags).toEqual(["entry_url_unverified"]);
-    expect(review.conditions.sourceUrl).toBe("https://koubo.jp/contest/402766");
+    expect(review.conditions.sourceUrl).toBe("https://koubo.jp/contest/397323");
     const r = await enter(ctx, review.id, { submit: true });
     expect(r).toMatchObject({ status: "skipped", recorded: false });
 
-    const s2 = await collectFromSources(ctx, ["koubo"], { fetch: mockSite(routes).fetch });
-    expect(s2).toMatchObject({ added: 0, updated: 2 });
+    const s2 = await collectFromSources(ctx, ["koubo"], { fetch: mockSite(routes).fetch, listPaths: LIST_PATHS });
+    expect(s2).toMatchObject({ added: 0, updated: 4 });
   });
 
   it("403 は errors に入る", async () => {
     const routes = defaultRoutes();
-    routes[LIST_URL(0)] = 403;
+    routes[ALL_URL] = 403;
     ctx = makeTestContext({}, { now: () => NOW });
     const s = await collectFromSources(ctx, ["koubo"], { fetch: mockSite(routes).fetch });
     expect(s.total).toBe(0);

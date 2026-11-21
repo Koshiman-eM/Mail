@@ -86,8 +86,8 @@ export const COLLECTOR_SOURCES = ["koubo"] as const;
 export type CollectorSource = (typeof COLLECTOR_SOURCES)[number];
 
 export interface SourceCollectorOptions {
-  /** 一覧の最大ページ数 */
-  pages?: number;
+  /** 一覧の取得元パス (koubo: 既定は /category/present/all → 各サブカテゴリ) */
+  listPaths?: string[];
   /** 詳細ページ取得の上限 */
   maxDetails?: number;
   /** テスト用に fetch を差し替える */
@@ -99,7 +99,7 @@ export function createSourceCollector(ctx: SweepContext, source: string, opts: S
   switch (source) {
     case "koubo":
       return new KouboCollector({
-        maxPages: opts.pages,
+        listPaths: opts.listPaths,
         maxDetails: opts.maxDetails,
         fetch: opts.fetch,
         sleep: ctx.sleep,

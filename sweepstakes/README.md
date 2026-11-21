@@ -59,7 +59,7 @@ npm run sweep -- <コマンド>      # または ./bin/sweep.mjs <コマンド>
 
 | コマンド | 説明 |
 | --- | --- |
-| `collect --source koubo [--pages n] [--max-details n]` | 実在サイト (公募ガイド) から収集し、詐欺チェック・採点して保存 (URL で重複排除) |
+| `collect --source koubo [--categories all,food,...] [--max-details n]` | 実在サイト (公募ガイド) から収集し、詐欺チェック・採点して保存 (URL で重複排除) |
 | `collect --html <file> [--html <file>...]` | ローカル HTML (例示用フォーマット) から収集 |
 | `list [--kind web_form\|x\|instagram\|crypto_quest]` | 一覧 (スコア順) |
 | `enter <id>` | Webフォームに入力し、**送信直前で停止**してスクリーンショットを保存 (dry-run) |
@@ -85,11 +85,15 @@ npm run sweep -- todo           # SNS / クエストは手で実施して mark
 
 #### 収集元: 公募ガイド (`--source koubo`, `src/collectors/koubo.ts`)
 
-- 一覧 `https://koubo.jp/contest/list?c=13&p=0..` (c=13 は懸賞カテゴリ。`--pages` で最大ページ数、既定 3) → 各項目の詳細 `https://koubo.jp/contest/{id}` を取得します (`--max-details` で上限、既定 60)
+- 一覧は robots.txt で許可されているカテゴリページ `https://koubo.jp/category/present/all` → 各サブカテゴリ (`baby` `entertainment` `fashion` `food` `gift-certificate` `life` `luxury` `pet` `prize`) の順に取得し、各項目の詳細 `https://koubo.jp/contest/{id}` を取得します
+  - `--categories all,food` のように絞れます (既定は all と全サブカテゴリ)。カテゴリページにはページ送りがないので各 1 ページです
+  - 詳細は id で重複排除し、`--max-details` 件 (既定 60) まで。上限に達したら残りのカテゴリページも取得しません
+  - robots.txt で Disallow されているクエリ付き一覧 (`/contest/list?...`) は使いません
+  - 一覧の締切は「11/30 締切」のように年がないため、現在の年 (180 日以上前になる場合は翌年) とみなします。正確な締切は詳細ページの値を使います
 - 詳細ページから 締切・主催者・賞・応募資格・主催者サイト URL・募集内容 を読み、次のように変換します
   - `url` は主催者サイト (応募先)。取れなかった場合は掲載ページを `url` にし、リスクフラグ `entry_url_unverified` (要確認) を付けます。このフラグがあるものは `enter` / `run` で自動応募しません
   - 掲載ページの URL は `conditions.sourceUrl`、タグ (「クイズ」「食品」「WEB応募可」など) は `conditions.tags`、募集内容など詳細の全項目は `conditions.terms` (規約の自動応募禁止ガードの対象) に入ります
-  - 種別: 応募先が x.com / instagram.com、または応募方法に X / Instagram と明記 → `x` / `instagram`。Web フォーム・「WEB応募可」→ `web_form`。はがき・郵送・レシートのみ → 収集しません。判定不能は `web_form` (送信前ガードに任せます。クイズ型は不明な必須欄で `needs_manual` になる想定)
+  - 種別: 一覧に応募方法 (「WEB応募可」) が出ていない項目が多いため、主に詳細ページの「応募方法/応募先」で判定します。応募先が x.com / instagram.com、または応募方法に X / Instagram と明記 → `x` / `instagram`。Web フォーム・「WEB応募可」→ `web_form`。はがき・郵送・レシートのみ → 収集しません。判定不能は `web_form` (送信前ガードに任せます。クイズ型は不明な必須欄で `needs_manual` になる想定)
   - 締切切れは詳細を取得せずに除外します
 - Next.js のストリーミング SSR で後から差し込まれる部分 (`<template id="P:x">` ← `<div hidden id="S:x">`) は解決してからパースします
 
@@ -102,7 +106,7 @@ npm run sweep -- todo           # SNS / クエストは手で実施して mark
 - 1 回の収集で取得する詳細ページは最大 60 件 (`--max-details`)
 - テストは fetch を差し替えたモックとフィクスチャ (`tests/fixtures/koubo/`、実ページから構造確認用に抜粋) を使い、実サイトにはアクセスしません
 
-**注意 (2026-11 時点)**: koubo.jp の robots.txt は `User-Agent: *` に対して `Disallow: /contest/list?*` を指定しているため、既定の一覧 URL は robots チェックで拒否され、収集は一覧を取得せずに中止します (詳細ページ `/contest/{id}` は許可)。robots.txt で許可された別の一覧 (例: `/category/present/all`) を使う場合は `KouboCollector` の `listUrl` オプションで差し替えられますが、構造が同じかは未確認です。
+**注意**: koubo.jp の robots.txt は `User-Agent: *` に対して `Disallow: /contest/list?*` を指定しています (ファイル後半の 2 つ目の `User-Agent: *` グループ)。そのため一覧にはカテゴリページを使います。カテゴリページの構造が変わったらパーサー (`parseKouboList`) とフィクスチャ (`tests/fixtures/koubo/present_all.html`) を更新してください。
 
 ## 送信前ガード (`src/core/guards.ts`)
 

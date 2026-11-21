@@ -10,6 +10,7 @@ import {
   enter,
   FixtureHtmlCollector,
   FLAG_LABELS,
+  KOUBO_PRESENT_SUBCATEGORIES,
   history,
   kindLabel,
   listCampaigns,
@@ -25,8 +26,10 @@ const USAGE = `懸賞自動応募ツール
 
 使い方: sweep <コマンド> [オプション]
 
-  collect --source <収集元> [--pages <n>] [--max-details <n>]
+  collect --source <収集元> [--categories <a,b,...>] [--max-details <n>]
                        実在サイトから収集して採点・保存 (収集元: ${COLLECTOR_SOURCES.join(" | ")})
+                       koubo の --categories: all と ${KOUBO_PRESENT_SUBCATEGORIES.join(",")}
+                       (既定: all → 全サブカテゴリ)
                        robots.txt を確認し、3〜6 秒間隔で取得。403/429 を受けたら中止
   collect --html <file> [--html <file> ...]
                        ローカルの HTML (例示用フォーマット) から収集
@@ -91,7 +94,7 @@ async function main(argv: string[]): Promise<number> {
       kind: { type: "string" },
       html: { type: "string", multiple: true },
       source: { type: "string", multiple: true },
-      pages: { type: "string" },
+      categories: { type: "string" },
       "max-details": { type: "string" },
       note: { type: "string" },
       limit: { type: "string" },
@@ -104,7 +107,7 @@ async function main(argv: string[]): Promise<number> {
         const files = values.html ?? [];
         const sources = values.source ?? [];
         if (!files.length && !sources.length) {
-          console.log("収集元が指定されていません。例: sweep collect --source koubo --pages 1");
+          console.log("収集元が指定されていません。例: sweep collect --source koubo --categories all");
           console.log("                                 sweep collect --html tests/fixtures/campaign_list.html");
           return 1;
         }
@@ -114,10 +117,16 @@ async function main(argv: string[]): Promise<number> {
           if (!Number.isInteger(n) || n < 0) throw new Error(`${name} は 0 以上の整数で指定してください`);
           return n;
         };
-        const pages = optInt(values.pages, "--pages");
+        let listPaths: string[] | undefined;
+        if (values.categories !== undefined) {
+          const cats = values.categories.split(",").map((c) => c.trim()).filter(Boolean);
+          const bad = cats.filter((c) => c !== "all" && !KOUBO_PRESENT_SUBCATEGORIES.includes(c));
+          if (!cats.length || bad.length) throw new Error(`--categories は all, ${KOUBO_PRESENT_SUBCATEGORIES.join(", ")} から指定してください`);
+          listPaths = cats.map((c) => `/category/present/${c}`);
+        }
         const maxDetails = optInt(values["max-details"], "--max-details");
         const collectors: Collector[] = [
-          ...sources.map((src) => createSourceCollector(ctx, src, { pages, maxDetails })),
+          ...sources.map((src) => createSourceCollector(ctx, src, { listPaths, maxDetails })),
           ...files.map((f) => new FixtureHtmlCollector(f, `html:${f}`)),
         ];
         const s = await collect(ctx, collectors);

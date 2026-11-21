@@ -1,6 +1,8 @@
 // 公募ガイド (https://koubo.jp) の懸賞カテゴリを収集する Collector
 //
-// 一覧 (/contest/list?c=13&p=N) → 各項目の詳細 (/contest/{id}) を取得し、CampaignInput に変換する。
+// 一覧 (/category/present/all → 各サブカテゴリ) → 各項目の詳細 (/contest/{id}) を取得し、CampaignInput に変換する。
+// robots.txt で Disallow されている /contest/list?* (クエリ付き一覧) は使わない。
+// カテゴリページにはページ送りがないため、各カテゴリページは 1 ページだけ取得する。
 // 取得は PoliteFetcher 経由 (正直な User-Agent / robots.txt 確認 / 3〜6 秒間隔 / 403・429 で中止)。
 // Next.js のストリーミング SSR で後から差し込まれる部分 (<template id="P:x"> ← <div hidden id="S:x">) は
 // 差し込み後の DOM に解決してからパースする。
@@ -10,8 +12,20 @@ import type { CampaignInput, CampaignKind } from "../core/types.js";
 import { FetchBlockedError, HttpError, PoliteFetcher, RobotsDisallowedError, type PoliteFetcherOptions } from "./http.js";
 
 export const KOUBO_BASE_URL = "https://koubo.jp";
-/** 懸賞系カテゴリ */
-export const KOUBO_PRESENT_CATEGORY = 13;
+/** 一覧の取得元 (この順で取得)。いずれも robots.txt で許可されているクエリなしのパス */
+export const KOUBO_PRESENT_ALL = "/category/present/all";
+export const KOUBO_PRESENT_SUBCATEGORIES: readonly string[] = [
+  "baby",
+  "entertainment",
+  "fashion",
+  "food",
+  "gift-certificate",
+  "life",
+  "luxury",
+  "pet",
+  "prize",
+];
+export const KOUBO_DEFAULT_LIST_PATHS: readonly string[] = [KOUBO_PRESENT_ALL, ...KOUBO_PRESENT_SUBCATEGORIES.map((c) => `/category/present/${c}`)];
 
 // ---------------------------------------------------------------------------
 // 共通
@@ -51,16 +65,31 @@ export interface KouboListItem {
   id: string;
   detailUrl: string;
   title: string;
-  summary: string;
   /** カテゴリ等のタグ (例: 「クイズ」「食品」) */
   tags: string[];
-  /** 応募方法などのキーワードタグ (例: 「WEB応募可」) */
+  /** 応募方法などのキーワード (例: 「WEB応募可」)。一覧に出ていないことも多い */
   keywords: string[];
   deadline: string | null;
   prize: string;
 }
 
-/** キーワードタグ (/contest/list?q=... へのリンク) を取り出す */
+/**
+ * 一覧の締切表記 (「11/30 締切」「2027/1/31 締切」) → "YYYY-MM-DD"。
+ * 年がない場合は now の年とし、それが 180 日以上前なら翌年とみなす。
+ */
+export function parseListDeadline(text: string, now: Date): string | null {
+  const full = text.match(/(\d{4})\/(\d{1,2})\/(\d{1,2})\s*締切/);
+  if (full) return `${full[1]}-${full[2]!.padStart(2, "0")}-${full[3]!.padStart(2, "0")}`;
+  const md = text.match(/(?<![\d/])(\d{1,2})\/(\d{1,2})\s*締切/);
+  if (!md) return parseJpDate(text);
+  const m = Number(md[1]);
+  const d = Number(md[2]);
+  let y = now.getFullYear();
+  if (new Date(y, m - 1, d, 23, 59, 59).getTime() < now.getTime() - 180 * 86_400_000) y++;
+  return `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+}
+
+/** キーワードタグ (/contest/list?q=... へのリンク) を取り出す (詳細ページ用) */
 function keywordLinks(html: string): string[] {
   const out: string[] = [];
   for (const m of html.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi)) {
@@ -72,49 +101,59 @@ function keywordLinks(html: string): string[] {
   return out;
 }
 
-export function parseKouboList(html: string, baseUrl: string = KOUBO_BASE_URL): KouboListItem[] {
+function uniq(xs: string[]): string[] {
+  return [...new Set(xs.filter(Boolean))];
+}
+
+/**
+ * カテゴリページ (/category/present/...) の一覧をパースする。
+ * 各項目は <a href="/contest/{id}"> のカードで、中に タグ (span) ・「M/D 締切」(span) ・タイトル (h4)・
+ * 応募方法 (ul > li, 例「WEB応募可」)・賞品 (h4 より後ろの div) がある。同じ項目が複数の枠に出るので id で統合する。
+ */
+export function parseKouboList(html: string, opts: { baseUrl?: string; now?: Date } = {}): KouboListItem[] {
+  const baseUrl = opts.baseUrl ?? KOUBO_BASE_URL;
+  const now = opts.now ?? new Date();
   const doc = resolveStreamedSegments(html);
-  const out: KouboListItem[] = [];
-  for (const m of doc.matchAll(/<article\b[^>]*>([\s\S]*?)<\/article>/gi)) {
-    const body = m[1]!;
-    const link = body.match(/<a\b[^>]*href="\/contest\/(\d+)"[^>]*>([\s\S]*?)<\/a>/i);
-    if (!link) continue;
-    const id = link[1]!;
-    const title = text(link[2]!.match(/<h3\b[^>]*>([\s\S]*?)<\/h3>/i)?.[1]);
+  const byId = new Map<string, KouboListItem>();
+  for (const m of doc.matchAll(/<a\b[^>]*href="(?:https?:\/\/koubo\.jp)?\/contest\/(\d+)\/?"[^>]*>([\s\S]*?)<\/a>/gi)) {
+    const id = m[1]!;
+    const card = m[2]!;
+    const title = text(card.match(/<h[2-4]\b[^>]*>([\s\S]*?)<\/h[2-4]>/i)?.[1]);
     if (!title) continue;
-    const summary = text(link[2]!.match(/<p\b[^>]*>([\s\S]*?)<\/p>/i)?.[1]);
 
-    // 先頭 section の最初の div にタグ (span) が並ぶ
     const tags: string[] = [];
-    const tagBox = body.match(/^\s*<section\b[^>]*>\s*<div\b[^>]*>([\s\S]*?)<\/div>/i);
-    if (tagBox) {
-      for (const s of tagBox[1]!.matchAll(/<span\b[^>]*>([\s\S]*?)<\/span>/gi)) {
-        const t = text(s[1]);
-        if (t && !/^\d+$/.test(t)) tags.push(t);
-      }
-    }
-
     let deadline: string | null = null;
-    let prize = "";
-    for (const dd of body.matchAll(/<dd\b[^>]*>([\s\S]*?)<\/dd>/gi)) {
-      const t = text(dd[1]);
-      if (!t) continue;
-      if (!deadline && /締切/.test(t) && parseJpDate(t)) deadline = parseJpDate(t);
-      else if (!prize) prize = t;
+    for (const sp of card.matchAll(/<span\b[^>]*>([\s\S]*?)<\/span>/gi)) {
+      const t = text(sp[1]);
+      if (!t || t === "NEW" || /^\d+$/.test(t)) continue;
+      if (/締切/.test(t)) deadline ??= parseListDeadline(t, now);
+      else tags.push(t);
     }
+    const keywords = [...card.matchAll(/<li\b[^>]*>([\s\S]*?)<\/li>/gi)].map((x) => text(x[1]));
+    // 賞品: タイトルより後ろにある、子要素を持たない div のうち日付以外の最後のもの
+    const afterTitle = card.slice(card.search(/<\/h[2-4]>/i));
+    const leaves = [...afterTitle.matchAll(/<div\b[^>]*>([^<]+)<\/div>/gi)].map((x) => text(x[1])).filter((t) => t && !/^\d{4}\/\d{1,2}\/\d{1,2}$/.test(t));
+    const prize = leaves.at(-1) ?? "";
 
-    out.push({
+    const prev = byId.get(id);
+    if (prev) {
+      prev.tags = uniq([...prev.tags, ...tags]);
+      prev.keywords = uniq([...prev.keywords, ...keywords]);
+      prev.deadline ??= deadline;
+      prev.prize ||= prize;
+      continue;
+    }
+    byId.set(id, {
       id,
       detailUrl: new URL(`/contest/${id}`, baseUrl).toString(),
       title,
-      summary,
-      tags,
-      keywords: keywordLinks(body),
+      tags: uniq(tags),
+      keywords: uniq(keywords),
       deadline,
       prize,
     });
   }
-  return out;
+  return [...byId.values()];
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +170,8 @@ export interface KouboDetail {
   eligibility: string;
   /** 主催者サイト (応募先)。取れなければ null */
   organizerUrl: string | null;
+  /** 募集内容の前にある概要文 */
+  summary: string;
   /** 募集内容 */
   content: string;
   /** 応募方法/応募先 */
@@ -178,6 +219,7 @@ export function parseKouboDetail(html: string, baseUrl: string = KOUBO_BASE_URL)
     prizeDetail: last(/^賞$/),
     eligibility: first(/^応募資格$/),
     organizerUrl,
+    summary: text(main.match(/<section\b[^>]*>\s*<p\b[^>]*>([\s\S]*?)<\/p>\s*<dl\b/i)?.[1]),
     content: first(/^募集内容$/),
     applyMethod: first(/応募方法/),
     keywords: keywordLinks(main),
@@ -245,7 +287,7 @@ export function toCampaignInput(item: KouboListItem, detail: KouboDetail): Campa
   const winnersMatch = (detail.prizeDetail || detail.prize).match(/(\d[\d,]*)\s*(?:名|人|組)/);
   const winners = winnersMatch ? Number(winnersMatch[1]!.replace(/,/g, "")) : null;
 
-  const terms = [item.summary, ...detail.fields.map((f) => `${f.label}: ${f.value}`)].filter(Boolean).join("\n");
+  const terms = [detail.summary, ...detail.fields.map((f) => `${f.label}: ${f.value}`)].filter(Boolean).join("\n");
   const notes = [
     detail.organizer && `主催者: ${detail.organizer}`,
     detail.eligibility && `応募資格: ${detail.eligibility}`,
@@ -282,24 +324,27 @@ export function toCampaignInput(item: KouboListItem, detail: KouboDetail): Campa
 
 export interface KouboCollectorOptions extends PoliteFetcherOptions {
   baseUrl?: string;
-  category?: number;
-  /** 一覧の最大ページ数 (既定 3) */
-  maxPages?: number;
+  /** 一覧の取得元パス (既定: /category/present/all → 各サブカテゴリ)。robots.txt で許可されたパスのみ取得される */
+  listPaths?: readonly string[];
   /** 1 回の収集で取得する詳細ページの上限 (既定 60) */
   maxDetails?: number;
   now?: () => Date;
-  /** 一覧 URL の組み立て (既定: /contest/list?c={category}&p={page}) */
-  listUrl?: (page: number) => string;
 }
 
 export interface KouboStats {
   listPages: number;
+  listFailed: number;
   listed: number;
   expired: number;
   postalOnly: number;
   detailFetched: number;
   detailFailed: number;
   returned: number;
+}
+
+/** 403/429・robots 拒否・通信エラーはその回の収集を中止。HTTP エラー (404 など) はその URL だけ飛ばす */
+function isSkippable(e: unknown): e is HttpError {
+  return e instanceof HttpError && !(e instanceof FetchBlockedError) && !(e instanceof RobotsDisallowedError);
 }
 
 export class KouboCollector implements Collector {
@@ -312,29 +357,35 @@ export class KouboCollector implements Collector {
     this.opts = opts;
   }
 
-  listUrl(page: number): string {
-    if (this.opts.listUrl) return this.opts.listUrl(page);
+  listUrls(): string[] {
     const base = this.opts.baseUrl ?? KOUBO_BASE_URL;
-    return new URL(`/contest/list?c=${this.opts.category ?? KOUBO_PRESENT_CATEGORY}&p=${page}`, base).toString();
+    return (this.opts.listPaths ?? KOUBO_DEFAULT_LIST_PATHS).map((p) => new URL(p, base).toString());
   }
 
   async fetch(): Promise<CampaignInput[]> {
     const baseUrl = this.opts.baseUrl ?? KOUBO_BASE_URL;
-    const maxPages = Math.max(1, Math.floor(this.opts.maxPages ?? 3));
     const maxDetails = Math.max(0, Math.floor(this.opts.maxDetails ?? 60));
     const now = this.opts.now ?? (() => new Date());
     const log = this.opts.log ?? (() => undefined);
     const fetcher = new PoliteFetcher(this.opts);
-    const stats: KouboStats = { listPages: 0, listed: 0, expired: 0, postalOnly: 0, detailFetched: 0, detailFailed: 0, returned: 0 };
+    const stats: KouboStats = { listPages: 0, listFailed: 0, listed: 0, expired: 0, postalOnly: 0, detailFetched: 0, detailFailed: 0, returned: 0 };
     this.lastStats = stats;
 
     const seen = new Set<string>();
     const candidates: KouboListItem[] = [];
-    pages: for (let p = 0; p < maxPages; p++) {
-      const items = parseKouboList(await fetcher.get(this.listUrl(p)), baseUrl);
+    for (const url of this.listUrls()) {
+      if (candidates.length >= maxDetails) break;
+      let html: string;
+      try {
+        html = await fetcher.get(url);
+      } catch (e) {
+        if (!isSkippable(e)) throw e;
+        stats.listFailed++;
+        log(`一覧の取得に失敗したため飛ばします: ${e.message}`);
+        continue;
+      }
       stats.listPages++;
-      if (!items.length) break;
-      for (const it of items) {
+      for (const it of parseKouboList(html, { baseUrl, now: now() })) {
         if (seen.has(it.id)) continue;
         seen.add(it.id);
         stats.listed++;
@@ -342,8 +393,7 @@ export class KouboCollector implements Collector {
           stats.expired++;
           continue;
         }
-        if (candidates.length >= maxDetails) break pages;
-        candidates.push(it);
+        if (candidates.length < maxDetails) candidates.push(it);
       }
     }
 
@@ -353,8 +403,7 @@ export class KouboCollector implements Collector {
       try {
         html = await fetcher.get(it.detailUrl);
       } catch (e) {
-        // 403/429・robots 拒否はその回の収集を中止。それ以外 (404 など) はその項目だけ飛ばす
-        if (e instanceof FetchBlockedError || e instanceof RobotsDisallowedError || !(e instanceof HttpError)) throw e;
+        if (!isSkippable(e)) throw e;
         stats.detailFailed++;
         log(`詳細の取得に失敗したため飛ばします: ${e.message}`);
         continue;
