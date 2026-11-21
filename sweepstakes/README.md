@@ -4,7 +4,7 @@
 
 - **Webフォーム型懸賞**: プロフィールから自動入力し、ガードを通過したものだけ送信します (既定は dry-run)
 - **X / Instagram / 仮想通貨クエスト**: 収集・採点・「今日やること」リスト化まで。フォロー・RT・いいね・コメント・ウォレット署名などの**自動操作は一切行いません**
-- コア機能は `src/core/` の関数群 (`src/core/index.ts` から export)。CLI (`src/cli.ts`) はその薄いラッパーです。将来 MCP サーバーから同じ関数を呼ぶ想定です
+- コア機能は `src/core/` の関数群 (`src/core/index.ts` から export)。CLI (`src/cli.ts`) と MCP サーバー (`src/mcp/server.ts`) はその薄いラッパーです
 
 ## セットアップ
 
@@ -33,6 +33,9 @@ npm test                             # テスト (外部サイトには一切ア
 | `SWEEP_CHROMIUM_PATH` | なし | 使用する Chromium の実行ファイルを明示 |
 | `SWEEP_NAV_TIMEOUT_MS` | `30000` | ページ操作のタイムアウト |
 | `SWEEP_USDJPY` | なし | 仮想通貨クエストの USD / USDT / USDC 報酬を円換算するレート (例: `150`)。未設定なら換算せず「価値不明」 |
+| `SWEEP_MCP_TOKEN` | なし (必須) | MCP サーバーの認証トークン。32 文字以上 (`openssl rand -hex 32`)。未設定・短すぎる場合は起動しません |
+| `SWEEP_MCP_HOST` / `SWEEP_MCP_PORT` | `127.0.0.1` / `8787` | MCP サーバーの待ち受け |
+| `SWEEP_MCP_TRUST_PROXY` | `1` | ループバックからの接続 (Caddy 経由) に限り `X-Forwarded-For` の右端を接続元 IP とみなす (認証失敗のレート制限用)。`0` で無効 |
 
 ## profile.json
 
@@ -230,8 +233,98 @@ npx playwright install --with-deps chromium
 - Oracle Linux の場合は `npx playwright install-deps` が非対応なので、`dnf install -y nss atk at-spi2-atk cups-libs libdrm libxkbcommon libXcomposite libXdamage libXrandr mesa-libgbm pango alsa-lib google-noto-sans-cjk-ttc-fonts` などで個別に入れてください
 - Playwright が配布する Chromium が動かない場合は、ディストリビューションの Chromium を入れて `SWEEP_CHROMIUM_PATH=/usr/bin/chromium` のように指定できます
 - `package.json` の `playwright` は事前インストール済みブラウザ (開発環境) に合わせて `1.63.0` に固定しています。上げる場合は `npx playwright install chromium` もやり直してください
-- 定期実行は cron / systemd timer で `npm run sweep -- run --submit` を 1 日数回程度にしてください (日次上限とランダム間隔は DB で管理されます)
+- 定期実行は `deploy/sweep-run.timer` (後述「サーバー導入 (Oracle Cloud)」) を使えます。日次上限とランダム間隔は DB で管理されます
 - メモリ 1GB 程度のインスタンスでは Chromium が不安定になることがあるため、スワップの追加を推奨します
+
+## MCP サーバー (`src/mcp/`)
+
+Meta Muse などの AI エージェントから操作するためのリモート MCP サーバーです。`@modelcontextprotocol/sdk` (1.32.2 に固定) の Streamable HTTP トランスポートをステートレス (セッションなし・JSON 応答) で使います。
+
+```bash
+SWEEP_MCP_TOKEN=$(openssl rand -hex 32) npm run mcp
+# → http://127.0.0.1:8787/mcp   (HTTPS 終端は前段の Caddy に任せる)
+```
+
+| パス | 説明 |
+| --- | --- |
+| `POST /mcp` | `Authorization: Bearer <token>` で認証 |
+| `POST /mcp/<token>` | ヘッダーを設定できないクライアント向けの URL パス方式 |
+| `GET /healthz` | 認証不要。`ok` のみ返す |
+
+- トークンの比較は `timingSafeEqual` (SHA-256 同士を比較するので長さも漏れません)。失敗は 401。ログ (`journalctl -u sweep-mcp`) にはトークンを出さず、パス方式は `/mcp/***` と記録します
+- 認証失敗が 1 分に 10 回続いた IP は 10 分間ブロックし、正しいトークンでも 429 を返します (メモリ内。再起動で解除)
+- `GET` / `DELETE /mcp` はステートレス運用のため 405 です
+
+### ツール
+
+すべて `src/core/service.ts` の関数を呼ぶだけです。CAPTCHA・規約で自動応募禁止・重複・日次上限・送信間隔・応募先 URL 未確認・詐欺除外のガードはサービス層で適用され、MCP から迂回する経路はありません。入力は zod で検証し、出力は日本語テキスト + `structuredContent` です。
+
+| ツール | 説明 | 注釈 |
+| --- | --- | --- |
+| `collect_sweepstakes` (source: `koubo`, categories?, maxDetails?) | 収集ジョブを開始してジョブ ID を返す | 書き込み・外部アクセス |
+| `run_web_forms` (submit=false, limit?) | Webフォーム一括応募ジョブを開始してジョブ ID を返す | **destructive** |
+| `get_job` (id?) | ジョブの進捗ログと結果。id 省略で最近のジョブ一覧 | 読み取り |
+| `enter_campaign` (id, submit=false) | 1 件応募。同期だが 120 秒を超えたらジョブ ID を返してバックグラウンドで継続 | **destructive** |
+| `list_campaigns` (kind?, status?, limit?) | キャンペーン一覧 (スコア順) | 読み取り |
+| `get_todo` (limit?) / `mark_done` (id, note?) / `get_history` (limit?) | 今日やること / 手動完了の記録 / 履歴 | |
+| `quest_add` / `quest_update` / `quest_list` | 仮想通貨クエストの登録・更新 (null で値を消す)・一覧。引数は CLI の `quest` と同じ項目 (`url`, `rewardType`, `rewardAmount`, ... , `fetch`) | |
+| `get_profile` / `update_profile` | プロフィールの表示・部分更新。郵便番号・電話・メール・生年月日・性別・フリガナの形式を検証し、不正なら書き込みません (一時ファイル → rename、権限 0600) | update は destructive |
+
+- `collect_sweepstakes` / `run_web_forms` は送信間隔の待機で数分〜数十分かかるため、ジョブとして実行します (メモリ内。完了済みは直近 50 件を保持。サーバー再起動で消えます)
+- ブラウザ操作・収集は同時に 1 ジョブまでです (`enter_campaign` も含む)。実行中に開始しようとするとエラーを返します
+- `submit` は既定 `false` (dry-run)。サーバーの instructions でも「利用者が明示的に指示したときだけ submit=true」と伝えています
+
+## サーバー導入 (Oracle Cloud)
+
+Oracle Cloud の Always Free の Ampere A1 (aarch64) / Ubuntu 24.04 を想定しています。資材は `deploy/` にあります。
+
+| ファイル | 内容 |
+| --- | --- |
+| `deploy/setup.sh` | Node 22 導入 → 専用ユーザー `sweep` 作成 → `/opt/sweep` に配置して `npm ci` → `npx playwright install --with-deps chromium` (`/opt/sweep/ms-playwright`) → `/opt/sweep/data` 作成 → `/etc/sweep/env` 作成 (初回のみ、トークン自動生成) → systemd 登録。何度実行しても同じ結果になります |
+| `deploy/sweep-mcp.service` | MCP サーバー (systemd)。`EnvironmentFile=/etc/sweep/env`、`Restart=always`、`ProtectSystem=strict` などの最小権限設定、書き込みは `/opt/sweep/data` のみ |
+| `deploy/sweep-run.service` / `deploy/sweep-run.timer` / `deploy/sweep-run.sh` | 定期実行 (日本時間 8 / 13 / 19 時ごろ、30 分のランダム遅延)。収集 → `run`。**`SWEEP_AUTO_SUBMIT=1` のときだけ `run --submit`**、それ以外は dry-run |
+| `deploy/Caddyfile` | `sweep.example.com` を差し替えて使う。自動 HTTPS (Let's Encrypt)、`/mcp*` と `/healthz` だけ `127.0.0.1:8787` へ転送し、それ以外は 404 |
+| `deploy/env.example` | `/etc/sweep/env` のひな形 (`SWEEP_MCP_TOKEN` は `openssl rand -hex 32` で生成) |
+
+### 手順
+
+1. **ドメイン**: 使うドメイン (例: `sweep.example.com`) の A レコードをインスタンスのパブリック IP に向けます
+2. **VCN のセキュリティリスト** (Oracle Cloud コンソール → ネットワーキング → 仮想クラウド・ネットワーク → サブネット → セキュリティ・リスト): イングレス・ルールに TCP 80 と 443 (ソース `0.0.0.0/0`) を追加します。80 は Let's Encrypt の HTTP-01 チャレンジと HTTPS へのリダイレクトに使います。8787 は開けないでください
+3. **インスタンス内の iptables**: Oracle の Ubuntu イメージは VCN とは別に iptables で 22 番以外を `REJECT` しています。セキュリティリストを開けただけでは届きません。`OPEN_FIREWALL=1` を付けて setup.sh を実行するか、手動で次を実行します (ufw は Oracle のルールと競合するので使わない)
+   ```bash
+   sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 80 -j ACCEPT
+   sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 443 -j ACCEPT
+   sudo netfilter-persistent save
+   ```
+   (`6` は `sudo iptables -L INPUT --line-numbers` で見た REJECT 行より前の位置にしてください)
+4. **導入**:
+   ```bash
+   git clone <このリポジトリ> && cd <リポジトリ>/sweepstakes
+   sudo SWEEP_DOMAIN=sweep.example.com OPEN_FIREWALL=1 ./deploy/setup.sh
+   sudo grep SWEEP_MCP_TOKEN /etc/sweep/env     # Muse に登録するトークン
+   curl -s https://sweep.example.com/healthz    # → ok
+   ```
+5. **プロフィール**: Muse から `update_profile` で登録するか、`/opt/sweep/data/profile.json` (所有者 `sweep`、0600) を作成します
+6. **定期実行** (任意): まず dry-run のまま `sudo systemctl enable --now sweep-run.timer` で様子を見て、`journalctl -u sweep-run` とスクリーンショット (`/opt/sweep/data/screenshots`) を確認してから `/etc/sweep/env` で `SWEEP_AUTO_SUBMIT=1` にします
+
+- 更新: `git pull` して `sudo ./deploy/setup.sh` を再実行 (env と data は上書きしません)
+- ログ: `journalctl -u sweep-mcp -f`。設定変更後は `sudo systemctl restart sweep-mcp`
+- MCP サーバーのジョブと定期実行 (`sweep-run`) は別プロセスなので、両者が同時にブラウザを動かすことはあり得ます。日次上限・送信間隔・重複は DB で判定されますが、時間帯が重なる場合は MCP からの一括応募を避けてください
+- メモリ 1GB 程度のシェイプではスワップを追加してください (A1 は 6GB 以上にできるので、余裕があれば 2 OCPU / 12GB 程度を推奨)
+
+## Meta Muse への接続
+
+> **未確認**: Meta Muse のカスタムコネクタ画面の具体的な操作・項目名・対応する認証方式は確認できていません。以下は一般的なリモート MCP コネクタの登録方法です。
+
+1. Muse の設定でカスタムコネクタ (リモート MCP サーバー) の追加を開きます
+2. URL を登録します
+   - ヘッダーを設定できる場合: URL `https://sweep.example.com/mcp`、ヘッダー `Authorization: Bearer <SWEEP_MCP_TOKEN>`
+   - ヘッダーを設定できない場合: URL `https://sweep.example.com/mcp/<SWEEP_MCP_TOKEN>` (URL 自体が秘密情報になるので共有しない)
+3. 接続できたら「今日やることを教えて」「公募ガイドから懸賞を集めて」「#12 に dry-run で応募して」のように話しかけます。収集・一括応募はジョブ ID が返るので「ジョブの結果を見せて」と続けます
+
+- トランスポートは Streamable HTTP (ステートレス) です。SSE 専用 (旧方式) のクライアントや、OAuth 認証を必須とするクライアントには対応していません
+- トークンを変えたら `/etc/sweep/env` を書き換えて `sudo systemctl restart sweep-mcp` し、Muse 側の登録も更新します
+- 送信 (`submit=true`) を伴うツールは destructive として公開しています。Muse が実行前に確認を求めるかどうかはクライアント側の実装次第です (未確認)
 
 ## テスト
 
@@ -241,7 +334,7 @@ npx tsc --noEmit  # 型チェック
 ```
 
 - テストは `node:http` で `tests/fixtures/forms/` のフォーム HTML (合成データ) をローカル配信し、Playwright で検証します。ブラウザからの通信は `127.0.0.1` 以外を遮断しています
-- 検証内容: 公募ガイドの一覧/詳細パース・種別判定・締切切れ除外・403 で中止・robots Disallow で中止・取得間隔、通常フォームの入力・送信値、確認画面付き 2 段階フォーム、CAPTCHA → needs_manual、規約で自動応募禁止 → skipped、不明な必須欄 → needs_manual、dry-run で未送信、重複応募・日次上限・送信間隔、欄推定・採点・詐欺チェックの単体テスト、仮想通貨クエストの登録・更新・円換算・distribution 別期待値・ガス差し引き・時給・unknown_platform・致命フラグでの除外・`--fetch` (モック)・todo の安全注意・CLI 引数パース (`tests/quest.test.ts`)
+- 検証内容: 公募ガイドの一覧/詳細パース・種別判定・締切切れ除外・403 で中止・robots Disallow で中止・取得間隔、通常フォームの入力・送信値、確認画面付き 2 段階フォーム、CAPTCHA → needs_manual、規約で自動応募禁止 → skipped、不明な必須欄 → needs_manual、dry-run で未送信、重複応募・日次上限・送信間隔、欄推定・採点・詐欺チェックの単体テスト、仮想通貨クエストの登録・更新・円換算・distribution 別期待値・ガス差し引き・時給・unknown_platform・致命フラグでの除外・`--fetch` (モック)・todo の安全注意・CLI 引数パース (`tests/quest.test.ts`)、MCP サーバー (`tests/mcpServer.test.ts`: ランダムポートで起動し SDK クライアントで接続。認証なし/誤トークン 401・Bearer/パス方式・tools/list・各ツールの往復・プロフィールの形式検証・ジョブ開始→get_job (収集はモック fetch、応募はローカルフォーム)・同時ジョブのロック・enter のタイムアウト・認証失敗のレート制限)
 
 ## 構成
 
@@ -249,8 +342,14 @@ npx tsc --noEmit  # 型チェック
 src/
   cli.ts              CLI (薄いラッパー)
   questCli.ts         CLI の quest サブコマンド (引数パース・表示)
+  mcp/
+    server.ts         MCP サーバー (Streamable HTTP・認証・healthz)
+    tools.ts          ツール定義 (service.ts の薄いラッパー)
+    jobs.ts           メモリ内ジョブ管理と排他ロック
+    auth.ts           トークン検証・認証失敗のレート制限
+    profileStore.ts   profile.json の部分更新・形式検証
   core/
-    index.ts          公開 API (CLI / 将来の MCP から利用)
+    index.ts          公開 API (CLI / MCP から利用)
     service.ts        collect / listCampaigns / enter / runAll / todo / mark / history / addQuest / updateQuest / listQuests
     quest.ts          仮想通貨クエストの入力検証・円換算・ページ情報抽出・並び順 (純粋関数)
     types.ts          Campaign / Entry / Profile など
@@ -266,6 +365,7 @@ src/
     formFiller.ts     Playwright での入力・送信
     score.ts          採点・詐欺チェック (純粋関数)
     todo.ts           「今日やること」(純粋関数)
+deploy/               Oracle Cloud 向け導入資材 (setup.sh・systemd・Caddyfile・env.example)
 tests/
   fixtures/           合成 HTML
   helpers/            ローカル HTTP サーバー・テスト用コンテキスト

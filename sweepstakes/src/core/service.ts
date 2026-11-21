@@ -23,7 +23,7 @@ import {
 } from "./quest.js";
 import { evaluateCampaign, FLAG_LABELS, isExpired, NEEDS_REVIEW_FLAG, type QuestMetrics } from "./score.js";
 import { buildTodoList, type TodoItem } from "./todo.js";
-import type { Campaign, CampaignKind, Entry, EntryStatus, Profile } from "./types.js";
+import type { Campaign, CampaignKind, CampaignStatus, Entry, EntryStatus, Profile } from "./types.js";
 
 export interface SweepContext {
   store: Store;
@@ -137,7 +137,7 @@ export function collectFromSources(ctx: SweepContext, sources: string[], opts: S
 // list / todo / mark / history
 // ---------------------------------------------------------------------------
 
-export function listCampaigns(ctx: SweepContext, opts: { kind?: CampaignKind } = {}): Campaign[] {
+export function listCampaigns(ctx: SweepContext, opts: { kind?: CampaignKind; status?: CampaignStatus } = {}): Campaign[] {
   return ctx.store.listCampaigns(opts);
 }
 
@@ -380,15 +380,16 @@ export async function enter(ctx: SweepContext, campaignId: number, opts: EnterOp
   return result(r.outcome, r.reason, { filled: r.filled, screenshotPath: r.screenshotPath });
 }
 
-/** 応募可能な web_form を一括処理する。日次上限に達したら停止 */
-export async function runAll(ctx: SweepContext, opts: { submit?: boolean } = {}): Promise<EnterResult[]> {
+/** 応募可能な web_form を一括処理する。日次上限に達したら停止 (limit 指定時はスコア上位から最大 limit 件) */
+export async function runAll(ctx: SweepContext, opts: { submit?: boolean; limit?: number } = {}): Promise<EnterResult[]> {
   const now = ctx.now();
-  const candidates = ctx.store
+  const filtered = ctx.store
     .listCampaigns({ kind: "web_form", status: "active" })
     .filter((c) => !isExpired(c.deadline, now))
     .filter((c) => !c.riskFlags.includes(NEEDS_REVIEW_FLAG))
     // 何らかの記録 (送信済み・要手動・規約で見送り・失敗) があるものは一括実行の対象外。個別に enter で再試行する
     .filter((c) => ctx.store.listEntries({ campaignId: c.id, limit: 1 }).length === 0);
+  const candidates = opts.limit !== undefined ? filtered.slice(0, Math.max(0, opts.limit)) : filtered;
   const results: EnterResult[] = [];
   if (!candidates.length) return results;
   const browser = await ctx.launchBrowser();

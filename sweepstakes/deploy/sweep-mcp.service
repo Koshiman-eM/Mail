@@ -1,0 +1,51 @@
+# 懸賞ツール MCP サーバー (Streamable HTTP, 127.0.0.1:8787)。HTTPS は前段の Caddy が終端する
+# 配置: /etc/systemd/system/sweep-mcp.service (deploy/setup.sh がコピーする)
+[Unit]
+Description=Sweepstakes MCP server
+Documentation=file:///opt/sweep/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sweep
+Group=sweep
+WorkingDirectory=/opt/sweep
+EnvironmentFile=/etc/sweep/env
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node --disable-warning=ExperimentalWarning --import tsx src/mcp/server.ts
+Restart=always
+RestartSec=5
+# 停止時は実行中のジョブごと終了する (ジョブはメモリ内なので再起動で消える)
+TimeoutStopSec=15
+
+# --- 最小権限 ---
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+# Chromium が netlink を使うため AF_NETLINK も許可
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# DB・スクリーンショット・profile.json だけ書き込み可
+ReadWritePaths=/opt/sweep/data
+UMask=0077
+# 注意: MemoryDenyWriteExecute は V8 / Chromium の JIT を壊すので付けない。
+#       SystemCallFilter / RestrictNamespaces も Chromium が動かなくなる可能性があるため付けていない
+MemoryMax=1500M
+TasksMax=512
+
+[Install]
+WantedBy=multi-user.target
