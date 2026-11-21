@@ -21,6 +21,8 @@
  * targetPerHour が 0 以下・非有限なら無効 (tempo は常に 0、capped は常に false)。
  */
 
+import { openDurationMs, type MarketCalendar } from "../core/calendar";
+
 /** テンポで緩めるときのコスト倍率 (利確幅 / 往復コスト) の下限。これより下には緩めない */
 export const TEMPO_COST_MULT_FLOOR = 1.5;
 
@@ -87,6 +89,11 @@ export interface TempoControllerOptions {
   capMultiplier?: number;
   /** 起点の時刻 (エントリーが一度も無いときの経過の基準)。省略時は最初に渡された時刻 */
   now?: number;
+  /**
+   * 取引時間のカレンダー。渡すと経過時間・窓を取引時間だけで測る (閉まっている間は不足も待ちも進めない)。
+   * 省略時は実時間 (従来どおり。暗号資産)
+   */
+  calendar?: MarketCalendar;
 }
 
 export interface TempoSnapshot {
@@ -115,6 +122,7 @@ export class TempoController {
   private lastEntryTs?: number;
   /** 窓の中のエントリーの時刻 (昇順) */
   private entries: number[] = [];
+  private readonly calendar?: MarketCalendar;
 
   constructor(opts: TempoControllerOptions) {
     const t = opts.targetPerHour;
@@ -124,6 +132,12 @@ export class TempoController {
     const c = opts.capMultiplier;
     this.capMultiplier = c !== undefined && c > 0 ? c : 2;
     if (opts.now !== undefined && Number.isFinite(opts.now)) this.start = opts.now;
+    if (opts.calendar) this.calendar = opts.calendar;
+  }
+
+  /** from から to までの経過 (ms)。カレンダーがあれば取引時間だけ */
+  private elapsed(from: number, to: number): number {
+    return this.calendar ? openDurationMs(this.calendar, from, to) : to - from;
   }
 
   /** 有効か (targetPerHour > 0) */
@@ -155,9 +169,14 @@ export class TempoController {
   /** windowMs より古い記録を捨てる */
   private prune(now: number): void {
     if (!Number.isFinite(now)) return;
-    const cut = now - this.windowMs;
     let k = 0;
-    while (k < this.entries.length && this.entries[k] <= cut) k++;
+    if (this.calendar) {
+      // 取引時間で windowMs 以上前のエントリーを捨てる
+      while (k < this.entries.length && this.entries[k] <= now && this.elapsed(this.entries[k], now) >= this.windowMs) k++;
+    } else {
+      const cut = now - this.windowMs;
+      while (k < this.entries.length && this.entries[k] <= cut) k++;
+    }
     if (k > 0) this.entries.splice(0, k);
   }
 
@@ -203,7 +222,7 @@ export class TempoController {
     if (deficit === 0) return 0;
     const interval = 60 / this.targetPerHour;
     const ref = this.lastEntryTs ?? this.start ?? now;
-    const since = (now - ref) / MIN_MS;
+    const since = this.elapsed(ref, now) / MIN_MS;
     const wait = clamp01((since - interval) / interval);
     return clamp01(deficit * wait);
   }

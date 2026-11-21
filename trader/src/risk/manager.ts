@@ -1,5 +1,6 @@
 import { enabledAssetClasses, enabledProfile } from "../core/assetClasses";
 import { quoteCostBps } from "../core/costs";
+import type { MarketCalendar } from "../core/calendar";
 import { D, floorToStep, Decimal } from "../core/decimal";
 import { costFeeRate } from "../core/fees";
 import { createLogger } from "../core/logger";
@@ -190,6 +191,8 @@ export interface RiskManagerOptions {
    * 既定なし (trader は使わない)。FX・株式の証拠金口座で使う
    */
   venueLeverageCaps?: Record<string, number>;
+  /** 取引時間のカレンダー (日次損失の日の区切り)。省略時は UTC の 0 時 (従来どおり) */
+  calendar?: MarketCalendar;
 }
 
 export class RiskManager {
@@ -208,6 +211,8 @@ export class RiskManager {
   private limitsCache?: { at: number; limits: RiskLimits; updatedAt: number };
   /** 取引先ごとの実効レバレッジの上限 (評価額の倍率)。無い取引先は判定しない */
   private readonly venueLeverageCaps?: Readonly<Record<string, number>>;
+  /** 取引時間のカレンダー (日の区切り)。無ければ UTC */
+  private readonly calendar?: MarketCalendar;
 
   /**
    * 取引先の建玉の合計 (絶対値の口座通貨換算) が 評価額 × 上限 を超えない余地 (建玉額)。
@@ -269,6 +274,7 @@ export class RiskManager {
       this.tradeMode = mode;
       if (store) this.overrideMode = mode;
       if (keyOrOpts.overrideCacheMs !== undefined) this.overrideCacheMs = keyOrOpts.overrideCacheMs;
+      if (keyOrOpts.calendar) this.calendar = keyOrOpts.calendar;
       if (keyOrOpts.venueLeverageCaps) {
         for (const [venue, k] of Object.entries(keyOrOpts.venueLeverageCaps)) {
           if (!(Number.isFinite(k) && k > 0)) throw new Error(`venueLeverageCaps の ${venue} は正の倍率で指定してください (${k})`);
@@ -351,7 +357,8 @@ export class RiskManager {
       log.warn("評価額が不正なため無視します", { equity: String(equity) });
       return { halted: this.isHalted(now).halted, killSwitch: !!st.killSwitch, dailyLossPct: 0, drawdownPct: 0 };
     }
-    const key = isoDayKey(now);
+    // 日の区切り: 取引時間のカレンダーがあればその取引日 (FX は NY 17:00 など)、無ければ UTC の日付 (従来どおり)
+    const key = this.calendar ? this.calendar.tradingDayKey(now) : isoDayKey(now);
     let changed = false;
     if (st.dayKey !== key || st.dayStartEquity <= 0) {
       st.dayKey = key;
@@ -367,7 +374,7 @@ export class RiskManager {
     const drawdownPct = st.peakEquity > 0 ? (st.peakEquity - equity) / st.peakEquity : 0;
 
     if (dailyLossPct > L.maxDailyLoss && (st.haltedUntil === undefined || now >= st.haltedUntil)) {
-      st.haltedUntil = nextUtcMidnight(now);
+      st.haltedUntil = this.calendar ? this.calendar.nextTradingDayStart(now) : nextUtcMidnight(now);
       changed = true;
       log.warn("日次損失上限に到達: 当日の新規エントリーを停止", { dailyLossPct });
       this.audit("risk.halt_daily", now, { equity, dayStartEquity: st.dayStartEquity, dailyLossPct, haltedUntil: st.haltedUntil });

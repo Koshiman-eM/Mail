@@ -1,4 +1,5 @@
 import { enabledProfile } from "../core/assetClasses";
+import type { MarketCalendar } from "../core/calendar";
 import type { AiOptions } from "../core/ai";
 import { DEFAULT_OBSERVE_ONLY_STRATEGIES, type AppConfig } from "../core/config";
 import { equitySinceReset, latestPaperReset } from "../paper/walletReset";
@@ -148,6 +149,11 @@ export interface EngineDeps {
   periodic?: PeriodicTask[];
   /** 取引先ごとの追加の情報 (Jupiter の流動性・選別に落ちた銘柄) */
   marketExtras?: MarketExtras;
+  /**
+   * 取引時間のカレンダー (src/core/calendar.ts)。閉まっている間は新規エントリーをしない (見送り market_closed)・
+   * テンポの経過時間を進めない。省略時は常に開いている (暗号資産。従来どおり)。決済は従来どおり
+   */
+  calendar?: MarketCalendar;
 }
 
 export interface TickResult {
@@ -215,6 +221,8 @@ interface TickCtx {
   plan?: StrategyPlan;
   halted: boolean;
   haltReason?: string;
+  /** 取引時間外 (カレンダー) で新規エントリーをしない */
+  marketClosed?: boolean;
   account: AccountState;
   /** 口座情報の欠落・取得失敗の継続による新規エントリーの停止 */
   entryBlock?: { key: string; sample: string };
@@ -480,6 +488,7 @@ export class TradingEngine {
   private readonly periodicAt = new Map<string, number>();
   private readonly periodicRunning = new Set<string>();
   private readonly marketExtras?: MarketExtras;
+  private readonly calendar?: MarketCalendar;
 
   constructor(deps: EngineDeps) {
     this.config = deps.config;
@@ -497,12 +506,13 @@ export class TradingEngine {
     this.timeframes = deps.timeframes;
     this.periodic = deps.periodic ?? [];
     this.marketExtras = deps.marketExtras;
+    this.calendar = deps.calendar;
     // 手組みの設定 (テスト) で未設定なら config の既定値と同じ扱い
     this.observeOnly = new Set(deps.config.env.OBSERVE_ONLY_STRATEGIES ?? DEFAULT_OBSERVE_ONLY_STRATEGIES.split(","));
     const env = deps.config.env;
     // テンポと最大保有 (手組みの設定 (テスト) で未設定なら無効 = 従来どおり)
     const target = env.TARGET_ENTRIES_PER_HOUR ?? 0;
-    if (Number.isFinite(target) && target > 0) this.tempo = new TempoController({ targetPerHour: target, capMultiplier: env.TEMPO_CAP_MULTIPLIER ?? 2 });
+    if (Number.isFinite(target) && target > 0) this.tempo = new TempoController({ targetPerHour: target, capMultiplier: env.TEMPO_CAP_MULTIPLIER ?? 2, ...(deps.calendar ? { calendar: deps.calendar } : {}) });
     this.tempoExploreAllowed = deps.brokerSet.mode === "paper" || env.TEMPO_ALLOW_LIVE_EXPLORE === true;
     const ex = env.TEMPO_EXPLORE_SIZE;
     this.tempoExploreSize = ex !== undefined && Number.isFinite(ex) && ex > 0 && ex <= 1 ? ex : 0.5;
@@ -1142,6 +1152,7 @@ export class TradingEngine {
       plan: this.store.latestPlan(),
       halted: halted.halted,
       haltReason: halted.reason,
+      ...(this.calendar && !this.calendar.isOpen(now) ? { marketClosed: true } : {}),
       account,
       ...(accountBlock ? { entryBlock: accountBlock } : {}),
       timedOut,
@@ -1892,6 +1903,10 @@ export class TradingEngine {
       }
       const owner = pos !== undefined && pos.strategyId === s.id ? pos : undefined;
       if (pos && !owner) continue; // 1 銘柄 1 ポジション: 保有中は持ち主の戦略だけ評価 (決済シグナル用)
+      if (!pos && ctx.marketClosed) {
+        this.skip("market_closed");
+        continue;
+      }
       if (!pos && ctx.halted) {
         this.skip("halted", ctx.haltReason);
         // 新規停止中も戦略を評価し、出たシグナルは仮想トレードとしてだけ記録する (発注・腕の乱数には触れない)
