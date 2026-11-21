@@ -1,0 +1,14 @@
+{
+  "mode": "ultra",
+  "inputMint": "So11111111111111111111111111111111111111112",
+  "outputMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  "inAmount": 100000000,
+  "outAmount": "14975000",
+  "otherAmountThreshold": "14900000",
+  "swapMode": "ExactIn",
+  "slippageBps": 50,
+  "priceImpactPct": "-0.0001",
+  "routePlan": [{ "swapInfo": { "label": "SyntheticAMM", "feeAmount": "0", "feeMint": "So11111111111111111111111111111111111111112" }, "percent": 100 }],
+  "transaction": null,
+  "requestId": "synthetic-request"
+}

@@ -166,7 +166,7 @@ describe.each(CASES)("$name", (c) => {
       expect(S.regimes).toEqual(["trend_up", "trend_down", "high_vol", "range"]);
       expect(getStrategy(c.name)).toBe(S);
       expect(strategiesFor("crypto", "short").map((s) => s.id)).toContain(c.name);
-      expect(strategiesFor("fx").map((s) => s.id)).not.toContain(c.name);
+      expect(strategiesFor("meme").map((s) => s.id)).not.toContain(c.name);
       expect(strategiesFor("meme").map((s) => s.id)).not.toContain(c.name);
     });
 
@@ -208,7 +208,7 @@ describe.each(CASES)("$name", (c) => {
       expect(tfs).toContain(c.execTf);
       expect(tfs).toContain(c.trendTf);
       expect(hubTimeframesFor([{ assetClass: "crypto" }], [S])).toEqual(["1m", c.execTf, c.trendTf]);
-      expect(hubTimeframesFor([{ assetClass: "fx" }], [S])).toEqual(["1m"]);
+      expect(hubTimeframesFor([{ assetClass: "meme" }], [S])).toEqual(["1m"]);
     });
 
     it("相場構造のフィルター・観測専用の既定には入れない (自前の上位足のトレンドの条件がある)", () => {

@@ -71,12 +71,11 @@ import type { BacktestOptions, BacktestResult, BacktestStats, IntelSource, Sizer
 const DEFAULT_COSTS: Record<AssetClass, { spreadBps: number; slippageBps: number }> = {
   crypto: { spreadBps: 2, slippageBps: 1 },
   meme: { spreadBps: 60, slippageBps: 20 },
-  fx: { spreadBps: 1, slippageBps: 0.5 },
-  stock: { spreadBps: 2, slippageBps: 1 },
 };
 
+/** 資産クラスの既定コスト。未知のクラス (廃止した fx / stock の古い記録など) は crypto の値 */
 export function defaultCosts(assetClass: AssetClass): { spreadBps: number; slippageBps: number } {
-  return { ...DEFAULT_COSTS[assetClass] };
+  return { ...(DEFAULT_COSTS[assetClass] ?? DEFAULT_COSTS.crypto) };
 }
 
 /** 足の間隔から時間足を推定する */

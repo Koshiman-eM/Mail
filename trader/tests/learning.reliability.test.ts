@@ -137,7 +137,7 @@ describe("SourceReliabilityTracker", () => {
     expect(tr.intelInfluence("crypto")).toBeLessThanOrEqual(1.5);
     expect(tr.intelInfluence("meme")).toBeLessThan(0.6);
     expect(tr.intelInfluence("meme")).toBeGreaterThanOrEqual(0);
-    expect(tr.intelInfluence("fx")).toBe(1);
+    expect(tr.intelInfluence("fx" as never)).toBe(1); // 廃止した資産クラスの名前で読んでも例外にしない (初期値)
     expect(store.kvGet("intelInfluence:paper:crypto")).toMatchObject({ n: 40 });
     expect(new SourceReliabilityTracker(store).intelInfluence("crypto")).toBe(tr.intelInfluence("crypto"));
   });

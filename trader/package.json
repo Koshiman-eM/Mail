@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "自己学習型マルチアセット自動売買ツール (仮想通貨・ミームコイン・FX・株式 / スキャルピング・短期中心)",
+  "description": "自己学習型の仮想通貨自動売買ツール (暗号資産・ミームコイン / スキャルピング・短期中心)",
   "engines": { "node": ">=22.13" },
   "scripts": {
     "trader": "tsx --env-file-if-exists=.env.local --env-file-if-exists=.env src/cli.ts",

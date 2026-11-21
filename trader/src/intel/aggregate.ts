@@ -15,7 +15,7 @@ const EVENT_LOOKAHEAD_MS = 6 * 3_600_000;
 const EVENT_AFTER_MS = 2 * 3_600_000;
 const MAX_SOURCE_IDS = 50;
 /** USD 指標が波及するクラス擬似資産 (eventRisk のみ、ブラックアウトは付けない) */
-const USD_SPILLOVER = ["CRYPTO", "MEME", "STOCKS"];
+const USD_SPILLOVER = ["CRYPTO", "MEME"];
 const SPILLOVER_SCALE = 0.5;
 /** now よりこれ以上未来の公開時刻は信用しない (情報源側の丸めと同じ 5 分) */
 export const MAX_FUTURE_SKEW_MS = 5 * 60_000;
@@ -150,7 +150,7 @@ function applyEvents(out: Record<string, IntelBias>, events: EconEvent[], now: n
     const dt = ev.ts - now;
     const risk = IMPACT_BASE[ev.impact] * proximity(dt);
     if (risk <= 0) continue;
-    const direct = ev.currency ? [ev.currency, "FX"] : ["FX"];
+    const direct = ev.currency ? [ev.currency] : [];
     const spill = ev.currency === "USD" ? USD_SPILLOVER : [];
     const active = ev.impact === "high" && dt <= EVENT_PRE_MS && dt >= -EVENT_POST_MS;
     for (const asset of direct) {

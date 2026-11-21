@@ -30,7 +30,7 @@ export function econEventsToItems(events: EconEvent[], now: number): IntelItem[]
     title: `${e.currency ?? "ALL"} ${e.title} (${e.impact})`,
     publishedAt: e.ts,
     fetchedAt: now,
-    assets: e.currency ? [e.currency, "FX"] : ["FX"],
+    assets: e.currency ? [e.currency] : [],
     importance: e.impact === "high" ? 0.9 : e.impact === "medium" ? 0.5 : 0.2,
   }));
 }

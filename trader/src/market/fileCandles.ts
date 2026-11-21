@@ -1,8 +1,8 @@
 /**
- * 日付ファイル単位でローソク足を返す取引所 (bitbank・GMOコイン) の共通部品。
- * どちらも 1hour 以下は YYYYMMDD (1 日分)、4hour 以上は YYYY (1 年分) のファイルで返す。
- * ファイルの日付境界・存在しない日付の扱いは取引所ごとに違うので、それぞれのモジュール
- * (src/market/feeds/bitbankCandles.ts・src/market/gmo/klines.ts) が決める。
+ * 日付ファイル単位でローソク足を返す取引所 (bitbank) の共通部品。
+ * 1hour 以下は YYYYMMDD (1 日分)、4hour 以上は YYYY (1 年分) のファイルで返す。
+ * ファイルの日付境界・存在しない日付の扱いは取引所ごとに違うので、取引所のモジュール
+ * (src/market/feeds/bitbankCandles.ts) が決める。
  */
 import type { Candle, Timeframe } from "../core/types";
 import { TIMEFRAME_MS } from "../core/types";
@@ -20,7 +20,7 @@ const pad = (n: number) => String(n).padStart(2, "0");
 export const utcDayStart = (t: number) => Math.floor(t / DAY) * DAY;
 export const utcYear = (t: number) => new Date(t).getUTCFullYear();
 /** 時刻 t の UTC 日付 (YYYYMMDD) */
-export const utcDayKey = (t: number) => {
+const utcDayKey = (t: number) => {
   const d = new Date(utcDayStart(t));
   return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}`;
 };

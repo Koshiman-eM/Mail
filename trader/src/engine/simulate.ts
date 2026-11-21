@@ -395,6 +395,6 @@ export function formatSimulationReport(r: SimulationReport): string {
       { arms: 12, lessons: 8, adjustments: 10 },
     ),
   );
-  lines.push("", "※ 情報源は使っていません (スタブのブリーフ)。戦略別の損益は決済時点の為替 (合成の USD/JPY) で口座通貨へ換算。");
+  lines.push("", "※ 情報源は使っていません (スタブのブリーフ)。戦略別の損益は決済時点の為替 (概算表の 1 USD = 150 JPY) で口座通貨へ換算。");
   return lines.join("\n");
 }

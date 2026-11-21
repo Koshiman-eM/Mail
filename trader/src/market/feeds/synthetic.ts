@@ -59,14 +59,12 @@ export function defaultSyntheticSpecs(venue = "paper"): SymbolSpec[] {
     mk("ETH/USDT", "crypto", "ETH", "USDT", 0.01, 0.001, 5, 0.001, false, 3_200, annualToSecSigma(0.75), 2, 0.8),
     // PEPE は値動きの大きい暗号資産として crypto に分類する (ミーム専用の戦略・自動の meme 分類は廃止)
     mk("PEPE/USDT", "crypto", "PEPE", "USDT", 1e-9, 1, 5, 0.001, false, 0.000012, annualToSecSigma(1.6), 12, 5_000_000),
-    mk("USD/JPY", "fx", "USD", "JPY", 0.001, 1, undefined, 0, true, 150, annualToSecSigma(0.1), 0.7, 1_000, { contractSize: 1 }),
-    mk("AAPL", "stock", "AAPL", "USD", 0.01, 1, undefined, 0, true, 190, annualToSecSigma(0.3), 2, 100),
   ];
 }
 
 /**
  * レジーム。drift は「そのレジーム中の 1 秒あたりドリフト = sigma × driftSigmaMul」。
- * 0.004 は 1 日続いても日次ボラの 1 倍程度 (BTC 数%、FX 約 0.5%、株 約 2%) に収まる大きさ。
+ * 0.004 は 1 日続いても日次ボラの 1 倍程度 (BTC 数%) に収まる大きさ。
  * 上昇と下降は対称で、期待ドリフトはゼロ (効率的な市場に近づけ、戦略に人工的なエッジを与えない)。
  */
 type Regime = { driftSigmaMul: number; volMul: number; revert: number };

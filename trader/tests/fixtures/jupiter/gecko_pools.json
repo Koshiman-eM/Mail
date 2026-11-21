@@ -1,0 +1,38 @@
+{
+  "data": [
+    {
+      "id": "solana_PooLAAAAbbbbCCCCddddEEEEffffGGGGhhhh1111",
+      "type": "pool",
+      "attributes": { "address": "PooLAAAAbbbbCCCCddddEEEEffffGGGGhhhh1111", "name": "SDOG / SOL", "reserve_in_usd": "500000.12", "pool_created_at": "2025-01-01T00:00:00Z" },
+      "relationships": {
+        "base_token": { "data": { "id": "solana_MemeAAAAbbbbCCCCddddEEEEffffGGGGhhhh1111", "type": "token" } },
+        "quote_token": { "data": { "id": "solana_So11111111111111111111111111111111111111112", "type": "token" } },
+        "dex": { "data": { "id": "raydium", "type": "dex" } }
+      }
+    },
+    {
+      "id": "solana_PooLBBBBccccDDDDeeeeFFFFggggHHHHjjjj2222",
+      "type": "pool",
+      "attributes": { "address": "PooLBBBBccccDDDDeeeeFFFFggggHHHHjjjj2222", "name": "USDC / SDOG", "reserve_in_usd": "9000000" },
+      "relationships": {
+        "base_token": { "data": { "id": "solana_EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "type": "token" } },
+        "quote_token": { "data": { "id": "solana_MemeAAAAbbbbCCCCddddEEEEffffGGGGhhhh1111", "type": "token" } }
+      }
+    },
+    {
+      "id": "solana_PooLCCCCddddEEEEffffGGGGhhhhJJJJkkkk3333",
+      "type": "pool",
+      "attributes": { "address": "PooLCCCCddddEEEEffffGGGGhhhhJJJJkkkk3333", "name": "SDOG / USDC", "reserve_in_usd": "1200000.5" },
+      "relationships": {
+        "base_token": { "data": { "id": "solana_MemeAAAAbbbbCCCCddddEEEEffffGGGGhhhh1111", "type": "token" } },
+        "quote_token": { "data": { "id": "solana_EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "type": "token" } }
+      }
+    },
+    {
+      "id": "solana_unknownbase",
+      "type": "pool",
+      "attributes": { "address": "PooLDDDDeeeeFFFFggggHHHHjjjjKKKKmmmm4444", "name": "??? / SOL", "reserve_in_usd": "99999999" }
+    },
+    { "type": "pool", "attributes": {} }
+  ]
+}

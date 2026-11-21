@@ -2155,7 +2155,7 @@ export class TradingEngine {
             tif: "GTC",
             ...(postOnly ? { postOnly: true } : {}),
             strategyId: c.strategy.id,
-            // 取引所側の保護ストップ (成行と同じく渡す。対応するアダプターだけが付ける。いまの発注先 (paper・GMO) は付けない。
+            // 取引所側の保護ストップ (成行と同じく渡す。対応するアダプターだけが付ける。いまの発注先 (paper) は付けない。
             // 損切りの判定はエンジン側で続ける)
             protectiveStop: sig.stopLoss,
           }

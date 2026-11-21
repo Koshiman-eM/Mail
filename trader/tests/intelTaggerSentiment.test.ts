@@ -17,18 +17,17 @@ describe("assetTagger", () => {
     expect(tagAssets("the solution is simple")).not.toContain("SOL");
   });
   it("マクロ・通貨", () => {
-    expect(tagAssets("FOMC and CPI data")).toEqual(expect.arrayContaining(["USD", "FX"]));
-    expect(tagAssets("日銀が円買い介入")).toEqual(expect.arrayContaining(["JPY", "FX"]));
+    expect(tagAssets("FOMC and CPI data")).toEqual(["USD"]); // FX の擬似資産は付けない (FX は廃止)
+    expect(tagAssets("日銀が円買い介入")).toEqual(["JPY"]);
+    expect(tagAssets("Wall Street rallies, S&P 500 record")).toEqual(["STOCKS"]); // 株式市場全体 (リスクオンの材料)
     expect(tagAssets("ECB holds rates")).toContain("EUR");
     const aud = tagAssets("Australian dollar firms");
     expect(aud).toContain("AUD");
     expect(aud).not.toContain("USD");
   });
-  it("株ティッカーと追加辞書", () => {
-    const r = tagAssets("NVDA beats estimates; AAPL flat", { stockTickers: ["NVDA", "AAPL", "TSLA"] });
-    expect(r).toEqual(expect.arrayContaining(["NVDA", "AAPL", "STOCKS"]));
-    expect(r).not.toContain("TSLA");
+  it("追加辞書", () => {
     expect(tagAssets("Toyota news", { extra: { toyota: ["7203"] } })).toContain("7203");
+    expect(tagAssets("dogwifhat pumps", { extra: { dogwifhat: ["WIF"] } })).toContain("WIF");
   });
 });
 

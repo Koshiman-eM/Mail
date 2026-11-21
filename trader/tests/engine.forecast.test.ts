@@ -16,12 +16,13 @@ const mkClock = (t = START): Clock & { t: number } => ({ t, now() { return this.
 const testConfig = () => loadConfig({ NODE_ENV: "test", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "JPY", INTEL_LOOP_MS: String(30 * MIN), LEARN_LOOP_MS: String(HOUR) });
 
 /** 常に同じ向きのシグナルを出すテスト用戦略 (scalp。保有中は何もしない) */
-function fixedStrategy(id: string, direction: "long" | "short", classes: AssetClass[] = ["crypto", "meme", "fx", "stock"]): Strategy {
+function fixedStrategy(id: string, direction: "long" | "short", classes: AssetClass[] = ["crypto", "meme"], symbols?: string[]): Strategy {
   return {
     id, horizon: "scalp", assetClasses: classes, regimes: ["trend_up", "trend_down", "range", "high_vol", "low_liquidity"],
     primaryTimeframe: "1m", timeframes: ["1m", "1h"], warmup: 1, defaultParams: { stopAtr: 1 }, paramBounds: { stopAtr: [0.5, 3] },
     evaluate(ctx: StrategyContext): Signal | null {
       if (ctx.position) return null;
+      if (symbols && !symbols.includes(ctx.market.instrument.symbol)) return null;
       const px = direction === "long" ? ctx.market.quote.ask : ctx.market.quote.bid;
       return {
         strategyId: id, horizon: "scalp", symbol: ctx.market.instrument.symbol, direction, confidence: 0.8, expectedEdgeBps: 300,
@@ -60,7 +61,10 @@ function orderTrail(store: MemoryStore) {
   };
 }
 
-/** 全資産クラス・全予想時間を「実力あり」にした集計と、バイアスだけのモデル (pUp = sigmoid(b)) */
+/**
+ * 全資産クラス・全予想時間を「実力あり」にした集計と、バイアスだけのモデル (pUp = sigmoid(b))。
+ * 廃止した fx / stock のグループも入れる (古い集計が残っていても読める・LIVE の判定のグループ数は 12 のまま)
+ */
 function injectLive(store: MemoryStore, bias: number) {
   const day = String(Math.floor(START / 86_400_000) * 86_400_000);
   const counts = { n: 200, hits: 140, flatPred: 0, flatHits: 0, noise: 0, expired: 0, brierSum: 40, brierN: 200 };
@@ -108,7 +112,8 @@ describe("エンジンの値動きの予想", () => {
     injectLive(store, 1); // pUp = sigmoid(1) ≈ 0.731 → up (起動前に kv へ入れる = 再起動後も続くことの確認を兼ねる)
     const rt2 = await buildRuntime(testConfig(), {
       clock, store, intelSources: [], ai: null, seed: 3, syntheticHistoryMs: 2 * 86_400_000, rng: mulberry32(7),
-      strategies: [fixedStrategy("t_long", "long", ["crypto"]), fixedStrategy("t_short", "short", ["fx"])],
+      // 売りは ETH/USDT だけ (現物なので paper の空売りの再現)。買いはそれ以外
+      strategies: [fixedStrategy("t_long", "long", ["crypto"], ["BTC/USDT", "PEPE/USDT"]), fixedStrategy("t_short", "short", ["crypto"], ["ETH/USDT"])],
     });
     const calls: { symbol: string; dir: string; rm: number }[] = [];
     const orig = rt2.risk.evaluateEntry.bind(rt2.risk);

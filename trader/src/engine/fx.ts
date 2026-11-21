@@ -2,8 +2,13 @@ import type { Quote } from "../core/types";
 
 /**
  * 通貨換算 (クオート通貨 → 口座通貨)。
- * 監視中の為替ペア (例: USD/JPY) の気配があればその仲値、無ければ下の概算表を使う。
+ * 監視中のペア (例: USDC/JPY のような通貨のペア) の気配があればその仲値、無ければ下の概算表 (FALLBACK_PER_USD) を使う。
  * USDT / USDC は USD と同一視する。
+ *
+ * USD→JPY のレートの出どころ: FX (USD/JPY の合成の銘柄) は廃止したので、いまの監視銘柄に USD と JPY のペアは無い。
+ * そのため USD 建て (USDT など) の暗号資産の円換算は概算表の 1 USD = 150 JPY を使う ("fallback")。
+ * paper はそのまま換算して取引する (従来の ccxt の実データでも同じ)。live は概算表を使う新規エントリーをしない (fxApproxReason。
+ * 決済・評価額の計算は続ける)。live で USD 建ての銘柄を扱うときは、実際のレートの気配を hub に渡す必要がある。
  */
 
 /**
@@ -38,7 +43,7 @@ const aliasesOf = (c: string): string[] => (c === "USD" ? USD_ALIASES : [c]);
 export interface FxConverterOptions {
   /** 口座通貨 */
   baseCurrency: string;
-  /** 統一シンボル ("USD/JPY" など) の最新気配 */
+  /** 統一シンボル ("USDC/JPY" など) の最新気配 */
   getQuote: (symbol: string) => Quote | undefined;
   /** フォールバック表の上書き (1 USD あたり) */
   fallbackPerUsd?: Record<string, number>;
@@ -151,7 +156,7 @@ export function fxApproxReason(fx: FxConverter, from: string, to: string, now: n
   return undefined;
 }
 
-/** シンボルからクオート通貨を推定 (レポート用。"BTC/USDT" → USDT、スラッシュ無しの株式は USD) */
+/** シンボルからクオート通貨を推定 (レポート用。"BTC/USDT" → USDT、スラッシュ無しは USD とみなす) */
 export function quoteCurrencyOfSymbol(symbol: string): string {
   const i = symbol.indexOf("/");
   return i >= 0 ? symbol.slice(i + 1) : "USD";

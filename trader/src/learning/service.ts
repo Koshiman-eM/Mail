@@ -109,7 +109,8 @@ export interface LearningSnapshot {
   forecast: ForecastSummary;
 }
 
-const ASSET_CLASSES: AssetClass[] = ["crypto", "meme", "fx", "stock"];
+/** 情報の効き具合を表示・計画に使う資産クラス (廃止した fx / stock の kv intelInfluence:<mode>:fx などは残し、読まないだけ) */
+const ASSET_CLASSES: AssetClass[] = ["crypto", "meme"];
 const MODES = ["paper", "live"] as const;
 
 /**

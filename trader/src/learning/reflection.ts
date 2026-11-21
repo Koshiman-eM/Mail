@@ -42,8 +42,9 @@ export const REFLECTION_RULES = {
 } as const;
 
 const STANDARD_PARAMS = ["stopAtr", "tpAtr", "trailAtr", "entryThreshold", "maxHoldBars"];
-const ASSET_CLASSES = ["crypto", "meme", "fx", "stock"] as const;
-const SCOPE_RE = /^(global|strategy:[\w.\-:]+|assetClass:(crypto|meme|fx|stock)|source:\S+|regime:(trend_up|trend_down|range|high_vol|low_liquidity))$/;
+/** 振り返りの提案・教訓の scope に使える資産クラス (廃止した fx / stock の古い教訓は DB に残し、読むときも例外にしない) */
+const ASSET_CLASSES = ["crypto", "meme"] as const;
+const SCOPE_RE = /^(global|strategy:[\w.\-:]+|assetClass:(crypto|meme)|source:\S+|regime:(trend_up|trend_down|range|high_vol|low_liquidity))$/;
 
 /** 要因ごとの対処の目安 (ルールベースの教訓文に使う) */
 const CAUSE_ADVICE: Record<CauseCode, string> = {

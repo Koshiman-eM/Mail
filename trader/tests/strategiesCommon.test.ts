@@ -96,7 +96,9 @@ describe("registry", () => {
     // meme (WATCHLIST で明示した銘柄) に掛かるのは scalp_momentum_burst だけ (専用の戦略は廃止)
     expect(strategiesFor("meme").map((s) => s.id)).toEqual(["scalp_momentum_burst"]);
     expect(strategiesFor("crypto", "scalp").map((s) => s.id)).toEqual(["scalp_obi", "scalp_vwap_revert", "scalp_momentum_burst", "scalp_micro", "scalp_rebound", "scalp_pullback"]);
-    expect(strategiesFor("fx", "short").length).toBe(3);
+    // FX・株式の資産クラスは廃止 (古い記録の名前で引いても空)
+    expect(strategiesFor("fx" as never, "short")).toEqual([]);
+    expect(ALL_STRATEGIES.every((s) => s.assetClasses.every((c) => c === "crypto" || c === "meme"))).toBe(true);
     // 押し目買い・戻り売りの 5 分足・15 分足は crypto の短期だけ
     expect(strategiesFor("crypto", "short").map((s) => s.id)).toEqual(["short_ema_trend", "short_rsi_revert", "short_breakout", "pullback_5m", "pullback_15m"]);
     expect(ALL_STRATEGIES.filter((s) => s.horizon === "mid" || s.horizon === "long")).toEqual([]);

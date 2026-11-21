@@ -3,15 +3,17 @@ import { PaperBroker } from "../src/execution/paper";
 import type { Instrument, OrderRequest, Quote } from "../src/core/types";
 
 const btc: Instrument = { symbol: "BTC/USDT", venue: "paper", assetClass: "crypto", baseCurrency: "BTC", quoteCurrency: "USDT", tickSize: 0.01, lotSize: 0.001, minQty: 0.001, takerFeeRate: 0.001, makerFeeRate: 0.0005, allowShort: false };
-const usdjpy: Instrument = { symbol: "USD/JPY", venue: "paper", assetClass: "fx", baseCurrency: "USD", quoteCurrency: "JPY", tickSize: 0.001, lotSize: 1, minQty: 1, takerFeeRate: 0, makerFeeRate: 0, allowShort: true, contractSize: 1 };
-const aapl: Instrument = { symbol: "AAPL", venue: "paper", assetClass: "stock", baseCurrency: "AAPL", quoteCurrency: "USD", tickSize: 0.01, lotSize: 1, minQty: 1, takerFeeRate: 0, makerFeeRate: 0, allowShort: true };
+/** 取引所で空売りできる銘柄 (allowShort=true) の例 */
+const xrpjpy: Instrument = { symbol: "XRP/JPY", venue: "paper", assetClass: "crypto", baseCurrency: "XRP", quoteCurrency: "JPY", tickSize: 0.001, lotSize: 1, minQty: 1, takerFeeRate: 0, makerFeeRate: 0, allowShort: true, contractSize: 1 };
+/** USD 建ての銘柄の例 */
+const solusd: Instrument = { symbol: "SOL/USD", venue: "paper", assetClass: "crypto", baseCurrency: "SOL", quoteCurrency: "USD", tickSize: 0.01, lotSize: 1, minQty: 1, takerFeeRate: 0, makerFeeRate: 0, allowShort: true };
 
 const q = (bid: number, ask: number): Quote => ({ ts: 1, bid, ask });
 let n = 0;
 const order = (o: Partial<OrderRequest> & Pick<OrderRequest, "symbol" | "side" | "qty">): OrderRequest => ({ clientId: `c${++n}`, type: "market", strategyId: "t", ...o });
 
 function mk(extra: Partial<ConstructorParameters<typeof PaperBroker>[0]> = {}) {
-  const b = new PaperBroker({ instruments: [btc, usdjpy, aapl], baseCurrency: "USDT", initialEquity: 10_000, slippageBps: 0, ...extra });
+  const b = new PaperBroker({ instruments: [btc, xrpjpy, solusd], baseCurrency: "USDT", initialEquity: 10_000, slippageBps: 0, ...extra });
   b.onQuote("BTC/USDT", q(100, 101));
   return b;
 }
@@ -46,10 +48,10 @@ describe("PaperBroker", () => {
 
   it("ドテン (FX)", async () => {
     const b = mk({ toAccount: (c) => (c === "JPY" ? 0.01 : 1) });
-    b.onQuote("USD/JPY", q(150, 150.01));
-    await b.placeOrder(order({ symbol: "USD/JPY", side: "buy", qty: "100" }));
-    b.onQuote("USD/JPY", q(151, 151.01));
-    await b.placeOrder(order({ symbol: "USD/JPY", side: "sell", qty: "250" })); // 100 決済 + 150 ショート
+    b.onQuote("XRP/JPY", q(150, 150.01));
+    await b.placeOrder(order({ symbol: "XRP/JPY", side: "buy", qty: "100" }));
+    b.onQuote("XRP/JPY", q(151, 151.01));
+    await b.placeOrder(order({ symbol: "XRP/JPY", side: "sell", qty: "250" })); // 100 決済 + 150 ショート
     const p = (await b.getPositions())[0];
     expect(p).toMatchObject({ qty: "-150", avgPrice: 151 });
     // 実現 (151-150.01)*100 = 99 JPY → 0.99 USDT 相当
@@ -73,7 +75,7 @@ describe("PaperBroker", () => {
     expect((await b.placeOrder(order({ symbol: "BTC/USDT", side: "buy", qty: "1000" }))).status).toBe("rejected");
     expect((await b.placeOrder(order({ symbol: "ZZZ", side: "buy", qty: "1" }))).status).toBe("rejected");
     expect((await b.placeOrder(order({ symbol: "BTC/USDT", side: "buy", qty: "0.0001" }))).status).toBe("rejected");
-    expect((await b.placeOrder(order({ symbol: "AAPL", side: "buy", qty: "1" }))).reason).toMatch(/クオート/);
+    expect((await b.placeOrder(order({ symbol: "SOL/USD", side: "buy", qty: "1" }))).reason).toMatch(/クオート/);
   });
 
   it("指値: 交差で即約定、非交差は板に置き onQuote で maker 約定", async () => {
@@ -132,15 +134,15 @@ describe("PaperBroker", () => {
     expect((await b2.getBalance()).equity).toBe((await b.getBalance()).equity);
   });
 
-  it("口座通貨換算 (株: USD 建て → JPY 口座)", async () => {
-    const b = new PaperBroker({ instruments: [aapl], baseCurrency: "JPY", initialEquity: 1_000_000, slippageBps: 0, toAccount: (c) => (c === "USD" ? 150 : 1) });
-    b.onQuote("AAPL", q(100, 100));
-    await b.placeOrder(order({ symbol: "AAPL", side: "buy", qty: "10" }));
-    b.onQuote("AAPL", q(110, 110));
+  it("口座通貨換算 (USD 建て → JPY 口座)", async () => {
+    const b = new PaperBroker({ instruments: [solusd], baseCurrency: "JPY", initialEquity: 1_000_000, slippageBps: 0, toAccount: (c) => (c === "USD" ? 150 : 1) });
+    b.onQuote("SOL/USD", q(100, 100));
+    await b.placeOrder(order({ symbol: "SOL/USD", side: "buy", qty: "10" }));
+    b.onQuote("SOL/USD", q(110, 110));
     expect(b.markToMarket().equity).toBeCloseTo(1_000_000 + 10 * 10 * 150, 4);
     const bal = await b.getBalance();
     expect(bal.currency).toBe("JPY");
-    // レバ 2 倍: 使用証拠金 = 110*10*150/2
-    expect(Number(bal.available)).toBeCloseTo(1_015_000 - 82_500, 4);
+    // 現物 (レバレッジ 1 倍): 使用証拠金 = 110*10*150
+    expect(Number(bal.available)).toBeCloseTo(1_015_000 - 165_000, 4);
   });
 });

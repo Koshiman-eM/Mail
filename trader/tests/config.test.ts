@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_OBSERVE_ONLY_STRATEGIES, DEFAULT_STRUCTURE_STRATEGIES, LIVE_CONFIRM_PHRASE, loadConfig, resolveMode } from "../src/core/config";
+import { DEFAULT_OBSERVE_ONLY_STRATEGIES, DEFAULT_STRUCTURE_STRATEGIES, LIVE_CONFIRM_PHRASE, loadConfig, removedEnvWarnings, resolveMode } from "../src/core/config";
 import { ALL_STRATEGIES } from "../src/strategies/registry";
 import { strategyIdListWarnings } from "../src/strategies/retired";
 import { D, floorToStep } from "../src/core/decimal";
@@ -38,7 +38,7 @@ describe("リスク値の範囲検証", () => {
     expect(r.maxDailyLoss).toBe(0.03);
     expect(r.maxDrawdown).toBe(0.15);
     expect(r.maxPositionPct).toBe(0.2);
-    expect(r.maxExposureByClass).toEqual({ crypto: 0.6, meme: 0.05, fx: 0.6, stock: 0.6 });
+    expect(r.maxExposureByClass).toEqual({ crypto: 0.6, meme: 0.05 });
     expect(r.maxOpenPositions).toBe(8);
     expect(r.maxOrdersPerMinute).toBe(30);
   });
@@ -61,8 +61,6 @@ describe("リスク値の範囲検証", () => {
     ["MAX_POSITION_PCT", "1.5"],
     ["MAX_EXPOSURE_CRYPTO", "2"],
     ["MAX_EXPOSURE_MEME", "0"],
-    ["MAX_EXPOSURE_FX", "1.01"],
-    ["MAX_EXPOSURE_STOCK", "-1"],
     ["MAX_OPEN_POSITIONS", "0"],
     ["MAX_OPEN_POSITIONS", "2.5"],
   ])("%s=%s は範囲外で起動を止める", (k, v) => {
@@ -70,6 +68,22 @@ describe("リスク値の範囲検証", () => {
   });
   it("数値でない値も止まる", () => {
     expect(() => loadConfig({ MAX_DRAWDOWN: "abc" })).toThrow(/MAX_DRAWDOWN/);
+  });
+  it("廃止した設定 (GMO_*・MAX_EXPOSURE_FX/STOCK) は値が不正でも起動を止めず、読まない (警告だけ)", () => {
+    const old = {
+      GMO_API_KEY: "k", GMO_API_SECRET: "s", GMO_SYMBOLS: "BTC_JPY", GMO_LEVERAGE_FEE_DAILY: "abc", GMO_MAX_EFFECTIVE_LEVERAGE: "9",
+      GMO_ALLOW_SPOT_CANDLES: "maybe", MAX_EXPOSURE_FX: "1.01", MAX_EXPOSURE_STOCK: "-1",
+    };
+    const c = loadConfig(old);
+    expect(c.risk.maxExposureByClass).toEqual({ crypto: 0.6, meme: 0.05 });
+    expect(Object.keys(c.env).filter((k) => k.startsWith("GMO_") || k.startsWith("MAX_EXPOSURE_FX") || k.startsWith("MAX_EXPOSURE_STOCK"))).toEqual([]);
+    const w = removedEnvWarnings({ ...old, GMO_EMPTY: " ", MAX_EXPOSURE_CRYPTO: "0.5" });
+    expect(w).toHaveLength(1);
+    expect(w[0]).toContain("GMO_ALLOW_SPOT_CANDLES, GMO_API_KEY, GMO_API_SECRET, GMO_LEVERAGE_FEE_DAILY, GMO_MAX_EFFECTIVE_LEVERAGE, GMO_SYMBOLS, MAX_EXPOSURE_FX, MAX_EXPOSURE_STOCK");
+    expect(w[0]).not.toContain("GMO_EMPTY");
+    expect(w[0]).not.toContain("MAX_EXPOSURE_CRYPTO");
+    expect(w[0]).not.toMatch(/=k|=s\b/); // 値は出さない
+    expect(removedEnvWarnings({ MAX_EXPOSURE_CRYPTO: "0.5" })).toEqual([]);
   });
 });
 

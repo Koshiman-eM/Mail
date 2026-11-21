@@ -52,7 +52,7 @@ const count = (key: string, def: number, max: number) =>
  */
 export type RiskSettingKey =
   | "riskPerTrade" | "maxDailyLoss" | "maxDrawdown" | "maxPositionPct"
-  | "maxExposureCrypto" | "maxExposureMeme" | "maxExposureFx" | "maxExposureStock"
+  | "maxExposureCrypto" | "maxExposureMeme"
   | "maxOpenPositions" | "maxOrdersPerMinute";
 
 export interface RiskSettingSpec {
@@ -73,8 +73,6 @@ export const RISK_SETTING_SPECS: Readonly<Record<RiskSettingKey, RiskSettingSpec
   maxPositionPct: { env: "MAX_POSITION_PCT", kind: "ratio", min: 0, max: 1, def: 0.2, label: "1 銘柄の上限" },
   maxExposureCrypto: { env: "MAX_EXPOSURE_CRYPTO", kind: "ratio", min: 0, max: 1, def: 0.6, label: "暗号資産の上限" },
   maxExposureMeme: { env: "MAX_EXPOSURE_MEME", kind: "ratio", min: 0, max: 1, def: 0.05, label: "ミームの上限" },
-  maxExposureFx: { env: "MAX_EXPOSURE_FX", kind: "ratio", min: 0, max: 1, def: 0.6, label: "FX の上限" },
-  maxExposureStock: { env: "MAX_EXPOSURE_STOCK", kind: "ratio", min: 0, max: 1, def: 0.6, label: "株式の上限" },
   maxOpenPositions: { env: "MAX_OPEN_POSITIONS", kind: "count", min: 1, max: 100, def: 8, label: "最大保有数" },
   maxOrdersPerMinute: { env: "MAX_ORDERS_PER_MINUTE", kind: "count", min: 1, max: 1000, def: 30, label: "1 分あたりの発注数" },
 };
@@ -82,7 +80,7 @@ export const RISK_SETTING_SPECS: Readonly<Record<RiskSettingKey, RiskSettingSpec
 /** 画面・CLI に出す順 */
 export const RISK_SETTING_KEYS: readonly RiskSettingKey[] = [
   "riskPerTrade", "maxDailyLoss", "maxDrawdown", "maxPositionPct",
-  "maxExposureCrypto", "maxExposureMeme", "maxExposureFx", "maxExposureStock",
+  "maxExposureCrypto", "maxExposureMeme",
   "maxOpenPositions", "maxOrdersPerMinute",
 ];
 
@@ -171,8 +169,8 @@ const EnvSchema = z.object({
   TRADING_MODE: str("paper"),
   LIVE_TRADING_CONFIRM: str(),
   /**
-   * 使う取引先 (カンマ区切り): synthetic, ccxt, gmo。live の発注は gmo だけ (ccxt は相場の取得と paper 用)。
-   * 廃止した oanda / alpaca / dex は起動時に警告して無視する (src/engine/setup.ts の parseVenues)
+   * 使う取引先 (カンマ区切り): synthetic, ccxt。どちらも相場の取得と paper 用 (live の発注先は未対応。TRADING_MODE=live では起動しない)。
+   * 廃止した gmo / oanda / alpaca / dex は起動時に警告して無視する (src/engine/setup.ts の parseVenues)
    */
   VENUES: str("synthetic"),
   /** 監視銘柄 (カンマ区切り、"venue|symbol|assetClass")。空なら既定のデモ銘柄 */
@@ -198,30 +196,6 @@ const EnvSchema = z.object({
 
   // 暗号資産取引所 (ccxt。相場の取得と paper 用で、発注はしない)
   CCXT_EXCHANGE: str("bitbank"),
-  // GMOコイン (取引所 レバレッジ取引)。キーは live の発注と `gmo check` の非公開 API (読み取り) だけに使う
-  GMO_API_KEY: str(),
-  GMO_API_SECRET: str(),
-  /** 使うレバレッジ銘柄 (GMO の表記、カンマ区切り)。WATCHLIST に gmo の銘柄があればそちらを優先 */
-  GMO_SYMBOLS: str("BTC_JPY,ETH_JPY,XRP_JPY"),
-  /**
-   * 建玉の持ち越し手数料 (レバレッジ手数料) の日率 (0〜0.01)。既定 0.0004 (0.04%/日、要確認)。
-   * paper で、日本時間 6:00 をまたいで保有した回数 × 建玉代金 × 日率を手数料に計上する
-   */
-  GMO_LEVERAGE_FEE_DAILY: num(0.0004).refine((x) => x >= 0 && x <= 0.01, {
-    message: "GMO_LEVERAGE_FEE_DAILY は 0 以上 0.01 以下の日率で指定してください (0.04%/日なら 0.0004)",
-  }),
-  /**
-   * GMO の建玉の合計 (絶対値の口座通貨換算) の上限 (評価額の倍率、0.1〜2)。既定 1 (レバレッジを掛けない)。
-   * 超える新規エントリーは RiskManager が拒否する (GMO 自体は 2 倍まで建てられる)
-   */
-  GMO_MAX_EFFECTIVE_LEVERAGE: num(1).refine((x) => x >= 0.1 && x <= 2, {
-    message: "GMO_MAX_EFFECTIVE_LEVERAGE は 0.1 以上 2 以下で指定してください (評価額の何倍まで建てるか)",
-  }),
-  /**
-   * レバレッジ銘柄の足が取れないとき、現物銘柄 (BTC など) の足に切り替えてよいか (既定 false)。
-   * paper では常に許可 (警告と監査ログ gmo.spot_candles を残す)。live ではこれが true のときだけ許可し、false なら例外
-   */
-  GMO_ALLOW_SPOT_CANDLES: bool("GMO_ALLOW_SPOT_CANDLES", false),
   // 情報収集
   CRYPTOPANIC_TOKEN: str(),
   NEWS_RSS_FEEDS: str(),
@@ -237,8 +211,6 @@ const EnvSchema = z.object({
   MIN_EDGE_TO_COST: num(2),
   MAX_EXPOSURE_CRYPTO: riskEnv("maxExposureCrypto"),
   MAX_EXPOSURE_MEME: riskEnv("maxExposureMeme"),
-  MAX_EXPOSURE_FX: riskEnv("maxExposureFx"),
-  MAX_EXPOSURE_STOCK: riskEnv("maxExposureStock"),
   /**
    * 資産クラス meme (WATCHLIST で明示した銘柄だけ。自動の分類はしない) の新規エントリーに求める 24 時間の流動性 (USD)。
    * RiskManager の判定 (未満・不明なら拒否)
@@ -452,8 +424,6 @@ export function loadConfig(source: Record<string, string | undefined> = process.
   const exposure: Record<AssetClass, number> = {
     crypto: env.MAX_EXPOSURE_CRYPTO,
     meme: env.MAX_EXPOSURE_MEME,
-    fx: env.MAX_EXPOSURE_FX,
-    stock: env.MAX_EXPOSURE_STOCK,
   };
   return {
     env,
@@ -477,3 +447,19 @@ export function loadConfig(source: Record<string, string | undefined> = process.
 }
 
 export const DEFAULT_RISK: RiskLimits = loadConfig({}).risk;
+
+/**
+ * 廃止した環境変数 (読まない)。.env に残っていても起動は止めず、status と run の起動時に知らせるだけ。
+ * GMO_*: GMOコインの取引先 (廃止)。MAX_EXPOSURE_FX / MAX_EXPOSURE_STOCK: FX・株式の資産クラス (廃止)
+ */
+const REMOVED_ENV_PREFIXES = ["GMO_"] as const;
+const REMOVED_ENV_KEYS = ["MAX_EXPOSURE_FX", "MAX_EXPOSURE_STOCK"] as const;
+
+/** 値の入った廃止した環境変数があれば警告文を返す (値は表示しない) */
+export function removedEnvWarnings(source: Record<string, string | undefined>): string[] {
+  const keys = Object.keys(source)
+    .filter((k) => (source[k] ?? "").trim() !== "")
+    .filter((k) => REMOVED_ENV_PREFIXES.some((p) => k.startsWith(p)) || (REMOVED_ENV_KEYS as readonly string[]).includes(k))
+    .sort();
+  return keys.length ? [`.env の ${keys.join(", ")} は廃止した設定のため読みません (GMOコイン・FX・株式は廃止。.env から外してください)`] : [];
+}

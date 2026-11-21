@@ -64,9 +64,6 @@ export interface FetchOptions extends Omit<RequestInit, "signal"> {
   sleep?: (ms: number) => Promise<void>;
 }
 
-/** 5 秒ループの気配取得用 (次の周期がすぐ来るので再試行を減らし、周期内に収まるタイムアウトにする) */
-export const QUOTE_FETCH_OPTIONS: Readonly<Pick<FetchOptions, "retries" | "timeoutMs">> = { retries: 1, timeoutMs: 4000 };
-
 export const DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024;
 export const DEFAULT_MAX_RETRY_AFTER_MS = 30_000;
 

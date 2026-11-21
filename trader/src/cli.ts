@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { loadConfig, type AppConfig } from "./core/config";
+import { loadConfig, removedEnvWarnings, type AppConfig } from "./core/config";
 import type { Store, TradeRecord } from "./core/types";
 import { isLoopbackHost, startDashboard, type DashboardServer } from "./dashboard/server";
 import { formatBacktestRows, runBacktestCommand, type BacktestSource } from "./engine/backtestCommand";
@@ -26,7 +26,7 @@ import {
   peekResolveRequests, PendingOrders, readLimitStats, requestResolve, RestingTakeProfits, type PendingOrder, type ResolveRequest,
 } from "./engine/orders";
 import { acquireEngineLock, releaseEngineLock, startEngineLockHeartbeat, type LockOwner } from "./engine/lock";
-import { assertLiveVenues, buildRuntime, parseVenues, resolveDbPath, type Runtime } from "./engine/setup";
+import { assertLiveSupported, buildRuntime, effectiveVenues, isRemovedVenue, parseWatchlist, resolveDbPath, type Runtime } from "./engine/setup";
 import { effectiveLimitTakeProfit, limitOrdersFromEnv } from "./engine/limitOrders";
 import { formatSimulationReport, runSimulation } from "./engine/simulate";
 import { formatTempoLine, TempoController, tempoSeedTimestamps, tempoStatusView } from "./engine/tempo";
@@ -35,9 +35,6 @@ import type { IntelSource } from "./intel/sources/common";
 import { TradeJournal } from "./learning/journal";
 import { LearningService } from "./learning/service";
 import { CcxtFeed } from "./market/feeds/ccxt";
-import { GmoFeed } from "./market/feeds/gmo";
-import { runGmoCheck } from "./market/gmo/check";
-import { parseGmoSymbols } from "./market/gmo/client";
 import { RiskManager } from "./risk/manager";
 import { requestResume } from "./risk/resumeRequest";
 import { riskOverrideLines } from "./risk/settings";
@@ -45,7 +42,6 @@ import { createStore } from "./storage";
 import { ReadOnlyOverlayStore } from "./storage/readonly";
 import { ALL_STRATEGIES, configuredStrategies, getStrategy } from "./strategies/registry";
 import { structureSettingsFromEnv } from "./structure/settings";
-import { unifiedToGmo } from "./market/gmo/client";
 import { TIMEFRAME_MS, type ExitReason, type Timeframe } from "./core/types";
 import { horizonLabel, strategyLabel, strategyLabelWithId } from "./strategies/labels";
 import { strategyIdListWarnings } from "./strategies/retired";
@@ -173,7 +169,8 @@ export function parseBacktestArgs(flags: ParsedArgs["flags"]): BacktestArgs {
   if (!strategy) throw new CliError("--strategy <戦略ID|all> を指定してください");
   if (strategy !== "all" && !getStrategy(strategy)) throw new CliError(`未知の戦略: ${strategy}`);
   const source = stringFlag(flags, "source", "synthetic");
-  if (source !== "synthetic" && source !== "ccxt" && source !== "gmo") throw new CliError("--source は synthetic / ccxt / gmo のどれかです");
+  if (source === "gmo") throw new CliError("--source gmo は廃止しました (GMOコインの取引先を廃止したため)。synthetic / ccxt のどちらかです");
+  if (source !== "synthetic" && source !== "ccxt") throw new CliError("--source は synthetic / ccxt のどちらかです");
   const symbol = flags.symbol === undefined ? undefined : stringFlag(flags, "symbol", "");
   return {
     strategy,
@@ -218,15 +215,15 @@ export interface Io {
 }
 const consoleIo: Io = { out: (s) => console.log(s), err: (s) => console.error(s) };
 
-export const HELP = `自己学習型マルチアセット自動売買ツール
+export const HELP = `自己学習型の仮想通貨自動売買ツール
 
 使い方: npm run trader -- <コマンド> [オプション]
 
   run                         実時間で起動 (既定は paper)。ダッシュボードも起動します
   simulate [--days 3] [--hours N] [--seed 1] [--db memory] [--step 15]
                               合成データ + 仮想時計で高速にペーパー運転 (ネット不要)
-  backtest --strategy <ID|all> [--symbol SYM] [--days 30] [--source synthetic|ccxt|gmo] [--seed 1]
-                              バックテスト (ccxt は CCXT_EXCHANGE、gmo は GMOコインの履歴を取得。STRUCTURE_* の構造フィルター込み)
+  backtest --strategy <ID|all> [--symbol SYM] [--days 30] [--source synthetic|ccxt] [--seed 1]
+                              バックテスト (ccxt は CCXT_EXCHANGE の履歴を取得。STRUCTURE_* の構造フィルター込み)
   backtest --structure-compare [--strategy <ID|all>] [--pivot-sweep] [--folds 5] [その他は backtest と同じ]
                               相場構造のフィルターの比較 (A: ラップなし 〜 G: conservative 版) を区間検証で表示
   regime --symbol SYM [--hours 3] [--tf 1m,15m,1h,4h] [--step 5]
@@ -248,10 +245,9 @@ export const HELP = `自己学習型マルチアセット自動売買ツール
                               paper の口座を指定の評価額で作り直す (学習データは残す)。--confirm なしは確認だけ (dry run)。
                               保有中の建玉は「リセットで決済」として記帳上だけ閉じ、学習・成績には使いません。
                               エンジンの停止が必要です (sudo systemctl stop trader)。TRADING_MODE=live では実行できません
-  gmo check                   GMOコインの API の応答の形を確かめる (公開 API と、キーがあれば読み取り専用の非公開 API。
-                              注文・取消は呼びません。キーは表示しません)
 
-実弾 (live) は TRADING_MODE=live と LIVE_TRADING_CONFIRM=I_UNDERSTAND_REAL_MONEY_RISK の両方が必要です。`;
+実弾 (live) は TRADING_MODE=live と LIVE_TRADING_CONFIRM=I_UNDERSTAND_REAL_MONEY_RISK の両方が必要です。
+いまは live の発注先が無いため、live では起動しません (Jupiter の実弾は次の段階で実装予定)。`;
 
 const venuesLine = (c: AppConfig) => `取引先: ${c.env.VENUES}${c.env.VENUES.split(",").some((v) => v.trim().startsWith("ccxt")) ? ` (ccxt: ${c.env.CCXT_EXCHANGE})` : ""}`;
 
@@ -264,17 +260,23 @@ function modeLines(c: AppConfig): { out: string[]; warn: string[] } {
 }
 
 /**
- * status 用: 廃止した取引先 (oanda / alpaca / dex)・戦略の id が .env に残っていれば知らせる
- * (エンジンは起動時に同じ内容をログに警告して無視する)。live で VENUES に ccxt があればエンジンが起動しない旨も出す
+ * status 用: 廃止した取引先 (gmo / oanda / alpaca / dex)・資産クラス (fx / stock)・戦略の id・環境変数 (GMO_* など) が
+ * .env に残っていれば知らせる (エンジンは起動時に同じ内容をログに警告して無視する)。live ならエンジンが起動しない旨も出す。
+ * rawEnv は .env の生の値 (廃止した環境変数は loadConfig が読まないので、こちらで調べる)
  */
-export function configCompatWarnings(c: AppConfig): string[] {
+export function configCompatWarnings(c: AppConfig, rawEnv: Record<string, string | undefined> = process.env): string[] {
   const warn: string[] = [];
   try {
-    const venues = parseVenues(c.env.VENUES, (m) => warn.push(`警告: ${m}`));
-    if (c.mode === "live") assertLiveVenues(venues);
+    effectiveVenues(c.env.VENUES, (m) => warn.push(`警告: ${m}`));
+    const removed = parseWatchlist(c.env.WATCHLIST, (m) => warn.push(`警告: ${m}`)).filter((w) => isRemovedVenue(w.venue));
+    if (removed.length > 0) {
+      warn.push(`警告: WATCHLIST の ${removed.map((w) => `${w.venue}|${w.symbol}`).join(", ")} は廃止した取引先の銘柄のため無視します (.env から外してください)`);
+    }
+    assertLiveSupported(c.mode);
   } catch (e) {
     warn.push(`警告: ${e instanceof Error ? e.message : String(e)} (このままではエンジンが起動しません)`);
   }
+  for (const w of removedEnvWarnings(rawEnv)) warn.push(`警告: ${w}`);
   const ids = ALL_STRATEGIES.map((x) => x.id);
   for (const w of strategyIdListWarnings("OBSERVE_ONLY_STRATEGIES", c.env.OBSERVE_ONLY_STRATEGIES ?? [], ids)) warn.push(`警告: ${w}`);
   return warn;
@@ -405,7 +407,17 @@ async function cmdRun(io: Io): Promise<number> {
   const config = loadConfig();
   const m = modeLines(config);
   m.out.forEach((l) => io.out(l));
+  // live の発注先はまだ無い。DB・ロック・feed に触れる前に止める (fail-closed。buildRuntime・createBrokers も live を拒否する)
+  if (config.mode === "live") {
+    try {
+      assertLiveSupported(config.mode);
+    } catch (e) {
+      io.err(`エラー: ${e instanceof Error ? e.message : String(e)}。TRADING_MODE=paper にしてください`);
+      return 1;
+    }
+  }
   m.warn.forEach((l) => io.err(l));
+  for (const w of removedEnvWarnings(process.env)) io.err(`警告: ${w}`);
   io.out(venuesLine(config));
   // 同じ mode のエンジンの二重起動防止 (同じ DB の kv にロックを書き、15 秒ごとに heartbeat を更新する)。
   // 状態を読み込む前にロックを取る (paper reset との競合防止)
@@ -537,18 +549,11 @@ async function cmdBacktest(flags: ParsedArgs["flags"], io: Io): Promise<number> 
   }
   const symbol =
     a.symbol ??
-    (a.source === "gmo"
-      ? "BTC/JPY"
-      : a.source === "ccxt"
-        ? ["bitflyer", "bitbank", "coincheck", "zaif"].includes(config.env.CCXT_EXCHANGE) ? "BTC/JPY" : "BTC/USDT"
-        : "SYN/USDT");
-  if (a.source === "gmo") {
-    io.out("GMOコインから履歴を取得します...");
-    // 履歴の取得だけ (発注しない)。レバレッジ銘柄の足が取れなければ現物の足で代用する (バックテスト用)
-    feed = new GmoFeed({ symbols: parseGmoSymbols(unifiedToGmo(symbol)), holdingFeeDaily: config.env.GMO_LEVERAGE_FEE_DAILY, allowSpotCandles: true });
-  }
+    (a.source === "ccxt"
+      ? ["bitflyer", "bitbank", "coincheck", "zaif"].includes(config.env.CCXT_EXCHANGE) ? "BTC/JPY" : "BTC/USDT"
+      : "SYN/USDT");
   const structure = structureSettingsFromEnv(config.env);
-  const sourceLabel = a.source === "synthetic" ? `合成データ (シード ${a.seed})` : a.source === "gmo" ? "GMOコイン" : `ccxt ${config.env.CCXT_EXCHANGE}`;
+  const sourceLabel = a.source === "synthetic" ? `合成データ (シード ${a.seed})` : `ccxt ${config.env.CCXT_EXCHANGE}`;
   const common = {
     ...a,
     symbol,
@@ -589,17 +594,9 @@ async function cmdBacktest(flags: ParsedArgs["flags"], io: Io): Promise<number> 
 async function cmdRegime(flags: ParsedArgs["flags"], io: Io): Promise<number> {
   const a = parseRegimeArgs(flags);
   const config = loadConfig();
-  // 運用中と同じ取引所の足で判定する (VENUES に gmo があれば GMOコイン、無ければ ccxt の CCXT_EXCHANGE)
-  let useGmo = false;
-  try {
-    useGmo = parseVenues(config.env.VENUES).includes("gmo");
-  } catch {
-    /* VENUES が不正なら ccxt を使う */
-  }
-  const feed = useGmo
-    ? new GmoFeed({ symbols: parseGmoSymbols(config.env.GMO_SYMBOLS), holdingFeeDaily: config.env.GMO_LEVERAGE_FEE_DAILY, allowSpotCandles: true })
-    : CcxtFeed.create(config.env.CCXT_EXCHANGE);
-  io.out(useGmo ? "GMOコインから履歴を取得します..." : `ccxt (${config.env.CCXT_EXCHANGE}) から履歴を取得します...`);
+  // ccxt の CCXT_EXCHANGE (既定 bitbank) の足で判定する
+  const feed = CcxtFeed.create(config.env.CCXT_EXCHANGE);
+  io.out(`ccxt (${config.env.CCXT_EXCHANGE}) から履歴を取得します...`);
   const sc = structureSettingsFromEnv(config.env).config;
   const structure = { pivotN: sc.pivotN, breakMode: sc.breakMode, reversalMode: sc.reversalMode, chopM: sc.chopM, chopR: sc.chopR };
   io.out(await runRegimeCommand({ feed, symbol: a.symbol, hours: a.hours, timeframes: a.timeframes, stepMin: a.stepMin, structure }));
@@ -1117,17 +1114,6 @@ function cmdPaper(positionals: string[], flags: ParsedArgs["flags"], io: Io): nu
   }
 }
 
-/** `gmo check`: GMOコインの API の応答の形を確かめる (GET だけ。注文・取消は呼ばない) */
-async function cmdGmo(positionals: string[], io: Io): Promise<number> {
-  const [sub, ...rest] = positionals;
-  if (sub !== "check" || rest.length > 0) throw new CliError(`使い方: npm run trader -- gmo check (未知の引数: ${positionals.join(" ") || "(なし)"})`);
-  const config = loadConfig();
-  return runGmoCheck({
-    env: { GMO_API_KEY: config.env.GMO_API_KEY, GMO_API_SECRET: config.env.GMO_API_SECRET, GMO_SYMBOLS: config.env.GMO_SYMBOLS },
-    out: (s) => io.out(s),
-  });
-}
-
 export async function main(argv: string[] = process.argv.slice(2), io: Io = consoleIo): Promise<number> {
   let args: ParsedArgs;
   try {
@@ -1136,7 +1122,8 @@ export async function main(argv: string[] = process.argv.slice(2), io: Io = cons
       io.out(HELP);
       return 0;
     }
-    if (args.command !== "orders" && args.command !== "gmo" && args.command !== "paper" && args.positionals.length > 0) {
+    if (args.command === "gmo") throw new CliError("gmo コマンド (gmo check) は廃止しました (GMOコインの取引先を廃止したため)");
+    if (args.command !== "orders" && args.command !== "paper" && args.positionals.length > 0) {
       throw new CliError(`余分な引数があります: ${args.positionals.join(" ")} (${args.command} は位置引数を取りません)`);
     }
     switch (args.command) {
@@ -1158,8 +1145,6 @@ export async function main(argv: string[] = process.argv.slice(2), io: Io = cons
         return cmdStatus(io);
       case "orders":
         return cmdOrders(args.positionals, args.flags, io);
-      case "gmo":
-        return await cmdGmo(args.positionals, io);
       case "paper":
         return cmdPaper(args.positionals, args.flags, io);
       default:

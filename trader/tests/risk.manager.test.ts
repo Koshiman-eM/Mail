@@ -101,14 +101,29 @@ describe("RiskManager.evaluateEntry", () => {
     expect(rm.evaluateEntry(params({ now: NOW + 60_000 })).ok).toBe(true);
   });
 
-  it("口座通貨換算 (FX: JPY 建て)", () => {
-    const rm = new RiskManager({ ...limits, maxPositionPct: 100, maxExposureByClass: { ...limits.maxExposureByClass, fx: 100 } });
-    const jpy: Instrument = { ...btc, symbol: "USD/JPY", assetClass: "fx", quoteCurrency: "JPY", lotSize: 1, minQty: 1, minNotional: undefined, takerFeeRate: 0, allowShort: true, contractSize: 1 };
+  it("口座通貨換算 (JPY 建ての銘柄、USD 口座)", () => {
+    const rm = new RiskManager({ ...limits, maxPositionPct: 100, maxExposureByClass: { ...limits.maxExposureByClass, crypto: 100 } });
+    const jpy: Instrument = { ...btc, symbol: "XRP/JPY", baseCurrency: "XRP", quoteCurrency: "JPY", lotSize: 1, minQty: 1, minNotional: undefined, takerFeeRate: 0, allowShort: true, contractSize: 1 };
     // 口座 USD 1000, risk 1% = 10 USD, 損切り幅 0.5 JPY = 0.005 USD/単位 → 2000 単位 (10/0.005)
     const d = rm.evaluateEntry({
-      ...params({ instrument: jpy, signal: sig({ symbol: "USD/JPY", stopLoss: 149.5 }), quote: { ts: NOW, bid: 149.99, ask: 150 }, equity: 1000, available: 1e9, toAccount: (c) => (c === "JPY" ? 0.01 : 1) }),
+      ...params({ instrument: jpy, signal: sig({ symbol: "XRP/JPY", stopLoss: 149.5 }), quote: { ts: NOW, bid: 149.99, ask: 150 }, equity: 1000, available: 1e9, toAccount: (c) => (c === "JPY" ? 0.01 : 1) }),
     });
     expect(d.ok && Number(d.qty)).toBe(2000);
+  });
+
+  it("廃止した資産クラス (fx / stock) の古い建玉があっても例外にせず、その銘柄の新規は上限が無いので拒否する", () => {
+    const rm = new RiskManager({ ...limits, maxPositionPct: 100 });
+    const old = { ...btc, symbol: "USD/JPY", assetClass: "fx", quoteCurrency: "JPY", allowShort: true } as unknown as Instrument;
+    // 古い fx の建玉は crypto の上限に数えない (別のクラスのキーに積む)
+    const ex = classExposure([{ symbol: "USD/JPY", qty: 10, avgPrice: 150, assetClass: "fx" as never }, { symbol: "BTC/USDT", qty: 1, avgPrice: 100, assetClass: "crypto" }], {}, { "USD/JPY": old });
+    expect(ex.exposure.crypto.toNumber()).toBe(100);
+    expect(ex.exposure.fx?.toNumber()).toBe(1500);
+    // BTC の新規は従来どおり判定できる (fx の建玉があっても落ちない)
+    const positions = [{ symbol: "USD/JPY", qty: 10, avgPrice: 150, assetClass: "fx" as never, quoteCurrency: "USDT" }];
+    expect(rm.evaluateEntry(params({ positions })).ok).toBe(true);
+    // 上限の無いクラスの銘柄の新規は拒否 (fail-closed)
+    const d = rm.evaluateEntry(params({ instrument: old, signal: sig({ symbol: "USD/JPY", stopLoss: 149 }), quote: { ts: NOW, bid: 149.99, ask: 150 } }));
+    expect(d).toMatchObject({ ok: false, reason: expect.stringContaining("対象外の資産クラス") });
   });
 });
 

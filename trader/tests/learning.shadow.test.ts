@@ -82,10 +82,13 @@ describe("ShadowTracker (見送ったシグナルの仮想トレード)", () => 
   });
 
   it("約定ずれは資産クラス別 (バックテストの既定値と同じ。meme は片道 20bps)", () => {
-    for (const [ac, bps] of [["crypto", 1], ["meme", 20], ["fx", 0.5], ["stock", 1]] as const) {
+    for (const [ac, bps] of [["crypto", 1], ["meme", 20]] as const) {
       expect(shadowSlippageBps(ac)).toBe(defaultCosts(ac).slippageBps);
       expect(shadowSlippageBps(ac)).toBe(bps);
     }
+    // 廃止した資産クラス (古い記録) は例外にせず crypto の値
+    expect(shadowSlippageBps("fx" as never)).toBe(1);
+    expect(defaultCosts("stock" as never)).toEqual(defaultCosts("crypto"));
     expect(shadowSlippageBps("meme", 3)).toBe(3); // 上書き
     const tr = tracker();
     tr.record(input({ instrument: { ...inst, symbol: "PEPE/USDT", assetClass: "meme" } }));

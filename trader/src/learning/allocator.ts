@@ -8,7 +8,7 @@ export const SIMULATED_SHORT_ARM_SUFFIX = "|short";
 /**
  * 腕のキー: 戦略×レジーム×資産クラス。
  * paper で再現した空売り (simulatedShort) は別の腕 `<戦略>|<レジーム>|<資産クラス>|short` で学習する
- * (live で実行できない取引の結果を買いの配分・停止の判断に混ぜない)。買いと、取引所で空売りできる銘柄 (FX・株) の売りは
+ * (live で実行できない取引の結果を買いの配分・停止の判断に混ぜない)。買いと、取引所で空売りできる銘柄の売り (廃止した GMOコイン・FX・株の古い記録) は
  * 従来どおり接尾辞なしのキー (保存済みの腕と互換)。live では simulatedShort が無いので short の腕は使われない
  */
 export const armKey = (strategyId: string, regime: RegimeLabel, assetClass: AssetClass, simulatedShort = false) =>

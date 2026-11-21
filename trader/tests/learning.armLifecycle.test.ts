@@ -101,7 +101,8 @@ describe("情報の効き具合: direction_bias の仮想トレードの答え�
     }
     expect(svc.intelInfluence("crypto")).toBeLessThan(0.8);
     expect(svc.intelInfluences().crypto).toBe(svc.intelInfluence("crypto"));
-    expect(svc.intelInfluences().fx).toBe(1);
+    expect(svc.intelInfluences().meme).toBe(1);
+    expect(Object.keys(svc.intelInfluences()).sort()).toEqual(["crypto", "meme"]); // 廃止した fx / stock は出さない
     // 0 で無効にできる
     const off = new LearningService({ store: new MemoryStore(), influenceShadowWeight: 0 });
     off.onShadowClosed(shadow(1.5, { reason: "direction_bias" }), { intelSentiment: 0.6 });

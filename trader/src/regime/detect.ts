@@ -37,8 +37,9 @@ export const DEFAULT_REGIME_OPTIONS: RegimeOptions = {
 
 /** 資産クラス別の既定値 (主にスプレッド閾値) */
 export function regimeOptionsFor(assetClass: AssetClass, overrides: Partial<RegimeOptions> = {}): RegimeOptions {
-  const spread: Record<AssetClass, number> = { crypto: 30, meme: 150, fx: 8, stock: 30 };
-  return { ...DEFAULT_REGIME_OPTIONS, maxSpreadBps: spread[assetClass], ...overrides };
+  // 未知のクラス (廃止した fx / stock の古い銘柄定義など) は crypto の値
+  const spread: Record<AssetClass, number> = { crypto: 30, meme: 150 };
+  return { ...DEFAULT_REGIME_OPTIONS, maxSpreadBps: spread[assetClass] ?? spread.crypto, ...overrides };
 }
 
 /** パーセンタイル計算に必要な最小サンプル数 (未満なら 0.5 = 不明) */

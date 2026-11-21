@@ -2,7 +2,6 @@ import { D, floorToStep, roundToStep, Decimal } from "../core/decimal";
 import { TerminalMap, isTerminalOrder } from "../core/sweep";
 import { createLogger } from "../core/logger";
 import { canShort, DEFAULT_SHORT_BORROW_RATE_DAILY } from "../core/short";
-import { holdingFeeDailyOf, jstCutoffCrossings } from "../core/holdingFee";
 import {
   systemClock, type Balance, type Broker, type BrokerCapabilities, type BrokerPosition, type Clock, type Fill, type Instrument, type OrderRequest, type OrderResult,
   type Quote,
@@ -20,15 +19,14 @@ export interface PaperBrokerOptions {
    * 換算できない通貨は NaN を返す: その銘柄の新規発注は拒否し、評価には最後に分かったレートを使う。
    */
   toAccount?: (ccy: string) => number;
-  /** 資産クラス別レバレッジ (証拠金計算)。既定: crypto/meme 1, fx 10, stock 2 */
+  /** 資産クラス別レバレッジ (証拠金計算)。既定: crypto/meme 1 (現物。未知のクラスも 1) */
   leverage?: Partial<Record<Instrument["assetClass"], number>>;
   clock?: Clock;
   /** quote が未受信のときの取得元 */
   quoteProvider?: (symbol: string) => Quote | undefined;
   /**
    * 空売りを再現する銘柄 (simulatedShort。allowShort=false の現物) の借入コストの日率 (既定 0.0004 = 0.04%/日)。
-   * 建玉代金 (平均建値 × 数量) × 日率 × 経過日数 (日割り) を、買い戻しの約定の手数料に加えて計上する。
-   * meta.holdingFeeDaily がある銘柄 (GMO) は代わりにその日率で、日本時間 6:00 をまたいだ回数分を計上する (src/core/holdingFee.ts)
+   * 建玉代金 (平均建値 × 数量) × 日率 × 経過日数 (日割り) を、買い戻しの約定の手数料に加えて計上する
    */
   shortBorrowRateDaily?: number;
 }
@@ -38,11 +36,10 @@ interface Pos {
   avg: Decimal;
   openedAt: number;
   /**
-   * 建玉の保有コストの計算の起点 (この時刻までの分は borrowAccrued に積んだ)。対象は次の 2 つ:
-   * - 再現した空売り (allowShort=false の銘柄の負の建玉) の借入コスト (日数比例)
-   * - instrument.meta.holdingFeeDaily がある銘柄 (GMOコインのレバレッジ取引) の買い・売り両方の建玉の持ち越し手数料
-   *   (日本時間 6:00 をまたいだ回数 × 建玉代金 × 日率)
-   * それ以外 (取引所で空売りできる FX・株、現物の買い) には付けない (従来の会計のまま)
+   * 建玉の保有コストの計算の起点 (この時刻までの分は borrowAccrued に積んだ)。
+   * 対象は再現した空売り (allowShort=false の銘柄の負の建玉) の借入コスト (日数比例) だけ。現物の買いには付けない。
+   * 廃止した GMOコインの持ち越し手数料で付いた古いスナップショットの買いの建玉は、積んだ分 (borrowAccrued) を決済時に払い、
+   * それ以降は積まない
    */
   borrowFrom?: number;
   /** borrowFrom までに積んだ未払いの保有コスト (クオート通貨建て) */
@@ -74,7 +71,7 @@ export interface PaperSnapshot {
   fxRates?: Record<string, string>;
 }
 
-const DEFAULT_LEVERAGE = { crypto: 1, meme: 1, fx: 10, stock: 2 };
+const DEFAULT_LEVERAGE = { crypto: 1, meme: 1 };
 const log = createLogger("paper");
 
 /**
@@ -126,16 +123,16 @@ export class PaperBroker implements Broker {
 
   /**
    * now までの未払いの保有コスト (クオート通貨建て)。対象外の建玉は 0。
-   * - 持ち越し手数料のある銘柄 (meta.holdingFeeDaily): 建玉代金 × 日率 × 日本時間 6:00 をまたいだ回数
-   * - 再現した空売り: 建玉代金 × PAPER_SHORT_BORROW_RATE_DAILY × 経過日数 (日割り)
+   * 再現した空売り (負の建玉): 建玉代金 × PAPER_SHORT_BORROW_RATE_DAILY × 経過日数 (日割り)。
+   * 買いの建玉 (古いスナップショットの GMO の持ち越し手数料の分) は積んだ分だけで、新たには積まない
    */
   private borrowOwed(p: Pos, inst: Instrument, now: number): Decimal {
     if (p.borrowFrom === undefined) return D(0);
+    const accrued = p.borrowAccrued ?? D(0);
+    if (!p.qty.isNegative()) return accrued;
     const notional = p.avg.mul(p.qty.abs()).mul(this.cs(inst));
-    const holding = holdingFeeDailyOf(inst);
-    if (holding !== undefined) return (p.borrowAccrued ?? D(0)).plus(notional.mul(holding).mul(jstCutoffCrossings(p.borrowFrom, now)));
     const days = D(Math.max(0, now - p.borrowFrom)).div(DAY_MS);
-    return (p.borrowAccrued ?? D(0)).plus(notional.mul(this.borrowRate).mul(days));
+    return accrued.plus(notional.mul(this.borrowRate).mul(days));
   }
 
   addInstrument(i: Instrument): void {
@@ -352,10 +349,8 @@ export class PaperBroker implements Broker {
     let realizedQuote = D(0);
     /** 保有コスト (決済した分。クオート通貨建て) */
     let borrowFee = D(0);
-    // 保有コストを積む建玉: 持ち越し手数料のある銘柄 (GMO) は買い・売りとも、それ以外は
-    // 取引所で空売りできない銘柄の負の建玉 (= paper で再現した空売り) だけ
-    const holding = holdingFeeDailyOf(inst) !== undefined;
-    const simulated = (q: Decimal) => (holding ? !q.isZero() : q.isNegative() && !inst.allowShort);
+    // 保有コストを積む建玉: 取引所で空売りできない銘柄の負の建玉 (= paper で再現した空売り) だけ
+    const simulated = (q: Decimal) => q.isNegative() && !inst.allowShort;
 
     if (!pos || cur.isZero() || cur.isPositive() === signed.isPositive()) {
       const newQty = cur.plus(signed);

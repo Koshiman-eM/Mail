@@ -61,21 +61,28 @@ describe("情報バイアス", () => {
     expect(intelBiasFor(btc, {}, 1)).toBeUndefined();
   });
 
-  it("FX は base − quote。クオート側の寄与は符号を反転し、ブラックアウトを引き継ぐ", () => {
-    const fx: Instrument = { ...btc, symbol: "USD/JPY", assetClass: "fx", baseCurrency: "USD", quoteCurrency: "JPY" };
-    const b = intelBiasFor(fx, { USD: bias("USD", 0.5, 0.8, { a: 0.5 }), JPY: bias("JPY", -0.2, 0.6, { b: -0.4 }, { blackoutUntil: NOW + H }) }, 1)!;
-    expect(b.sentiment).toBeCloseTo(0.7, 9);
-    expect(b.sourceContrib).toEqual({ a: 0.5, b: 0.4 });
+  it("クオート通貨の経済指標のブラックアウトを引き継ぐ。寄与は基準通貨 (個別) の分だけ", () => {
+    const jpy: Instrument = { ...btc, symbol: "BTC/JPY", quoteCurrency: "JPY" };
+    const b = intelBiasFor(jpy, { BTC: bias("BTC", 0.5, 0.8, { a: 0.5 }), JPY: bias("JPY", -0.2, 0.6, { b: -0.4 }, { blackoutUntil: NOW + H }) }, 1)!;
+    expect(b.asset).toBe("BTC");
+    expect(b.sentiment).toBeCloseTo(0.5, 9);
+    expect(b.sourceContrib).toEqual({ a: 0.5 });
     expect(b.blackoutUntil).toBe(NOW + H);
+  });
+
+  it("廃止した資産クラス (fx) の古い銘柄定義でも例外にしない (擬似資産なし、個別のバイアスだけ)", () => {
+    const fx = { ...btc, symbol: "USD/JPY", assetClass: "fx", baseCurrency: "USD", quoteCurrency: "JPY" } as unknown as Instrument;
+    expect(intelBiasFor(fx, { CRYPTO: bias("CRYPTO", -0.4, 0.5, {}) }, 1)).toBeUndefined();
+    expect(intelBiasFor(fx, { USD: bias("USD", 0.3, 0.5, {}) }, 1)?.sentiment).toBeCloseTo(0.3, 9);
   });
 });
 
 describe("その他の判定", () => {
   it("ブラックアウト・計画用時間足・見送り理由の正規化", () => {
-    const plan = { blackouts: [{ start: NOW - H, end: NOW + H, assetClasses: ["fx" as const], reason: "USD CPI" }] };
-    expect(activeBlackout(plan, "fx", NOW)?.reason).toBe("USD CPI");
+    const plan = { blackouts: [{ start: NOW - H, end: NOW + H, assetClasses: ["meme" as const], reason: "AI: 上場廃止の噂" }] };
+    expect(activeBlackout(plan, "meme", NOW)?.reason).toBe("AI: 上場廃止の噂");
     expect(activeBlackout(plan, "crypto", NOW)).toBeUndefined();
-    expect(activeBlackout(plan, "fx", NOW + 2 * H)).toBeUndefined();
+    expect(activeBlackout(plan, "meme", NOW + 2 * H)).toBeUndefined();
     expect(planRegimeTimeframe(["1m", "5m", "15m", "1h"])).toBe("15m");
     expect(planRegimeTimeframe(["1m", "5m"])).toBe("5m");
     expect(normalizeReason("期待値幅 12.3bps < コスト 4.0bps × 2")).toBe("期待値幅 #bps < コスト #bps × #");

@@ -9,7 +9,7 @@
  * - 未決済は kv `shadow:open:<mode>` に保存し、再起動後も続ける。
  * - R は統計値なので number で計算する (会計値ではない)。
  * - 約定の見積もりはバックテスト (src/backtest/engine.ts) と同じ考え方で、楽観しない:
- *   - 約定ずれ (片道) は資産クラス別のバックテストの既定値 (defaultCosts: crypto 1 / meme 20 / fx 0.5 / stock 1 bps)。手数料は銘柄の taker 手数料 (往復)
+ *   - 約定ずれ (片道) は資産クラス別のバックテストの既定値 (defaultCosts: crypto 1 / meme 20 bps。未知のクラスは crypto の値)。手数料は銘柄の taker 手数料 (往復)
  *   - エントリー: 買いは ask + 約定ずれ、売りは bid − 約定ずれ
  *   - 損切り: 決済側 (買い: bid / 売り: ask) で判定し、ストップ価格 (窓開けで越えていれば現在の決済側の気配) に約定ずれを不利側に加えて約定
  *   - 利確: 指値扱い (約定ずれなし)。時間切れ: 決済側の気配 ∓ 約定ずれ
@@ -17,7 +17,7 @@
  *     有利側 (利確・MFE) はエントリー時刻以降に始まった足と毎ティックの気配だけで判定する (保守的。確定足だけを使うので先読みはしない)
  * - 読みの管理 (options.thesis が有効): シグナルに最大保有・読みの期限があった仮想トレード (thesisExpectedMs あり) は、
  *   実際の建玉と同じ src/engine/thesis.ts の規則で 途中で読み外れ / 期限で読み外れ / 延長 / 延長の上限 を判定する。
- *   純 R は「今時間切れで決済したら」の netR (約定ずれ・借入コスト・持ち越し手数料込み)。延長後の建値・トレーリングは
+ *   純 R は「今時間切れで決済したら」の netR (約定ずれ・借入コスト込み)。延長後の建値・トレーリングは
  *   延長した時点からの有利な極値 (thesisPeak。延長した時点の決済側の気配から始め、延長した時刻以降に始まった 1m 足と気配だけで進める)
  *   から計算する。前回の判定までの極値を使い (同じ判定の足の高値でストップを上げない = 保守的)、延長した判定ではストップを判定しない。
  *   延長後の保護ストップに触れたかは、延長した時刻以降に始まった 1m 足と気配だけで判定する (当初の損切りは従来どおり)。決済理由は trailing。
@@ -33,7 +33,6 @@
  */
 import { randomUUID } from "node:crypto";
 import { defaultCosts } from "../backtest/engine";
-import { holdingFeeDailyOf, jstCutoffCrossings } from "../core/holdingFee";
 import {
   advancePeak, decideThesis, resolveThesisMs, thesisGrossR, thesisOutcomeOf, thesisTrailStop, tighterStop, type ThesisSettings,
 } from "../engine/thesis";
@@ -100,8 +99,7 @@ export interface ShadowCounters {
 }
 
 export interface ShadowRecordInput {
-  /** meta.holdingFeeDaily がある銘柄 (GMO) は持ち越し手数料を PaperBroker と同じ計算で costR / netR に含める */
-  instrument: Pick<Instrument, "symbol" | "assetClass" | "takerFeeRate"> & Partial<Pick<Instrument, "meta">>;
+  instrument: Pick<Instrument, "symbol" | "assetClass" | "takerFeeRate">;
   quote: Pick<Quote, "bid" | "ask">;
   signal: Pick<Signal, "strategyId" | "direction" | "confidence" | "expectedEdgeBps" | "stopLoss" | "takeProfit" | "maxHoldMs" | "expectedMs"> & { horizon?: Horizon };
   regime: RegimeLabel;
@@ -334,7 +332,6 @@ export class ShadowTracker {
       ...(input.simulatedShort && !long
         ? { simulatedShort: true, borrowRateDaily: finite(input.borrowRateDaily) ? Math.max(0, input.borrowRateDaily) : 0 }
         : {}),
-      ...(holdingFeeDailyOf(inst) !== undefined ? { holdingFeeDaily: holdingFeeDailyOf(inst) } : {}),
       ...(reversalTf ? { reversalTf } : {}),
     };
     this.open.push(o);
@@ -569,7 +566,10 @@ export class ShadowTracker {
     };
   }
 
-  /** 決済したときの R (shadowR + 再現した空売りの借入コスト + 持ち越し手数料) */
+  /**
+   * 決済したときの R (shadowR + 再現した空売りの借入コスト)。
+   * 廃止した GMOコインの持ち越し手数料 (古い記録の holdingFeeDaily) は計上しない (記録は書き換えない)
+   */
   private closeR(o: ShadowOpen, exit: ShadowExitFill, now: number): { grossR: number; costR: number; netR: number } {
     const r = shadowR(o, exit);
     // 再現した空売りの借入コスト (PaperBroker と同じ: 建玉代金 × 日率 × 保有日数。ここでは 1 単位あたりを R に換算)
@@ -579,14 +579,6 @@ export class ShadowTracker {
     if (borrow > 0) {
       r.netR -= borrow;
       r.costR += borrow;
-    }
-    // 持ち越し手数料 (GMO。PaperBroker と同じ: 建玉代金 × 日率 × 日本時間 6:00 をまたいだ回数。1 単位あたりを R に換算)
-    const holding = finite(o.holdingFeeDaily) && o.holdingFeeDaily > 0
-      ? (o.entryMid * o.holdingFeeDaily * jstCutoffCrossings(o.entryTs, now)) / o.risk
-      : 0;
-    if (holding > 0) {
-      r.netR -= holding;
-      r.costR += holding;
     }
     return r;
   }

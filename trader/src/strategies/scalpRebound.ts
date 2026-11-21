@@ -49,7 +49,7 @@ import { relaxToward, TEMPO_COST_MULT_FLOOR } from "../engine/tempo";
  *
  * クールダウン: 直前 cooldownBars 本のどれかでも同じ条件が成立していたら見送る (同じ反発での連続エントリーを防ぐ)。
  *
- * 資産クラスは crypto のみ (scalp_micro と同じ理由。meme はスプレッドが大きく、fx・stock は出来高・取引時間の性質が違う)。
+ * 資産クラスは crypto のみ (scalp_micro と同じ理由。meme はスプレッドが大きい)。
  */
 
 /** 保有本数 (1m) の範囲。maxHoldMs を 15〜30 分にする */

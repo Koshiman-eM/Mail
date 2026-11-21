@@ -442,26 +442,28 @@ describe("比較コマンド (--structure-compare) と regime の構造の列", 
     expect(formatCompareRows(rows).split("\n")[0]).toContain("N");
   }, 120_000);
 
-  it("CLI の引数: --structure-compare は --strategy 省略で all。--source gmo を受け付ける", async () => {
+  it("CLI の引数: --structure-compare は --strategy 省略で all。--source ccxt を受け付け、廃止した gmo は拒否する", async () => {
     const { parseBacktestArgs } = await import("../src/cli");
     expect(parseBacktestArgs({ "structure-compare": true })).toMatchObject({ strategy: "all", structureCompare: true, folds: 5 });
-    expect(parseBacktestArgs({ "structure-compare": true, "pivot-sweep": true, source: "gmo" })).toMatchObject({ pivotSweep: true, source: "gmo" });
+    expect(parseBacktestArgs({ "structure-compare": true, "pivot-sweep": true, source: "ccxt" })).toMatchObject({ pivotSweep: true, source: "ccxt" });
     expect(() => parseBacktestArgs({ strategy: "all", "pivot-sweep": true })).toThrow(/--structure-compare/);
-    expect(parseBacktestArgs({ strategy: "all", source: "gmo" }).source).toBe("gmo");
+    expect(parseBacktestArgs({ strategy: "all", source: "ccxt" }).source).toBe("ccxt");
+    expect(() => parseBacktestArgs({ strategy: "all", source: "gmo" })).toThrow(/--source gmo は廃止しました/);
+    expect(() => parseBacktestArgs({ strategy: "all", source: "oanda" })).toThrow(/synthetic \/ ccxt/);
   });
 
-  it("gmo / ccxt の feed (モック) から足を取って比較できる", async () => {
+  it("ccxt の feed (モック) から足を取って比較できる", async () => {
     const { runStructureCompare } = await import("../src/engine/structureCompare");
     const { generateCandles } = await import("../src/backtest/synthetic");
     const now = Date.UTC(2026, 0, 20);
     const all = generateCandles({ seed: 5, bars: 4000, timeframe: "15m", vol: 0.004, startTs: now - 4000 * M15 });
-    const gmoInst = syntheticInstrument({ symbol: "BTC/JPY", venue: "gmo" });
+    const inst = syntheticInstrument({ symbol: "BTC/JPY", venue: "ccxt:bitbank" });
     const feed = {
-      listInstruments: async () => [gmoInst],
+      listInstruments: async () => [inst],
       fetchCandles: async (_s: string, _tf: string, limit: number, since?: number) => all.filter((c) => c.ts >= (since ?? 0)).slice(0, limit),
       fetchQuote: async () => { throw new Error("unused"); },
     } as unknown as import("../src/core/types").MarketDataFeed;
-    const rows = await runStructureCompare({ strategy: "short_ema_trend", days: 20, source: "gmo", seed: 1, feed, now });
+    const rows = await runStructureCompare({ strategy: "short_ema_trend", symbol: "BTC/JPY", days: 20, source: "ccxt", seed: 1, feed, now });
     expect(rows).toHaveLength(7);
     expect(rows.every((r) => r.metrics !== undefined)).toBe(true);
   }, 120_000);

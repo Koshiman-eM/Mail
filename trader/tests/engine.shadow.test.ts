@@ -213,7 +213,7 @@ describe("ニュースと値動きの答え合わせ (エンジン統合)", () =
         ];
       },
     };
-    const { rt, clock } = await runtime({}, { intelSources: [source], strategies: [fixedStrategy("noop", { classes: ["stock"] })] });
+    const { rt, clock } = await runtime({}, { intelSources: [source], strategies: [fixedStrategy("noop", { classes: ["meme"] })] });
     await rt.engine.tick(START);
     await rt.engine.runIntel(START);
     expect(rt.learning.news.listPending().map((p) => `${p.itemId}:${p.symbol}`)).toEqual(["btc-1:BTC/USDT"]);

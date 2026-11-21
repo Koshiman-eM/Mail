@@ -9,14 +9,14 @@ const inst = (symbol: string, assetClass: Instrument["assetClass"], base: string
 });
 const BTC = inst("BTC/USDT", "crypto", "BTC", "USDT");
 const PEPE = inst("PEPE/SOL", "meme", "PEPE", "SOL", false);
-const USDJPY = inst("USD/JPY", "fx", "USD", "JPY");
+const ETHJPY = inst("ETH/JPY", "crypto", "ETH", "JPY");
 const regime = (label: RegimeLabel, over: Partial<RegimeFeatures> = {}): RegimeFeatures => ({
   label, trend: 0, trendStrength: 20, volatility: 0.01, volatilityPercentile: 0.5, spreadBps: 2, ...over,
 });
 const strategies: PlanStrategy[] = [
-  { id: "scalp_obi", horizon: "scalp", assetClasses: ["crypto", "meme", "fx"], regimes: ["range", "trend_up", "trend_down"] },
-  { id: "momo_short", horizon: "short", assetClasses: ["crypto", "meme", "fx", "stock"], regimes: ["trend_up", "trend_down", "high_vol"] },
-  { id: "swing_mid", horizon: "mid", assetClasses: ["crypto", "stock"], regimes: ["trend_up"] },
+  { id: "scalp_obi", horizon: "scalp", assetClasses: ["crypto"], regimes: ["range", "trend_up", "trend_down"] },
+  { id: "momo_short", horizon: "short", assetClasses: ["crypto", "meme"], regimes: ["trend_up", "trend_down", "high_vol"] },
+  { id: "swing_mid", horizon: "mid", assetClasses: ["crypto"], regimes: ["trend_up"] },
   { id: "trend_long", horizon: "long", assetClasses: ["crypto"], regimes: ["trend_up", "range"] },
 ];
 const bias = (asset: string, sentiment: number, confidence: number, eventRisk = 0): IntelBias => ({ asset, sentiment, confidence, eventRisk, sourceIds: [], sourceContrib: {} });
@@ -32,8 +32,8 @@ describe("planner baseline", () => {
     expect(p.perSymbol["BTC/USDT"].enabledStrategies.sort()).toEqual(["momo_short", "scalp_obi", "swing_mid", "trend_long"]);
     const r = await plan({ regimes: { "BTC/USDT": regime("range") } });
     expect(r.perSymbol["BTC/USDT"].enabledStrategies.sort()).toEqual(["scalp_obi", "trend_long"]);
-    const fx = await plan({ instruments: [USDJPY], regimes: { "USD/JPY": regime("high_vol") } });
-    expect(fx.perSymbol["USD/JPY"].enabledStrategies).toEqual(["momo_short"]);
+    const meme = await plan({ instruments: [PEPE], regimes: { "PEPE/SOL": regime("high_vol") } });
+    expect(meme.perSymbol["PEPE/SOL"].enabledStrategies).toEqual(["momo_short"]);
   });
   it("low_liquidity は全停止 (riskMultiplier 0)", async () => {
     const p = await plan({ regimes: { "BTC/USDT": regime("low_liquidity") } });
@@ -64,7 +64,7 @@ describe("planner baseline", () => {
     expect(await dir(0.5)).toBe("both");
     expect(await dir(0)).toBe("both");
     // 別の資産クラスの効き具合は影響しない
-    expect((await plan({ brief: brief([bias("BTC", 0.6, 0.7)]), intelInfluence: { fx: 0 } })).perSymbol["BTC/USDT"].directionBias).toBe("long");
+    expect((await plan({ brief: brief([bias("BTC", 0.6, 0.7)]), intelInfluence: { meme: 0 } })).perSymbol["BTC/USDT"].directionBias).toBe("long");
     // 効いている (1.5) なら弱いバイアスでも片側化しうる
     expect((await plan({ brief: brief([bias("BTC", 0.3, 0.4)]) })).perSymbol["BTC/USDT"].directionBias).toBe("both");
     expect((await plan({ brief: brief([bias("BTC", 0.3, 0.4)]), intelInfluence: { crypto: 1.5 } })).perSymbol["BTC/USDT"].directionBias).toBe("long");
@@ -80,12 +80,11 @@ describe("planner baseline", () => {
     const noShort = await plan({ instruments: [PEPE], regimes: { "PEPE/SOL": regime("trend_up") }, brief: brief([bias("PEPE", -0.7, 0.8)]) });
     expect(noShort.perSymbol["PEPE/SOL"].directionBias).toBe("both");
   });
-  it("FX は base - quote のバイアス", async () => {
-    const p = await plan({
-      instruments: [USDJPY], regimes: { "USD/JPY": regime("trend_up") },
-      brief: brief([bias("USD", -0.5, 0.8), bias("JPY", 0.4, 0.8)]),
-    });
-    expect(p.perSymbol["USD/JPY"].directionBias).toBe("short");
+  it("向きは基準通貨 (個別) のバイアスで決める。クオート通貨 (JPY) のバイアスは向きに使わない", async () => {
+    const dir = async (biases: IntelBias[]) =>
+      (await plan({ instruments: [ETHJPY], regimes: { "ETH/JPY": regime("trend_up") }, brief: brief(biases) })).perSymbol["ETH/JPY"].directionBias;
+    expect(await dir([bias("ETH", -0.6, 0.8), bias("JPY", 0.9, 0.9)])).toBe("short");
+    expect(await dir([bias("JPY", 0.9, 0.9)])).toBe("both");
   });
   it("riskMultiplier は 0〜1.5 で riskOn/eventRisk/ボラ/ミームを反映", async () => {
     const m = async (b: MarketBrief, r = regime("trend_up"), i = BTC) =>
@@ -106,7 +105,7 @@ describe("planner baseline", () => {
     const scalp = (await plan({ strategies: [strategies[0]] })).perSymbol["BTC/USDT"].riskMultiplier;
     expect(long).toBeLessThan(scalp);
   });
-  it("経済指標からブラックアウト、validUntil", async () => {
+  it("経済指標から資産クラスのブラックアウトは作らない (FX・株式向けは廃止)。validUntil", async () => {
     const ts = NOW + 45 * 60_000;
     const p = await plan({
       brief: brief([], { events: [
@@ -115,8 +114,7 @@ describe("planner baseline", () => {
         { ts: NOW + 48 * 3_600_000, title: "far", currency: "EUR", impact: "high", source: "x" },
       ] }),
     });
-    expect(p.blackouts).toHaveLength(1);
-    expect(p.blackouts[0]).toMatchObject({ start: ts - 30 * 60_000, end: ts + 15 * 60_000, assetClasses: ["fx", "stock"] });
+    expect(p.blackouts).toEqual([]);
     expect(p.validUntil).toBeGreaterThan(NOW);
     expect(p.rationale).toMatch(/ベースライン/);
   });
@@ -128,24 +126,25 @@ describe("planner baseline", () => {
 
 describe("mergeAiPlan の制約", () => {
   it("許可外戦略・倍率超過・停止銘柄の再開・ブラックアウト削除を拒否", async () => {
-    const base = await plan({
-      instruments: [BTC, USDJPY],
-      regimes: { "BTC/USDT": regime("trend_up"), "USD/JPY": regime("low_liquidity") },
-      brief: brief([], { events: [{ ts: NOW + 600_000, title: "NFP", currency: "USD", impact: "high", source: "x" }] }),
+    const built = await plan({
+      instruments: [BTC, ETHJPY],
+      regimes: { "BTC/USDT": regime("trend_up"), "ETH/JPY": regime("low_liquidity") },
     });
+    // 既存のブラックアウト (前の AI の追加分など) は削除できない
+    const base = { ...built, blackouts: [{ start: NOW, end: NOW + 600_000, assetClasses: ["meme" as const], reason: "AI: 既存" }] };
     const merged = mergeAiPlan(base, {
       rationale: "調整",
       adjustments: [
         { symbol: "BTC/USDT", enabledStrategies: ["scalp_obi", "hacker"], directionBias: "long", riskMultiplier: 9, notes: "x" },
-        { symbol: "USD/JPY", enabledStrategies: ["momo_short"], directionBias: "both", riskMultiplier: 1.5, notes: "" },
+        { symbol: "ETH/JPY", enabledStrategies: ["momo_short"], directionBias: "both", riskMultiplier: 1.5, notes: "" },
         { symbol: "UNKNOWN", enabledStrategies: [], directionBias: "both", riskMultiplier: 1, notes: "" },
       ],
-      extraBlackouts: [{ start: NOW, end: NOW + 3_600_000, assetClasses: ["crypto"], reason: "追加" }, { start: NOW + 5, end: NOW, assetClasses: ["fx"], reason: "bad" }],
-    }, [BTC, USDJPY], NOW);
+      extraBlackouts: [{ start: NOW, end: NOW + 3_600_000, assetClasses: ["crypto"], reason: "追加" }, { start: NOW + 5, end: NOW, assetClasses: ["meme"], reason: "bad" }],
+    }, [BTC, ETHJPY], NOW);
     expect(merged.perSymbol["BTC/USDT"].enabledStrategies).toEqual(["scalp_obi"]);
     expect(merged.perSymbol["BTC/USDT"].riskMultiplier).toBe(1.5);
-    expect(merged.perSymbol["USD/JPY"].enabledStrategies).toEqual([]);
-    expect(merged.perSymbol["USD/JPY"].riskMultiplier).toBe(0);
+    expect(merged.perSymbol["ETH/JPY"].enabledStrategies).toEqual([]);
+    expect(merged.perSymbol["ETH/JPY"].riskMultiplier).toBe(0);
     expect(merged.perSymbol.UNKNOWN).toBeUndefined();
     expect(merged.blackouts).toHaveLength(base.blackouts.length + 1);
     expect(merged.blackouts[0]).toEqual(base.blackouts[0]);

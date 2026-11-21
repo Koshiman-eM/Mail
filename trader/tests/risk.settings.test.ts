@@ -40,16 +40,51 @@ describe("範囲とプリセットの定義 (config.ts と共有)", () => {
     expect(riskValuesOf(DEFAULT_RISK)).toMatchObject(RISK_PRESETS.standard.values);
     expect(RISK_PRESETS.conservative.values).toEqual({
       riskPerTrade: 0.0025, maxDailyLoss: 0.015, maxDrawdown: 0.08, maxPositionPct: 0.1,
-      maxExposureCrypto: 0.3, maxExposureMeme: 0.02, maxExposureFx: 0.3, maxExposureStock: 0.3, maxOpenPositions: 4,
+      maxExposureCrypto: 0.3, maxExposureMeme: 0.02, maxOpenPositions: 4,
     });
     expect(RISK_PRESETS.aggressive.values).toEqual({
       riskPerTrade: 0.01, maxDailyLoss: 0.05, maxDrawdown: 0.25, maxPositionPct: 0.3,
-      maxExposureCrypto: 0.8, maxExposureMeme: 0.1, maxExposureFx: 0.8, maxExposureStock: 0.8, maxOpenPositions: 12,
+      maxExposureCrypto: 0.8, maxExposureMeme: 0.1, maxOpenPositions: 12,
     });
     for (const id of RISK_PRESET_IDS) {
       expect(Object.keys(RISK_PRESETS[id].values)).not.toContain("maxOrdersPerMinute");
       for (const k of RISK_PRESET_KEYS) expect(checkRiskValue(k, RISK_PRESETS[id].values[k])).toBeUndefined();
     }
+  });
+});
+
+describe("廃止した項目 (maxExposureFx / maxExposureStock) が kv に残っている", () => {
+  const legacy = () => {
+    const store = new MemoryStore();
+    store.kvSet(riskLimitsKey("paper"), { values: { riskPerTrade: 0.004, maxExposureFx: 0.3, maxExposureStock: 0.25 }, updatedAt: NOW - 1, source: "dashboard" });
+    return store;
+  };
+
+  it("読むときは無視し (例外にしない・ほかの上書きは効く)、kv は書き換えない", () => {
+    const store = legacy();
+    const o = readRiskOverride(store, "paper", env)!;
+    expect(o.values).toEqual({ riskPerTrade: 0.004 });
+    expect(effectiveRiskLimits(env, store, "paper").limits.maxExposureByClass).toEqual(env.maxExposureByClass);
+    expect(effectiveRiskLimits(env, store, "paper").limits.riskPerTrade).toBe(0.004);
+    expect(riskOverrideLines(store, "paper", env, String).join("\n")).not.toMatch(/Fx|Stock|FX|株式/);
+    expect(store.kvGet(riskLimitsKey("paper"))).toMatchObject({ values: { maxExposureFx: 0.3, maxExposureStock: 0.25 } });
+  });
+
+  it("保存し直しても廃止した項目の値は消さない。古い画面から送られた廃止した項目は拒否せず無視する", () => {
+    const store = legacy();
+    const r = change(store, "paper", { action: "set", values: { riskPerTrade: 0.003, maxExposureFx: 0.9 } });
+    expect(r).toMatchObject({ ok: true, changed: true });
+    if (r.ok) expect(r.override?.values).toEqual({ riskPerTrade: 0.003 });
+    expect(store.kvGet(riskLimitsKey("paper"))).toMatchObject({ values: { riskPerTrade: 0.003, maxExposureFx: 0.3, maxExposureStock: 0.25 } });
+    expect(readRiskOverride(store, "paper", env)!.values).toEqual({ riskPerTrade: 0.003 });
+    // .env の値に戻しても廃止した項目は残す (実効値は .env のまま)
+    expect(change(store, "paper", { action: "reset" })).toMatchObject({ ok: true, changed: true });
+    expect(store.kvGet(riskLimitsKey("paper"))).toMatchObject({ values: { maxExposureFx: 0.3, maxExposureStock: 0.25 } });
+    expect(effectiveRiskLimits(env, store, "paper").limits).toEqual(env);
+    // それ以上は変更なし (監査ログも増えない)
+    const n = store.listAudit({}).filter((e) => e.type === RISK_LIMITS_AUDIT).length;
+    expect(change(store, "paper", { action: "reset" })).toMatchObject({ ok: true, changed: false });
+    expect(store.listAudit({}).filter((e) => e.type === RISK_LIMITS_AUDIT)).toHaveLength(n);
   });
 });
 

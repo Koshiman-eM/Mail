@@ -1,0 +1,4 @@
+[
+  { "id": "So11111111111111111111111111111111111111112", "name": "Wrapped SOL", "symbol": "SOL", "decimals": 9, "usdPrice": 150.25, "isVerified": true },
+  { "id": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "name": "USD Coin", "symbol": "USDC", "decimals": 6, "usdPrice": 1, "isVerified": true }
+]

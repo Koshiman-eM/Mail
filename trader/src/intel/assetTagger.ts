@@ -1,8 +1,6 @@
 /** タイトル・本文から関連資産を正規化して付与する */
 
 export interface TagOptions {
-  /** 株のティッカー (大文字小文字区別、単語一致)。例: ["AAPL","NVDA"] */
-  stockTickers?: string[];
   /** 追加辞書: キーワード → 付与する資産。英数字は単語一致 (大小無視)、それ以外は部分一致 */
   extra?: Record<string, string[]>;
 }
@@ -56,7 +54,7 @@ const RULES: Rule[] = [
   { assets: ["CHF"], ci: ["swiss franc", "snb"] },
   { assets: ["NZD"], ci: ["rbnz", "kiwi", "new zealand dollar"] },
   { assets: ["CNY"], ci: ["yuan", "pboc", "renminbi"], jp: ["人民元"] },
-  { assets: ["FX"], ci: ["forex", "fx market", "currency pair"], jp: ["為替"] },
+  // 株式市場全体のニュース (リスクオン指数の材料。株式の取引はしない)
   { assets: ["STOCKS"], ci: ["stocks", "wall street", "s&p 500", "nasdaq", "dow jones", "equities"], jp: ["株式", "株価"] },
 ];
 
@@ -92,17 +90,8 @@ export function tagAssets(text: string, opts: TagOptions = {}): string[] {
     const hit = isAscii(kw) ? wordRe(kw, true).test(text) : text.includes(kw);
     if (hit) assets.forEach((a) => out.add(a));
   }
-  let stock = false;
-  for (const t of opts.stockTickers ?? []) {
-    if (wordRe(t, false).test(text)) {
-      out.add(t);
-      stock = true;
-    }
-  }
   // クラス単位の擬似資産を自動付与
   const list = [...out];
   if (list.some((a) => CRYPTO_BASES.has(a))) out.add("CRYPTO");
-  if (list.some((a) => CURRENCIES.has(a))) out.add("FX");
-  if (stock) out.add("STOCKS");
   return [...out].sort();
 }

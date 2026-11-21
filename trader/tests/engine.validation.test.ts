@@ -77,7 +77,8 @@ describe("パラメータ検証 (長い履歴・区間分割)", () => {
     const short = mockFeed(candles.slice(-1500)); // 要求 3080 本に対して半分未満
     const v2 = createParamValidator({ hub: { watched: () => [inst] }, strategies: [s], clock: clockAt(end), feedFor: () => short });
     expect(await v2(s.id, "crypto", s.defaultParams)).toBeUndefined();
-    expect(await v(s.id, "fx", s.defaultParams)).toBeUndefined();
+    expect(await v(s.id, "meme", s.defaultParams)).toBeUndefined();
+    expect(await v(s.id, "fx" as never, s.defaultParams)).toBeUndefined(); // 廃止した資産クラス (古い記録の調整候補) も例外にしない
     expect(await v("scalp_obi", "crypto", getStrategy("scalp_obi")!.defaultParams)).toBeUndefined();
     expect(await v("unknown", "crypto", {})).toBeUndefined();
     const none = createParamValidator({ hub: { watched: () => [inst] }, strategies: [s], clock: clockAt(end), feedFor: () => undefined });

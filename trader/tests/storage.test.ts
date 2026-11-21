@@ -72,18 +72,19 @@ describe.each<[string, () => Store]>([
   it("trades: 保存・フィルタ・昇順・limit は最新 N 件", () => {
     const s = make();
     s.saveTrade(trade("t1", 1000));
-    s.saveTrade(trade("t3", 3000, { strategyId: "b", symbol: "USD/JPY", assetClass: "fx", mode: "live" }));
+    s.saveTrade(trade("t3", 3000, { strategyId: "b", symbol: "USD/JPY", assetClass: "fx" as never, mode: "live" }));
     s.saveTrade(trade("t2", 2000));
     expect(s.listTrades().map((t) => t.id)).toEqual(["t1", "t2", "t3"]);
     expect(s.listTrades({ since: 2000 }).map((t) => t.id)).toEqual(["t2", "t3"]);
     expect(s.listTrades({ until: 2000 }).map((t) => t.id)).toEqual(["t1", "t2"]);
     expect(s.listTrades({ strategyId: "b" }).map((t) => t.id)).toEqual(["t3"]);
     expect(s.listTrades({ symbol: "BTC/USDT" }).map((t) => t.id)).toEqual(["t1", "t2"]);
-    expect(s.listTrades({ assetClass: "fx" }).map((t) => t.id)).toEqual(["t3"]);
+    // 廃止した資産クラス (fx) の古い記録も読める
+    expect(s.listTrades({ assetClass: "fx" as never }).map((t) => t.id)).toEqual(["t3"]);
     expect(s.listTrades({ mode: "paper" }).map((t) => t.id)).toEqual(["t1", "t2"]);
     expect(s.listTrades({ limit: 2 }).map((t) => t.id)).toEqual(["t2", "t3"]);
     // 内容の往復
-    expect(s.listTrades({ limit: 1 })[0]).toEqual(trade("t3", 3000, { strategyId: "b", symbol: "USD/JPY", assetClass: "fx", mode: "live" }));
+    expect(s.listTrades({ limit: 1 })[0]).toEqual(trade("t3", 3000, { strategyId: "b", symbol: "USD/JPY", assetClass: "fx" as never, mode: "live" }));
     s.close();
   });
 

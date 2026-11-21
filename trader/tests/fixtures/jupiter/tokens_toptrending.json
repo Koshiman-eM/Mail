@@ -1,0 +1,66 @@
+[
+  {
+    "id": "MemeAAAAbbbbCCCCddddEEEEffffGGGGhhhh1111",
+    "name": "Synthetic Dog",
+    "symbol": "SDOG",
+    "icon": "https://example.invalid/sdog.png",
+    "decimals": 5,
+    "usdPrice": 0.0000234,
+    "liquidity": 812345.67,
+    "mcap": 23400000,
+    "fdv": 23400000,
+    "holderCount": 15432,
+    "organicScore": 78.5,
+    "organicScoreLabel": "high",
+    "isVerified": true,
+    "tags": ["verified", "community", 42],
+    "audit": { "mintAuthorityDisabled": true, "freezeAuthorityDisabled": true, "topHoldersPercentage": 18.2, "devMints": 1 },
+    "firstPool": { "id": "PooLAAAAbbbbCCCCddddEEEEffffGGGGhhhh1111", "createdAt": "2025-01-01T00:00:00Z" },
+    "stats5m": { "priceChange": 0.5, "buyVolume": 1200.5, "sellVolume": 900, "numBuys": 30, "numSells": 25, "numTraders": 40 },
+    "stats1h": { "priceChange": 2.1, "volumeChange": 12.3, "buyVolume": "15000", "sellVolume": "14000.5", "numBuys": 300, "numSells": 280, "numTraders": 410 },
+    "stats24h": { "priceChange": -3.25, "buyVolume": 250000, "sellVolume": 240000 },
+    "updatedAt": "2025-06-01T12:00:00Z",
+    "someNewField": { "nested": true }
+  },
+  {
+    "id": "MemeBBBBccccDDDDeeeeFFFFggggHHHHjjjj2222",
+    "name": "String Numbers Cat",
+    "symbol": "SCAT",
+    "decimals": "6",
+    "usdPrice": "1.5",
+    "liquidity": "300000",
+    "holderCount": "2500",
+    "organicScore": "65",
+    "organicScoreLabel": "MEDIUM",
+    "isVerified": "false",
+    "tags": null,
+    "audit": { "mintAuthorityDisabled": "true", "freezeAuthorityDisabled": 1, "topHoldersPercentage": "30.5", "isSus": null },
+    "firstPool": { "id": "PooLBBBBccccDDDDeeeeFFFFggggHHHHjjjj2222", "createdAt": 1735689600 },
+    "stats1h": null
+  },
+  {
+    "id": "MemeCCCCddddEEEEffffGGGGhhhhJJJJkkkk3333",
+    "symbol": "RUG",
+    "liquidity": null,
+    "holderCount": "NaN",
+    "organicScore": "abc",
+    "audit": null,
+    "firstPool": null
+  },
+  {
+    "id": "MemeDDDDeeeeFFFFggggHHHHjjjjKKKKmmmm4444",
+    "symbol": "SUS",
+    "liquidity": 1000000,
+    "holderCount": 50000,
+    "organicScore": 90,
+    "audit": { "mintAuthorityDisabled": false, "freezeAuthorityDisabled": true, "topHoldersPercentage": 60, "isSus": true },
+    "firstPool": { "createdAt": "2025-05-31T12:00:00Z" }
+  },
+  { "name": "no id" },
+  { "id": "not-a-solana-address!!" },
+  "garbage",
+  {
+    "id": "MemeAAAAbbbbCCCCddddEEEEffffGGGGhhhh1111",
+    "symbol": "SDOG_DUP"
+  }
+]

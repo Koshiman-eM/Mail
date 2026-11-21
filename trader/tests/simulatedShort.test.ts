@@ -41,8 +41,9 @@ const spot: Instrument = {
 const simSpot: Instrument = { ...spot, simulatedShort: true };
 const meme: Instrument = { ...spot, symbol: "PEPE/JPY", assetClass: "meme" };
 const dexCrypto: Instrument = { ...spot, symbol: "X/SOL", venue: "dex:solana" };
-const fx: Instrument = {
-  symbol: "USD/JPY", venue: "paper", assetClass: "fx", baseCurrency: "USD", quoteCurrency: "JPY", tickSize: 0.001, lotSize: 1, minQty: 1,
+/** 取引所で空売りできる銘柄 (allowShort=true) の例 */
+const shortable: Instrument = {
+  symbol: "XRP/JPY", venue: "paper", assetClass: "crypto", baseCurrency: "XRP", quoteCurrency: "JPY", tickSize: 0.001, lotSize: 1, minQty: 1,
   takerFeeRate: 0, makerFeeRate: 0, allowShort: true, contractSize: 1,
 };
 
@@ -55,10 +56,10 @@ describe("canShort / 対象銘柄", () => {
     expect(canShort(simSpot, "backtest")).toBe(false);
     expect(canShort(simSpot, undefined)).toBe(false);
     expect(canShort(spot, "paper")).toBe(false); // 印が無ければ paper でも不可
-    expect(canShort(fx, "live")).toBe(true);
+    expect(canShort(shortable, "live")).toBe(true);
     expect(isSimulatedShort(simSpot, "paper", "short")).toBe(true);
     expect(isSimulatedShort(simSpot, "paper", "long")).toBe(false);
-    expect(isSimulatedShort(fx, "paper", "short")).toBe(false); // 取引所で空売りできる銘柄は再現ではない
+    expect(isSimulatedShort(shortable, "paper", "short")).toBe(false); // 取引所で空売りできる銘柄は再現ではない
   });
 
   it("meme と DEX は対象外 (印が付いていても空売りしない)", () => {
@@ -75,7 +76,7 @@ describe("canShort / 対象銘柄", () => {
     expect(withSimulatedShort(spot, { mode: "live", enabled: true }).simulatedShort).toBeUndefined();
     expect(withSimulatedShort(spot, { mode: "paper", enabled: false }).simulatedShort).toBeUndefined();
     expect(withSimulatedShort(meme, { mode: "paper", enabled: true }).simulatedShort).toBeUndefined();
-    expect(withSimulatedShort(fx, { mode: "paper", enabled: true })).toBe(fx);
+    expect(withSimulatedShort(shortable, { mode: "paper", enabled: true })).toBe(shortable);
   });
 });
 
@@ -150,17 +151,17 @@ describe("PaperBroker: 空売りの再現", () => {
     expect(Number(rest.fills[0].fee)).toBeCloseTo(100 + 50, 9);
   });
 
-  it("印の無い現物・meme の空売りは従来どおり拒否、FX の売りは借入コストなし (従来の会計)", async () => {
+  it("印の無い現物・meme の空売りは従来どおり拒否、取引所で空売りできる銘柄の売りは借入コストなし (従来の会計)", async () => {
     const clock = mkClock();
-    const b = mk([spot, { ...meme, simulatedShort: true }, fx], clock, 0.01);
+    const b = mk([spot, { ...meme, simulatedShort: true }, shortable], clock, 0.01);
     b.onQuote("BTC/JPY", quote(100, 100));
     b.onQuote("PEPE/JPY", quote(100, 100));
-    b.onQuote("USD/JPY", quote(150, 150));
+    b.onQuote("XRP/JPY", quote(150, 150));
     expect((await b.placeOrder({ clientId: "x", symbol: "BTC/JPY", side: "sell", type: "market", qty: "1", strategyId: "t" })).status).toBe("rejected");
     expect((await b.placeOrder({ clientId: "y", symbol: "PEPE/JPY", side: "sell", type: "market", qty: "1", strategyId: "t" })).status).toBe("rejected");
-    expect((await b.placeOrder({ clientId: "z", symbol: "USD/JPY", side: "sell", type: "market", qty: "100", strategyId: "t" })).status).toBe("filled");
+    expect((await b.placeOrder({ clientId: "z", symbol: "XRP/JPY", side: "sell", type: "market", qty: "100", strategyId: "t" })).status).toBe("filled");
     clock.t = START + 10 * DAY;
-    const close = await b.placeOrder({ clientId: "w", symbol: "USD/JPY", side: "buy", type: "market", qty: "100", strategyId: "t" });
+    const close = await b.placeOrder({ clientId: "w", symbol: "XRP/JPY", side: "buy", type: "market", qty: "100", strategyId: "t" });
     expect(close.fills[0].fee).toBe("0");
     expect(b.snapshot().positions).toEqual([]);
   });
@@ -244,7 +245,8 @@ describe("学習の分離", () => {
     expect(armKey("s1", "range", "crypto")).toBe("s1|range|crypto");
     expect(armKey("s1", "range", "crypto", true)).toBe("s1|range|crypto|short");
     expect(armKeyOf(trade())).toBe("s1|range|crypto");
-    expect(armKeyOf(trade({ direction: "short", assetClass: "fx" }))).toBe("s1|range|fx");
+    expect(armKeyOf(trade({ direction: "short", symbol: "XRP/JPY" }))).toBe("s1|range|crypto"); // 取引所で可能な売り
+    expect(armKeyOf(trade({ direction: "short", assetClass: "fx" as never }))).toBe("s1|range|fx"); // 廃止したクラスの古い記録も同じキー
     expect(armKeyOf(trade({ direction: "short", simulatedShort: true }))).toBe("s1|range|crypto|short");
     const store = new MemoryStore();
     const a = new StrategyAllocator(store, {}, "paper");
@@ -254,7 +256,7 @@ describe("学習の分離", () => {
   });
 
   it("パラメータ調整・振り返りの対象 (learnableTrades) から再現した空売りを除く", () => {
-    const ts = [trade(), trade({ direction: "short", simulatedShort: true }), trade({ direction: "short", assetClass: "fx" }), trade({ estimated: true })];
+    const ts = [trade(), trade({ direction: "short", simulatedShort: true }), trade({ direction: "short", symbol: "XRP/JPY" }), trade({ estimated: true })];
     expect(learnableTrades(ts)).toEqual([ts[0], ts[2]]);
   });
 });
@@ -264,7 +266,7 @@ describe("集計の分離 (report / ダッシュボード)", () => {
     const ts = [
       trade({ netPnl: 10, rMultiple: 1 }), trade({ netPnl: -5, rMultiple: -0.5 }),
       trade({ direction: "short", simulatedShort: true, netPnl: 7, rMultiple: 0.7 }),
-      trade({ direction: "short", symbol: "USD/JPY", assetClass: "fx", netPnl: 3, rMultiple: 0.3 }),
+      trade({ direction: "short", symbol: "XRP/JPY", netPnl: 3, rMultiple: 0.3 }),
     ];
     const rows = summarizeBySide(ts, () => 1);
     expect(rows.map((r) => [r.side, r.label, r.trades, r.netPnl])).toEqual([
@@ -341,7 +343,7 @@ describe("エンジン統合 (paper)", () => {
     // PEPE/USDT は WATCHLIST で meme にする (合成データの既定は crypto)
     const { rt, store, run } = await paperRuntime({
       PAPER_SHORT_BORROW_RATE_DAILY: "0.01",
-      WATCHLIST: "synthetic|BTC/USDT,synthetic|ETH/USDT,synthetic|PEPE/USDT|meme,synthetic|USD/JPY,synthetic|AAPL",
+      WATCHLIST: "synthetic|BTC/USDT,synthetic|ETH/USDT,synthetic|PEPE/USDT|meme",
     }, 30);
     const btc = rt.hub.instrument("BTC/USDT")!;
     expect(btc).toMatchObject({ allowShort: false, simulatedShort: true });

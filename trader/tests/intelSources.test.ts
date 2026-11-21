@@ -24,7 +24,8 @@ describe("rss", () => {
   it("Atom をパース", () => {
     const [it] = parseFeed(fx("atom.xml"), { source: "rss:x", now: NOW });
     expect(it.url).toBe("https://news.example.com/b1");
-    expect(it.assets).toEqual(expect.arrayContaining(["USD", "JPY", "FX"]));
+    expect(it.assets).toEqual(expect.arrayContaining(["USD", "JPY"]));
+    expect(it.assets).not.toContain("FX"); // FX の擬似資産は廃止
   });
   it("ID は決定的", () => {
     const a = parseFeed(fx("rss.xml"), { source: "s", now: 1 });
@@ -102,6 +103,6 @@ describe("econCalendar", () => {
     expect(ev.find((e) => e.title === "Minor Index")!.currency).toBeUndefined();
     const items = econEventsToItems(ev, NOW);
     expect(items.every((i) => i.kind === "calendar")).toBe(true);
-    expect(items.find((i) => i.assets.includes("USD"))!.assets).toEqual(["USD", "FX"]);
+    expect(items.find((i) => i.assets.includes("USD"))!.assets).toEqual(["USD"]);
   });
 });

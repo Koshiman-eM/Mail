@@ -1,0 +1,7 @@
+{
+  "MemeAAAAbbbbCCCCddddEEEEffffGGGGhhhh1111": { "usdPrice": 0.0000234, "blockId": 348004023, "decimals": 5, "priceChange24h": -3.25 },
+  "MemeBBBBccccDDDDeeeeFFFFggggHHHHjjjj2222": { "usdPrice": "1.5", "decimals": "6" },
+  "MemeCCCCddddEEEEffffGGGGhhhhJJJJkkkk3333": { "usdPrice": null, "blockId": 348004023 },
+  "MemeDDDDeeeeFFFFggggHHHHjjjjKKKKmmmm4444": { "usdPrice": 0 },
+  "So11111111111111111111111111111111111111112": { "usdPrice": 150.25, "blockId": 348004023, "decimals": 9, "priceChange24h": 1.1, "extraField": "kept" }
+}

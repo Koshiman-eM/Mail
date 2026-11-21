@@ -195,7 +195,7 @@ describe("ParamTuner.run", () => {
     expect(adj.validation).toEqual({ baselineScore: 5, candidateScore: 10, trades: 100 });
     expect(v.calls.map((p) => p.stopAtr)).toEqual([1.5, 1.6]);
     expect(tuner.currentParams("s1", "crypto", INFO.defaultParams)).toMatchObject({ stopAtr: 1.6, tpAtr: 2 });
-    expect(tuner.currentParams("s1", "fx", INFO.defaultParams).stopAtr).toBe(1.5);
+    expect(tuner.currentParams("s1", "meme", INFO.defaultParams).stopAtr).toBe(1.5);
     // 50 件のうち古い 20 件 (good, 0.5R) を比較対象に取り置き、残り 30 件で判断する
     expect(adj.reason).toContain("直近 30 件");
     const meta = store.kvGet<Record<string, number>>(`adjmeta:paper:${adj.id}`)!;
@@ -416,8 +416,8 @@ describe("ParamTuner.propose", () => {
     const store = new MemoryStore();
     seed(store, many("good", 50));
     const t2 = new ParamTuner({ store, getStrategy });
-    const p2 = await t2.propose({ strategyId: "s1", assetClass: "fx", param: "entryThreshold", direction: "up", reason: "x" }, NOW);
-    expect(p2).toBeUndefined(); // fx の取引は無い
+    const p2 = await t2.propose({ strategyId: "s1", assetClass: "meme", param: "entryThreshold", direction: "up", reason: "x" }, NOW);
+    expect(p2).toBeUndefined(); // meme の取引は無い
     const p3 = await t2.propose({ strategyId: "s1", assetClass: "crypto", param: "entryThreshold", direction: "up", reason: "x" }, NOW);
     expect(p3?.status).toBe("proposed");
     expect(t2.currentParams("s1", "crypto", INFO.defaultParams).entryThreshold).toBe(0.5);

@@ -112,10 +112,13 @@ const finiteNum = (v: unknown): v is number => typeof v === "number" && Number.i
 
 /** 資産クラス別エクスポージャーの詳細 (口座通貨建て、decimal) */
 export interface ClassExposure {
-  /** 資産クラス別の建玉額。換算できない建玉があるクラスは、換算できた分だけの合計 */
-  exposure: Record<AssetClass, Decimal>;
+  /**
+   * 資産クラス別の建玉額。換算できない建玉があるクラスは、換算できた分だけの合計。
+   * 廃止したクラス (fx / stock) の古い建玉があればそのクラスのキーにも積む (例外にしない)
+   */
+  exposure: Record<AssetClass, Decimal> & Partial<Record<string, Decimal>>;
   /** 換算できない (価格・数量・為替が非有限) 建玉があり、合計が不明な資産クラスと銘柄 */
-  unknown: Partial<Record<AssetClass, string[]>>;
+  unknown: Partial<Record<string, string[]>>;
 }
 
 /**
@@ -129,9 +132,9 @@ export function classExposure(
   instruments?: EntryParams["instruments"],
   toAccount: (ccy: string) => number = () => 1,
 ): ClassExposure {
-  const exposure: Record<AssetClass, Decimal> = { crypto: D(0), meme: D(0), fx: D(0), stock: D(0) };
-  const unknown: Partial<Record<AssetClass, string[]>> = {};
-  const markUnknown = (cls: AssetClass, sym: string) => {
+  const exposure: ClassExposure["exposure"] = { crypto: D(0), meme: D(0) };
+  const unknown: ClassExposure["unknown"] = {};
+  const markUnknown = (cls: string, sym: string) => {
     (unknown[cls] ??= []).push(sym);
   };
   for (const p of positions) {
@@ -152,7 +155,7 @@ export function classExposure(
       markUnknown(cls, p.symbol);
       continue;
     }
-    exposure[cls] = exposure[cls].plus(D(p.qty).abs().mul(px).mul(cs).mul(rate));
+    exposure[cls] = (exposure[cls] ?? D(0)).plus(D(p.qty).abs().mul(px).mul(cs).mul(rate));
   }
   return { exposure, unknown };
 }
@@ -161,11 +164,6 @@ export function classExposure(
  * サイズ倍率 (計画 × 腕の重み × 予想) の上限。呼び出し側でも同じ値で制限しているが、RiskManager でも二重に制限する
  */
 export const MAX_SIZE_MULTIPLIER = 1.5;
-
-/** GMOコインの建玉の合計の上限 (評価額の倍率) の既定値 (GMO_MAX_EFFECTIVE_LEVERAGE の既定と同じ) */
-export const DEFAULT_GMO_MAX_EFFECTIVE_LEVERAGE = 1;
-/** GMOコインの venue 名 (src/market/feeds/gmo.ts の GMO_VENUE と同じ) */
-const GMO_VENUE = "gmo";
 
 /**
  * ダッシュボードの上書き値 (kv `risk:limits:<mode>`) を読み直す間隔 (ms)。
@@ -188,8 +186,6 @@ export class RiskManager {
    */
   readonly tradeMode?: TradingMode;
   private limitsCache?: { at: number; limits: RiskLimits; updatedAt: number };
-  /** GMO の建玉の合計 (絶対値の口座通貨換算) の上限 (評価額の倍率) */
-  private readonly gmoMaxLeverage: number = DEFAULT_GMO_MAX_EFFECTIVE_LEVERAGE;
 
   /**
    * 状態は kv `risk:state:<mode>` に保存する (既定 paper)。paper は旧キー `risk:state` からも引き継ぐ。
@@ -202,15 +198,10 @@ export class RiskManager {
   constructor(
     private readonly envLimits: RiskLimits,
     private readonly store?: Store,
-    keyOrOpts: string | { mode?: TradingMode; overrideCacheMs?: number; gmoMaxEffectiveLeverage?: number } = {},
+    keyOrOpts: string | { mode?: TradingMode; overrideCacheMs?: number } = {},
   ) {
     let saved: InternalState | undefined;
     this.overrideCacheMs = RISK_OVERRIDE_CACHE_MS;
-    if (typeof keyOrOpts === "object") {
-      const lev = keyOrOpts.gmoMaxEffectiveLeverage;
-      // 不正な値 (非有限・0 以下) は既定値 (1 倍) を使う。上限 2 倍は config の検証と同じ
-      if (lev !== undefined && Number.isFinite(lev) && lev > 0) this.gmoMaxLeverage = Math.min(lev, 2);
-    }
     if (typeof keyOrOpts === "string") {
       this.key = keyOrOpts;
       saved = store?.kvGet<InternalState>(this.key);
@@ -514,48 +505,13 @@ export class RiskManager {
         reason: `${inst.assetClass} のエクスポージャーが不明のため拒否 (口座通貨へ換算できない建玉: ${unknownSyms.join(", ")})`,
       };
     }
-    const classRoom = D(equity).mul(L.maxExposureByClass[inst.assetClass]).minus(exposure[inst.assetClass]);
+    // 上限の無い資産クラス (廃止した fx / stock の古い銘柄定義など) は新規エントリーしない (fail-closed)
+    const classLimit = (L.maxExposureByClass as Partial<Record<string, number>>)[inst.assetClass];
+    if (!finiteNum(classLimit)) return { ok: false, reason: `${inst.assetClass} は対象外の資産クラスのため拒否 (エクスポージャー上限がありません)` };
+    const classRoom = D(equity).mul(classLimit).minus(exposure[inst.assetClass] ?? D(0));
     if (!classRoom.isFinite()) return { ok: false, reason: `${inst.assetClass} のエクスポージャー上限の余地が計算できないため拒否` };
     if (classRoom.lte(0)) return { ok: false, reason: `${inst.assetClass} のエクスポージャー上限に到達` };
     cap(`${inst.assetClass} エクスポージャー上限`, classRoom.div(perUnitNotional));
-
-    // GMOコイン: 建玉の合計 (絶対値の口座通貨換算) が評価額 × GMO_MAX_EFFECTIVE_LEVERAGE を超えないようにする。
-    // 評価額は GMO 口座の評価額 (actualProfitLoss) を前提とする: live の発注先は GMO だけ (起動時に setup.ts の assertLiveVenues と
-    // execution/router.ts の createBrokers が gmo 以外を拒否する) なので、エンジンが渡す評価額は GMO 口座の評価額。
-    // paper は単一の PaperBroker の評価額 (全銘柄の合計) を使う
-    // (GMO は証拠金の 2 倍まで建てられるが、このツールでは既定 1 倍まで。上の判定に追加で効く = 緩めない)
-    if (inst.venue === GMO_VENUE) {
-      let gmoExposure = D(0);
-      for (const x of open) {
-        const xi = x.symbol === inst.symbol ? inst : lookup(p.instruments, x.symbol);
-        if (!xi) return { ok: false, reason: `取引先の分からない建玉 (${x.symbol}) があるため GMO の実効レバレッジを確認できず拒否` };
-        if (xi.venue !== GMO_VENUE) {
-          // live に GMO 以外の建玉があるのは想定外 (起動時に拒否している)。評価額が GMO 口座だけの値でないので拒否する
-          if (this.tradeMode === "live") {
-            return { ok: false, reason: `live に GMO 以外の建玉 (${x.symbol}, ${xi.venue}) があり、GMO 口座の評価額で実効レバレッジを確認できないため拒否` };
-          }
-          continue;
-        }
-        const px = x.price ?? p.prices?.[x.symbol] ?? x.avgPrice;
-        let rate = NaN;
-        try {
-          rate = xi.quoteCurrency ? toAcct(xi.quoteCurrency) : 1;
-        } catch {
-          rate = NaN;
-        }
-        const xcs = x.contractSize ?? xi.contractSize ?? 1;
-        if (!finiteNum(x.qty) || !finiteNum(px) || !(px >= 0) || !finiteNum(rate) || !(rate > 0) || !finiteNum(xcs) || !(xcs > 0)) {
-          return { ok: false, reason: `GMO の建玉額が計算できないため拒否 (${x.symbol})` };
-        }
-        gmoExposure = gmoExposure.plus(D(Math.abs(x.qty)).mul(px).mul(xcs).mul(rate));
-      }
-      const levRoom = D(equity).mul(this.gmoMaxLeverage).minus(gmoExposure);
-      if (!levRoom.isFinite()) return { ok: false, reason: "GMO の実効レバレッジの余地が計算できないため拒否" };
-      if (levRoom.lte(0)) {
-        return { ok: false, reason: `GMO の建玉の合計が評価額の ${this.gmoMaxLeverage} 倍 (実効レバレッジの上限) に達しているため拒否` };
-      }
-      cap(`GMO の実効レバレッジ上限 (評価額の ${this.gmoMaxLeverage} 倍)`, levRoom.div(perUnitNotional));
-    }
 
     if (!(available > 0)) return { ok: false, reason: "余力がありません" };
     cap("余力", D(available).div(perUnitNotional));

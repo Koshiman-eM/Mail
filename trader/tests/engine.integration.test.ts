@@ -13,8 +13,8 @@ const HOUR = 3_600_000;
 const START = Date.UTC(2026, 0, 5);
 
 const mkClock = (t = START): Clock & { t: number } => ({ t, now() { return this.t; } });
-/** 既定の監視銘柄は PEPE/USDT を除く 4 銘柄 (PEPE は crypto に分類したので、crypto の試験の銘柄数を変えないため。使う試験は WATCHLIST で指定する) */
-const DEFAULT_TEST_WATCHLIST = "synthetic|BTC/USDT,synthetic|ETH/USDT,synthetic|USD/JPY,synthetic|AAPL";
+/** 既定の監視銘柄は PEPE/USDT を除く 2 銘柄 (PEPE は crypto に分類したので、crypto の試験の銘柄数を変えないため。使う試験は WATCHLIST で指定する) */
+const DEFAULT_TEST_WATCHLIST = "synthetic|BTC/USDT,synthetic|ETH/USDT";
 const testConfig = (env: Record<string, string> = {}) =>
   loadConfig({
     NODE_ENV: "test", LIMIT_ENTRY: "false", LIMIT_TAKE_PROFIT: "false", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "JPY",
@@ -78,8 +78,11 @@ function skipCounts(store: MemoryStore): Record<string, number> {
 
 describe("TradingEngine 統合 (合成データ + 仮想時計 + MemoryStore)", () => {
   it("既定の戦略で仮想 8 時間: 決済・要因分析・腕の更新・評価額の記録・paper のみ", async () => {
-    const { rt, clock, store } = await runtime({ INTEL_LOOP_MS: String(30 * MIN), LEARN_LOOP_MS: String(HOUR) });
+    // 合成データの全銘柄 (BTC/ETH/PEPE。暗号資産だけ) で動かす。手数料 0 の FX・株式の合成銘柄を廃止したので、
+    // 8 時間で決済が出るシード (4) にする (シード 3 では暗号資産の手数料を越える期待値のシグナルが出ない)
+    const { rt, clock, store } = await runtime({ WATCHLIST: "", INTEL_LOOP_MS: String(30 * MIN), LEARN_LOOP_MS: String(HOUR) }, { seed: 4 });
     const { engine } = rt;
+    expect(rt.instruments.map((i) => i.symbol)).toEqual(["BTC/USDT", "ETH/USDT", "PEPE/USDT"]);
     for (let now = START; now <= START + 8 * HOUR; now += 30_000) {
       clock.t = now;
       await engine.advance(now);
@@ -201,30 +204,37 @@ describe("TradingEngine 統合 (合成データ + 仮想時計 + MemoryStore)", 
   });
 
   it("計画で無効な戦略・方向バイアス違反・ブラックアウトは見送る", async () => {
-    const s = fixedStrategy("always_long", { classes: ["crypto", "fx", "stock"] });
-    const { rt, store } = await runtime({}, { strategies: [s] });
+    const s = fixedStrategy("always_long", { classes: ["crypto", "meme"], stopPct: 0.03, edge: 300 });
+    // PEPE は meme (資産クラス単位のブラックアウトの対象)。BTC は方向バイアス違反、ETH は計画で無効
+    const { rt, store } = await runtime({ WATCHLIST: "synthetic|BTC/USDT,synthetic|ETH/USDT,synthetic|PEPE/USDT|meme" }, { strategies: [s] });
     const plan: StrategyPlan = {
       generatedAt: START - MIN,
       validUntil: START + HOUR,
       perSymbol: {
         "BTC/USDT": { symbol: "BTC/USDT", enabledStrategies: ["always_long"], directionBias: "short", riskMultiplier: 1 },
         "ETH/USDT": { symbol: "ETH/USDT", enabledStrategies: [], directionBias: "both", riskMultiplier: 0 },
-        "USD/JPY": { symbol: "USD/JPY", enabledStrategies: ["always_long"], directionBias: "both", riskMultiplier: 1 },
-        AAPL: { symbol: "AAPL", enabledStrategies: ["always_long"], directionBias: "both", riskMultiplier: 1 },
+        "PEPE/USDT": { symbol: "PEPE/USDT", enabledStrategies: ["always_long"], directionBias: "both", riskMultiplier: 1 },
       },
-      blackouts: [{ start: START - MIN, end: START + HOUR, assetClasses: ["fx"], reason: "USD 雇用統計" }],
+      blackouts: [{ start: START - MIN, end: START + HOUR, assetClasses: ["meme"], reason: "AI: 取引所の障害" }],
       rationale: "test",
     };
     store.savePlan(plan);
     await rt.engine.tick(START);
-    const entries = store.listAudit({ type: "engine.entry" }).map((e) => e.data.symbol);
-    expect(entries).toEqual(["AAPL"]);
+    expect(store.listAudit({ type: "engine.entry" })).toHaveLength(0);
     const skips = skipCounts(store);
     expect(skips.direction_bias).toBe(1);
     expect(skips.plan_disabled).toBe(1);
     expect(skips.blackout).toBe(1);
-    // AAPL は計画の倍率 × 腕の重み (新しい腕は 1)
-    expect(rt.engine.positions.get("AAPL")!.entryContext.riskMultiplier).toBe(1);
+
+    // 計画で許可した銘柄はエントリーし、計画の倍率 × 腕の重み (新しい腕は 1)
+    const b = await runtime({}, { strategies: [s] });
+    b.store.savePlan({
+      ...plan,
+      perSymbol: { "BTC/USDT": { ...plan.perSymbol["BTC/USDT"], directionBias: "both" }, "ETH/USDT": plan.perSymbol["ETH/USDT"] },
+    });
+    await b.rt.engine.tick(START);
+    expect(b.store.listAudit({ type: "engine.entry" }).map((e) => e.data.symbol)).toEqual(["BTC/USDT"]);
+    expect(b.rt.engine.positions.get("BTC/USDT")!.entryContext.riskMultiplier).toBe(1);
   });
 
   it("WATCHLIST で meme にした銘柄は 24 時間出来高 × 価格 (USD) を流動性の代理指標にしてエントリーする", async () => {
@@ -298,8 +308,8 @@ describe("TradingEngine 統合 (合成データ + 仮想時計 + MemoryStore)", 
     expect(st.baseCurrency).toBe("JPY");
     expect(st.positions).toHaveLength(2);
     expect(st.positions[0].unrealizedPnlAccount).toBeDefined();
-    expect(st.watched.map((w) => w.symbol)).toContain("USD/JPY");
-    expect(st.plan?.symbols.length).toBe(4);
+    expect(st.watched.map((w) => w.symbol)).toEqual(["BTC/USDT", "ETH/USDT"]);
+    expect(st.plan?.symbols.length).toBe(2);
     expect(st.brief?.stub).toBe(true);
     expect(st.equityHistory.length).toBeGreaterThan(0);
     expect(st.risk.limits.maxDrawdown).toBe(rt.config.risk.maxDrawdown);

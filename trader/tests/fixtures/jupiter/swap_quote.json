@@ -1,0 +1,28 @@
+{
+  "inputMint": "So11111111111111111111111111111111111111112",
+  "inAmount": "100000000",
+  "outputMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  "outAmount": "14980000",
+  "otherAmountThreshold": "14905100",
+  "swapMode": "ExactIn",
+  "slippageBps": 50,
+  "platformFee": null,
+  "priceImpactPct": "0.0002",
+  "routePlan": [
+    {
+      "swapInfo": {
+        "ammKey": "PooLCCCCddddEEEEffffGGGGhhhhJJJJkkkk3333",
+        "label": "SyntheticAMM",
+        "inputMint": "So11111111111111111111111111111111111111112",
+        "outputMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "inAmount": "100000000",
+        "outAmount": "14980000",
+        "feeAmount": "250000",
+        "feeMint": "So11111111111111111111111111111111111111112"
+      },
+      "percent": 100
+    }
+  ],
+  "contextSlot": 348004023,
+  "timeTaken": 0.012
+}

@@ -10,7 +10,7 @@ import { buildEntrySignal, candlesOf, clamp, entryBlocked, exitSignal, period, p
 export const shortEmaTrend: Strategy = {
   id: "short_ema_trend",
   horizon: "short",
-  assetClasses: ["crypto", "fx", "stock"],
+  assetClasses: ["crypto"],
   regimes: ["trend_up", "trend_down"],
   primaryTimeframe: "15m",
   timeframes: ["15m"],
@@ -86,7 +86,7 @@ export const shortEmaTrend: Strategy = {
 export const shortRsiRevert: Strategy = {
   id: "short_rsi_revert",
   horizon: "short",
-  assetClasses: ["crypto", "fx", "stock"],
+  assetClasses: ["crypto"],
   regimes: ["range"],
   primaryTimeframe: "15m",
   timeframes: ["15m"],
@@ -160,7 +160,7 @@ export const shortRsiRevert: Strategy = {
 export const shortBreakout: Strategy = {
   id: "short_breakout",
   horizon: "short",
-  assetClasses: ["crypto", "fx", "stock"],
+  assetClasses: ["crypto"],
   regimes: ["trend_up", "trend_down", "high_vol"],
   primaryTimeframe: "1h",
   timeframes: ["1h"],

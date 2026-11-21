@@ -32,8 +32,9 @@ describe("synthetic feed", () => {
   it("既定銘柄・板・約定", async () => {
     const f = new SyntheticFeed({ clock: mkClock(), historyMs: 3_600_000 });
     const list = await f.listInstruments();
-    expect(list.map((i) => i.assetClass)).toEqual(["crypto", "crypto", "crypto", "fx", "stock"]);
-    const q = await f.fetchQuote("USD/JPY");
+    // 暗号資産だけ (FX・株式の合成銘柄は廃止)
+    expect(list.map((i) => [i.symbol, i.assetClass])).toEqual([["BTC/USDT", "crypto"], ["ETH/USDT", "crypto"], ["PEPE/USDT", "crypto"]]);
+    const q = await f.fetchQuote("BTC/USDT");
     expect(q.ask).toBeGreaterThan(q.bid);
     const ob = await f.fetchOrderBook("PEPE/USDT", 5);
     expect(ob.bids).toHaveLength(5);

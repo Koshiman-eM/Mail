@@ -128,7 +128,7 @@ describe("scalp_micro: シグナル", () => {
   it("登録と既定: horizon scalp / 1m / crypto のみ / 標準パラメータ名 / 板は任意", () => {
     expect(getStrategy("scalp_micro")).toBe(scalpMicro);
     expect(strategiesFor("crypto", "scalp").map((s) => s.id)).toContain("scalp_micro");
-    expect(strategiesFor("fx").map((s) => s.id)).not.toContain("scalp_micro");
+    expect(strategiesFor("meme").map((s) => s.id)).not.toContain("scalp_micro");
     expect(scalpMicro.horizon).toBe("scalp");
     expect(scalpMicro.primaryTimeframe).toBe("1m");
     expect(scalpMicro.requiresBook).toBeFalsy();

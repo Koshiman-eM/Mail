@@ -12,10 +12,12 @@
 // ───────────────────────── 基本列挙 ─────────────────────────
 
 /**
- * 資産クラス。meme は自動では分類しない (WATCHLIST で "venue|symbol|meme" と明示した銘柄だけ。専用の戦略は無い)。
- * 学習データ (腕のキー・予想・振り返り) とダッシュボードのリスク設定に meme が残っているので、クラスとしては残す
+ * 資産クラス (仮想通貨だけ)。meme は自動では分類しない (WATCHLIST で "venue|symbol|meme" と明示した銘柄だけ。専用の戦略は無い)。
+ * meme は Solana のミームコインで再び使う予定で、学習データ (腕のキー・予想・振り返り) とダッシュボードのリスク設定にも残っている。
+ * fx / stock は廃止した。DB の古い記録 (取引・仮想トレード・腕・パラメータ・振り返り・予想の集計) には "fx" / "stock" が残りうるので、
+ * 記録の assetClass を読むコードは未知のクラスでも例外にしない (クラス別の表を引くときは既定値に落とす)
  */
-export type AssetClass = "crypto" | "meme" | "fx" | "stock";
+export type AssetClass = "crypto" | "meme";
 /**
  * トレードの時間軸。登録している戦略は scalp と short だけ。mid / long の戦略は廃止したが、
  * 古い取引・仮想トレードの記録と MAX_HOLD_MINUTES の規則 (isHoldLimitedHorizon) のために残す
@@ -41,9 +43,9 @@ export const TIMEFRAME_MS: Record<Timeframe, number> = {
 // ───────────────────────── 銘柄・市場データ ─────────────────────────
 
 export interface Instrument {
-  /** 統一シンボル。例: "BTC/USDT", "BTC/JPY", "USD/JPY", "AAPL" */
+  /** 統一シンボル。例: "BTC/USDT", "BTC/JPY", "SOL/USDC" */
   symbol: string;
-  /** 取引先。例: "paper", "ccxt:bitbank", "gmo" (古い paper のスナップショットには廃止した "oanda" / "dex:solana" などが残りうる) */
+  /** 取引先。例: "paper", "ccxt:bitbank" (古い paper のスナップショットには廃止した "gmo" / "oanda" / "dex:solana" などが残りうる) */
   venue: string;
   assetClass: AssetClass;
   baseCurrency: string;
@@ -64,9 +66,9 @@ export interface Instrument {
    * 実効の空売り可否は必ず canShort(inst, mode) で判定する (live では常に無視される)
    */
   simulatedShort?: boolean;
-  /** 1 単位あたりの契約サイズ (FX/先物用。現物は 1) */
+  /** 1 単位あたりの契約サイズ (先物用。現物は 1) */
   contractSize?: number;
-  /** 取引先固有の情報 (GMO の建玉の持ち越し手数料の日率 holdingFeeDaily など) */
+  /** 取引先固有の情報 (古いスナップショットには廃止した GMO の holdingFeeDaily が残りうる。読まない) */
   meta?: Record<string, string | number>;
 }
 
@@ -148,7 +150,7 @@ export interface IntelItem {
   url?: string;
   publishedAt: number;
   fetchedAt: number;
-  /** 関連資産 (正規化済み)。例: ["BTC", "ETH"], ["USD", "JPY"], ["AAPL"] */
+  /** 関連資産 (正規化済み)。例: ["BTC", "ETH"], ["SOL"], ["USD"] */
   assets: string[];
   /** -1 (弱気) 〜 1 (強気)。未分析なら undefined */
   sentiment?: number;
@@ -362,7 +364,7 @@ export interface OrderRequest {
   strategyId: string;
   /**
    * 取引所側に置く保護用ストップ価格 (対応アダプターのみ。エンジン側の損切りが主で、これはプロセス停止時の保険)。
-   * 決済時に取引所側で自動的に取り消されることが保証できるアダプターだけが付ける (いまの発注先の paper・GMO は付けない)。
+   * 決済時に取引所側で自動的に取り消されることが保証できるアダプターだけが付ける (いまの発注先の paper は付けない)。
    */
   protectiveStop?: number;
 }
@@ -773,8 +775,6 @@ export interface ShadowTradeRecord {
   simulatedShort?: boolean;
   /** 空売りの借入コストの日率 (simulatedShort のときだけ。記録時の PAPER_SHORT_BORROW_RATE_DAILY) */
   borrowRateDaily?: number;
-  /** 建玉の持ち越し手数料の日率 (meta.holdingFeeDaily がある銘柄 = GMO のとき。買い・売りとも。src/core/holdingFee.ts) */
-  holdingFeeDaily?: number;
   /**
    * 読みの管理 (シグナルに最大保有・読みの期限があったものだけ。古い記録には無い)。
    * thesisExpectedMs: 読みの期限までの時間 / thesisExtendedAt: 延長した時刻 / thesisNetRAtDeadline: 期限の時点の純 R /

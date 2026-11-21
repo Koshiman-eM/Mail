@@ -1,4 +1,4 @@
-/** CLI の backtest コマンド (合成データ・ccxt・GMOコインの履歴で runBacktest) */
+/** CLI の backtest コマンド (合成データ・ccxt の履歴で runBacktest) */
 import { generateCandles, syntheticInstrument } from "../backtest/synthetic";
 import { runBacktest } from "../backtest/engine";
 import type { BacktestMetrics, BacktestOptions } from "../backtest/types";
@@ -24,7 +24,7 @@ export interface BacktestCommandOptions {
   minEdgeToCostRatio?: number;
   riskPerTrade?: number;
   maxPositionPct?: number;
-  /** ccxt / gmo のときの feed (CcxtFeed.create(CCXT_EXCHANGE)、GmoFeed など) */
+  /** ccxt のときの feed (CcxtFeed.create(CCXT_EXCHANGE) など) */
   feed?: MarketDataFeed;
   now?: number;
   /** 戦略一覧の差し替え (テスト用) */
@@ -85,8 +85,8 @@ export async function fetchCandlesPaged(
   return out;
 }
 
-/** 足の取得元。synthetic 以外は o.feed (ccxt は CcxtFeed、gmo は GmoFeed) から履歴を取る */
-export type BacktestSource = "synthetic" | "ccxt" | "gmo";
+/** 足の取得元。ccxt は o.feed (CcxtFeed) から履歴を取る */
+export type BacktestSource = "synthetic" | "ccxt";
 
 export interface BacktestData {
   base: Timeframe;
@@ -103,7 +103,7 @@ export interface BacktestDataLoader {
 
 /**
  * バックテスト用の足を用意する。期間 days の前に主時間足で (leadBars ?? warmup + 50) 本分のウォームアップを付ける。
- * synthetic は固定の開始時刻から生成 (シード固定)、ccxt / gmo は feed から [until - 期間 - ウォームアップ, until) をページングで取得する。
+ * synthetic は固定の開始時刻から生成 (シード固定)、ccxt は feed から [until - 期間 - ウォームアップ, until) をページングで取得する。
  */
 export async function createBacktestDataLoader(o: Pick<BacktestCommandOptions, "symbol" | "days" | "source" | "seed" | "feed" | "now">): Promise<BacktestDataLoader> {
   if (!(o.days > 0)) throw new Error("--days は正の数を指定してください");
@@ -113,7 +113,7 @@ export async function createBacktestDataLoader(o: Pick<BacktestCommandOptions, "
   let feedInst: Instrument | undefined;
   if (o.source !== "synthetic") {
     if (!o.feed) throw new Error(`${o.source} の feed がありません`);
-    const sym = o.symbol ?? (o.source === "gmo" ? "BTC/JPY" : "BTC/USDT");
+    const sym = o.symbol ?? "BTC/USDT";
     feedInst = (await o.feed.listInstruments()).find((i) => i.symbol === sym);
     if (!feedInst) throw new Error(`取引所に銘柄がありません: ${sym}`);
   }

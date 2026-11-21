@@ -87,7 +87,8 @@ describe("経済指標ブラックアウト", () => {
     const b = buildBiases([], { ...opts, events: [e] });
     expect(b.USD.blackoutUntil).toBe(e.ts + EVENT_POST_MS);
     expect(b.USD.eventRisk).toBe(1);
-    expect(b.FX.blackoutUntil).toBe(e.ts + EVENT_POST_MS);
+    expect(b.FX).toBeUndefined(); // FX の擬似資産は廃止
+    expect(b.STOCKS).toBeUndefined();
     expect(b.CRYPTO.blackoutUntil).toBeUndefined();
     expect(b.CRYPTO.eventRisk).toBeGreaterThan(0);
   });

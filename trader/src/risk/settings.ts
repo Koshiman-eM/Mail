@@ -31,6 +31,22 @@ export const RISK_PRESET_KEYS: readonly RiskPresetKey[] = RISK_SETTING_KEYS.filt
 /** .env の値より上げられない (下げる方向だけ許可) 項目 */
 export const LOWER_ONLY_KEYS: readonly RiskSettingKey[] = ["maxOrdersPerMinute"];
 
+/**
+ * 廃止した項目 (FX・株式の資産クラスの上限)。kv `risk:limits:<mode>` に残っていても読まない (実効値に使わない) が、
+ * ダッシュボードから保存し直すときも消さずに引き継ぐ (ユーザーが保存した値を消さない)。変更要求に含まれていても無視する
+ */
+const RETIRED_RISK_KEYS = ["maxExposureFx", "maxExposureStock"] as const;
+
+/** kv の上書き値のうち廃止した項目 (値はそのまま。読まない) */
+function retiredRiskValues(store: Store, mode: TradingMode): Record<string, unknown> {
+  const raw = store.kvGet<unknown>(riskLimitsKey(mode));
+  const src = raw && typeof raw === "object" ? (raw as { values?: unknown }).values : undefined;
+  if (!src || typeof src !== "object") return {};
+  const out: Record<string, unknown> = {};
+  for (const k of RETIRED_RISK_KEYS) if ((src as Record<string, unknown>)[k] !== undefined) out[k] = (src as Record<string, unknown>)[k];
+  return out;
+}
+
 const standardValues = Object.fromEntries(RISK_PRESET_KEYS.map((k) => [k, RISK_SETTING_SPECS[k].def])) as Record<RiskPresetKey, number>;
 
 /** プリセット。標準 = config の既定値 (RISK_SETTING_SPECS.def)。範囲内であることはテストで確認する */
@@ -39,7 +55,7 @@ export const RISK_PRESETS: Readonly<Record<RiskPresetId, { label: string; values
     label: "保守的",
     values: {
       riskPerTrade: 0.0025, maxDailyLoss: 0.015, maxDrawdown: 0.08, maxPositionPct: 0.1,
-      maxExposureCrypto: 0.3, maxExposureMeme: 0.02, maxExposureFx: 0.3, maxExposureStock: 0.3, maxOpenPositions: 4,
+      maxExposureCrypto: 0.3, maxExposureMeme: 0.02, maxOpenPositions: 4,
     },
   },
   standard: { label: "標準", values: standardValues },
@@ -47,7 +63,7 @@ export const RISK_PRESETS: Readonly<Record<RiskPresetId, { label: string; values
     label: "積極的",
     values: {
       riskPerTrade: 0.01, maxDailyLoss: 0.05, maxDrawdown: 0.25, maxPositionPct: 0.3,
-      maxExposureCrypto: 0.8, maxExposureMeme: 0.1, maxExposureFx: 0.8, maxExposureStock: 0.8, maxOpenPositions: 12,
+      maxExposureCrypto: 0.8, maxExposureMeme: 0.1, maxOpenPositions: 12,
     },
   },
 };
@@ -73,8 +89,6 @@ export function riskValuesOf(l: RiskLimits): RiskValues {
     maxPositionPct: l.maxPositionPct,
     maxExposureCrypto: l.maxExposureByClass.crypto,
     maxExposureMeme: l.maxExposureByClass.meme,
-    maxExposureFx: l.maxExposureByClass.fx,
-    maxExposureStock: l.maxExposureByClass.stock,
     maxOpenPositions: l.maxOpenPositions,
     maxOrdersPerMinute: l.maxOrdersPerMinute,
   };
@@ -94,8 +108,6 @@ export function applyRiskValues(base: RiskLimits, v: Partial<RiskValues>): RiskL
     maxExposureByClass: {
       crypto: pick("maxExposureCrypto", base.maxExposureByClass.crypto),
       meme: pick("maxExposureMeme", base.maxExposureByClass.meme),
-      fx: pick("maxExposureFx", base.maxExposureByClass.fx),
-      stock: pick("maxExposureStock", base.maxExposureByClass.stock),
     },
   };
 }
@@ -119,6 +131,7 @@ export function checkRiskValue(key: RiskSettingKey, v: unknown, envValue?: numbe
 
 /**
  * kv の上書き値を読む。範囲外・型違いの項目は捨てる (壊れた kv で上限を緩めない)。
+ * 廃止した項目 (maxExposureFx / maxExposureStock) が kv に残っていても読まない (kv は書き換えない)。
  * 下げる方向だけの項目は .env の値で頭打ちにする (.env を下げた後に古い上書きで上がらないように)。
  */
 export function readRiskOverride(store: Store, mode: TradingMode, envLimits: RiskLimits): RiskLimitsOverride | undefined {
@@ -182,9 +195,11 @@ export function matchingPreset(v: RiskValues): RiskPresetId | undefined {
 
 // ───────── 変更要求 (ダッシュボードの POST) ─────────
 
-const valuesSchema = z.strictObject(
-  Object.fromEntries(RISK_SETTING_KEYS.map((k) => [k, z.number().optional()])) as Record<RiskSettingKey, z.ZodOptional<z.ZodNumber>>,
-);
+// 廃止した項目 (RETIRED_RISK_KEYS) は古い画面から送られても拒否せず無視する (それ以外の未知の項目は書き間違いとして拒否)
+const valuesSchema = z.strictObject({
+  ...(Object.fromEntries(RISK_SETTING_KEYS.map((k) => [k, z.number().optional()])) as Record<RiskSettingKey, z.ZodOptional<z.ZodNumber>>),
+  ...(Object.fromEntries(RETIRED_RISK_KEYS.map((k) => [k, z.unknown().optional()])) as Record<(typeof RETIRED_RISK_KEYS)[number], z.ZodOptional<z.ZodUnknown>>),
+});
 
 export const RiskSettingsRequestSchema = z.discriminatedUnion("action", [
   z.strictObject({
@@ -289,17 +304,20 @@ export function applyRiskSettingsChange(opts: {
   const dl = opts.metrics.dailyLossPct;
   if (dl !== undefined && Number.isFinite(dl) && after.maxDailyLoss < dl) warnings.push("日次損失の上限が当日の損失を下回るため、次の評価で当日の新規エントリーが止まります");
 
-  if (changes.length === 0 && (req.action === "set" ? sameOverride(cur.override?.values ?? {}, newValues) : !cur.override)) {
+  const hasOverride = cur.override !== undefined && Object.keys(cur.override.values).length > 0;
+  if (changes.length === 0 && (req.action === "set" ? sameOverride(cur.override?.values ?? {}, newValues) : !hasOverride)) {
     return { ok: true, changed: false, limits: cur.limits, ...(cur.override ? { override: cur.override } : {}), changes, raised: false, warnings };
   }
 
   // プリセット名は値が実際にそのプリセットと一致するときだけ残す (調整後に名前だけ残らないように)
   const preset = req.action === "set" && req.preset && matchingPreset(after) === req.preset ? req.preset : undefined;
   let override: RiskLimitsOverride | undefined;
-  if (Object.keys(newValues).length === 0) store.kvSet(riskLimitsKey(mode), undefined);
+  // 廃止した項目の保存済みの値は消さずに引き継ぐ (読まないので実効値には影響しない)
+  const retired = retiredRiskValues(store, mode);
+  if (Object.keys(newValues).length === 0 && Object.keys(retired).length === 0) store.kvSet(riskLimitsKey(mode), undefined);
   else {
-    override = { values: newValues, ...(preset ? { preset } : {}), updatedAt: now, source: opts.source ?? "dashboard" };
-    store.kvSet(riskLimitsKey(mode), override);
+    if (Object.keys(newValues).length > 0) override = { values: newValues, ...(preset ? { preset } : {}), updatedAt: now, source: opts.source ?? "dashboard" };
+    store.kvSet(riskLimitsKey(mode), { values: { ...retired, ...newValues }, ...(override?.preset ? { preset: override.preset } : {}), updatedAt: now, source: opts.source ?? "dashboard" });
   }
   store.audit({
     ts: now,

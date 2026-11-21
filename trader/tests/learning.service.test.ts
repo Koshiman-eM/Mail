@@ -118,7 +118,7 @@ describe("LearningService", () => {
     expect(snap.lessons.length).toBeGreaterThan(0);
     expect(snap.adjustments.map((a) => a.status)).toEqual(["applied"]);
     expect(snap.sources["rss:a"].n).toBe(25);
-    expect(Object.keys(snap.intelInfluence).sort()).toEqual(["crypto", "fx", "meme", "stock"]);
+    expect(Object.keys(snap.intelInfluence).sort()).toEqual(["crypto", "meme"]);
     expect(snap.causes.trades).toBe(45);
     expect(snap.causes.all.stop_too_tight).toBe(45);
     expect(snap.causes.outcomes.loss).toBe(45);
@@ -126,7 +126,7 @@ describe("LearningService", () => {
     const w = svc.armWeight("s1", "range", "crypto", () => 0.5);
     expect(w).toBeGreaterThanOrEqual(0.25);
     expect(w).toBeLessThan(1);
-    expect(svc.armWeight("s2", "trend_up", "fx")).toBe(1);
+    expect(svc.armWeight("s2", "trend_up", "meme")).toBe(1);
     expect(svc.intelInfluence("crypto")).toBeGreaterThanOrEqual(0);
   });
 

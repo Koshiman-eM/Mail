@@ -14,7 +14,7 @@ import { buildEntrySignal, candlesOf, clamp, entryBlocked, exitSignal, period, p
 export const scalpObi: Strategy = {
   id: "scalp_obi",
   horizon: "scalp",
-  assetClasses: ["crypto", "fx", "stock"],
+  assetClasses: ["crypto"],
   regimes: ["range", "trend_up", "trend_down", "high_vol"],
   requiresBook: true,
   primaryTimeframe: "1m",
@@ -90,7 +90,7 @@ export const scalpObi: Strategy = {
 export const scalpVwapRevert: Strategy = {
   id: "scalp_vwap_revert",
   horizon: "scalp",
-  assetClasses: ["crypto", "fx", "stock"],
+  assetClasses: ["crypto"],
   regimes: ["range"],
   primaryTimeframe: "1m",
   timeframes: ["1m"],
@@ -167,7 +167,7 @@ export const scalpVwapRevert: Strategy = {
 export const scalpMomentumBurst: Strategy = {
   id: "scalp_momentum_burst",
   horizon: "scalp",
-  assetClasses: ["crypto", "meme", "fx", "stock"],
+  assetClasses: ["crypto", "meme"],
   regimes: ["trend_up", "trend_down", "high_vol"],
   primaryTimeframe: "1m",
   timeframes: ["1m"],

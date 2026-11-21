@@ -4,7 +4,6 @@ import { askStructured, aiEnabled, type AiOptions } from "../core/ai";
 import { createLogger } from "../core/logger";
 import type {
   AssetClass,
-  EconEvent,
   Horizon,
   Instrument,
   IntelBias,
@@ -16,7 +15,6 @@ import type {
   SymbolPlan,
   TradingMode,
 } from "../core/types";
-import { EVENT_POST_MS, EVENT_PRE_MS } from "./aggregate";
 import { buildPlannerPrompt, formatLessons, isPlannerScope, PLANNER_SYSTEM } from "./prompts";
 import { clamp } from "../core/util";
 
@@ -56,9 +54,10 @@ export interface PlanInput {
   mode?: TradingMode;
 }
 
-const CLASS_PSEUDO: Record<AssetClass, string> = { crypto: "CRYPTO", meme: "MEME", fx: "FX", stock: "STOCKS" };
+/** 資産クラスの擬似資産 (情報バイアスのキー)。未知のクラス (廃止した fx / stock の古い銘柄定義) は擬似資産なし */
+const CLASS_PSEUDO: Record<AssetClass, string> = { crypto: "CRYPTO", meme: "MEME" };
 
-/** 銘柄に対応するバイアス (個別 → クラス擬似資産の順。FX は base - quote) */
+/** 銘柄に対応するバイアス (個別 → クラス擬似資産の順) */
 export function biasForInstrument(
   inst: Instrument,
   biases: Record<string, IntelBias>,
@@ -67,25 +66,15 @@ export function biasForInstrument(
   let sentiment = 0;
   let confidence = 0;
   let found = false;
-  if (inst.assetClass === "fx") {
-    const b = biases[inst.baseCurrency];
-    const q = biases[inst.quoteCurrency];
-    if (b || q) {
-      sentiment = clamp((b?.sentiment ?? 0) - (q?.sentiment ?? 0), -1, 1);
-      confidence = Math.min(b?.confidence ?? 0, q?.confidence ?? 0) || Math.max(b?.confidence ?? 0, q?.confidence ?? 0) * 0.5;
-      found = true;
-    }
-  } else {
-    const own = biases[inst.baseCurrency] ?? biases[inst.symbol.split("/")[0]];
-    const src = own ?? pseudo;
-    if (src) {
-      sentiment = src.sentiment;
-      confidence = src.confidence;
-      found = true;
-    }
+  const own = biases[inst.baseCurrency] ?? biases[inst.symbol.split("/")[0]];
+  const src = own ?? pseudo;
+  if (src) {
+    sentiment = src.sentiment;
+    confidence = src.confidence;
+    found = true;
   }
-  // eventRisk: 関連する全資産の最大
-  const ev = [biases[inst.baseCurrency], biases[inst.quoteCurrency], pseudo, inst.assetClass === "fx" ? biases.FX : undefined]
+  // eventRisk: 関連する全資産の最大 (クオート通貨の経済指標を含む)
+  const ev = [biases[inst.baseCurrency], biases[inst.quoteCurrency], pseudo]
     .filter((x): x is IntelBias => Boolean(x))
     .reduce((m, x) => Math.max(m, x.eventRisk), 0);
   return { sentiment, confidence, eventRisk: ev, found };
@@ -104,20 +93,6 @@ export function influencedBias(
   const k = influence !== undefined && Number.isFinite(influence) ? Math.max(0, influence) : 1;
   if (k === 1) return b;
   return { ...b, sentiment: clamp(b.sentiment * k, -1, 1), confidence: clamp(b.confidence * k, 0, 1) };
-}
-
-/** 経済指標からブラックアウト (高インパクトのみ)。影響クラスは通貨で決める */
-export function blackoutsFromEvents(events: EconEvent[], now: number, validUntil: number): StrategyPlan["blackouts"] {
-  const out: StrategyPlan["blackouts"] = [];
-  for (const e of events) {
-    if (e.impact !== "high") continue;
-    const start = e.ts - EVENT_PRE_MS;
-    const end = e.ts + EVENT_POST_MS;
-    if (end <= now || start >= validUntil) continue;
-    const assetClasses: AssetClass[] = e.currency === "USD" ? ["fx", "stock"] : ["fx"];
-    out.push({ start, end, assetClasses, reason: `${e.currency ?? ""} ${e.title}`.trim() });
-  }
-  return out;
 }
 
 export function buildBaselinePlan(input: PlanInput): StrategyPlan {
@@ -186,11 +161,13 @@ export function buildBaselinePlan(input: PlanInput): StrategyPlan {
     };
   }
 
-  const blackouts = blackoutsFromEvents(brief.events, now, validUntil);
+  // 資産クラス単位のブラックアウトは AI の追加分 (mergeAiPlan の extraBlackouts) だけ。経済指標の FX・株式向けのブラックアウトは廃止した
+  // (経済指標の前後の新規エントリーの停止は、クオート通貨の IntelBias.blackoutUntil として銘柄ごとに効く)
+  const blackouts: StrategyPlan["blackouts"] = [];
   const active = Object.values(perSymbol).filter((p) => p.enabledStrategies.length > 0).length;
   const rationale =
     `ベースライン計画: ${instruments.length} 銘柄中 ${active} 銘柄で戦略を有効化。` +
-    `リスクオン指数 ${riskOn.toFixed(2)}、ブラックアウト ${blackouts.length} 件。` +
+    `リスクオン指数 ${riskOn.toFixed(2)}。` +
     "スキャルピング・短期戦略を主軸とし、中長期はリスクを控えめにしています。";
   return { generatedAt: now, validUntil, perSymbol, blackouts, rationale };
 }
@@ -210,7 +187,7 @@ const AiPlanSchema = z.object({
     z.object({
       start: z.number(),
       end: z.number(),
-      assetClasses: z.array(z.enum(["crypto", "meme", "fx", "stock"])),
+      assetClasses: z.array(z.enum(["crypto", "meme"])),
       reason: z.string(),
     }),
   ),

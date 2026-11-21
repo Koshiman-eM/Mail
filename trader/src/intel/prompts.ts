@@ -5,8 +5,8 @@ export const ANALYZER_SYSTEM = `あなたは自動売買システムの市場情
 与えられたニュース・トレンド情報を読み、各記事について次を判定します。
 - sentiment: -1 (強い弱気) 〜 1 (強い強気)。対象資産への短期 (数分〜数日) の価格影響で評価する。
 - importance: 0〜1。価格を動かす力が強いほど大きい。単なる解説・再掲載は小さく。
-- assets: 関連資産の正規化シンボル (例: BTC, ETH, SOL, DOGE, PEPE, USD, JPY, EUR, AAPL)。
-  クラス単位は CRYPTO / MEME / FX / STOCKS を使う。
+- assets: 関連資産の正規化シンボル (例: BTC, ETH, SOL, DOGE, PEPE, BONK, USD, JPY)。
+  クラス単位は CRYPTO / MEME を使う (株式市場全体のニュースは STOCKS。リスクオンの判断材料で、株式は取引しない)。
 全体として riskOn (-1 リスクオフ 〜 1 リスクオン)、日本語の summary (200 字程度)、
 ミームコインの新規監視候補 watchlist (シンボル、最大 5 件、ラグプルの危険が高いものは除く) を返してください。
 断定的な価格予想はしないこと。根拠が薄い・煽り記事は importance を低くすること。
@@ -29,8 +29,10 @@ export function formatLessons(lessons: Lesson[], scopes: (s: string) => boolean)
 }
 
 export const isIntelScope = (scope: string) => scope === "global" || scope === "intel" || scope.startsWith("intel:");
+/** 計画に渡す教訓の scope。廃止した資産クラス (fx / stock) の古い教訓は DB に残すが、計画には渡さない */
 export const isPlannerScope = (scope: string) =>
-  scope === "global" || scope === "plan" || scope === "intel" || scope.startsWith("assetClass:") || scope.startsWith("strategy:");
+  scope === "global" || scope === "plan" || scope === "intel" || scope.startsWith("strategy:") ||
+  (scope.startsWith("assetClass:") && scope !== "assetClass:fx" && scope !== "assetClass:stock");
 
 export function buildAnalyzerPrompt(
   articles: { id: string; source: string; kind: string; title: string; summary?: string; assets: string[]; metrics?: Record<string, number> }[],

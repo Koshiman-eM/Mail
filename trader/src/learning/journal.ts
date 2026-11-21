@@ -33,7 +33,7 @@ export interface OpenTradeInput {
   entryContext: EntryContext;
   /** エントリー時の手数料 (決済時の fees に加算される) */
   entryFees?: number;
-  /** 1 単位あたりの契約サイズ (FX/先物)。既定 1 */
+  /** 1 単位あたりの契約サイズ (先物)。既定 1 */
   contractSize?: number;
   /** 約定を確認できず、建玉の照会・手動の申告から数量・価格を推定したエントリー */
   estimated?: boolean;

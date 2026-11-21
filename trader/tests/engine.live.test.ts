@@ -10,7 +10,7 @@ import { buildRuntime, type RuntimeOptions } from "../src/engine/setup";
 import { requestResolve } from "../src/engine/orders";
 import type { BrokerSet } from "../src/execution/router";
 import { TradeJournal } from "../src/learning/journal";
-import { mulberry32, SyntheticFeed } from "../src/market/feeds/synthetic";
+import { annualToSecSigma, defaultSyntheticSpecs, mulberry32, SyntheticFeed } from "../src/market/feeds/synthetic";
 import { RiskManager } from "../src/risk/manager";
 import { peekResumeRequest, requestResume } from "../src/risk/resumeRequest";
 import { MemoryStore } from "../src/storage/memory";
@@ -83,7 +83,10 @@ async function liveRuntime(
 ) {
   const clock = mkClock();
   const store = o.store ?? new MemoryStore();
-  const feed = new ControlledFeed(new SyntheticFeed({ clock, seed: 3, historyMs: 2 * 86_400_000 }), clock);
+  // 合成データの既定の銘柄 (暗号資産だけ) に、為替のレートの元になる USDC/JPY (USDC は USD と同一視する) を加える
+  const specs = defaultSyntheticSpecs();
+  const usdc = { ...specs[0], instrument: { ...specs[0].instrument, symbol: "USDC/JPY", baseCurrency: "USDC", quoteCurrency: "JPY", tickSize: 0.001, lotSize: 0.01, minQty: 0.01 }, startPrice: 150, sigma: annualToSecSigma(0.1), spreadBps: 1, baseVolume: 1_000 };
+  const feed = new ControlledFeed(new SyntheticFeed({ clock, seed: 3, historyMs: 2 * 86_400_000, specs: [...specs, usdc] }), clock);
   const symbols = o.symbols ?? [SYM];
   const all = await feed.listInstruments();
   const instruments = symbols.map((s) => all.find((i) => i.symbol === s)!);
@@ -442,7 +445,7 @@ describe("paper と live の分離", () => {
     // paper で BTC / ETH を保有 (評価額 100 万 JPY 基準のリスク状態)
     const paperClock = mkClock();
     // PEPE/USDT は crypto なので除く (この試験は BTC・ETH の 2 銘柄の建玉を見る)
-    const paper = await buildRuntime(loadConfig({ NODE_ENV: "test", LIMIT_ENTRY: "false", LIMIT_TAKE_PROFIT: "false", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "JPY", WATCHLIST: "synthetic|BTC/USDT,synthetic|ETH/USDT,synthetic|USD/JPY,synthetic|AAPL" }), {
+    const paper = await buildRuntime(loadConfig({ NODE_ENV: "test", LIMIT_ENTRY: "false", LIMIT_TAKE_PROFIT: "false", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "JPY", WATCHLIST: "synthetic|BTC/USDT,synthetic|ETH/USDT" }), {
       clock: paperClock, store, intelSources: [], ai: null, seed: 3, syntheticHistoryMs: 2 * 86_400_000, rng: mulberry32(7), strategies: [alwaysLong()],
     });
     await paper.engine.tick(START);
@@ -807,8 +810,9 @@ describe("live 前の安全対策 (決済の再送・約定直後の建玉・為
 
   it("paper: 追跡中の建玉は PaperBroker の建玉と一致し、口座情報に差分を足さない (挙動は変わらない)", async () => {
     const clock = mkClock();
+    // 手数料 0 の FX・株式の合成銘柄を廃止したので、既定の戦略では 3 時間で建玉ができない。常に買う戦略で建玉を作る
     const rt = await buildRuntime(loadConfig({ NODE_ENV: "test", LIMIT_ENTRY: "false", LIMIT_TAKE_PROFIT: "false", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "JPY" }), {
-      clock, store: new MemoryStore(), intelSources: [], ai: null, seed: 3, syntheticHistoryMs: 2 * 86_400_000, rng: mulberry32(7),
+      clock, store: new MemoryStore(), intelSources: [], ai: null, seed: 3, syntheticHistoryMs: 2 * 86_400_000, rng: mulberry32(7), strategies: [alwaysLong()],
     });
     let opened = 0;
     for (let t = START; t <= START + 3 * 3_600_000; t += 30_000) {
@@ -825,7 +829,7 @@ describe("live 前の安全対策 (決済の再送・約定直後の建玉・為
     await rt.engine.stop();
   });
 
-  it("live: 為替が固定の概算表 (USD/JPY の気配なし) なら新規エントリーしない。ステータスに概算レート使用中を出す", async () => {
+  it("live: 為替が固定の概算表 (USD と JPY のペアの気配なし) なら新規エントリーしない。ステータスに概算レート使用中を出す", async () => {
     const broker = new FakeLiveBroker("paper");
     broker.placeMode = "fill";
     const { rt, store } = await liveRuntime({ broker, env: { BASE_CURRENCY: "JPY" } });
@@ -838,15 +842,15 @@ describe("live 前の安全対策 (決済の再送・約定直後の建玉・為
     expect(skipCounts(store).fx_approx).toBeGreaterThan(0);
   });
 
-  it("live: USD/JPY の気配が 5 分より古ければ新規エントリーしない。新しくなればエントリーする", async () => {
+  it("live: レートの元の気配 (USDC/JPY) が 5 分より古ければ新規エントリーしない。新しくなればエントリーする", async () => {
     const broker = new FakeLiveBroker("paper");
     broker.placeMode = "fill";
-    const { rt, feed, tick } = await liveRuntime({ broker, symbols: [SYM, "USD/JPY"], env: { BASE_CURRENCY: "JPY" } });
-    feed.quoteAgeMs.set("USD/JPY", 6 * MIN);
+    const { rt, feed, tick } = await liveRuntime({ broker, symbols: [SYM, "USDC/JPY"], env: { BASE_CURRENCY: "JPY" } });
+    feed.quoteAgeMs.set("USDC/JPY", 6 * MIN);
     await rt.engine.tick(START);
-    expect(broker.placed).toHaveLength(0);
+    expect(broker.placed.filter((r) => r.symbol === SYM)).toHaveLength(0);
     expect((await rt.engine.status()).account.fxApprox?.join(" ")).toMatch(/古い/);
-    feed.quoteAgeMs.delete("USD/JPY");
+    feed.quoteAgeMs.delete("USDC/JPY");
     await tick(MIN); // 新しい 1 分足
     expect(broker.placed.filter((r) => r.symbol === SYM)).toHaveLength(1);
     expect((await rt.engine.status()).account.fxApprox).toBeUndefined();
