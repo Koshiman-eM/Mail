@@ -2,7 +2,8 @@
  * Jupiter (Solana) の相場の feed (MarketDataFeed)。paper 用 (スワップは実行しない)。
  *
  * 価格:
- * - Price V3 を JUPITER_POLL_MS (既定 5 秒) ごとに、監視中の全 mint を 1 回 (50 件ずつ) で取る。fetchQuote は最後の一括取得の結果を返し、
+ * - Price V3 を JUPITER_POLL_MS (既定 2.5 秒) ごとに、監視中の全 mint を 1 回 (50 件ずつ) で取る。
+ *   API の上限 (キーなし 0.5 回/秒) を超えないよう、実際の間隔は effectivePollMs (上限の 80% まで。キーなしの 1 回なら 2.5 秒) 以上にする。fetchQuote は最後の一括取得の結果を返し、
  *   間隔が過ぎていれば先に取り直す (銘柄ごとに API を呼ばない)。
  * - 気配: 仲値 = 最新の価格、買い・売り気配 = 代わりのスリッページのモデル (estimateFillFallback) を代表的な約定代金
  *   (JUPITER_QUOTE_SIZE_USD、既定 $50) と流動性で評価した価格。見積もり API は毎回は呼ばない (約定のときだけ。jupiterFill.ts)。
@@ -24,15 +25,17 @@
  *   不明の間に出来高を根拠にした判断は無い。分かった出来高は「その時点で分かっている過去の値」で、先読みではない (遅れて見えるだけ)。
  * - GeckoTerminal の高値・安値は使わない (返した足の高値・安値を書き換えるとスイング・ATR が後から変わるため)。
  * - 履歴 (backfill) は、凍結した最初の足より前にだけ足す (途中の空白には差し込まない)。1m の履歴はポーリングの最初の足より前だけ。
- * 結果として、出来高を使う戦略 (scalp_momentum_burst・scalp_micro・short_breakout) は直近の足の出来高が常に不明なので、
- * Jupiter の銘柄では入らない (fail-closed)。
+ * 結果として、1m の足を使う出来高の戦略 (scalp_momentum_burst・scalp_micro) は直近の足の出来高が常に不明なので、
+ * Jupiter の銘柄では入らない (fail-closed。1m の足は出来高が分かる前に次の足へ置き換わる)。
+ * short_breakout (1h) は Strategy.needsVolume = true で、出来高が分かるまで (足の確定から 10 分まで) エンジンが同じ足の評価を
+ * 次のティックに持ち越す (評価済みにしない)。分かった時点で 1 回だけ評価し、10 分を過ぎても不明なら従来どおり入らない。
  */
 import { redactedErrMsg } from "../../core/http";
 import { TIMEFRAME_MS, type AssetClass, type Candle, type Instrument, type MarketDataFeed, type Quote, type Timeframe } from "../../core/types";
 import { resamplePolled, PolledCandleStore, type PolledCandle } from "../jupiter/candles";
 import type { JupiterClient } from "../jupiter/client";
 import type { GeckoTerminalClient } from "../jupiter/gecko";
-import { fetchPrices, type JupiterPrice } from "../jupiter/price";
+import { effectivePricePollMs, fetchPrices, type JupiterPrice } from "../jupiter/price";
 import { DEFAULT_FALLBACK_SLIPPAGE, estimateFillFallback, type FallbackSlippageSettings } from "../jupiter/quote";
 import { searchTokens, type JupiterToken } from "../jupiter/tokens";
 
@@ -199,7 +202,7 @@ export class JupiterFeed implements MarketDataFeed {
 
   constructor(private readonly o: JupiterFeedOptions) {
     this.now = o.now ?? Date.now;
-    this.pollMs = o.pollMs ?? 5_000;
+    this.pollMs = o.pollMs ?? 2_500;
     this.quoteSizeUsd = o.quoteSizeUsd ?? 50;
     this.networkFeeUsd = o.networkFeeUsd ?? 0.02;
     this.minNotionalUsd = o.minNotionalUsd ?? 5;
@@ -353,10 +356,18 @@ export class JupiterFeed implements MarketDataFeed {
     return [...this.bySymbol.values()].map((s) => s.inst);
   }
 
+  /**
+   * 実際の価格の取得間隔 (ミリ秒) = max(pollMs, API の上限から決まる下限)。
+   * 価格の取得は 50 件ごとに 1 回の呼び出しで、約定の見積もり・自動探索と同じ枠を共有するので、上限の 80% までしか使わない
+   */
+  effectivePollMs(): number {
+    return effectivePricePollMs(this.pollMs, this.o.client.limiter?.ratePerSec ?? Number.POSITIVE_INFINITY, this.byMint.size);
+  }
+
   /** 価格を一括で取り直す (間隔内なら何もしない。同時の呼び出しは 1 回にまとめる) */
   async refresh(force = false): Promise<void> {
     const t = this.now();
-    if (!force && this.lastPollAt !== undefined && t - this.lastPollAt < this.pollMs) return;
+    if (!force && this.lastPollAt !== undefined && t - this.lastPollAt < this.effectivePollMs()) return;
     if (this.pollInflight) return this.pollInflight;
     this.lastPollAt = t;
     const p = this.pollOnce().finally(() => {

@@ -9,7 +9,7 @@ import { createLogger, type Logger } from "../core/logger";
 import { DEFAULT_SHORT_BORROW_RATE_DAILY, isSimulatedShort } from "../core/short";
 import {
   systemClock, type Balance, type Broker, type BrokerPosition, type Clock, type EntryContext, type Instrument, type IntelBias, type MarketBrief,
-  type IntelItem, type MarketDataFeed, type MarketView, type OrderRequest, type Params, type Quote, type RegimeFeatures, type Signal, type Store, type Strategy,
+  type IntelItem, type MarketDataFeed, type MarketView, type OrderRequest, type Candle, type Params, type Quote, type RegimeFeatures, type Signal, type Store, type Strategy,
   type ShadowTradeRecord, type StrategyContext, type StrategyPlan, type Timeframe, type TradeRecord, TIMEFRAME_MS, isLearningExcludedTrade,
 } from "../core/types";
 import type { BrokerSet } from "../execution/brokerSet";
@@ -29,6 +29,7 @@ import type { MarketHub } from "../market/hub";
 import { detectRegime, regimeOptionsFor } from "../regime/detect";
 import { clearResumeRequest, peekResumeRequest } from "../risk/resumeRequest";
 import { costBps, type RiskManager, type RiskPosition } from "../risk/manager";
+import { volumeWindowUnknown } from "../strategies/common";
 import { ALL_STRATEGIES, resolveParams } from "../strategies/registry";
 import { RETIRED_STRATEGIES } from "../strategies/retired";
 import {
@@ -53,6 +54,8 @@ import { quoteMid } from "../core/util";
 export const PAPER_SNAPSHOT_KEY = "paper:snapshot";
 /** レジーム判定に必要な最低本数 (未満なら「レジーム不明」) */
 const MIN_REGIME_BARS = 30;
+/** needsVolume の戦略が出来高の判明を待つ上限 (足が確定してからのミリ秒。これを過ぎたら待たずに評価する = 従来どおり fail-closed) */
+export const VOLUME_RETRY_MAX_MS = 10 * 60_000;
 
 export interface EngineOptions {
   /** 評価額の保存間隔 (既定 60 秒) */
@@ -1280,6 +1283,8 @@ export class TradingEngine {
       if (last === undefined) return;
       const k = `${inst.symbol}|${s.id}`;
       if (this.lastEval.get(k) === last) return;
+      // 出来高待ち (needsVolume): 評価済みにせず次のティックで取り直す
+      if (this.volumePending(s, c!, last, ctx.now)) return;
       this.lastEval.set(k, last);
     }
     let signal: Signal | null;
@@ -1869,6 +1874,18 @@ export class TradingEngine {
     return { ok: true, directionBias, riskMultiplier };
   }
 
+  /**
+   * needsVolume の戦略の新規の評価を、出来高が分かるまで待たせるか (true なら lastEval を更新せず、次のティックで同じ足を取り直す)。
+   * 待つのは、主時間足の直近 21 本に出来高が不明な足 (volumeKnown === false。Jupiter) があり、かつ足が確定してから
+   * VOLUME_RETRY_MAX_MS 未満のとき。足が入れ替われば (last が変われば) 自然に終わり、期限を過ぎたら従来どおり評価して (fail-closed) 評価済みにする。
+   * volumeKnown を持たない足 (ccxt・合成) は常に false
+   */
+  private volumePending(s: Strategy, candles: readonly Candle[], last: number, now: number): boolean {
+    if (!s.needsVolume || !volumeWindowUnknown(candles)) return false;
+    const closeAt = last + (TIMEFRAME_MS[s.primaryTimeframe] ?? 0);
+    return now - closeAt < VOLUME_RETRY_MAX_MS;
+  }
+
   private async processSymbol(inst: Instrument, view: MarketView, ctx: TickCtx): Promise<void> {
     const sym = inst.symbol;
     let pos = this.positions.get(sym);
@@ -1899,6 +1916,8 @@ export class TradingEngine {
         if (last === undefined) continue;
         const k = `${sym}|${s.id}`;
         if (this.lastEval.get(k) === last) continue;
+        // 出来高待ち (needsVolume): 新規の評価だけ。保有中 (決済) は出来高を使わないので待たない
+        if (!pos && this.volumePending(s, c!, last, ctx.now)) continue;
         this.lastEval.set(k, last);
       }
       const owner = pos !== undefined && pos.strategyId === s.id ? pos : undefined;

@@ -17,6 +17,25 @@ import { chunk, isRecord, JupiterShapeError, toFiniteNumber, uniqueNonEmpty } fr
 export const PRICE_IDS_PER_CALL = 50;
 export const PRICE_PATH = "/price/v3";
 
+/** 価格の取得が API の上限 (回/秒) のうち使ってよい割合。残りは約定の見積もり・自動探索・トークン情報 (同じ枠を共有) のために空ける */
+export const PRICE_POLL_RATE_SHARE = 0.8;
+
+/**
+ * 価格の取得間隔の下限 (ミリ秒) = 1 回の取得の呼び出し数 (50 件ずつ) / (上限 × PRICE_POLL_RATE_SHARE)。
+ * キーなし (0.5 回/秒) で 1 回なら 2500、2 回 (51〜100 銘柄) なら 5000、キーあり (1 回/秒) で 1 回なら 1250。
+ * 上限が不正 (0 以下・非数) なら Infinity ではなく 0 (呼び出し側の指定を優先)
+ */
+export function minPricePollMs(ratePerSec: number, mintCount: number): number {
+  if (!(Number.isFinite(ratePerSec) && ratePerSec > 0)) return 0;
+  const calls = Math.max(1, Math.ceil(mintCount / PRICE_IDS_PER_CALL));
+  return Math.ceil((1000 * calls) / (ratePerSec * PRICE_POLL_RATE_SHARE));
+}
+
+/** 実際の価格の取得間隔 = max(指定の間隔, 上限から決まる下限)。キーなしで間隔を詰めても上限を超えない */
+export function effectivePricePollMs(requestedMs: number, ratePerSec: number, mintCount: number): number {
+  return Math.max(requestedMs, minPricePollMs(ratePerSec, mintCount));
+}
+
 export interface JupiterPrice {
   /** USD 建ての価格 */
   usd: number;

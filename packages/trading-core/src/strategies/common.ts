@@ -27,6 +27,17 @@ export function volumeUnknown(c: readonly Candle[], from: number, to: number): b
   return false;
 }
 
+/** 出来高の平均の窓 + 今の足 (本数)。short_breakout の出来高の判定 (直前の 20 本の平均と今の足) が見る範囲 */
+export const VOLUME_WINDOW_BARS = 21;
+
+/**
+ * 主時間足の末尾 VOLUME_WINDOW_BARS 本に出来高が不明な足があるか (volumeUnknown の末尾の窓版)。
+ * Strategy.needsVolume の戦略をエンジンが待たせる (評価済みにしない) かの判定に使う
+ */
+export function volumeWindowUnknown(c: readonly Candle[]): boolean {
+  return volumeUnknown(c, c.length - VOLUME_WINDOW_BARS, c.length - 1);
+}
+
 export function candlesOf(ctx: StrategyContext, tf: Timeframe, n: number): Candle[] {
   return tail(ctx.market.candles[tf], n);
 }

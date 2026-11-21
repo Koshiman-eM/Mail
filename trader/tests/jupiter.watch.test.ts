@@ -56,7 +56,7 @@ describe("Jupiter の固定の銘柄と自動探索", () => {
   it("設定: 未設定の選別の条件はモジュールの既定値、既定で探索は有効・20 分ごと・期限 6 時間", () => {
     const s = jupiterSettingsFromEnv(loadConfig({}).env);
     expect(s.screen).toEqual({ ...DEFAULT_DISCOVERY_SETTINGS });
-    expect(s).toMatchObject({ discovery: true, discoveryEveryMs: 20 * 60_000, ttlMs: 6 * H, maxAuto: 10, networkFeeUsd: 0.02, quoteSizeUsd: 50, minNotionalUsd: 5, pollMs: 5000, geckoCallsPerMin: 10 });
+    expect(s).toMatchObject({ discovery: true, discoveryEveryMs: 20 * 60_000, ttlMs: 6 * H, maxAuto: 10, networkFeeUsd: 0.02, quoteSizeUsd: 50, minNotionalUsd: 5, pollMs: 2500, geckoCallsPerMin: 10 });
     const t = jupiterSettingsFromEnv(loadConfig({ JUPITER_DISCOVERY_MIN_LIQUIDITY_USD: "1000", JUPITER_DISCOVERY_MIN_AGE_DAYS: "1", JUPITER_RPS: "2" }).env);
     expect(t.screen.minLiquidityUsd).toBe(1000);
     expect(t.screen.minAgeMs).toBe(86_400_000);

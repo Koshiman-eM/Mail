@@ -21,6 +21,8 @@ import {
   type DiscoverySettings, type Rejection, type WatchEntry,
 } from "../market/jupiter/discovery";
 import { isSolanaAddress } from "../market/jupiter/parse";
+import { effectivePricePollMs } from "../market/jupiter/price";
+import { JUPITER_KEYED_RPS, JUPITER_KEYLESS_RPS } from "../market/jupiter/client";
 import { fetchTokenCategory, searchTokens, type JupiterToken } from "../market/jupiter/tokens";
 import type { JupiterFeed, JupiterTokenSpec } from "../market/feeds/jupiter";
 
@@ -71,7 +73,7 @@ export function jupiterSettingsFromEnv(env: Partial<JupiterEnv>): JupiterSetting
   return {
     ...(key ? { apiKey: key } : {}),
     ...(env.JUPITER_RPS !== undefined ? { ratePerSec: env.JUPITER_RPS } : {}),
-    pollMs: pick(env.JUPITER_POLL_MS, 5_000),
+    pollMs: pick(env.JUPITER_POLL_MS, 2_500),
     geckoCallsPerMin: pick(env.GECKO_CALLS_PER_MIN, 10),
     tokens: (env.JUPITER_TOKENS ?? "SOL,JUP,BONK,WIF,POPCAT,MEW").split(",").map((x) => x.trim()).filter(Boolean),
     discovery: env.JUPITER_DISCOVERY ?? true,
@@ -97,8 +99,12 @@ export function jupiterSettingsFromEnv(env: Partial<JupiterEnv>): JupiterSetting
 /** status 用の設定の表示 (キーは有無だけ) */
 export function formatJupiterSettings(s: JupiterSettings): string[] {
   const sc = s.screen;
+  const rps = s.ratePerSec ?? (s.apiKey ? JUPITER_KEYED_RPS : JUPITER_KEYLESS_RPS);
+  // 上限から決まる下限 (50 銘柄まで = 1 回の呼び出し) より短く指定していたら、実際の間隔を併記する
+  const eff = effectivePricePollMs(s.pollMs, rps, 1);
+  const poll = eff > s.pollMs ? `${eff / 1000} 秒ごと (指定 ${s.pollMs / 1000} 秒は上限を超えるため伸ばします。51 銘柄以上は呼び出しが増えるのでさらに伸びます)` : `${s.pollMs / 1000} 秒ごと`;
   return [
-    `Jupiter: API キー ${s.apiKey ? "あり (表示しません)" : "なし"} / 上限 ${s.ratePerSec ?? (s.apiKey ? 1 : 0.5)} 回/秒 / 価格の取得 ${s.pollMs / 1000} 秒ごと / GeckoTerminal ${s.geckoCallsPerMin} 回/分`,
+    `Jupiter: API キー ${s.apiKey ? "あり (表示しません)" : "なし"} / 上限 ${rps} 回/秒 / 価格の取得 ${poll} / GeckoTerminal ${s.geckoCallsPerMin} 回/分`,
     `  固定の銘柄 (JUPITER_TOKENS): ${s.tokens.join(", ") || "(なし)"}`,
     `  自動探索 (JUPITER_DISCOVERY): ${s.discovery ? `有効 (${s.discoveryEveryMs / 60_000} 分ごと、期限 ${s.ttlMs / 3_600_000} 時間、最大 ${s.maxAuto} 件)` : "無効"}`,
     `  選別: 流動性 ≥ $${sc.minLiquidityUsd} / 保有者 ≥ ${sc.minHolderCount} / 上場 ≥ ${sc.minAgeMs / 86_400_000} 日 / organicScore ≥ ${sc.minOrganicScore} / 上位保有者 ≤ ${sc.maxTopHoldersPct}% / 検証済みだけ ${sc.verifiedOnly ? "はい" : "いいえ"}`,

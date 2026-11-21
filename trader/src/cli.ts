@@ -1064,8 +1064,14 @@ export function strategyStatusLines(config: AppConfig): string[] {
   const structure = structureSettingsFromEnv(config.env);
   const filtering = structure.mode === "filter" ? new Set(structure.strategies) : new Set<string>();
   const out = [`戦略 (${ALL_STRATEGIES.length} 本。環境変数では [ ] の id で指定):`];
+  // VENUES が jupiter だけなら、板 (order book) が必要な戦略は評価されない (Jupiter の feed に板が無い)
+  const venues = effectiveVenues(config.env.VENUES).map((v) => v.split(":")[0].trim().toLowerCase());
+  const jupiterOnly = venues.length > 0 && venues.every((v) => v === JUPITER_VENUE);
   for (const s of ALL_STRATEGIES) {
-    const tags = [observe.has(s.id) ? "観測専用" : "", filtering.has(s.id) ? "構造フィルター対象" : ""].filter(Boolean);
+    const tags = [
+      observe.has(s.id) ? "観測専用" : "", filtering.has(s.id) ? "構造フィルター対象" : "",
+      jupiterOnly && s.requiresBook ? "板が必要: Jupiter では動きません" : "",
+    ].filter(Boolean);
     out.push(`  ${strategyLabelWithId(s.id)} / ${horizonLabel(s.horizon)}${tags.length ? ` / ${tags.join("・")}` : ""}`);
   }
   return out;

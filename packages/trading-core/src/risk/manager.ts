@@ -178,7 +178,7 @@ export const MAX_SIZE_MULTIPLIER = 1.5;
 /**
  * ダッシュボードの上書き値 (kv `risk:limits:<mode>`) を読み直す間隔 (ms)。
  * 評価のたびに kv を読まないための短いキャッシュ。エンジンは毎ティックの onEquity で必ず読み直すので、
- * 変更は次のティックから効く (ティック間隔 SCALP_LOOP_MS の既定 5 秒より短くしておく)。
+ * 変更は次のティックから効く (ティック間隔 SCALP_LOOP_MS の既定 2.5 秒より短くしておく)。
  */
 export const RISK_OVERRIDE_CACHE_MS = 2_000;
 

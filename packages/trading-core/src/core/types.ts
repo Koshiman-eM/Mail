@@ -339,6 +339,12 @@ export interface Strategy {
   regimes: RegimeLabel[];
   /** 板情報が必須か (板がない場合は evaluate が null を返す) */
   requiresBook?: boolean;
+  /**
+   * 出来高 (主時間足の直近 21 本) が必要か。出来高が後から分かる feed (Jupiter: volumeKnown が false → true) で、
+   * 出来高が不明な間は評価済みにせず次のティックで取り直す (足が確定してから 10 分まで)。
+   * 1m の戦略には付けない (足が出来高の判明より先に次の足へ置き換わる)。volumeKnown を持たない足 (ccxt・合成) では何も変わらない
+   */
+  needsVolume?: boolean;
   /** 主時間足 */
   primaryTimeframe: Timeframe;
   /** 必要な時間足 */

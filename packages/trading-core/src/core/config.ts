@@ -403,7 +403,7 @@ const coreStaticShape = {
   STRUCTURE_CHOP_R: ranged("STRUCTURE_CHOP_R", 3, 1, 100, true),
 
   // ループ間隔
-  SCALP_LOOP_MS: num(5_000),
+  SCALP_LOOP_MS: num(2_500),
   INTEL_LOOP_MS: num(900_000),
   LEARN_LOOP_MS: num(3_600_000),
   DASHBOARD_PORT: num(8787),

@@ -1,6 +1,6 @@
 import type { Signal, Strategy, StrategyContext } from "../core/types";
 import { adx, atr, bollinger, closesOf, donchian, ema, rsi, sma, volumesOf } from "../indicators/series";
-import { buildEntrySignal, candlesOf, clamp, entryBlocked, exitSignal, period, positionSide, volumeUnknown } from "./common";
+import { buildEntrySignal, candlesOf, clamp, entryBlocked, exitSignal, period, positionSide, volumeUnknown, VOLUME_WINDOW_BARS } from "./common";
 
 /** 短期戦略 (5m/15m/1h) */
 
@@ -164,6 +164,8 @@ export const shortBreakout: Strategy = {
   horizon: "short",
   assetClasses: ["crypto"],
   regimes: ["trend_up", "trend_down", "high_vol"],
+  // 出来高が後から分かる feed (Jupiter) では、出来高が分かるまで同じ足の評価を待つ (エンジンが取り直す)
+  needsVolume: true,
   primaryTimeframe: "1h",
   timeframes: ["1h"],
   warmup: 30,
@@ -212,7 +214,7 @@ export const shortBreakout: Strategy = {
       return null;
     }
     // 出来高の平均の窓 (直前の 20 本) か今の足に出来高が不明な足 (Jupiter の価格のポーリングの足) があれば入らない (fail-closed)
-    if (entryBlocked(ctx) || volumeUnknown(c, n - 21, n - 1) || volRatio < p.entryThreshold) return null;
+    if (entryBlocked(ctx) || volumeUnknown(c, n - VOLUME_WINDOW_BARS, n - 1) || volRatio < p.entryThreshold) return null;
     let direction: "long" | "short" | null = null;
     if (cur.close > upperPrev) direction = "long";
     else if (cur.close < lowerPrev) direction = "short";
