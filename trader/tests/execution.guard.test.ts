@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { loadConfig, LIVE_CONFIRM_PHRASE, resolveMode } from "../src/appConfig";
+import { LIVE_CONFIRM_PHRASE, resolveMode } from "../src/core/config";
+import { coreConfig as loadConfig } from "../src/testing/runtime";
 import { assertLive, LiveModeRequiredError } from "../src/execution/guard";
 
 /**

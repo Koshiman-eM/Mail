@@ -1,6 +1,6 @@
 /** 読みの管理 (src/engine/thesis.ts) の純粋な判定 */
 import { describe, expect, it } from "vitest";
-import { loadConfig } from "../src/appConfig";
+import { coreConfig as loadConfig } from "../src/testing/runtime";
 import {
   activeThesisMs, advancePeak, breakevenPrice, thesisGrossR, decideThesis, DEFAULT_THESIS_SETTINGS, formatThesisSettings, initialRiskPerUnit, resolveThesisMs, THESIS_DISABLED,
   thesisNetR, thesisOutcomeOf, thesisSettingsFromEnv, thesisTrailStop, tighterStop, type ThesisInput, type ThesisPricing, type ThesisSettings,

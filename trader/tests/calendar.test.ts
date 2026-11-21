@@ -78,7 +78,7 @@ describe("weeklySessionCalendar", () => {
 describe("カレンダーの利用: テンポ・RiskManager の日の区切り", async () => {
   const { TempoController } = await import("../src/engine/tempo");
   const { RiskManager } = await import("../src/risk/manager");
-  const { DEFAULT_RISK } = await import("../src/appConfig");
+  const DEFAULT_RISK = (await import("../src/testing/runtime")).coreDefaultRisk();
   const { MemoryStore } = await import("../src/storage/memory");
 
   it("テンポ: 閉まっている間は経過 (待ち) を進めない", () => {

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ALL_STRATEGIES, configuredStrategies } from "../src/strategies/registry";
 import { armLabel, HORIZON_LABELS, STRATEGY_LABELS, strategyLabel, strategyLabelWithId } from "../src/strategies/labels";
 import { structureSettingsFromEnv } from "../src/structure/settings";
-import { loadConfig } from "../src/appConfig";
+import { coreConfig as loadConfig } from "../src/testing/runtime";
 
 describe("戦略の表示名 (表示専用。id は変えない)", () => {
   it("全戦略に表示名があり、long / short / ロング / ショート を含まない", () => {

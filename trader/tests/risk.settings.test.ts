@@ -2,14 +2,21 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { DEFAULT_RISK, loadConfig, RISK_SETTING_KEYS, RISK_SETTING_SPECS } from "../src/appConfig";
+import { riskSettingKeys, RISK_SETTING_SPECS } from "../src/core/config";
+import { coreConfig as loadConfig, coreDefaultRisk } from "../src/testing/runtime";
 import type { Instrument, RiskLimits, Signal } from "../src/core/types";
 import { RiskManager, type EntryParams } from "../src/risk/manager";
 import {
-  applyRiskSettingsChange, checkRiskValue, effectiveRiskLimits, readRiskOverride, RISK_LIMITS_AUDIT, RISK_PRESET_IDS, RISK_PRESET_KEYS, RISK_PRESETS,
+  applyRiskSettingsChange, checkRiskValue, effectiveRiskLimits, readRiskOverride, RISK_LIMITS_AUDIT, RISK_PRESET_IDS, riskPresetKeys, riskPresets,
   RISK_RAISE_CONFIRM, riskLimitsKey, riskOverrideLines, riskValuesOf,
 } from "../src/risk/settings";
+
 import { MemoryStore, SqliteStore } from "../src/storage";
+
+const DEFAULT_RISK = coreDefaultRisk();
+const RISK_SETTING_KEYS = riskSettingKeys();
+const RISK_PRESETS = riskPresets();
+const RISK_PRESET_KEYS = riskPresetKeys();
 
 const NOW = Date.parse("2026-03-02T12:00:00Z");
 const env: RiskLimits = DEFAULT_RISK;

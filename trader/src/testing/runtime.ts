@@ -32,10 +32,18 @@ export interface TestRuntimeOptions {
 
 let coreTestDefinition: ReturnType<typeof defineAppConfig<{}>> | undefined;
 
-/** コアの環境変数だけの設定 (アプリが選んだ資産クラス。未設定なら語彙の全部) */
-export function testConfig(env: Record<string, string> = {}): AppConfig {
+/** コアの環境変数だけの設定 (アプリが選んだ資産クラス。未設定なら語彙の全部)。source をそのまま解析する */
+export function coreConfig(source: Record<string, string | undefined> = {}): AppConfig {
   coreTestDefinition ??= defineAppConfig({ assetClasses: enabledAssetClasses(), shape: {} });
-  return coreTestDefinition.loadConfig({ NODE_ENV: "test", DB_PATH: "memory", LIMIT_ENTRY: "false", ...env });
+  return coreTestDefinition.loadConfig(source);
+}
+
+/** 既定値のリスク上限 (コアの環境変数の既定) */
+export const coreDefaultRisk = () => coreConfig({}).risk;
+
+/** テスト用の設定 (NODE_ENV=test・DB_PATH=memory・成行のエントリーに env を重ねる) */
+export function testConfig(env: Record<string, string> = {}): AppConfig {
+  return coreConfig({ NODE_ENV: "test", DB_PATH: "memory", LIMIT_ENTRY: "false", ...env });
 }
 
 /** 合成フィード + paper の runtime と仮想時計 */

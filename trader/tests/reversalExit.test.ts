@@ -1,6 +1,6 @@
 /** 転換で決済 (REVERSAL_EXIT) の純粋な判定と設定。すべて合成データ (オフライン) */
 import { describe, expect, it } from "vitest";
-import { loadConfig } from "../src/appConfig";
+import { coreConfig as loadConfig } from "../src/testing/runtime";
 import type { Candle } from "../src/core/types";
 import {
   checkReversal, DEFAULT_REVERSAL_SETTINGS, entryBarIndex, formatReversalSettings, REVERSAL_ATR_WINDOW, reversalAppliesTo, reversalConfigWarnings,

@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_RISK } from "../src/appConfig";
+import { coreDefaultRisk } from "../src/testing/runtime";
+
+const DEFAULT_RISK = coreDefaultRisk();
 import { RiskManager, type EntryParams } from "../src/risk/manager";
 import type { Instrument, RiskLimits, Signal } from "../src/core/types";
 import { quoteCostBps, roundTripCostBps } from "../src/core/costs";

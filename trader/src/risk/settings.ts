@@ -80,9 +80,6 @@ export function riskPresets(): Readonly<Record<RiskPresetId, { label: string; va
   return { conservative: build("conservative"), standard: build("standard"), aggressive: build("aggressive") };
 }
 export const RISK_PRESET_IDS: readonly RiskPresetId[] = ["conservative", "standard", "aggressive"];
-/** このアプリのプリセットと項目 (読み込み時の資産クラスで作る。コアへ移すときはアプリの設定側に置く) */
-export const RISK_PRESETS = riskPresets();
-export const RISK_PRESET_KEYS: readonly RiskPresetKey[] = riskPresetKeys();
 
 export interface RiskLimitsOverride {
   values: Partial<RiskValues>;

@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_RISK } from "../src/appConfig";
+import { coreDefaultRisk } from "../src/testing/runtime";
+
+const DEFAULT_RISK = coreDefaultRisk();
 import { classExposure, costBps, DEFAULT_TEMPO_MIN_EDGE_TO_COST, MAX_SIZE_MULTIPLIER, MIN_STOP_DISTANCE_SPREADS, RiskManager, tempoEdgeRequirement, type EntryParams } from "../src/risk/manager";
 import type { AuditEvent, Instrument, RiskLimits, Signal, Store } from "../src/core/types";
 
