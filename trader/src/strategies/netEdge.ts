@@ -3,6 +3,7 @@
  * 往復コスト・勝率を仮定した期待値・コストの条件 (cost / spread / edge) の判定と、見送ったシグナルの観測用の通知。
  * 期待値の定義は src/strategies/scalpMicro.ts の説明を参照。
  */
+import { roundTripCostBps, quoteSpreadBps } from "../core/costs";
 import { costFeeRate } from "../core/fees";
 import type { Signal, StrategyContext } from "../core/types";
 import { tempoNetEdgeFloor } from "../engine/tempo";
@@ -11,14 +12,15 @@ import { clamp } from "./common";
 /** 既定の勝率の上乗せの上限 (ランダムウォークの勝率 p0 に対して) */
 export const DEFAULT_WIN_EDGE_MAX = 0.1;
 
-/** 往復コスト (bps)。takerFeeRate には固定手数料の率換算を含めた値 (costFeeRate) を渡す。気配が無効なら undefined */
-export function roundTripCostBps(takerFeeRate: number, bid: number, ask: number, slippageBps: number): number | undefined {
+/**
+ * 気配からの往復コスト (bps。src/core/costs.ts の roundTripCostBps)。takerFeeRate には固定手数料の率換算を含めた値 (costFeeRate) を渡す。
+ * 気配が無効なら undefined。手数料率・約定ずれの非有限・負の値は 0 とみなす
+ */
+export function quoteRoundTripCostBps(takerFeeRate: number, bid: number, ask: number, slippageBps: number): number | undefined {
   if (!(bid > 0) || !(ask >= bid) || !Number.isFinite(ask)) return undefined;
-  const mid = (bid + ask) / 2;
-  const spread = ((ask - bid) / mid) * 1e4;
-  const fee = Math.max(0, Number.isFinite(takerFeeRate) ? takerFeeRate : 0) * 2 * 1e4;
-  const slip = 2 * Math.max(0, Number.isFinite(slippageBps) ? slippageBps : 0);
-  return fee + spread + slip;
+  const fee = Math.max(0, Number.isFinite(takerFeeRate) ? takerFeeRate : 0);
+  const slip = Math.max(0, Number.isFinite(slippageBps) ? slippageBps : 0);
+  return roundTripCostBps(fee, quoteSpreadBps({ bid, ask }), slip);
 }
 
 /**
@@ -66,7 +68,7 @@ export function netEdgeEntry(a: NetEdgeEntryArgs): Signal | null {
 
   // コスト
   const q = ctx.market.quote;
-  const costBps = roundTripCostBps(costFeeRate(ctx.market.instrument), q?.bid ?? NaN, q?.ask ?? NaN, p.slippageBps);
+  const costBps = quoteRoundTripCostBps(costFeeRate(ctx.market.instrument), q?.bid ?? NaN, q?.ask ?? NaN, p.slippageBps);
   if (costBps === undefined) return null;
   const spread = q.ask - q.bid;
   const tpDist = Math.abs(sig.takeProfit - price);

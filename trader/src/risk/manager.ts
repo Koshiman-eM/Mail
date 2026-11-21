@@ -1,4 +1,5 @@
 import { enabledAssetClasses, enabledProfile } from "../core/assetClasses";
+import { quoteCostBps } from "../core/costs";
 import { D, floorToStep, Decimal } from "../core/decimal";
 import { costFeeRate } from "../core/fees";
 import { createLogger } from "../core/logger";
@@ -20,16 +21,9 @@ export const MIN_STOP_DISTANCE_SPREADS = 2;
 
 /**
  * 往復の想定コスト (bps) = 往復の手数料 (taker + 約定ごとの固定手数料の率換算。src/core/fees.ts) + スプレッド。
- * 固定手数料の無い銘柄は従来どおり 往復 taker 手数料 + スプレッド
+ * 固定手数料の無い銘柄は従来どおり 往復 taker 手数料 + スプレッド (定義は src/core/costs.ts)
  */
-export function costBps(
-  instrument: Pick<Instrument, "takerFeeRate"> & Partial<Pick<Instrument, "fixedFeePerOrder" | "costModel">>,
-  quote: Pick<Quote, "bid" | "ask">,
-): number {
-  const mid = (quote.bid + quote.ask) / 2;
-  const spreadBps = mid > 0 ? ((quote.ask - quote.bid) / mid) * 10_000 : 0;
-  return costFeeRate(instrument) * 2 * 10_000 + Math.max(0, spreadBps);
-}
+export const costBps = quoteCostBps;
 
 /** リスク計算に使うポジション。assetClass 等が無ければ instruments から解決する */
 export type RiskPosition = Pick<PositionView, "symbol" | "qty" | "avgPrice"> & {
@@ -187,6 +181,17 @@ export const MAX_SIZE_MULTIPLIER = 1.5;
  */
 export const RISK_OVERRIDE_CACHE_MS = 2_000;
 
+export interface RiskManagerOptions {
+  mode?: TradingMode;
+  overrideCacheMs?: number;
+  /**
+   * 取引先 (Instrument.venue と完全一致) ごとの実効レバレッジの上限 (評価額の倍率。正の数)。
+   * その取引先の建玉の合計 (絶対値の口座通貨換算) が 評価額 × 上限 を超える新規エントリーを縮める・拒否する (ほかの上限に追加で効く)。
+   * 既定なし (trader は使わない)。FX・株式の証拠金口座で使う
+   */
+  venueLeverageCaps?: Record<string, number>;
+}
+
 export class RiskManager {
   private st: InternalState;
   private lastAudit = new Map<string, number>();
@@ -201,6 +206,45 @@ export class RiskManager {
    */
   readonly tradeMode?: TradingMode;
   private limitsCache?: { at: number; limits: RiskLimits; updatedAt: number };
+  /** 取引先ごとの実効レバレッジの上限 (評価額の倍率)。無い取引先は判定しない */
+  private readonly venueLeverageCaps?: Readonly<Record<string, number>>;
+
+  /**
+   * 取引先の建玉の合計 (絶対値の口座通貨換算) が 評価額 × 上限 を超えない余地 (建玉額)。
+   * 評価額はその取引先の口座の評価額を前提とする: live でほかの取引先の建玉があれば (評価額が口座ごとでないので) 拒否する。
+   * paper は単一の PaperBroker の評価額 (全銘柄の合計) を使い、ほかの取引先の建玉は数えない
+   */
+  private venueLeverageRoom(
+    inst: Instrument, levCap: number, open: RiskPosition[], p: EntryParams, toAcct: (ccy: string) => number, equity: number,
+  ): { ok: true; room: Decimal } | { ok: false; reason: string } {
+    let venueExposure = D(0);
+    for (const x of open) {
+      const xi = x.symbol === inst.symbol ? inst : lookup(p.instruments, x.symbol);
+      if (!xi) return { ok: false, reason: `取引先の分からない建玉 (${x.symbol}) があるため ${inst.venue} の実効レバレッジを確認できず拒否` };
+      if (xi.venue !== inst.venue) {
+        if (this.tradeMode === "live") {
+          return { ok: false, reason: `live にほかの取引先の建玉 (${x.symbol}, ${xi.venue}) があり、${inst.venue} の口座の評価額で実効レバレッジを確認できないため拒否` };
+        }
+        continue;
+      }
+      const px = x.price ?? p.prices?.[x.symbol] ?? x.avgPrice;
+      let rate = NaN;
+      try {
+        rate = xi.quoteCurrency ? toAcct(xi.quoteCurrency) : 1;
+      } catch {
+        rate = NaN;
+      }
+      const xcs = x.contractSize ?? xi.contractSize ?? 1;
+      if (!finiteNum(x.qty) || !finiteNum(px) || !(px >= 0) || !finiteNum(rate) || !(rate > 0) || !finiteNum(xcs) || !(xcs > 0)) {
+        return { ok: false, reason: `${inst.venue} の建玉額が計算できないため拒否 (${x.symbol})` };
+      }
+      venueExposure = venueExposure.plus(D(Math.abs(x.qty)).mul(px).mul(xcs).mul(rate));
+    }
+    const room = D(equity).mul(levCap).minus(venueExposure);
+    if (!room.isFinite()) return { ok: false, reason: `${inst.venue} の実効レバレッジの余地が計算できないため拒否` };
+    if (room.lte(0)) return { ok: false, reason: `${inst.venue} の建玉の合計が評価額の ${levCap} 倍 (実効レバレッジの上限) に達しているため拒否` };
+    return { ok: true, room };
+  }
 
   /**
    * 状態は kv `risk:state:<mode>` に保存する (既定 paper)。paper は旧キー `risk:state` からも引き継ぐ。
@@ -213,7 +257,7 @@ export class RiskManager {
   constructor(
     private readonly envLimits: RiskLimits,
     private readonly store?: Store,
-    keyOrOpts: string | { mode?: TradingMode; overrideCacheMs?: number } = {},
+    keyOrOpts: string | RiskManagerOptions = {},
   ) {
     let saved: InternalState | undefined;
     this.overrideCacheMs = RISK_OVERRIDE_CACHE_MS;
@@ -225,6 +269,12 @@ export class RiskManager {
       this.tradeMode = mode;
       if (store) this.overrideMode = mode;
       if (keyOrOpts.overrideCacheMs !== undefined) this.overrideCacheMs = keyOrOpts.overrideCacheMs;
+      if (keyOrOpts.venueLeverageCaps) {
+        for (const [venue, k] of Object.entries(keyOrOpts.venueLeverageCaps)) {
+          if (!(Number.isFinite(k) && k > 0)) throw new Error(`venueLeverageCaps の ${venue} は正の倍率で指定してください (${k})`);
+        }
+        this.venueLeverageCaps = { ...keyOrOpts.venueLeverageCaps };
+      }
       this.key = riskStateKey(mode);
       saved = store?.kvGet<InternalState>(this.key);
       if (saved === undefined && mode === "paper") saved = store?.kvGet<InternalState>(LEGACY_RISK_STATE_KEY);
@@ -537,6 +587,14 @@ export class RiskManager {
     if (!classRoom.isFinite()) return { ok: false, reason: `${inst.assetClass} のエクスポージャー上限の余地が計算できないため拒否` };
     if (classRoom.lte(0)) return { ok: false, reason: `${inst.assetClass} のエクスポージャー上限に到達` };
     cap(`${inst.assetClass} エクスポージャー上限`, classRoom.div(perUnitNotional));
+
+    // 取引先ごとの実効レバレッジの上限 (venueLeverageCaps。FX・株式の証拠金口座など。既定なし = 判定しない)
+    const venueCap = this.venueLeverageCaps?.[inst.venue];
+    if (venueCap !== undefined) {
+      const r = this.venueLeverageRoom(inst, venueCap, open, p, toAcct, equity);
+      if (!r.ok) return { ok: false, reason: r.reason };
+      cap(`${inst.venue} の実効レバレッジ上限 (評価額の ${venueCap} 倍)`, r.room.div(perUnitNotional));
+    }
 
     if (!(available > 0)) return { ok: false, reason: "余力がありません" };
     cap("余力", D(available).div(perUnitNotional));

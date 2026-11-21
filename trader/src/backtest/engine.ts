@@ -17,6 +17,7 @@ import type {
 } from "../core/types";
 import { TIMEFRAME_MS } from "../core/types";
 import { costFeeRate, fixedFeeOf } from "../core/fees";
+import { roundTripCostBps } from "../core/costs";
 import { profileOrDefault } from "../core/assetClasses";
 import { D, Decimal, floorToStep } from "../core/decimal";
 import { defaultRiskLimits } from "../core/config";
@@ -220,7 +221,7 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
   const riskMultiplier = opts.riskMultiplier ?? 1;
   const maxPositionPct = opts.maxPositionPct ?? defaultRiskLimits().maxPositionPct;
   const sizer = opts.sizer ?? riskBasedSizer;
-  const costBps = 2 * costFeeRate(instrument) * 1e4 + spreadBps + 2 * slippageBps;
+  const costBps = roundTripCostBps(costFeeRate(instrument), spreadBps, slippageBps);
   const minEdgeRatio = opts.minEdgeToCostRatio ?? 0;
   const historyBars = opts.historyBars ?? Math.max(300, strategy.warmup + 100);
   const regimeOpts = regimeOptionsFor(instrument.assetClass, opts.regime);

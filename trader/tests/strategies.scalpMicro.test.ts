@@ -3,7 +3,7 @@ import type { AssetClass, Candle, Horizon, Instrument, OrderBook, PositionView, 
 import { TIMEFRAME_MS } from "../src/core/types";
 import { createRng, generateCandles, syntheticInstrument } from "../src/backtest/synthetic";
 import { runBacktest } from "../src/backtest/engine";
-import { microExpectedEdge, roundTripCostBps } from "../src/strategies/netEdge";
+import { microExpectedEdge, quoteRoundTripCostBps as roundTripCostBps } from "../src/strategies/netEdge";
 import { ALL_STRATEGIES, getStrategy, resolveParams } from "../src/strategies/registry";
 import { createScalpMicro, detectBurst, SCALP_MICRO_HOLD_BOUNDS, scalpMicro } from "../src/strategies/scalpMicro";
 
