@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { buildReportText, main } from "../src/cli";
-import { loadConfig } from "../src/core/config";
+import { loadConfig } from "../src/appConfig";
 import { isSignalLikeExit, type EntryContext, type TradeRecord } from "../src/core/types";
 import { EXIT_REASON_LABEL, renderReversalTable, summarizeReversal, tpCaptureOf } from "../src/engine/report";
 import { formatSimulationReport, runSimulation } from "../src/engine/simulate";

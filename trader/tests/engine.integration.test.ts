@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { LIVE_CONFIRM_PHRASE, loadConfig } from "../src/core/config";
+import { LIVE_CONFIRM_PHRASE, loadConfig } from "../src/appConfig";
 import type { AssetClass, Clock, MarketDataFeed, Signal, Strategy, StrategyContext, StrategyPlan } from "../src/core/types";
 import { PAPER_SNAPSHOT_KEY } from "../src/engine/engine";
 import { buildRuntime, type RuntimeOptions } from "../src/engine/setup";

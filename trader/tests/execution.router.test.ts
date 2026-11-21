@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { loadConfig, LIVE_CONFIRM_PHRASE } from "../src/core/config";
+import { loadConfig, LIVE_CONFIRM_PHRASE } from "../src/appConfig";
 import { createBrokers, LIVE_UNSUPPORTED_MESSAGE } from "../src/execution/router";
 import { PaperBroker } from "../src/execution/paper";
 import type { Instrument } from "../src/core/types";

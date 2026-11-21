@@ -21,7 +21,7 @@
  * ATR は最後の REVERSAL_ATR_WINDOW 本だけから求める (渡す足の本数によらず同じ値にするため。運用とバックテストで一致させる)。
  * 価格は統計値なので number で計算する (会計値ではない)。
  */
-import type { Env } from "../core/config";
+import type { CoreEnv } from "../core/config";
 import { TIMEFRAME_MS, type Candle, type Timeframe } from "../core/types";
 import { atrLast } from "../indicators/series";
 import { confirmedPivots, detectPivots, normalizePivotN } from "../structure/pivots";
@@ -87,7 +87,7 @@ export const REVERSAL_ATR_WINDOW = 100;
 export const REVERSAL_EXIT_LABEL = "転換で決済";
 export const reversalDetailLabel = (direction: "long" | "short"): string => (direction === "long" ? "押し安値割れ" : "戻り高値超え");
 
-type ReversalEnv = Partial<Pick<Env, "REVERSAL_EXIT" | "REVERSAL_EXIT_PIVOT_N" | "REVERSAL_EXIT_BUFFER_ATR" | "REVERSAL_EXIT_STRATEGIES" | "REVERSAL_EXIT_TF" | "REVERSAL_EXIT_FALLBACK">>;
+type ReversalEnv = Partial<Pick<CoreEnv, "REVERSAL_EXIT" | "REVERSAL_EXIT_PIVOT_N" | "REVERSAL_EXIT_BUFFER_ATR" | "REVERSAL_EXIT_STRATEGIES" | "REVERSAL_EXIT_TF" | "REVERSAL_EXIT_FALLBACK">>;
 
 const finite = (x: unknown): x is number => typeof x === "number" && Number.isFinite(x);
 

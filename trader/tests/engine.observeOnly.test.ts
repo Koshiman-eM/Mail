@@ -1,6 +1,6 @@
 /** エンジン統合: 観測専用の戦略 (OBSERVE_ONLY_STRATEGIES) は発注せず、仮想トレード (observe_only) だけを記録する (合成データ、オフライン) */
 import { describe, expect, it } from "vitest";
-import { loadConfig } from "../src/core/config";
+import { loadConfig } from "../src/appConfig";
 import { createLogger } from "../src/core/logger";
 import type { Clock, RegimeLabel, Signal, Strategy, StrategyContext } from "../src/core/types";
 import { buildRuntime } from "../src/engine/setup";

@@ -1,6 +1,6 @@
 /** Jupiter の配線のレビュー指摘の修正の試験 (H1・H2・M1・M2・M4・M5・M6・L1・L2・L4・L5) */
 import { describe, expect, it } from "vitest";
-import { DEFAULT_RISK, loadConfig } from "../src/core/config";
+import { DEFAULT_RISK, loadConfig } from "../src/appConfig";
 import { D } from "../src/core/decimal";
 import type { Instrument, Quote, Signal } from "../src/core/types";
 import { createFxConverter, fxApproxReason } from "../src/engine/fx";

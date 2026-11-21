@@ -1,10 +1,7 @@
 import { z } from "zod";
-import { ASSET_CLASS_PROFILES, ASSET_CLASSES, classKeySuffix, enabledAssetClasses, isEnabledAssetClass, setEnabledAssetClasses, type AssetClass } from "./assetClasses";
+import { ASSET_CLASS_PROFILES, ASSET_CLASSES, classKeySuffix, enabledAssetClasses, setEnabledAssetClasses, type AssetClass } from "./assetClasses";
 import { DEFAULT_SHORT_BORROW_RATE_DAILY, MAX_SHORT_BORROW_RATE_DAILY } from "./short";
 import type { RiskLimits } from "./types";
-
-/** このアプリ (暗号資産のボット) が使う資産クラス */
-export const TRADER_ASSET_CLASSES = setEnabledAssetClasses(["crypto", "meme"]);
 
 /**
  * 環境変数からの設定読み込み。シークレットは必ず環境変数 (.env.local) 経由。
@@ -108,9 +105,6 @@ export function riskSettingKeys(classes: readonly AssetClass[] = enabledAssetCla
   ];
 }
 
-/** このアプリの項目 (画面・CLI に出す順) */
-export const RISK_SETTING_KEYS: readonly RiskSettingKey[] = riskSettingKeys();
-
 /** 定義から環境変数の検証を作る */
 const riskEnv = (k: RiskSettingKey) => {
   const s = RISK_SETTING_SPECS[k];
@@ -204,18 +198,14 @@ const checkedNum = (key: string, def: number, ok: (x: number) => boolean, messag
       return z.NEVER;
     });
 
-const EnvSchema = z.object({
+/**
+ * コアの環境変数 (全アプリ共通)。資産クラスの上限 MAX_EXPOSURE_<CLASS> は使うクラスの分だけ。
+ * アプリの環境変数 (取引先・銘柄・API キーなど) は defineAppConfig の shape で足す (ここにあるキーは再定義できない)
+ */
+const coreStaticShape = {
   NODE_ENV: str("development"),
   TRADING_MODE: str("paper"),
   LIVE_TRADING_CONFIRM: str(),
-  /**
-   * 使う取引先 (カンマ区切り): jupiter (既定。Solana の DEX アグリゲーター)、synthetic、ccxt。いずれも相場の取得と paper 用
-   * (live の発注先は未対応。TRADING_MODE=live では起動しない)。ccxt・synthetic は paper・バックテスト用に残す。
-   * 廃止した gmo / oanda / alpaca / dex は起動時に警告して無視する (src/engine/setup.ts の parseVenues)
-   */
-  VENUES: str("jupiter"),
-  /** 監視銘柄 (カンマ区切り、"venue|symbol|assetClass")。空なら既定のデモ銘柄 */
-  WATCHLIST: str(),
   BASE_CURRENCY: str("JPY"),
   PAPER_INITIAL_EQUITY: num(1_000_000),
   /**
@@ -235,57 +225,7 @@ const EnvSchema = z.object({
   ANTHROPIC_API_KEY: str(),
   ANTHROPIC_MODEL: str("claude-opus-5-5"),
 
-  // 暗号資産取引所 (ccxt。相場の取得と paper 用で、発注はしない)
-  CCXT_EXCHANGE: str("bitbank"),
-  // Jupiter (Solana。src/market/jupiter/・src/market/feeds/jupiter.ts。相場の取得と paper 用で、スワップは実行しない)
-  /** API キー (任意)。あればキーありの既定の上限 (1 回/秒) で呼ぶ。表示・ログには出さない */
-  JUPITER_API_KEY: str(),
-  /** 1 秒あたりの呼び出しの上限 (空 = キーなし 0.5 / キーあり 1)。プランに合わせて変える */
-  JUPITER_RPS: optRanged("JUPITER_RPS", 0.05, 50),
-  /**
-   * 価格 (Price V3) の取得間隔 (ミリ秒、1000〜15000、既定 5000)。監視中の全 mint を 50 件ずつ一括で取る。
-   * 上限はエンジンの気配の古さの上限 (30 秒) の半分 (それより長いと取得の合間に気配が古くなり、新規エントリーが止まる)
-   */
-  JUPITER_POLL_MS: checkedNum(
-    "JUPITER_POLL_MS", 5_000, (x) => Number.isInteger(x) && x >= 1_000 && x <= 15_000,
-    "1000 以上 15000 以下のミリ秒の整数で指定してください (気配の古さの上限 30 秒の半分以下。それより長いと取得の合間に気配が古くなり新規エントリーが止まります)",
-  ),
-  /** GeckoTerminal (過去の足・出来高) の 1 分あたりの呼び出しの上限 (1〜30、既定 10) */
-  GECKO_CALLS_PER_MIN: ranged("GECKO_CALLS_PER_MIN", 10, 1, 30),
-  /**
-   * 固定の監視銘柄 (カンマ区切り。mint のアドレスか symbol。symbol は tokens/v2/search で mint を引く)。
-   * SOL・JUP は資産クラス crypto、それ以外は meme。既定 SOL,JUP,BONK,WIF,POPCAT,MEW
-   */
-  JUPITER_TOKENS: str("SOL,JUP,BONK,WIF,POPCAT,MEW"),
-  /** ミームコインの自動探索 (toptrending / toporganicscore の 1h → 選別 → 監視銘柄に期限つきで追加。既定 true) */
-  JUPITER_DISCOVERY: bool("JUPITER_DISCOVERY", true),
-  /** 自動探索の間隔 (分、5〜1440、既定 20) */
-  JUPITER_DISCOVERY_MINUTES: ranged("JUPITER_DISCOVERY_MINUTES", 20, 5, 1440),
-  /** 自動追加した銘柄の期限 (最後に選別に合格してから。時間、1〜168、既定 6) */
-  JUPITER_DISCOVERY_TTL_HOURS: ranged("JUPITER_DISCOVERY_TTL_HOURS", 6, 1, 168),
-  /** 自動追加の最大件数 (0〜50。空 = 選別の既定 10) */
-  JUPITER_DISCOVERY_MAX_TOKENS: optRanged("JUPITER_DISCOVERY_MAX_TOKENS", 0, 50, true),
-  /** 選別: 最低の流動性 (USD。空 = 既定 250000) */
-  JUPITER_DISCOVERY_MIN_LIQUIDITY_USD: optRanged("JUPITER_DISCOVERY_MIN_LIQUIDITY_USD", 0, 1e12),
-  /** 選別: 最低の保有者数 (空 = 既定 2000) */
-  JUPITER_DISCOVERY_MIN_HOLDERS: optRanged("JUPITER_DISCOVERY_MIN_HOLDERS", 0, 1e9, true),
-  /** 選別: 最初のプールができてからの最低の日数 (空 = 既定 3) */
-  JUPITER_DISCOVERY_MIN_AGE_DAYS: optRanged("JUPITER_DISCOVERY_MIN_AGE_DAYS", 0, 3650),
-  /** 選別: 最低の organicScore (0〜100。空 = 既定 60) */
-  JUPITER_DISCOVERY_MIN_ORGANIC_SCORE: optRanged("JUPITER_DISCOVERY_MIN_ORGANIC_SCORE", 0, 100),
-  /** 選別: 上位保有者の比率の上限 (%、0〜100。空 = 既定 35) */
-  JUPITER_DISCOVERY_MAX_TOP_HOLDERS_PCT: optRanged("JUPITER_DISCOVERY_MAX_TOP_HOLDERS_PCT", 0, 100),
-  /** 選別: 検証済み (isVerified) だけ (既定 false) */
-  JUPITER_DISCOVERY_VERIFIED_ONLY: bool("JUPITER_DISCOVERY_VERIFIED_ONLY", false),
-  /** 1 回の取引 (スワップ) ごとの Solana のネットワーク手数料 (USD、0〜5、既定 0.02)。paper の約定とコストの見積もりに入れる */
-  JUPITER_NETWORK_FEE_USD: ranged("JUPITER_NETWORK_FEE_USD", 0.02, 0, 5),
-  /** 気配 (仮の買い・売り気配) とコストの見積もりに使う代表的な約定代金 (USD、1〜100000、既定 50) */
-  JUPITER_QUOTE_SIZE_USD: ranged("JUPITER_QUOTE_SIZE_USD", 50, 1, 100_000),
-  /** 最小の約定代金 (USD、0〜100000、既定 5) */
-  JUPITER_MIN_NOTIONAL_USD: ranged("JUPITER_MIN_NOTIONAL_USD", 5, 0, 100_000),
-
-  // 情報収集
-  CRYPTOPANIC_TOKEN: str(),
+  // 情報収集 (RSS。src/intel/sources/rss.ts。空ならアプリの既定のフィード)
   NEWS_RSS_FEEDS: str(),
 
   // リスク (評価額比)
@@ -297,8 +237,6 @@ const EnvSchema = z.object({
   MAX_POSITION_PCT: riskEnv("maxPositionPct"),
   MAX_ORDERS_PER_MINUTE: riskEnv("maxOrdersPerMinute"),
   MIN_EDGE_TO_COST: num(2),
-  // 資産クラスのエクスポージャー上限 (MAX_EXPOSURE_<CLASS>。使うクラスの分だけ)
-  ...(Object.fromEntries(enabledAssetClasses().map((c) => [exposureEnvKey(c), riskEnv(exposureSettingKey(c))])) as Record<string, ReturnType<typeof riskEnv>>),
   /**
    * 資産クラス meme の新規エントリーに求める流動性 (USD)。Jupiter の銘柄はトークン情報の liquidity (1 時間ごとに取り直す)、
    * WATCHLIST で |meme を付けた ccxt などの銘柄は 24 時間の出来高からの推定。RiskManager の判定 (未満・不明なら拒否)
@@ -476,19 +414,34 @@ const EnvSchema = z.object({
    * 未設定 (または 16 文字未満) ならループバック以外からは書き込めない。ループバック待ち受けでは不要
    */
   DASHBOARD_WRITE_TOKEN: str(),
-});
+};
 
-export type Env = z.infer<typeof EnvSchema>;
 
-export interface AppConfig {
-  env: Env;
+/** 使うクラスの上限の環境変数 (MAX_EXPOSURE_<CLASS>) */
+function exposureEnvShape(classes: readonly AssetClass[]) {
+  return Object.fromEntries(classes.map((c) => [exposureEnvKey(c), riskEnv(exposureSettingKey(c))])) as Record<string, ReturnType<typeof riskEnv>>;
+}
+
+type CoreStaticShape = typeof coreStaticShape;
+/** コアの設定 (全アプリ共通の環境変数を解析した値)。コアのモジュールはこれだけを読む */
+export type CoreEnv = z.infer<z.ZodObject<CoreStaticShape>> & { [k: `MAX_EXPOSURE_${string}`]: number };
+
+/** 起動の設定 (環境変数の解析結果 + 実弾の判定 + リスク上限 + AI)。E はアプリの環境変数を足した型 */
+export interface AppConfig<E extends CoreEnv = CoreEnv> {
+  env: E;
   mode: "paper" | "live";
   liveBlockedReason?: string;
   risk: RiskLimits;
   ai: { apiKey: string; model: string; enabled: boolean };
+  /** アプリが使う資産クラス */
+  assetClasses: readonly AssetClass[];
 }
 
-export function resolveMode(env: Pick<Env, "NODE_ENV" | "TRADING_MODE" | "LIVE_TRADING_CONFIRM">): {
+/**
+ * 実弾 (live) の判定 (二重ロック)。TRADING_MODE=live と LIVE_TRADING_CONFIRM=I_UNDERSTAND_REAL_MONEY_RISK が揃ったときだけ live。
+ * テスト (NODE_ENV=test) では常に paper。この判定はコアにだけ置く (アプリで再定義しない)
+ */
+export function resolveMode(env: Pick<CoreEnv, "NODE_ENV" | "TRADING_MODE" | "LIVE_TRADING_CONFIRM">): {
   mode: "paper" | "live";
   liveBlockedReason?: string;
 } {
@@ -500,18 +453,26 @@ export function resolveMode(env: Pick<Env, "NODE_ENV" | "TRADING_MODE" | "LIVE_T
   return { mode: "live" };
 }
 
-export function loadConfig(source: Record<string, string | undefined> = process.env): AppConfig {
-  const parsed = EnvSchema.safeParse(source);
+/** コアの環境変数の名前 (アプリの shape・defaults で再定義できない)。資産クラスの上限は語彙の全クラスぶん */
+export const CORE_ENV_KEYS: readonly string[] = [...Object.keys(coreStaticShape), ...ASSET_CLASSES.map(exposureEnvKey)];
+/** 実弾の二重ロックの鍵 (アプリの defaults でも既定値を変えられない) */
+const LIVE_LOCK_KEYS = ["NODE_ENV", "TRADING_MODE", "LIVE_TRADING_CONFIRM"] as const;
+
+/** 環境変数の解析の誤りを読める文章にして例外にする */
+function parseEnvOrThrow<T>(schema: z.ZodType<T>, source: Record<string, string | undefined>): T {
+  const parsed = schema.safeParse(source);
   if (!parsed.success) {
     // 設定の誤りは JSON ではなく読める文章で出して起動を止める
     const lines = parsed.error.issues.map((i) => `${i.path.join(".") || "(設定)"}: ${i.message}`);
     throw new Error(`設定が不正です:\n  ${lines.join("\n  ")}`);
   }
-  const env = parsed.data;
+  return parsed.data;
+}
+
+/** 環境変数の解析結果から起動の設定を組み立てる */
+function buildAppConfig<E extends CoreEnv>(env: E, classes: readonly AssetClass[]): AppConfig<E> {
   const { mode, liveBlockedReason } = resolveMode(env);
-  const exposure: Partial<Record<AssetClass, number>> = Object.fromEntries(
-    enabledAssetClasses().map((c) => [c, (env as Record<string, unknown>)[exposureEnvKey(c)] as number]),
-  );
+  const exposure: Partial<Record<AssetClass, number>> = Object.fromEntries(classes.map((c) => [c, env[`MAX_EXPOSURE_${c.toUpperCase()}`]]));
   return {
     env,
     mode,
@@ -530,24 +491,70 @@ export function loadConfig(source: Record<string, string | undefined> = process.
       memeMinLiquidityUsd: env.MEME_MIN_LIQUIDITY_USD,
     },
     ai: { apiKey: env.ANTHROPIC_API_KEY, model: env.ANTHROPIC_MODEL, enabled: env.ANTHROPIC_API_KEY !== "" },
+    assetClasses: classes,
   };
 }
 
-export const DEFAULT_RISK: RiskLimits = loadConfig({}).risk;
+export interface AppConfigDefinition<E extends CoreEnv> {
+  /** アプリが使う資産クラス */
+  assetClasses: readonly AssetClass[];
+  /** 環境変数を解析して起動の設定を作る (不正なら読める文章の例外) */
+  loadConfig(source?: Record<string, string | undefined>): AppConfig<E>;
+  /** 既定値 (環境変数なし) のリスク上限 */
+  defaultRisk: RiskLimits;
+  /** ダッシュボード・CLI のリスク項目 (使うクラスの上限だけ) */
+  riskSettingKeys: readonly RiskSettingKey[];
+  /** 使わない資産クラスの上限の環境変数 (読まない。.env に残っていたら警告する) */
+  unusedClassEnvKeys: readonly string[];
+}
 
 /**
- * 廃止した環境変数 (読まない)。.env に残っていても起動は止めず、status と run の起動時に知らせるだけ。
- * GMO_*: GMOコインの取引先 (廃止)。MAX_EXPOSURE_FX / MAX_EXPOSURE_STOCK: FX・株式の資産クラス (廃止)
+ * アプリの設定を定義する (アプリの起動時に 1 回。テストの共通の前処理からも読み込む)。
+ * - assetClasses: 使う資産クラス (プロセス全体で 1 組。enabledAssetClasses() が返す)
+ * - shape: アプリの環境変数 (取引先・銘柄・API キーなど。envHelpers で作る)。コアのキー (CORE_ENV_KEYS) を含めたら例外
+ * - defaults: コアの環境変数の既定値の上書き (文字列。例 { DB_PATH: "./data/fx.db", DASHBOARD_PORT: "8788" })。
+ *   実弾の二重ロックの鍵 (NODE_ENV / TRADING_MODE / LIVE_TRADING_CONFIRM) は上書きできない (例外)
  */
-const REMOVED_ENV_PREFIXES = ["GMO_"] as const;
-/** 使わない資産クラスの上限 (trader では MAX_EXPOSURE_FX / MAX_EXPOSURE_STOCK) */
-const REMOVED_ENV_KEYS: readonly string[] = ASSET_CLASSES.filter((c) => !isEnabledAssetClass(c)).map(exposureEnvKey);
-
-/** 値の入った廃止した環境変数があれば警告文を返す (値は表示しない) */
-export function removedEnvWarnings(source: Record<string, string | undefined>): string[] {
-  const keys = Object.keys(source)
-    .filter((k) => (source[k] ?? "").trim() !== "")
-    .filter((k) => REMOVED_ENV_PREFIXES.some((p) => k.startsWith(p)) || REMOVED_ENV_KEYS.includes(k))
-    .sort();
-  return keys.length ? [`.env の ${keys.join(", ")} は廃止した設定のため読みません (GMOコイン・FX・株式は廃止。.env から外してください)`] : [];
+export function defineAppConfig<S extends z.ZodRawShape>(o: {
+  assetClasses: readonly AssetClass[];
+  shape: S;
+  defaults?: Partial<Record<keyof CoreStaticShape, string>>;
+}): AppConfigDefinition<CoreEnv & z.infer<z.ZodObject<S>>> {
+  const redefined = Object.keys(o.shape).filter((k) => CORE_ENV_KEYS.includes(k));
+  if (redefined.length > 0) {
+    throw new Error(`アプリの設定はコアの環境変数を再定義できません: ${redefined.join(", ")} (実弾の二重ロック・リスク上限などはコアだけが読む)`);
+  }
+  const defaults = o.defaults ?? {};
+  const badDefaults = Object.keys(defaults).filter((k) => (LIVE_LOCK_KEYS as readonly string[]).includes(k) || !(k in coreStaticShape));
+  if (badDefaults.length > 0) throw new Error(`defaults で上書きできない環境変数です: ${badDefaults.join(", ")}`);
+  const classes = setEnabledAssetClasses(o.assetClasses);
+  const schema = z.object({ ...coreStaticShape, ...exposureEnvShape(classes), ...o.shape });
+  type E = CoreEnv & z.infer<z.ZodObject<S>>;
+  const loadConfig = (source: Record<string, string | undefined> = process.env): AppConfig<E> => {
+    const src: Record<string, string | undefined> = { ...source };
+    for (const [k, v] of Object.entries(defaults)) if (src[k] === undefined) src[k] = v;
+    return buildAppConfig(parseEnvOrThrow(schema, src) as unknown as E, classes);
+  };
+  return {
+    assetClasses: classes,
+    loadConfig,
+    defaultRisk: loadConfig({}).risk,
+    riskSettingKeys: riskSettingKeys(classes),
+    unusedClassEnvKeys: ASSET_CLASSES.filter((c) => !classes.includes(c)).map(exposureEnvKey),
+  };
 }
+
+/** 既定値のリスク上限 (使うクラスの上限は RISK_SETTING_SPECS の既定値)。バックテストのサイズの既定に使う */
+export function defaultRiskLimits(classes: readonly AssetClass[] = enabledAssetClasses()): RiskLimits {
+  const env = parseEnvOrThrow(z.object({ ...coreStaticShape, ...exposureEnvShape(classes) }), {}) as unknown as CoreEnv;
+  return buildAppConfig(env, classes).risk;
+}
+
+/** 環境変数の検証の部品 (アプリの shape もこれで作る) */
+export const envHelpers = { num, ratio, count, bool, str, idList, choice, ranged, optRanged, checkedNum } as const;
+
+/**
+ * zod (コアと同じ実体)。アプリの shape は必ずこの z で作る (別の zod の実体のスキーマとコアのスキーマを合成しない)。
+ * API の応答の解析だけに使うアプリの zod は、コアのスキーマと合成しない限り別の実体でもよい
+ */
+export { z };

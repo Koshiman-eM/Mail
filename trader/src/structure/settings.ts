@@ -1,5 +1,5 @@
 /** 環境変数 (STRUCTURE_*) → 相場構造のラッパーの設定と、戦略の一覧への適用 */
-import { DEFAULT_STRUCTURE_STRATEGIES, type Env } from "../core/config";
+import { DEFAULT_STRUCTURE_STRATEGIES, type CoreEnv } from "../core/config";
 import type { Strategy } from "../core/types";
 import { strategyIdListWarnings } from "../strategies/retired";
 import { DEFAULT_PERFECT_ORDER } from "./types";
@@ -32,10 +32,10 @@ export const STRUCTURE_EXCLUDED: Readonly<Record<string, string>> = {
   scalp_rebound: "15m の下降トレンド中の 1m の反発を買う。上位足の目線 (下) と逆向きに入るのが設計",
 };
 
-/** STRUCTURE_* (検証済みの Env) から設定を作る */
+/** STRUCTURE_* (検証済みの CoreEnv) から設定を作る */
 export function structureSettingsFromEnv(
   env: Pick<
-    Env,
+    CoreEnv,
     | "STRUCTURE_MODE" | "STRUCTURE_STRATEGIES" | "STRUCTURE_PIVOT_N" | "STRUCTURE_BREAK_MODE" | "STRUCTURE_BIAS_METHOD" | "STRUCTURE_REVERSAL_MODE"
     | "STRUCTURE_USE_MTF" | "STRUCTURE_USE_PERFECT_ORDER" | "STRUCTURE_STOP_MODE" | "STRUCTURE_STOP_ATR_BUFFER" | "STRUCTURE_EXIT_ON_REVERSAL"
     | "STRUCTURE_EXIT_ON_WEAKENING" | "STRUCTURE_CHOP_M" | "STRUCTURE_CHOP_R"

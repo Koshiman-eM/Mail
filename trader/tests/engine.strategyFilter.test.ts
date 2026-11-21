@@ -1,6 +1,6 @@
 /** 戦略が見送ったシグナル (onFiltered) は仮想トレードとしてだけ記録され、発注されない */
 import { describe, expect, it } from "vitest";
-import { loadConfig } from "../src/core/config";
+import { loadConfig } from "../src/appConfig";
 import type { Clock, Signal, Strategy, StrategyContext } from "../src/core/types";
 import { buildRuntime } from "../src/engine/setup";
 import { mulberry32 } from "../src/market/feeds/synthetic";

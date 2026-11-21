@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { loadConfig, removedEnvWarnings, type AppConfig } from "./core/config";
+import { loadConfig, removedEnvWarnings, type AppConfig } from "./appConfig";
 import type { MarketDataFeed, Store, TradeRecord } from "./core/types";
 import { isLoopbackHost, startDashboard, type DashboardServer } from "./dashboard/server";
 import { formatBacktestRows, runBacktestCommand, type BacktestSource } from "./engine/backtestCommand";

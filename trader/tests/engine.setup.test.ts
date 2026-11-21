@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
-import { loadConfig } from "../src/core/config";
+import { loadConfig } from "../src/appConfig";
 import type { Candle } from "../src/core/types";
 import { createParamValidator, createPriceAt } from "../src/engine/learningHooks";
 import {

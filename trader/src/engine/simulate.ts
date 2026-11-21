@@ -3,7 +3,7 @@
  * 情報源は使わず (sources = [] のスタブ brief)、AI も使わない。学習ループは仮想時間 1 時間ごと。
  */
 import { resolve } from "node:path";
-import { loadConfig } from "../core/config";
+import { loadConfig } from "../appConfig";
 import type { Clock, ExitReason, Lesson, ParamAdjustment, Store } from "../core/types";
 import type { ArmSnapshot } from "../learning/allocator";
 import type { CauseSummary, LearningSnapshot } from "../learning/service";

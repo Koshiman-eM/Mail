@@ -3,7 +3,7 @@
  * paper は PaperBroker、live の経路は Broker を実装した偽のブローカー (FakeLiveBroker) を注入する。実在の取引所へは送信しない。
  */
 import { describe, expect, it, vi } from "vitest";
-import { loadConfig } from "../src/core/config";
+import { loadConfig } from "../src/appConfig";
 import type { Candle, Clock, Instrument, MarketDataFeed, Quote, ShadowTradeRecord, Signal, Strategy, StrategyContext, Timeframe } from "../src/core/types";
 import { readLimitStats } from "../src/engine/orders";
 import { buildRuntime } from "../src/engine/setup";

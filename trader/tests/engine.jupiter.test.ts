@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { unconfiguredVenuePositionWarnings, configCompatWarnings } from "../src/cli";
-import { loadConfig } from "../src/core/config";
+import { loadConfig } from "../src/appConfig";
 import type { AssetClass, Signal, Strategy, StrategyContext } from "../src/core/types";
 import { PAPER_SNAPSHOT_KEY } from "../src/engine/engine";
 import { buildRuntime } from "../src/engine/setup";

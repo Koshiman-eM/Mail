@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { DEFAULT_RISK, loadConfig, RISK_SETTING_KEYS, RISK_SETTING_SPECS } from "../src/core/config";
+import { DEFAULT_RISK, loadConfig, RISK_SETTING_KEYS, RISK_SETTING_SPECS } from "../src/appConfig";
 import type { Instrument, RiskLimits, Signal } from "../src/core/types";
 import { RiskManager, type EntryParams } from "../src/risk/manager";
 import {

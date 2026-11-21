@@ -2,7 +2,8 @@
 import { existsSync } from "node:fs";
 import { basename, dirname, extname, join } from "node:path";
 import type { AiOptions } from "../core/ai";
-import type { AppConfig } from "../core/config";
+import { TRADER_ASSET_CLASSES, type AppConfig } from "../appConfig";
+import { ASSET_CLASSES as ALL_ASSET_CLASSES } from "../core/assetClasses";
 import { createLogger, type Logger } from "../core/logger";
 import { withSimulatedShort } from "../core/short";
 import {
@@ -40,9 +41,10 @@ import {
   reversalAppliesTo, reversalConfigWarnings, reversalSettingsFromEnv, reversalTimeframeFor, type ReversalSettings,
 } from "./reversalExit";
 
-const ASSET_CLASSES: AssetClass[] = ["crypto", "meme"];
-/** 廃止した資産クラス (FX・株式)。WATCHLIST に残っていても起動を止めず、警告してその銘柄を無視する */
-const REMOVED_ASSET_CLASSES = ["fx", "stock"] as const;
+/** WATCHLIST で使える資産クラス (このアプリが使うクラス: crypto・meme) */
+const ASSET_CLASSES: readonly AssetClass[] = TRADER_ASSET_CLASSES;
+/** このアプリで使わない (廃止した) 資産クラス (FX・株式)。WATCHLIST に残っていても起動を止めず、警告してその銘柄を無視する */
+const REMOVED_ASSET_CLASSES: readonly string[] = ALL_ASSET_CLASSES.filter((c) => !TRADER_ASSET_CLASSES.includes(c));
 export const KNOWN_VENUES = ["jupiter", "synthetic", "ccxt"] as const;
 /**
  * 廃止した取引先 (GMOコイン・OANDA・Alpaca・DEX)。VENUES / WATCHLIST に残っていても起動を止めず、警告して無視する
@@ -70,7 +72,7 @@ export function parseWatchlist(s: string, warn?: (message: string) => void): Wat
   for (const raw of s.split(",").map((x) => x.trim()).filter(Boolean)) {
     const [venue, symbol, cls] = raw.split("|").map((x) => x.trim());
     if (!venue || !symbol) throw new Error(`WATCHLIST の形式が不正です: "${raw}" (venue|symbol|assetClass)`);
-    if (cls && (REMOVED_ASSET_CLASSES as readonly string[]).includes(cls.toLowerCase())) {
+    if (cls && REMOVED_ASSET_CLASSES.includes(cls.toLowerCase())) {
       warn?.(`WATCHLIST の "${raw}" は廃止した資産クラス (${cls}) のため無視します (使える資産クラス: ${ASSET_CLASSES.join("/")}。.env から外してください)`);
       continue;
     }

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { buildReportText, main } from "../src/cli";
-import { loadConfig } from "../src/core/config";
+import { loadConfig } from "../src/appConfig";
 import type { EntryContext, TradeRecord } from "../src/core/types";
 import { EXIT_REASON_LABEL, renderTempoTable, renderThesisTable, summarizeByTempo, summarizeThesis } from "../src/engine/report";
 import { attributeTrade } from "../src/learning/attribution";

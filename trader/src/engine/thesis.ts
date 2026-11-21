@@ -21,7 +21,7 @@
  * 読みの管理が無効・期限が無い・当初のリスクが 0 以下 (純 R が求まらない) ときは、従来の時間切れ (maxHoldMs で "time") に戻す。
  * R は統計値なので number で計算する (会計値ではない)。
  */
-import type { Env } from "../core/config";
+import type { CoreEnv } from "../core/config";
 import type { TradeRecord } from "../core/types";
 
 export type ThesisExitReason = "thesis_failed" | "thesis_timeout" | "thesis_cap";
@@ -50,7 +50,7 @@ export const DEFAULT_THESIS_SETTINGS: Readonly<ThesisSettings> = { enabled: true
 /** 無効 (従来の時間切れ)。バックテスト・PositionManager・仮想トレードで設定を渡さないときの既定 */
 export const THESIS_DISABLED: Readonly<ThesisSettings> = { ...DEFAULT_THESIS_SETTINGS, enabled: false };
 
-type ThesisEnv = Partial<Pick<Env, "THESIS_EXIT" | "THESIS_MIN_R" | "THESIS_EARLY_CUT_R" | "THESIS_EXTEND_MULT" | "THESIS_TRAIL_R">>;
+type ThesisEnv = Partial<Pick<CoreEnv, "THESIS_EXIT" | "THESIS_MIN_R" | "THESIS_EARLY_CUT_R" | "THESIS_EXTEND_MULT" | "THESIS_TRAIL_R">>;
 
 const finite = (x: unknown): x is number => typeof x === "number" && Number.isFinite(x);
 

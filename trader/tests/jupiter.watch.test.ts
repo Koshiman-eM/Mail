@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Instrument } from "../src/core/types";
 import { jupiterSettingsFromEnv, jupiterWatchKey, JupiterWatchManager, resolveFixedTokens, type PersistedWatch } from "../src/engine/jupiterWatch";
-import { loadConfig } from "../src/core/config";
+import { loadConfig } from "../src/appConfig";
 import { JupiterFeed } from "../src/market/feeds/jupiter";
 import { JupiterClient } from "../src/market/jupiter/client";
 import { DEFAULT_DISCOVERY_SETTINGS } from "../src/market/jupiter/discovery";

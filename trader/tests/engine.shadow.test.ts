@@ -1,6 +1,6 @@
 /** エンジン統合: 見送ったシグナルの仮想トレードと、ニュースと値動きの答え合わせ (合成データ + 仮想時計 + MemoryStore、オフライン) */
 import { describe, expect, it } from "vitest";
-import { loadConfig } from "../src/core/config";
+import { loadConfig } from "../src/appConfig";
 import type { AssetClass, Clock, IntelItem, Signal, Strategy, StrategyContext } from "../src/core/types";
 import { buildRuntime, type RuntimeOptions } from "../src/engine/setup";
 import { buildReportText } from "../src/cli";

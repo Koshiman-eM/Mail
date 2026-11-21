@@ -1,5 +1,5 @@
 import type { BacktestOptions } from "../backtest/types";
-import type { Env } from "../core/config";
+import type { CoreEnv } from "../core/config";
 import type { TradingMode } from "../core/types";
 
 /**
@@ -7,7 +7,7 @@ import type { TradingMode } from "../core/types";
  * (取消の失敗・照会の遅れで損切りが止まる・過剰決済になる経路を実弾に持ち込まない)。
  * 手組みの設定で未設定なら既定値 (false) と同じ扱い
  */
-export function effectiveLimitTakeProfit(env: Partial<Pick<Env, "LIMIT_TAKE_PROFIT">>, mode: TradingMode): boolean {
+export function effectiveLimitTakeProfit(env: Partial<Pick<CoreEnv, "LIMIT_TAKE_PROFIT">>, mode: TradingMode): boolean {
   return mode !== "live" && (env.LIMIT_TAKE_PROFIT ?? false) === true;
 }
 
@@ -18,7 +18,7 @@ export function effectiveLimitTakeProfit(env: Partial<Pick<Env, "LIMIT_TAKE_PROF
  * 手組みの設定で未設定なら既定値 (LIMIT_ENTRY は true、LIMIT_TAKE_PROFIT は false) と同じ扱い
  */
 export function limitOrdersFromEnv(
-  env: Partial<Pick<Env, "LIMIT_ENTRY" | "LIMIT_TAKE_PROFIT" | "LIMIT_ENTRY_TIMEOUT_MS">>,
+  env: Partial<Pick<CoreEnv, "LIMIT_ENTRY" | "LIMIT_TAKE_PROFIT" | "LIMIT_ENTRY_TIMEOUT_MS">>,
   mode: TradingMode,
 ): NonNullable<BacktestOptions["limitOrders"]> {
   return {

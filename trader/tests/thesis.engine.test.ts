@@ -3,7 +3,7 @@
  * 実在の取引所へは送信しない (オフライン)。
  */
 import { describe, expect, it } from "vitest";
-import { loadConfig } from "../src/core/config";
+import { loadConfig } from "../src/appConfig";
 import type { Candle, Clock, Instrument, MarketDataFeed, Quote, Signal, Strategy, StrategyContext, Timeframe } from "../src/core/types";
 import { buildRuntime } from "../src/engine/setup";
 import type { BrokerSet } from "../src/execution/router";

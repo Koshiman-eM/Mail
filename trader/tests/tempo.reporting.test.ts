@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 import { runBacktest } from "../src/backtest/engine";
 import { syntheticInstrument } from "../src/backtest/synthetic";
 import { buildReportText, tempoStatusLine } from "../src/cli";
-import { loadConfig } from "../src/core/config";
+import { loadConfig } from "../src/appConfig";
 import type { Candle, Signal, Strategy, StrategyContext, TradeRecord } from "../src/core/types";
 import { runBacktestCommand } from "../src/engine/backtestCommand";
 import { renderTempoTable, summarizeByTempo, tempoClassOf } from "../src/engine/report";

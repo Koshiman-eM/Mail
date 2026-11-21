@@ -3,7 +3,7 @@
  * 実口座アダプターは生成せず、Broker を実装した偽のブローカーを brokerSet に注入する。
  */
 import { describe, expect, it, vi } from "vitest";
-import { loadConfig } from "../src/core/config";
+import { loadConfig } from "../src/appConfig";
 import type { Candle, Clock, Instrument, MarketDataFeed, Quote, Signal, Strategy, StrategyContext, Timeframe } from "../src/core/types";
 import { requestOrderResolve } from "../src/cli";
 import { buildRuntime, type RuntimeOptions } from "../src/engine/setup";

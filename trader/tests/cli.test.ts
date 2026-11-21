@@ -7,7 +7,7 @@ import {
 import { engineLockKey } from "../src/engine/lock";
 import { learningMigrationFlagKey } from "../src/learning/migration";
 import { PendingOrders, peekResolveRequests, type PendingOrder } from "../src/engine/orders";
-import { loadConfig } from "../src/core/config";
+import { loadConfig } from "../src/appConfig";
 import type { Candle } from "../src/core/types";
 import { fetchCandlesPaged, formatBacktestRows, runBacktestCommand } from "../src/engine/backtestCommand";
 import { exitFxRates, formatTable, strWidth, summarizeByStrategy } from "../src/engine/report";

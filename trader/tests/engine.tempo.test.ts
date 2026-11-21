@@ -3,7 +3,7 @@
  * 合成データ・PaperBroker、live の経路は偽のブローカー (FakeLiveBroker)。実在の取引所へは送信しない (オフライン)。
  */
 import { describe, expect, it, vi } from "vitest";
-import { loadConfig } from "../src/core/config";
+import { loadConfig } from "../src/appConfig";
 import type {
   Candle, Clock, Horizon, Instrument, MarketDataFeed, Quote, RegimeLabel, Signal, Strategy, StrategyContext, Timeframe, TradeRecord,
 } from "../src/core/types";

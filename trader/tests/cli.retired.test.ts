@@ -1,7 +1,7 @@
 /** 廃止した GMOコイン・FX・株式の古い設定と、live の発注先が無いときの CLI の挙動 (ネットに出ない) */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { configCompatWarnings, main } from "../src/cli";
-import { LIVE_CONFIRM_PHRASE, loadConfig } from "../src/core/config";
+import { LIVE_CONFIRM_PHRASE, loadConfig } from "../src/appConfig";
 
 const io = () => {
   const out: string[] = [];

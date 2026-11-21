@@ -5,7 +5,7 @@
  * - 学習データ (腕の kv) は消さない
  */
 import { describe, expect, it } from "vitest";
-import { loadConfig } from "../src/core/config";
+import { loadConfig } from "../src/appConfig";
 import type { Clock, RegimeLabel, Signal, Strategy, StrategyContext } from "../src/core/types";
 import { buildRuntime, type RuntimeOptions } from "../src/engine/setup";
 import { armKey, armStateKey } from "../src/learning/allocator";

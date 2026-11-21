@@ -13,7 +13,7 @@
  */
 import { redactedErrMsg } from "../core/http";
 import type { Logger } from "../core/logger";
-import type { Env } from "../core/config";
+import type { Env } from "../appConfig";
 import type { AssetClass, Instrument, Store, TradingMode } from "../core/types";
 import type { JupiterClient } from "../market/jupiter/client";
 import {

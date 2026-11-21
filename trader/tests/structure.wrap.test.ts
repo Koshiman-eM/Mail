@@ -1,7 +1,7 @@
 /** 相場構造のラッパー withStructure: フィルター・MTF・構造の損切り・決済・設定・off で従来と同一 */
 import { describe, expect, it } from "vitest";
 import { syntheticInstrument } from "../src/backtest/synthetic";
-import { loadConfig } from "../src/core/config";
+import { loadConfig } from "../src/appConfig";
 import type { Candle, Clock, PositionView, RegimeFeatures, Signal, Strategy, StrategyContext } from "../src/core/types";
 import { TIMEFRAME_MS } from "../src/core/types";
 import { buildRuntime } from "../src/engine/setup";

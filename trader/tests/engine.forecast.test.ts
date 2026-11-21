@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { loadConfig } from "../src/core/config";
+import { loadConfig } from "../src/appConfig";
 import type { AssetClass, AuditEvent, Clock, Signal, Strategy, StrategyContext } from "../src/core/types";
 import { routeDashboard } from "../src/dashboard/server";
 import { buildRuntime, type RuntimeOptions } from "../src/engine/setup";

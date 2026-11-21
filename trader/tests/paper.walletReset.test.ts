@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireRunLock, buildReportText, main, paperResetCommand, parsePaperResetArgs, prepareRunRuntime, settledTradesLine, CliError } from "../src/cli";
 import type { Runtime } from "../src/engine/setup";
-import { loadConfig } from "../src/core/config";
+import { loadConfig } from "../src/appConfig";
 import type { EntryContext, Instrument, Store, TradeRecord } from "../src/core/types";
 import { tradesPayload } from "../src/dashboard/server";
 import { EXIT_REASON_LABEL } from "../src/engine/report";

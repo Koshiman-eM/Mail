@@ -1,6 +1,6 @@
 /** エンジン: paper の口座リセット (paper reset) 後の status と、テンポの復元から除く取引 (合成データ、オフライン) */
 import { describe, expect, it } from "vitest";
-import { loadConfig } from "../src/core/config";
+import { loadConfig } from "../src/appConfig";
 import type { Clock, TradeRecord } from "../src/core/types";
 import { buildRuntime } from "../src/engine/setup";
 import { PAPER_RESETS_KEY } from "../src/paper/walletReset";

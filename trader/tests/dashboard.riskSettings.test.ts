@@ -1,7 +1,7 @@
 import { request } from "node:http";
 import { Readable } from "node:stream";
 import { describe, expect, it } from "vitest";
-import { DEFAULT_RISK } from "../src/core/config";
+import { DEFAULT_RISK } from "../src/appConfig";
 import type { TradingMode } from "../src/core/types";
 import {
   createDashboardHandler, createRateLimiter, dashboardAllowedHosts, routeDashboard, startDashboard, type DashboardDeps, type DashboardRequestContext,

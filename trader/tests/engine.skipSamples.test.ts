@@ -1,6 +1,6 @@
 /** 見送り理由の実例 (samples): 集計キーは # のまま、数字入りの元の文字列を skip_summary に載せる */
 import { describe, expect, it } from "vitest";
-import { loadConfig } from "../src/core/config";
+import { loadConfig } from "../src/appConfig";
 import type { Clock, Signal, Strategy, StrategyContext } from "../src/core/types";
 import { buildRuntime } from "../src/engine/setup";
 import { mulberry32 } from "../src/market/feeds/synthetic";

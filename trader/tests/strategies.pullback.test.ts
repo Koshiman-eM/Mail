@@ -8,7 +8,7 @@ import type { AssetClass, Candle, Horizon, Instrument, PositionView, RegimeFeatu
 import { TIMEFRAME_MS } from "../src/core/types";
 import { generateCandles, syntheticInstrument } from "../src/backtest/synthetic";
 import { runBacktest } from "../src/backtest/engine";
-import { DEFAULT_OBSERVE_ONLY_STRATEGIES, DEFAULT_STRUCTURE_STRATEGIES } from "../src/core/config";
+import { DEFAULT_OBSERVE_ONLY_STRATEGIES, DEFAULT_STRUCTURE_STRATEGIES } from "../src/appConfig";
 import { TEMPO_COST_MULT_FLOOR } from "../src/engine/tempo";
 import { hubTimeframesFor } from "../src/engine/setup";
 import { ALL_STRATEGIES, getStrategy } from "../src/strategies/registry";

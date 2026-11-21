@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { runBacktest } from "../src/backtest/engine";
-import { loadConfig } from "../src/core/config";
+import { loadConfig } from "../src/appConfig";
 import type { Candle, Clock, Strategy, TradeRecord } from "../src/core/types";
 import { createLogger } from "../src/core/logger";
 import { PositionManager } from "../src/engine/positions";

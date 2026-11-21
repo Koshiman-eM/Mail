@@ -1,7 +1,7 @@
 /** `trader intel` の IntelService: 情報源の信頼度はエンジンと同じ mode 別キーを読む (旧キーを読まない)。オフライン */
 import { describe, expect, it } from "vitest";
 import { createCliIntelService } from "../src/cli";
-import { loadConfig, type AppConfig } from "../src/core/config";
+import { loadConfig, type AppConfig } from "../src/appConfig";
 import type { IntelItem, SourceReliability } from "../src/core/types";
 import type { IntelSource } from "../src/intel/sources/common";
 import { SOURCE_RELIABILITY_KV_KEY, sourceReliabilityKey } from "../src/learning/reliability";

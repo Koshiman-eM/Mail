@@ -1,6 +1,6 @@
 import { request } from "node:http";
 import { describe, expect, it } from "vitest";
-import { loadConfig } from "../src/core/config";
+import { loadConfig } from "../src/appConfig";
 import type { IntelItem, Signal, Strategy, StrategyContext } from "../src/core/types";
 import {
   createDashboardHandler, dashboardAllowedHosts, isAllowedHost, parseLimit, routeDashboard, startDashboard, withDashboardCaches, type DashboardDeps,

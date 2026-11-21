@@ -1,6 +1,6 @@
 /** エンジン統合: 無効化された腕の計画・探索・仮想トレード、direction_bias の答え合わせ (合成データ + 仮想時計 + MemoryStore、オフライン) */
 import { describe, expect, it } from "vitest";
-import { loadConfig } from "../src/core/config";
+import { loadConfig } from "../src/appConfig";
 import type { AssetClass, Clock, RegimeLabel, Signal, Strategy, StrategyContext } from "../src/core/types";
 import { emptyBrief } from "../src/engine/context";
 import { buildRuntime, type RuntimeOptions } from "../src/engine/setup";

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_OBSERVE_ONLY_STRATEGIES, DEFAULT_STRUCTURE_STRATEGIES, LIVE_CONFIRM_PHRASE, loadConfig, removedEnvWarnings, resolveMode } from "../src/core/config";
+import { DEFAULT_OBSERVE_ONLY_STRATEGIES, DEFAULT_STRUCTURE_STRATEGIES, LIVE_CONFIRM_PHRASE, loadConfig, removedEnvWarnings, resolveMode } from "../src/appConfig";
 import { ALL_STRATEGIES } from "../src/strategies/registry";
 import { strategyIdListWarnings } from "../src/strategies/retired";
 import { D, floorToStep } from "../src/core/decimal";

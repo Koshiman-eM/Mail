@@ -6,7 +6,7 @@
  * - 腕のキーが方向別 (…|short)、パラメータ調整から除外、report / ダッシュボードの集計で分ける
  */
 import { describe, expect, it } from "vitest";
-import { loadConfig } from "../src/core/config";
+import { loadConfig } from "../src/appConfig";
 import { canShort, isSimulatedShort, simulatedShortEligible, withSimulatedShort } from "../src/core/short";
 import type {
   Clock, Instrument, IntelBias, MarketView, RegimeFeatures, Signal, Strategy, StrategyContext, TradeRecord,
@@ -23,7 +23,7 @@ import { armKey, armKeyOf, armStateKey, StrategyAllocator } from "../src/learnin
 import { summarizeShadowTrades } from "../src/learning/shadow";
 import { learnableTrades } from "../src/learning/tuner";
 import { mulberry32, SyntheticFeed } from "../src/market/feeds/synthetic";
-import { DEFAULT_RISK } from "../src/core/config";
+import { DEFAULT_RISK } from "../src/appConfig";
 import { RiskManager } from "../src/risk/manager";
 import { MemoryStore } from "../src/storage/memory";
 import { buildEntrySignal } from "../src/strategies/common";
