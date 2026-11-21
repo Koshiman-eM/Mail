@@ -108,7 +108,8 @@ export async function runJupiterCheck(client: JupiterClient, gecko: GeckoTermina
       const issues: string[] = [];
       for (const k of known) {
         const actual = bySym.get(k.mint);
-        const ok = actual !== undefined && actual.toUpperCase() === k.symbol.toUpperCase();
+        const norm = (s: string) => s.replace(/^[$]+/, "").toUpperCase(); // WIF は "$WIF" で登録されている
+        const ok = actual !== undefined && norm(actual) === norm(k.symbol);
         tokenVerification.push({ mint: k.mint, expected: k.symbol, ...(actual !== undefined ? { actual } : {}), ok });
         if (!ok) issues.push(`${k.symbol} (${k.mint}): ${actual === undefined ? "見つからない" : `symbol が ${actual}`}`);
       }
