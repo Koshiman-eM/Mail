@@ -8,7 +8,14 @@ console.table(q("SELECT type, COUNT(*) n FROM audit WHERE ts>? GROUP BY type ORD
 console.log("== risk.reject の理由 ==");
 const rows = q("SELECT data FROM audit WHERE type='risk.reject' AND ts>?", since);
 const c = {};
-for (const r of rows) { const d = JSON.parse(r.data); const k = String(d.reason).slice(0, 60); c[k] = (c[k] ?? 0) + 1; }
+for (const r of rows) { const e = JSON.parse(r.data); const d = e.data ?? e; const k = String(d.reason).replace(/[0-9.]+/g, '#').slice(0, 70); c[k] = (c[k] ?? 0) + 1; }
 console.table(Object.entries(c).sort((a, b) => b[1] - a[1]).slice(0, 15).map(([reason, n]) => ({ reason, n })));
+console.log("== engine.skip_summary (見送り理由の合計) ==");
+const sk = {};
+for (const r of q("SELECT data FROM audit WHERE type='engine.skip_summary' AND ts>?", since)) {
+  const e = JSON.parse(r.data); const rs = (e.data ?? e).reasons ?? {};
+  for (const [k, v] of Object.entries(rs)) sk[k.slice(0, 70)] = (sk[k.slice(0, 70)] ?? 0) + (v.count ?? 1);
+}
+console.table(Object.entries(sk).sort((a, b) => b[1] - a[1]).slice(0, 15).map(([reason, n]) => ({ reason, n })));
 console.log("== 最後の equity ==");
 console.table(q("SELECT ts, mode FROM equity ORDER BY ts DESC LIMIT 2"));
