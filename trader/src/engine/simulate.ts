@@ -1,9 +1,10 @@
 /**
  * 合成データ + 仮想時計による高速ペーパー運転 (ネット接続不要のデモ)。
+ * 部品の組み立てはアプリが渡す SimulationRuntimeFactory (設定の読み込み・合成データの runtime) で行う。
  * 情報源は使わず (sources = [] のスタブ brief)、AI も使わない。学習ループは仮想時間 1 時間ごと。
  */
 import { resolve } from "node:path";
-import { loadConfig } from "../appConfig";
+import type { AppConfig } from "../core/config";
 import type { Clock, ExitReason, Lesson, ParamAdjustment, Store } from "../core/types";
 import type { ArmSnapshot } from "../learning/allocator";
 import type { CauseSummary, LearningSnapshot } from "../learning/service";
@@ -12,7 +13,7 @@ import { createStore, MemoryStore } from "../storage";
 import { configuredStrategies } from "../strategies/registry";
 import { structureSettingsFromEnv } from "../structure/settings";
 import { isStructureWrapped, withFilterCounter } from "../structure/wrap";
-import { buildRuntime, syntheticDbPath, type Runtime } from "./setup";
+import type { AssembleOptions, Runtime } from "./runtime";
 import { readLimitStats, type LimitStats } from "./orders";
 import { effectiveLimitTakeProfit } from "./limitOrders";
 import {
@@ -29,7 +30,26 @@ const HOUR = 3_600_000;
 /** 既定の開始時刻 (再現性のため固定。月曜 00:00 UTC) */
 export const DEFAULT_SIM_START = Date.UTC(2026, 0, 5);
 
+/** simulate の runtime の組み立てに渡す設定 (AI なし・情報源なし・固定シード) */
+export interface SimulationRuntimeOptions extends Pick<AssembleOptions, "strategies" | "clock" | "store" | "intelSources" | "ai" | "rng" | "learning" | "engine"> {
+  seed: number;
+  syntheticHistoryMs?: number;
+}
+
+/** アプリが渡す simulate の部品 (設定の読み込みと、合成データの runtime の組み立て) */
+export interface SimulationRuntimeFactory {
+  /** アプリの設定を読む */
+  loadConfig(env: Record<string, string | undefined>): AppConfig;
+  /** simulate で固定するアプリの環境変数 (取引先を合成データにする等。例 trader: VENUES=synthetic, WATCHLIST=) */
+  simulationEnv?: Record<string, string>;
+  /** simulate で使えない DB (実運転用の DB とその派生) */
+  guardedDbPaths?(config: AppConfig): string[];
+  buildRuntime(config: AppConfig, opts: SimulationRuntimeOptions): Promise<Runtime>;
+}
+
 export interface SimulationOptions {
+  /** アプリの部品 */
+  factory: SimulationRuntimeFactory;
   /** 期間 (日)。hours と併用時は合算 */
   days?: number;
   hours?: number;
@@ -133,14 +153,13 @@ export interface SimulationReport {
   };
 }
 
-/** シミュレーション用の設定 (paper・synthetic・AI なしに固定) */
-export function simulationConfig(env: Record<string, string | undefined>, db: string) {
-  return loadConfig({
+/** シミュレーション用の設定 (paper・AI なし・DB を固定。取引先はアプリの simulationEnv で合成データに固定) */
+export function simulationConfig(factory: SimulationRuntimeFactory, env: Record<string, string | undefined>, db: string): AppConfig {
+  return factory.loadConfig({
     ...env,
     TRADING_MODE: "paper",
     LIVE_TRADING_CONFIRM: "",
-    VENUES: "synthetic",
-    WATCHLIST: "",
+    ...(factory.simulationEnv ?? {}),
     ANTHROPIC_API_KEY: "",
     DB_PATH: db,
   });
@@ -150,23 +169,24 @@ export function simulationConfig(env: Record<string, string | undefined>, db: st
  * simulate が使えない DB か。DB_PATH (実運転用) とその合成データ用 (<ベース名>-synthetic.db) は拒否する
  * (仮想時間の取引・追跡ポジション・リスク状態を運転中の DB に混ぜない)。memory / :memory: は可。
  */
-export function assertSimulationDb(db: string, env: Record<string, string | undefined>): void {
+export function assertSimulationDb(factory: SimulationRuntimeFactory, db: string, env: Record<string, string | undefined>): void {
   if (db === "memory" || db === ":memory:") return;
-  const dbPath = loadConfig(env).env.DB_PATH;
-  const guarded = [dbPath, syntheticDbPath(dbPath)].filter((p) => p !== "" && p !== "memory" && p !== ":memory:").map((p) => resolve(p));
+  const config = factory.loadConfig(env);
+  const dbPath = config.env.DB_PATH;
+  const guarded = [dbPath, ...(factory.guardedDbPaths?.(config) ?? [])].filter((p) => p !== "" && p !== "memory" && p !== ":memory:").map((p) => resolve(p));
   if (guarded.includes(resolve(db))) {
     throw new Error(`simulate は DB_PATH (${dbPath}) と同じファイル (合成データ用を含む) を使えません。--db に別のファイルを指定してください`);
   }
 }
 
-export async function runSimulation(o: SimulationOptions = {}): Promise<{ report: SimulationReport; runtime: Runtime }> {
+export async function runSimulation(o: SimulationOptions): Promise<{ report: SimulationReport; runtime: Runtime }> {
   const seed = o.seed ?? 1;
   const durationMs = Math.round(((o.days ?? (o.hours === undefined ? 3 : 0)) * 24 + (o.hours ?? 0)) * HOUR);
   if (!(durationMs > 0)) throw new Error("期間が 0 です (--days / --hours を確認してください)");
   const stepMs = Math.max(1_000, Math.round(o.stepMs ?? 15_000));
   const db = o.db ?? "memory";
-  if (!o.store) assertSimulationDb(db, o.env ?? process.env);
-  const config = simulationConfig(o.env ?? process.env, db);
+  if (!o.store) assertSimulationDb(o.factory, db, o.env ?? process.env);
+  const config = simulationConfig(o.factory, o.env ?? process.env, db);
   const store = o.store ?? (db === "memory" ? new MemoryStore() : createStore(db));
 
   // 既存の DB に追記する場合は時刻が逆行しないよう続きから始める
@@ -179,7 +199,7 @@ export async function runSimulation(o: SimulationOptions = {}): Promise<{ report
   const structureFiltered: Record<string, number> = {};
   const strategies = configuredStrategies(structure).map((s) => (isStructureWrapped(s) ? withFilterCounter(s, structureFiltered) : s));
 
-  const runtime = await buildRuntime(config, {
+  const runtime = await o.factory.buildRuntime(config, {
     strategies,
     clock,
     store,

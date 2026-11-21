@@ -4,13 +4,7 @@ import { createLogger, type Logger } from "../core/logger";
 import type { EconEvent, IntelItem, MarketBrief, SourceReliability, Store, TradingMode } from "../core/types";
 import { SOURCE_RELIABILITY_KV_KEY, sourceReliabilityKey } from "../learning/reliability";
 import { analyzeIntelDetailed } from "./analyzer";
-import type { TagOptions } from "./assetTagger";
-import { createCoinGeckoSource } from "./sources/coingecko";
-import type { FetchJsonFn, FetchTextFn, IntelSource } from "./sources/common";
-import { createCryptoPanicSource } from "./sources/cryptopanic";
-import { createEconCalendarSource } from "./sources/econCalendar";
-import { createFearGreedSource } from "./sources/fearGreed";
-import { createRssSources } from "./sources/rss";
+import type { IntelSource } from "./sources/common";
 
 const EVENTS_KV_KEY = "intel:events";
 
@@ -113,19 +107,4 @@ export class IntelService {
   latestEvents(): EconEvent[] {
     return this.events;
   }
-}
-
-/** 既定の情報源一式 (CRYPTOPANIC_TOKEN 未設定なら cryptopanic は含まれない) */
-export function createDefaultSources(
-  opts: { env?: Record<string, string | undefined>; fetchText?: FetchTextFn; fetchJson?: FetchJsonFn; tag?: TagOptions } = {},
-): IntelSource[] {
-  const env = opts.env ?? process.env;
-  const list: (IntelSource | undefined)[] = [
-    ...createRssSources({ env: env.NEWS_RSS_FEEDS, fetchText: opts.fetchText, tag: opts.tag }),
-    createFearGreedSource({ fetchJson: opts.fetchJson }),
-    createCryptoPanicSource({ token: env.CRYPTOPANIC_TOKEN, fetchJson: opts.fetchJson }),
-    createCoinGeckoSource({ fetchJson: opts.fetchJson }),
-    createEconCalendarSource({ fetchJson: opts.fetchJson }),
-  ];
-  return list.filter((s): s is IntelSource => Boolean(s));
 }

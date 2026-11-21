@@ -18,7 +18,7 @@ import { LearningService } from "../src/learning/service";
 import { learnableTrades } from "../src/learning/tuner";
 import { riskStateKey, RiskManager } from "../src/risk/manager";
 import { riskLimitsKey } from "../src/risk/settings";
-import { runSimulation } from "../src/engine/simulate";
+import { runSimulation } from "../src/simulation";
 import { MemoryStore } from "../src/storage/memory";
 import { SqliteStore } from "../src/storage/sqlite";
 import {

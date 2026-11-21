@@ -7,7 +7,7 @@ import { buildReportText, main } from "../src/cli";
 import { loadConfig } from "../src/appConfig";
 import { isSignalLikeExit, type EntryContext, type TradeRecord } from "../src/core/types";
 import { EXIT_REASON_LABEL, renderReversalTable, summarizeReversal, tpCaptureOf } from "../src/engine/report";
-import { formatSimulationReport, runSimulation } from "../src/engine/simulate";
+import { formatSimulationReport, runSimulation } from "../src/simulation";
 import { reversalDetailLabel } from "../src/engine/reversalExit";
 import { thesisOutcomeOf } from "../src/engine/thesis";
 import { attributeTrade } from "../src/learning/attribution";

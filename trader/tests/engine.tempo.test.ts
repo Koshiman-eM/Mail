@@ -8,7 +8,7 @@ import type {
   Candle, Clock, Horizon, Instrument, MarketDataFeed, Quote, RegimeLabel, Signal, Strategy, StrategyContext, Timeframe, TradeRecord,
 } from "../src/core/types";
 import { buildRuntime } from "../src/engine/setup";
-import { formatSimulationReport, runSimulation } from "../src/engine/simulate";
+import { formatSimulationReport, runSimulation } from "../src/simulation";
 import type { BrokerSet } from "../src/execution/router";
 import { armKey, armStateKey, type ArmState } from "../src/learning/allocator";
 import type { EntryParams } from "../src/risk/manager";

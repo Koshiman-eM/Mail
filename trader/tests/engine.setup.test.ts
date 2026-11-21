@@ -7,7 +7,7 @@ import {
   assertLiveSupported, buildRuntime, effectiveVenues, hubTimeframesFor, parseVenues, parseWatchlist, resolveDbPath, syntheticDbPath,
 } from "../src/engine/setup";
 import { LIVE_UNSUPPORTED_MESSAGE } from "../src/execution/router";
-import { assertSimulationDb } from "../src/engine/simulate";
+import { assertSimulationDb } from "../src/simulation";
 import { DEFAULT_REVERSAL_SETTINGS, type ReversalSettings } from "../src/engine/reversalExit";
 import { ClosedCandleCacheFeed } from "../src/engine/feedCache";
 import { CcxtFeed, PRECISION, type CcxtLike } from "../src/market/feeds/ccxt";

@@ -12,7 +12,7 @@ import {
   type IntelItem, type MarketDataFeed, type MarketView, type OrderRequest, type Params, type Quote, type RegimeFeatures, type Signal, type Store, type Strategy,
   type ShadowTradeRecord, type StrategyContext, type StrategyPlan, type Timeframe, type TradeRecord, TIMEFRAME_MS, isLearningExcludedTrade,
 } from "../core/types";
-import type { BrokerSet } from "../execution/router";
+import type { BrokerSet } from "../execution/brokerSet";
 import type { PaperSnapshot } from "../execution/paper";
 import type { IntelService } from "../intel/service";
 import { biasForInstrument, buildBaselinePlan, buildStrategyPlan, MAX_RISK_MULTIPLIER } from "../intel/planner";

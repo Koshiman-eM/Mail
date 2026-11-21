@@ -1,4 +1,5 @@
 /** CLI の regime コマンド: 運用中と同じ detectRegime で、過去の各時刻の相場の状態 (レジーム) を確かめる */
+import { enabledAssetClasses } from "../core/assetClasses";
 import { TIMEFRAME_MS, type AssetClass, type Candle, type MarketDataFeed, type RegimeLabel, type Timeframe } from "../core/types";
 import { detectRegime, regimeOptionsFor, type RegimeOptions } from "../regime/detect";
 import { structureAt } from "../structure/machine";
@@ -128,7 +129,8 @@ export function buildRegimeReport(o: {
   assetClass?: AssetClass;
   structure?: RegimeStructureOptions;
 }): RegimeSeries[] {
-  const opts = regimeOptionsFor(o.assetClass ?? "crypto");
+  // 資産クラスのスプレッド閾値 (省略時はアプリが最初に選んだクラス。trader は crypto)
+  const opts = regimeOptionsFor(o.assetClass ?? enabledAssetClasses()[0]);
   const times = regimeTimes(o.from, o.until, o.stepMs);
   return o.timeframes.map((tf) => regimeSeries(o.candlesByTf[tf] ?? [], tf, times, opts, o.structure ?? {}));
 }

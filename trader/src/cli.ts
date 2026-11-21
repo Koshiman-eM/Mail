@@ -9,7 +9,10 @@ import { pathToFileURL } from "node:url";
 import { loadConfig, removedEnvWarnings, type AppConfig } from "./appConfig";
 import type { MarketDataFeed, Store, TradeRecord } from "./core/types";
 import { isLoopbackHost, startDashboard, type DashboardServer } from "./dashboard/server";
-import { formatBacktestRows, runBacktestCommand, type BacktestSource } from "./engine/backtestCommand";
+import {
+  backtestSourceNames, backtestSourceSpec, formatBacktestRows, registerBacktestSource, runBacktestCommand, type BacktestSource,
+  type BacktestSourceSpec,
+} from "./engine/backtestCommand";
 import { compareFootnotes, formatCompareRows, runStructureCompare } from "./engine/structureCompare";
 import { DEFAULT_REGIME_TIMEFRAMES, runRegimeCommand } from "./engine/regimeReport";
 import { createFxConverter, quoteCurrencyOfSymbol } from "./engine/fx";
@@ -30,9 +33,10 @@ import {
   assertLiveSupported, buildRuntime, effectiveVenues, isRemovedVenue, parseWatchlist, resolveDbPath, syntheticDbSwitchWarning, type Runtime,
 } from "./engine/setup";
 import { effectiveLimitTakeProfit, limitOrdersFromEnv } from "./engine/limitOrders";
-import { formatSimulationReport, runSimulation } from "./engine/simulate";
+import { formatSimulationReport, runSimulation } from "./simulation";
 import { formatTempoLine, TempoController, tempoSeedTimestamps, tempoStatusView } from "./engine/tempo";
-import { createDefaultSources, IntelService } from "./intel/service";
+import { IntelService } from "./intel/service";
+import { createDefaultSources } from "./intel/defaultSources";
 import type { IntelSource } from "./intel/sources/common";
 import { TradeJournal } from "./learning/journal";
 import { LearningService } from "./learning/service";
@@ -181,7 +185,7 @@ export function parseBacktestArgs(flags: ParsedArgs["flags"]): BacktestArgs {
   if (strategy !== "all" && !getStrategy(strategy)) throw new CliError(`未知の戦略: ${strategy}`);
   const source = stringFlag(flags, "source", "synthetic");
   if (source === "gmo") throw new CliError("--source gmo は廃止しました (GMOコインの取引先を廃止したため)。synthetic / ccxt / jupiter のどれかです");
-  if (source !== "synthetic" && source !== "ccxt" && source !== "jupiter") throw new CliError("--source は synthetic / ccxt / jupiter のどれかです");
+  if (!backtestSourceNames().includes(source)) throw new CliError(`--source は ${backtestSourceNames().join(" / ")} のどれかです`);
   if (flags.token !== undefined && source !== "jupiter") throw new CliError("--token は --source jupiter と一緒に指定してください");
   const token = source === "jupiter" ? stringFlag(flags, "token", "SOL") : undefined;
   if (source === "jupiter" && flags.symbol !== undefined) throw new CliError("--source jupiter では --symbol ではなく --token <mint|symbol> を指定してください");
@@ -588,25 +592,15 @@ async function cmdSimulate(flags: ParsedArgs["flags"], io: Io): Promise<number> 
 async function cmdBacktest(flags: ParsedArgs["flags"], io: Io): Promise<number> {
   const a = parseBacktestArgs(flags);
   const config = loadConfig();
-  let feed: MarketDataFeed | undefined;
-  let jupiterSymbol: string | undefined;
-  if (a.source === "ccxt") {
-    io.out(`ccxt (${config.env.CCXT_EXCHANGE}) から履歴を取得します...`);
-    feed = CcxtFeed.create(config.env.CCXT_EXCHANGE);
-  } else if (a.source === "jupiter") {
-    const j = await jupiterBacktestFeed(config, a.token ?? "SOL", a.days, io);
-    feed = j.feed;
-    jupiterSymbol = j.symbol;
-  }
-  const symbol =
-    jupiterSymbol ??
-    a.symbol ??
-    (a.source === "ccxt"
-      ? ["bitflyer", "bitbank", "coincheck", "zaif"].includes(config.env.CCXT_EXCHANGE) ? "BTC/JPY" : "BTC/USDT"
-      : "SYN/USDT");
+  // 足の取得元: synthetic (コア) か、trader が登録した ccxt / jupiter (TRADER_BACKTEST_SOURCES)
+  const spec = a.source === "synthetic" ? undefined : backtestSourceSpec<BacktestSourceCtx>(a.source);
+  if (a.source !== "synthetic" && !spec) throw new CliError(`未知の --source: ${a.source}`);
+  const ctx: BacktestSourceCtx = { config, args: a, io };
+  const opened = spec ? await spec.open(ctx) : undefined;
+  const feed: MarketDataFeed | undefined = opened?.feed;
+  const symbol = opened?.symbol ?? a.symbol ?? "SYN/USDT";
   const structure = structureSettingsFromEnv(config.env);
-  const sourceLabel =
-    a.source === "synthetic" ? `合成データ (シード ${a.seed})` : a.source === "jupiter" ? "Jupiter (GeckoTerminal の足)" : `ccxt ${config.env.CCXT_EXCHANGE}`;
+  const sourceLabel = spec ? spec.label(ctx) : `合成データ (シード ${a.seed})`;
   const common = {
     ...a,
     symbol,
@@ -616,7 +610,7 @@ async function cmdBacktest(flags: ParsedArgs["flags"], io: Io): Promise<number> 
     maxPositionPct: config.risk.maxPositionPct,
     // 指値 (maker) の前提を実運用 (LIMIT_ENTRY / LIMIT_TAKE_PROFIT。利確の指値は現在の mode で有効なときだけ) に合わせる。
     // Jupiter は成行 (スワップ) だけなので指値なし
-    ...(a.source === "jupiter" ? {} : { limitOrders: limitOrdersFromEnv(config.env, config.mode) }),
+    ...(spec?.marketOnly ? {} : { limitOrders: limitOrdersFromEnv(config.env, config.mode) }),
   };
   if (a.structureCompare) {
     const folds = a.folds ?? 5;
@@ -644,6 +638,34 @@ async function cmdBacktest(flags: ParsedArgs["flags"], io: Io): Promise<number> 
   io.out("※ 損益はクオート通貨建て (初期評価額 1,000,000)。期間の前にウォームアップ用の足を付けています。");
   return 0;
 }
+
+/** trader が登録する backtest の足の取得元の文脈 */
+interface BacktestSourceCtx {
+  config: AppConfig;
+  args: BacktestArgs;
+  io: Io;
+}
+
+/** trader の backtest の足の取得元: ccxt (CCXT_EXCHANGE の足)・jupiter (GeckoTerminal の最良のプールの足。成行だけ) */
+const TRADER_BACKTEST_SOURCES: BacktestSourceSpec<BacktestSourceCtx>[] = [
+  {
+    name: "ccxt",
+    label: ({ config }) => `ccxt ${config.env.CCXT_EXCHANGE}`,
+    async open({ config, args, io }) {
+      io.out(`ccxt (${config.env.CCXT_EXCHANGE}) から履歴を取得します...`);
+      const feed = CcxtFeed.create(config.env.CCXT_EXCHANGE);
+      const symbol = args.symbol ?? (["bitflyer", "bitbank", "coincheck", "zaif"].includes(config.env.CCXT_EXCHANGE) ? "BTC/JPY" : "BTC/USDT");
+      return { feed, symbol };
+    },
+  },
+  {
+    name: "jupiter",
+    label: () => "Jupiter (GeckoTerminal の足)",
+    open: ({ config, args, io }) => jupiterBacktestFeed(config, args.token ?? "SOL", args.days, io),
+    marketOnly: true,
+  },
+];
+for (const spec of TRADER_BACKTEST_SOURCES) registerBacktestSource(spec);
 
 /**
  * backtest --source jupiter: トークン (mint か symbol) を解決し、GeckoTerminal の最良のプールの足を返す feed を作る。

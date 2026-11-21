@@ -1,9 +1,13 @@
-/** CLI の backtest コマンド (合成データ・ccxt の履歴で runBacktest) */
+/**
+ * CLI の backtest コマンド (合成データ・feed の履歴で runBacktest)。
+ * 足の取得元は synthetic (合成データ) か feed (o.feed)。アプリは取得元の名前を登録する (trader: ccxt・jupiter。registerBacktestSource)
+ */
 import { generateCandles, syntheticInstrument } from "../backtest/synthetic";
 import { runBacktest } from "../backtest/engine";
 import type { BacktestMetrics, BacktestOptions } from "../backtest/types";
 import { TIMEFRAME_MS, type Candle, type Instrument, type MarketDataFeed, type Strategy, type Timeframe } from "../core/types";
 import { mergeCandles } from "../market/candles";
+import { enabledAssetClasses } from "../core/assetClasses";
 import { ALL_STRATEGIES, getStrategy } from "../strategies/registry";
 import { fmtNum, fmtPct, formatTable } from "./report";
 import { isHoldLimitedHorizon } from "./tempo";
@@ -85,8 +89,40 @@ export async function fetchCandlesPaged(
   return out;
 }
 
-/** 足の取得元。ccxt は o.feed (CcxtFeed)、jupiter は o.feed (GeckoHistoryFeed: GeckoTerminal のプールの OHLCV) から履歴を取る */
-export type BacktestSource = "synthetic" | "ccxt" | "jupiter";
+/**
+ * 足の取得元。synthetic は合成データ、それ以外 ("feed"・アプリが登録した名前。trader の ccxt は CcxtFeed、jupiter は
+ * GeckoHistoryFeed) は o.feed から履歴を取る
+ */
+export type BacktestSource = "synthetic" | "feed" | (string & {});
+
+/** アプリが登録する足の取得元 (CLI の --source)。Ctx はアプリの CLI の文脈 (設定・引数・出力) */
+export interface BacktestSourceSpec<Ctx = never> {
+  name: string;
+  /** 表示名 (例: "ccxt bitbank") */
+  label(ctx: Ctx): string;
+  /** 履歴の feed と既定の銘柄を用意する */
+  open(ctx: Ctx): Promise<{ feed: MarketDataFeed; symbol: string }>;
+  /** 指値を使わない (成行だけの取引先) */
+  marketOnly?: boolean;
+}
+
+const BACKTEST_SOURCES = new Map<string, BacktestSourceSpec<any>>();
+
+/** 足の取得元を登録する (同じ名前は上書き。"synthetic" / "feed" は登録できない) */
+export function registerBacktestSource<Ctx>(spec: BacktestSourceSpec<Ctx>): void {
+  if (spec.name === "synthetic" || spec.name === "feed") throw new Error(`${spec.name} はコアの取得元です`);
+  BACKTEST_SOURCES.set(spec.name, spec);
+}
+
+/** 登録した取得元 (無ければ undefined) */
+export function backtestSourceSpec<Ctx>(name: string): BacktestSourceSpec<Ctx> | undefined {
+  return BACKTEST_SOURCES.get(name);
+}
+
+/** CLI で選べる取得元の名前 (synthetic + 登録順) */
+export function backtestSourceNames(): string[] {
+  return ["synthetic", ...BACKTEST_SOURCES.keys()];
+}
 
 export interface BacktestData {
   base: Timeframe;
@@ -127,7 +163,8 @@ export async function createBacktestDataLoader(o: Pick<BacktestCommandOptions, "
         const key = `syn|${base}|${bars}`;
         const candles = cache.get(key) ?? generateCandles({ seed: o.seed, bars, timeframe: base, vol: syntheticVolFor(base), startTs: BACKTEST_SYNTHETIC_START });
         cache.set(key, candles);
-        const cls = s.assetClasses.includes("crypto") ? "crypto" : s.assetClasses[0];
+        // アプリが使う資産クラスのうち戦略が対応する最初のもの (trader は crypto 優先)
+        const cls = enabledAssetClasses().find((c) => s.assetClasses.includes(c)) ?? s.assetClasses[0];
         const instrument = syntheticInstrument({ symbol: o.symbol ?? "SYN/USDT", assetClass: cls });
         return { base, candles, instrument, tradeFromTs: BACKTEST_SYNTHETIC_START + warmupMs };
       }

@@ -3,9 +3,8 @@ import type { IntelItem } from "../../core/types";
 import { tagAssets, type TagOptions } from "../assetTagger";
 import { defaultFetchText, intelId, stripHtml, type FetchTextFn, type IntelSource } from "./common";
 
+/** 資産クラスによらない既定の RSS (経済・ビジネスのニュース)。アプリは createRssSources の defaults で自分の一覧を渡す */
 export const DEFAULT_RSS_FEEDS = [
-  "https://www.coindesk.com/arc/outboundfeeds/rss/",
-  "https://cointelegraph.com/rss",
   "https://www.cnbc.com/id/100003114/device/rss/rss.html",
   "https://feeds.bbci.co.uk/news/business/rss.xml",
 ];
@@ -117,9 +116,13 @@ export function createRssSource(opts: RssSourceOptions): IntelSource {
   return { id, fetch: async (now) => parseFeed(await get(opts.url), { source: id, now, tag: opts.tag }) };
 }
 
+/**
+ * NEWS_RSS_FEEDS (env) と既定の一覧 (defaults。省略時は DEFAULT_RSS_FEEDS) から RSS の情報源を作る。
+ * env の先頭が "=" なら既定を置き換え、それ以外は既定に追加
+ */
 export function createRssSources(
-  opts: { env?: string; fetchText?: FetchTextFn; tag?: TagOptions } = {},
+  opts: { env?: string; defaults?: string[]; fetchText?: FetchTextFn; tag?: TagOptions } = {},
 ): IntelSource[] {
   const env = opts.env ?? process.env.NEWS_RSS_FEEDS;
-  return resolveFeedUrls(env).map((url) => createRssSource({ url, fetchText: opts.fetchText, tag: opts.tag }));
+  return resolveFeedUrls(env, opts.defaults ?? DEFAULT_RSS_FEEDS).map((url) => createRssSource({ url, fetchText: opts.fetchText, tag: opts.tag }));
 }

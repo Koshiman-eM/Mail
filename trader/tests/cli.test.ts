@@ -11,7 +11,7 @@ import { loadConfig } from "../src/appConfig";
 import type { Candle } from "../src/core/types";
 import { fetchCandlesPaged, formatBacktestRows, runBacktestCommand } from "../src/engine/backtestCommand";
 import { exitFxRates, formatTable, strWidth, summarizeByStrategy } from "../src/engine/report";
-import { formatSimulationReport, runSimulation } from "../src/engine/simulate";
+import { formatSimulationReport, runSimulation } from "../src/simulation";
 import { RiskManager } from "../src/risk/manager";
 import { MemoryStore } from "../src/storage/memory";
 
