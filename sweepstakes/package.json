@@ -1,0 +1,28 @@
+{
+  "name": "sweepstakes-auto-entry",
+  "private": true,
+  "version": "0.1.0",
+  "description": "懸賞の収集・採点・Webフォーム自動応募 (ガード付き) と手動タスクのリスト化",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "bin": {
+    "sweep": "./bin/sweep.mjs"
+  },
+  "scripts": {
+    "sweep": "node --disable-warning=ExperimentalWarning --import tsx src/cli.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "playwright": "1.63.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^5.1.1"
+  }
+}

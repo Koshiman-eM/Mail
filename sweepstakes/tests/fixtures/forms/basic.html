@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8"><title>プレゼントキャンペーン応募フォーム (合成データ)</title>
+<style>.hp { position: absolute; left: -9999px; display: none; }</style>
+</head>
+<body>
+<h1>秋の合成プレゼントキャンペーン</h1>
+<p>必要事項をご入力のうえ、ご応募ください。</p>
+<form action="/submit" method="post">
+  <table>
+    <tr><th>お名前 <span>必須</span></th>
+      <td>姓 <input type="text" name="sei" required> 名 <input type="text" name="mei" required></td></tr>
+    <tr><th>フリガナ <span>必須</span></th>
+      <td>セイ <input type="text" name="sei_kana" required> メイ <input type="text" name="mei_kana" required></td></tr>
+    <tr><th>郵便番号 <span>必須</span></th>
+      <td><input type="text" name="zip" placeholder="1000001" maxlength="7" required></td></tr>
+    <tr><th>都道府県 <span>必須</span></th>
+      <td><select name="pref" required>
+        <option value="">選択してください</option>
+        <option value="1">北海道</option><option value="13">東京都</option>
+        <option value="27">大阪府</option><option value="47">沖縄県</option>
+      </select></td></tr>
+    <tr><th>市区町村 <span>必須</span></th><td><input type="text" name="city" required></td></tr>
+    <tr><th>番地 <span>必須</span></th><td><input type="text" name="addr1" required></td></tr>
+    <tr><th>建物名</th><td><input type="text" name="addr2"></td></tr>
+    <tr><th>電話番号 <span>必須</span></th><td><input type="tel" name="tel" required></td></tr>
+    <tr><th>メールアドレス <span>必須</span></th><td><input type="email" name="email" required></td></tr>
+    <tr><th>メールアドレス（確認） <span>必須</span></th><td><input type="email" name="email_confirm" required></td></tr>
+    <tr><th>生年月日 <span>必須</span></th>
+      <td>
+        <select name="birth_y" required><option value="">--</option><option>1989</option><option>1990</option><option>1991</option><option>2000</option></select>年
+        <select name="birth_m" required><option value="">--</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option><option value="9">9</option><option value="10">10</option><option value="11">11</option><option value="12">12</option></select>月
+        <select name="birth_d" required><option value="">--</option><option value="1">1</option><option value="2">2</option><option value="15">15</option><option value="31">31</option></select>日
+      </td></tr>
+    <tr><th>性別 <span>必須</span></th>
+      <td><label><input type="radio" name="gender" value="m" required>男性</label>
+          <label><input type="radio" name="gender" value="f">女性</label>
+          <label><input type="radio" name="gender" value="o">回答しない</label></td></tr>
+  </table>
+  <p><label><input type="checkbox" name="mailmag" value="1">メールマガジンを受け取る</label></p>
+  <p><label><input type="checkbox" name="agree" value="yes" required>応募規約に同意する</label></p>
+  <div class="hp"><input type="text" name="website" value=""></div>
+  <input type="hidden" name="campaign_code" value="AUTUMN">
+  <button type="reset">クリア</button>
+  <button type="submit">応募する</button>
+</form>
+</body></html>
