@@ -21,6 +21,7 @@ import {
   type Collector,
   type EnterResult,
 } from "./core/index.js";
+import { formatQuestMetrics, QUEST_USAGE, runQuestCommand } from "./questCli.js";
 
 const USAGE = `懸賞自動応募ツール
 
@@ -40,8 +41,12 @@ const USAGE = `懸賞自動応募ツール
   mark <id> [--note <メモ>]  手動タスクを完了として記録
   history [--limit <n>] 応募履歴
 
+  仮想通貨クエスト (手動登録。自動収集・ウォレット操作の自動化はしません):
+${QUEST_USAGE.replace(/^/gm, "  ")}
+
 環境変数: SWEEP_DB, SWEEP_PROFILE, SWEEP_SCREENSHOT_DIR, SWEEP_MIN_INTERVAL_SEC,
-          SWEEP_MAX_INTERVAL_SEC, SWEEP_DAILY_LIMIT, SWEEP_HEADLESS, SWEEP_CHROMIUM_PATH
+          SWEEP_MAX_INTERVAL_SEC, SWEEP_DAILY_LIMIT, SWEEP_HEADLESS, SWEEP_CHROMIUM_PATH,
+          SWEEP_USDJPY
 `;
 
 const STATUS_LABEL: Record<string, string> = {
@@ -85,6 +90,14 @@ async function main(argv: string[]): Promise<number> {
   if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") {
     console.log(USAGE);
     return 0;
+  }
+  if (cmd === "quest") {
+    const qctx = createContext({ log: (m) => console.log(m) });
+    try {
+      return await runQuestCommand(qctx, rest);
+    } finally {
+      qctx.store.close();
+    }
   }
   const { values, positionals } = parseArgs({
     args: rest,
@@ -180,6 +193,7 @@ async function main(argv: string[]): Promise<number> {
           console.log(`${i + 1}. [#${c.id}] ${kindLabel(c.kind)}: ${c.title}  (${left} / スコア ${c.score.toFixed(2)})`);
           console.log(`   ${c.url}`);
           if (c.prize) console.log(`   賞品: ${c.prize}`);
+          if (t.questMetrics) console.log(`   ${formatQuestMetrics(t.questMetrics)}`);
           t.steps.forEach((s, j) => console.log(`   ${j + 1}) ${s}`));
           if (t.warnings.length) console.log(`   [注意] ${t.warnings.join(" / ")}`);
           console.log(`   完了したら: sweep mark ${c.id}\n`);

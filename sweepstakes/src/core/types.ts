@@ -36,6 +36,39 @@ export interface Conditions {
   tags?: string[];
   /** 収集元の掲載ページ URL (url は応募先。両者が異なる場合に保存) */
   sourceUrl?: string;
+  /** 手動登録した仮想通貨クエストの追加情報 (kind=crypto_quest, source=manual) */
+  quest?: QuestMeta;
+}
+
+// ---------------------------------------------------------------------------
+// 仮想通貨クエスト (手動登録)
+// ---------------------------------------------------------------------------
+
+export type QuestRewardType = "token" | "stablecoin" | "nft" | "points" | "whitelist" | "other";
+export const QUEST_REWARD_TYPES: readonly QuestRewardType[] = ["token", "stablecoin", "nft", "points", "whitelist", "other"];
+
+/** raffle: 抽選 / fcfs: 先着 / all: 全員 / leaderboard: 順位制 */
+export type QuestDistribution = "raffle" | "fcfs" | "all" | "leaderboard";
+export const QUEST_DISTRIBUTIONS: readonly QuestDistribution[] = ["raffle", "fcfs", "all", "leaderboard"];
+
+/** 円換算の根拠 */
+export type QuestValueSource = "direct" | "usdjpy" | "jpy" | "unknown";
+
+export interface QuestMeta {
+  rewardType: QuestRewardType;
+  rewardAmount?: number | null;
+  /** USD / USDT / USDC / JPY / トークン記号 (大文字) */
+  rewardCurrency?: string | null;
+  /** 利用者が直接指定した円換算額 (指定があれば換算より優先) */
+  rewardValueJpyManual?: number | null;
+  /** 円換算に使った USD/JPY レート */
+  usdJpy?: number | null;
+  valueSource: QuestValueSource;
+  distribution: QuestDistribution;
+  requiresOnchainTx: boolean;
+  gasCostJpy?: number | null;
+  /** --fetch で取得した日時 (ISO) */
+  fetchedAt?: string | null;
 }
 
 export interface Campaign {

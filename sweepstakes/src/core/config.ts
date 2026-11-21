@@ -15,12 +15,20 @@ export interface Config {
   chromiumPath?: string;
   /** ページ操作のタイムアウト (ms) */
   navigationTimeoutMs: number;
+  /** USD/USDT/USDC → 円の換算レート (SWEEP_USDJPY)。未設定なら換算しない */
+  usdJpy: number | null;
 }
 
 function num(v: string | undefined, def: number): number {
   if (v === undefined || v.trim() === "") return def;
   const n = Number(v);
   return Number.isFinite(n) && n >= 0 ? n : def;
+}
+
+function positiveOrNull(v: string | undefined): number | null {
+  if (v === undefined || v.trim() === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : null;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -36,5 +44,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     headless: env.SWEEP_HEADLESS !== "0" && env.SWEEP_HEADLESS !== "false",
     chromiumPath: env.SWEEP_CHROMIUM_PATH || undefined,
     navigationTimeoutMs: num(env.SWEEP_NAV_TIMEOUT_MS, 30_000),
+    usdJpy: positiveOrNull(env.SWEEP_USDJPY),
   };
 }

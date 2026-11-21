@@ -9,6 +9,7 @@ export * from "./score.js";
 export * from "./fieldMapper.js";
 export * from "./formFiller.js";
 export * from "./todo.js";
+export * from "./quest.js";
 export * from "./service.js";
 export * from "../collectors/http.js";
 export * from "../collectors/koubo.js";

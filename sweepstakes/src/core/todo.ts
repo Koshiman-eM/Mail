@@ -1,6 +1,6 @@
 // X / Instagram / 仮想通貨クエストの「今日やること」リスト (純粋関数)
 // フォロー・RT・いいね・コメント・ウォレット署名などの自動操作は一切行わない。
-import { deadlineToDate, FLAG_LABELS, isExpired } from "./score.js";
+import { deadlineToDate, FLAG_LABELS, isExpired, questMetrics, type QuestMetrics } from "./score.js";
 import type { Campaign, ConditionStep, Entry } from "./types.js";
 
 const KIND_LABEL: Record<Campaign["kind"], string> = {
@@ -41,10 +41,30 @@ function stepText(kind: Campaign["kind"], s: ConditionStep): string {
   }
 }
 
+/** 仮想通貨クエストの手順の先頭に必ず付ける安全注意 */
+export const CRYPTO_SAFETY_NOTES: readonly string[] = [
+  "[安全] 懸賞専用のウォレットで行う (資産の入ったメインウォレットは接続しない)",
+  "[安全] シードフレーズ / 秘密鍵は絶対に入力しない (公式が求めることはありません)",
+  "[安全] approve / setApprovalForAll / 無制限承認の署名は拒否する",
+];
+
+/** オンチェーン操作がある場合のガス代の注意 */
+export function gasNote(gasCostJpy: number | null | undefined): string {
+  return gasCostJpy != null
+    ? `[ガス代] オンチェーン操作あり: 約 ${gasCostJpy} 円 (期待値から差し引き済み)`
+    : "[ガス代] オンチェーン操作あり: ガス代不明 (署名前にウォレットの表示で確認)";
+}
+
 /** conditions を人間向けの手順リストに整形する */
 export function formatSteps(c: Pick<Campaign, "kind" | "conditions" | "url">): string[] {
-  const steps = (c.conditions.steps ?? []).map((s) => stepText(c.kind, s));
-  if (!steps.length) steps.push(`${c.url} を開いて応募条件を確認する`);
+  const steps: string[] = [];
+  if (c.kind === "crypto_quest") {
+    steps.push(...CRYPTO_SAFETY_NOTES);
+    if (c.conditions.quest?.requiresOnchainTx) steps.push(gasNote(c.conditions.quest.gasCostJpy));
+  }
+  const actions = (c.conditions.steps ?? []).map((s) => stepText(c.kind, s));
+  steps.push(...actions);
+  if (!actions.length) steps.push(`${c.url} を開いて応募条件を確認する`);
   if (c.conditions.notes) steps.push(`注意: ${c.conditions.notes}`);
   return steps;
 }
@@ -55,6 +75,8 @@ export interface TodoItem {
   /** 締切までの残り時間 (時間)。締切なしは null */
   hoursLeft: number | null;
   warnings: string[];
+  /** 手動登録クエストの期待値・時給 */
+  questMetrics?: QuestMetrics;
 }
 
 /**
@@ -73,6 +95,7 @@ export function buildTodoList(campaigns: Campaign[], entries: Entry[], now: Date
         steps: formatSteps(c),
         hoursLeft: d ? Math.max(0, Math.round(((d.getTime() - now.getTime()) / 3_600_000) * 10) / 10) : null,
         warnings: c.riskFlags.map((f) => FLAG_LABELS[f] ?? f),
+        ...(c.kind === "crypto_quest" && c.conditions.quest ? { questMetrics: questMetrics({ ...c, quest: c.conditions.quest }) } : {}),
       };
     })
     .sort((a, b) => {

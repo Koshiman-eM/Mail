@@ -47,6 +47,7 @@ describe("checkDomain (タイポスクワット)", () => {
     ["rnetamask.io", "紛らわしい"],
     ["uniswap-airdrop.xyz", "公式名を含む"],
     ["claim-opensea.io", "公式名を含む"],
+    ["ga1xe-claim.xyz", "公式名を含む"],
     ["app.coinbasse.com", "綴り違い"],
   ])("偽物: %s", (h, why) => {
     const v = checkDomain(h);

@@ -32,6 +32,7 @@ npm test                             # テスト (外部サイトには一切ア
 | `SWEEP_HEADLESS` | `1` | `0` でブラウザを表示 |
 | `SWEEP_CHROMIUM_PATH` | なし | 使用する Chromium の実行ファイルを明示 |
 | `SWEEP_NAV_TIMEOUT_MS` | `30000` | ページ操作のタイムアウト |
+| `SWEEP_USDJPY` | なし | 仮想通貨クエストの USD / USDT / USDC 報酬を円換算するレート (例: `150`)。未設定なら換算せず「価値不明」 |
 
 ## profile.json
 
@@ -68,6 +69,9 @@ npm run sweep -- <コマンド>      # または ./bin/sweep.mjs <コマンド>
 | `todo` | X / Instagram / 仮想通貨クエストの「今日やること」(締切が近い順 → 同じ日ならスコア順) |
 | `mark <id> [--note <メモ>]` | 手動タスクを完了として記録 (todo から消える) |
 | `history [--limit n]` | 応募履歴 |
+| `quest add <url> [オプション] [--fetch]` | 仮想通貨クエストを手動登録 (詐欺チェック・採点) |
+| `quest update <id> [オプション] [--clear 項目,...]` | 登録済みクエストを更新して再採点 |
+| `quest list` | クエスト一覧 (時給の高い順、価値不明は末尾、除外は最後) |
 
 推奨の流れ:
 
@@ -108,6 +112,70 @@ npm run sweep -- todo           # SNS / クエストは手で実施して mark
 
 **注意**: koubo.jp の robots.txt は `User-Agent: *` に対して `Disallow: /contest/list?*` を指定しています (ファイル後半の 2 つ目の `User-Agent: *` グループ)。そのため一覧にはカテゴリページを使います。カテゴリページの構造が変わったらパーサー (`parseKouboList`) とフィクスチャ (`tests/fixtures/koubo/present_all.html`) を更新してください。
 
+## 仮想通貨クエストの手動登録 (`quest`)
+
+Galxe / Zealy などには誰でも使えるクエスト一覧 API がなく、非公開 API の利用は規約上避けるため、**クエストは自動収集しません**。
+URL と分かっている情報を登録すると、ツールが詐欺チェック・期待値の採点・締切管理・「今日やること」化を行います (kind=`crypto_quest`, source=`manual`)。
+コア関数は `addQuest(ctx, input, { fetch })` / `updateQuest(ctx, id, patch)` / `listQuests(ctx)` (`src/core/service.ts`) で、将来 MCP からも同じ関数を呼ぶ想定です。
+
+**ウォレット署名・トランザクション・SNS 操作の自動化は一切実装していません。** クエストの実施は必ず自分の手で行ってください。
+
+```bash
+export SWEEP_USDJPY=150
+npm run sweep -- quest add https://app.galxe.com/quest/xxxx/GCxxxx \
+  --title "Example Quest" --reward-type stablecoin --amount 100 --currency USDC \
+  --winners 50 --participants 5000 --distribution raffle --minutes 10 \
+  --deadline 2026-12-01 --onchain --gas-jpy 30
+npm run sweep -- quest update 12 --participants 8000 --clear gas-jpy
+npm run sweep -- quest list
+npm run sweep -- todo           # 手順と安全注意を確認して手で実施
+npm run sweep -- mark 12        # 終わったら完了記録
+```
+
+| オプション | 内容 |
+| --- | --- |
+| `--title` | タイトル (`--fetch` 時は未指定ならページの og:title / `<title>` で補完。それもなければ URL) |
+| `--reward-type` | `token` / `stablecoin` / `nft` / `points` / `whitelist` / `other` (既定 `other`) |
+| `--amount` / `--currency` | 報酬額と通貨 (`USD` `USDT` `USDC` `JPY` またはトークン記号) |
+| `--value-jpy` | 円換算額を直接指定 (換算より優先。points / NFT などの価値が分かる場合にも使う) |
+| `--winners` / `--participants` | 当選数 (先着枠) / 参加者数 |
+| `--distribution` | `raffle` (抽選・既定) / `fcfs` (先着) / `all` (全員) / `leaderboard` (順位制) |
+| `--minutes` | 所要時間 (分。既定 15) |
+| `--deadline` | 締切 (`YYYY-MM-DD` または ISO 8601) |
+| `--onchain` / `--no-onchain` | オンチェーン操作 (トランザクション) が必要か |
+| `--gas-jpy` | ガス代の見込み (円) |
+| `--notes` | メモ (詐欺チェックの対象にもなります) |
+| `--fetch` | (add のみ) URL を 1 回だけ取得 (後述) |
+| `--clear` | (update のみ) 値を消す: `amount,currency,value-jpy,winners,participants,minutes,deadline,gas-jpy,notes` |
+
+### 円換算
+
+- 直接指定 (`--value-jpy`) > `JPY` > `USD` / `USDT` / `USDC` × `SWEEP_USDJPY` の順
+- `SWEEP_USDJPY` が未設定なら換算できないため価値不明 (警告を表示)。update 時に未設定なら登録時のレートを使います
+- その他のトークンは自動換算しません (価格 API を使わないため)。`--value-jpy` がなければ価値不明
+- `points` / `nft` / `whitelist` は価値不明扱い (0 円ではなく null。表示は「価値不明」)
+
+### 採点
+
+- 期待値 (円): `raffle` = 価値 × 当選数 / max(参加者数, 1) (参加者数不明は 1000 人と仮定) / `fcfs` = 参加者数 < 枠なら価値そのもの、枠以上なら価値 × 0.01 (ほぼ 0) / `all` = 価値そのもの / `leaderboard` = 不明
+- 正味 = 期待値 − ガス代、時給換算 (円/時) = 正味 ÷ 所要分数 × 60 (赤字はマイナスのまま表示)
+- `score` (円/分) = 正味 ÷ 所要分数 × リスク減点係数。価値不明は 0。既存の `list` / `todo` の並び順にそのまま統合されます
+
+### `--fetch`
+
+- 既存の `PoliteFetcher` で robots.txt を確認してからページを 1 回だけ取得し、og:title / `<title>` / og:description / 本文テキスト (script・style は除く) を読みます
+- 本文テキストは詐欺チェックにかけ、`conditions.terms` に保存します (update 時の再チェックにも使用)
+- robots.txt で不許可・403・429・その他の取得失敗は取得を中止し、**登録は取得なしで続行**して警告を表示します
+- Galxe などは JavaScript で描画されるため、取得しても情報はほとんど得られないことがあります
+
+### 安全注意
+
+- **懸賞専用のウォレットを使う** (資産の入ったメインウォレットは接続しない)
+- **シードフレーズ / 秘密鍵は絶対に入力しない** (公式が求めることはありません)
+- **approve / setApprovalForAll / 無制限承認の署名は拒否する**
+- `todo` の仮想通貨クエストの手順には上記の注意が必ず先頭に付き、`--onchain` の場合はガス代も表示されます
+- 致命的な詐欺フラグ (偽ドメイン・シードフレーズ要求・無制限承認) が付いたクエストも記録はしますが、状態は「除外」になり `todo` に出ません。理由は `quest add` / `quest list` に表示されます
+
 ## 送信前ガード (`src/core/guards.ts`)
 
 ガードはすべて純粋関数で、以下のどれかに該当すると送信しません。
@@ -134,8 +202,8 @@ npm run sweep -- todo           # SNS / クエストは手で実施して mark
   - 締切切れは `expired`、致命的リスクは `excluded`、その他のリスクフラグは係数で減点
 - 仮想通貨クエストの詐欺チェック `checkCryptoScam()`
   - **致命的 (除外)**: 公式ドメインに似た偽ドメイン (TLD 違い・綴り違い・紛らわしい文字・公式名を含む別ドメイン・IDN)、シードフレーズ / 秘密鍵 / recovery phrase の入力要求、無制限承認
-  - **減点**: `approve` / `setApprovalForAll` / permit 等の承認要求
-  - 既知の公式ドメイン一覧は `KNOWN_OFFICIAL_DOMAINS` (必要に応じて追加してください)
+  - **減点**: `approve` / `setApprovalForAll` / permit 等の承認要求、既知のクエストプラットフォーム以外のドメイン (`unknown_platform`)
+  - 既知の公式ドメイン一覧は `KNOWN_OFFICIAL_DOMAINS`、正規のクエストプラットフォーム一覧は `QUEST_PLATFORM_DOMAINS` (galxe.com / zealy.io / layer3.xyz / taskon.xyz / intract.io / questn.com / quest3.xyz とそのサブドメイン)。必要に応じて追加してください
 
 ## Oracle Cloud (Arm / aarch64 Linux) での導入メモ
 
@@ -173,16 +241,18 @@ npx tsc --noEmit  # 型チェック
 ```
 
 - テストは `node:http` で `tests/fixtures/forms/` のフォーム HTML (合成データ) をローカル配信し、Playwright で検証します。ブラウザからの通信は `127.0.0.1` 以外を遮断しています
-- 検証内容: 公募ガイドの一覧/詳細パース・種別判定・締切切れ除外・403 で中止・robots Disallow で中止・取得間隔、通常フォームの入力・送信値、確認画面付き 2 段階フォーム、CAPTCHA → needs_manual、規約で自動応募禁止 → skipped、不明な必須欄 → needs_manual、dry-run で未送信、重複応募・日次上限・送信間隔、欄推定・採点・詐欺チェックの単体テスト
+- 検証内容: 公募ガイドの一覧/詳細パース・種別判定・締切切れ除外・403 で中止・robots Disallow で中止・取得間隔、通常フォームの入力・送信値、確認画面付き 2 段階フォーム、CAPTCHA → needs_manual、規約で自動応募禁止 → skipped、不明な必須欄 → needs_manual、dry-run で未送信、重複応募・日次上限・送信間隔、欄推定・採点・詐欺チェックの単体テスト、仮想通貨クエストの登録・更新・円換算・distribution 別期待値・ガス差し引き・時給・unknown_platform・致命フラグでの除外・`--fetch` (モック)・todo の安全注意・CLI 引数パース (`tests/quest.test.ts`)
 
 ## 構成
 
 ```
 src/
   cli.ts              CLI (薄いラッパー)
+  questCli.ts         CLI の quest サブコマンド (引数パース・表示)
   core/
     index.ts          公開 API (CLI / 将来の MCP から利用)
-    service.ts        collect / listCampaigns / enter / runAll / todo / mark / history
+    service.ts        collect / listCampaigns / enter / runAll / todo / mark / history / addQuest / updateQuest / listQuests
+    quest.ts          仮想通貨クエストの入力検証・円換算・ページ情報抽出・並び順 (純粋関数)
     types.ts          Campaign / Entry / Profile など
     config.ts         環境変数
     db.ts             node:sqlite の保存層 (URL で重複排除)

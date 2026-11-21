@@ -1,14 +1,27 @@
 // コア機能の公開 API。CLI や将来の MCP サーバーはこの関数群を呼ぶだけにする。
 import { chromium, type Browser } from "playwright";
 import { KouboCollector } from "../collectors/koubo.js";
-import type { FetchLike } from "../collectors/http.js";
+import { PoliteFetcher, type FetchLike } from "../collectors/http.js";
 import type { Collector } from "./collector.js";
 import { loadConfig, type Config } from "./config.js";
 import { Store } from "./db.js";
 import { attemptEntry, type AttemptResult, type FilledField } from "./formFiller.js";
 import { duplicateGuard, rateLimitGuard, startOfLocalDay } from "./guards.js";
 import { loadProfile } from "./profile.js";
-import { evaluateCampaign, isExpired, NEEDS_REVIEW_FLAG } from "./score.js";
+import {
+  applyQuestPatch,
+  buildQuestCampaignInput,
+  extractQuestPageInfo,
+  FETCHED_TEXT_MAX,
+  questInputFromCampaign,
+  questMetricsOf,
+  sortQuests,
+  validateQuestFields,
+  type QuestInput,
+  type QuestListItem,
+  type QuestPatch,
+} from "./quest.js";
+import { evaluateCampaign, FLAG_LABELS, isExpired, NEEDS_REVIEW_FLAG, type QuestMetrics } from "./score.js";
 import { buildTodoList, type TodoItem } from "./todo.js";
 import type { Campaign, CampaignKind, Entry, EntryStatus, Profile } from "./types.js";
 
@@ -150,6 +163,132 @@ export function history(ctx: SweepContext, opts: { limit?: number } = {}): Histo
     const c = ctx.store.getCampaign(e.campaignId);
     return { ...e, title: c?.title ?? "(削除済み)", url: c?.url ?? "", kind: c?.kind ?? "?" };
   });
+}
+
+// ---------------------------------------------------------------------------
+// 仮想通貨クエストの手動登録 (CLI / MCP の入口)
+// 自動収集はしない。ウォレット署名・トランザクション・SNS 操作の自動化も行わない。
+// ---------------------------------------------------------------------------
+
+export interface AddQuestOptions {
+  /** true のときだけ URL を 1 回取得してタイトル補完・本文の詐欺チェックを行う */
+  fetch?: boolean;
+  /** テスト用に fetch を差し替える */
+  fetchImpl?: FetchLike;
+}
+
+export interface QuestResult {
+  campaign: Campaign;
+  created: boolean;
+  /** 換算不能・取得失敗などの警告 */
+  warnings: string[];
+  /** 採点の根拠 (致命的リスクによる除外理由を含む) */
+  reasons: string[];
+  /** 詐欺チェックの詳細 */
+  scamDetails: string[];
+  metrics: QuestMetrics | null;
+  /** excluded の場合の理由 (表示用) */
+  excludedReason?: string;
+}
+
+function questResult(
+  ctx: SweepContext,
+  ev: ReturnType<typeof evaluateCampaign>,
+  warnings: string[],
+): QuestResult {
+  const { campaign, created } = ctx.store.upsertCampaign(ev, ctx.now());
+  const res: QuestResult = {
+    campaign,
+    created,
+    warnings,
+    reasons: ev.reasons,
+    scamDetails: ev.scamDetails,
+    metrics: questMetricsOf(campaign),
+  };
+  if (campaign.status === "excluded") {
+    const labels = campaign.riskFlags.map((f) => FLAG_LABELS[f] ?? f).join(", ");
+    res.excludedReason = labels || ev.reasons.join(" / "); // 詳細は scamDetails
+  }
+  return res;
+}
+
+/**
+ * 仮想通貨クエストを登録する (kind=crypto_quest, source=manual)。同じ URL があれば上書き更新。
+ * 致命的な詐欺フラグがあっても登録はし、status=excluded にする。
+ */
+export async function addQuest(ctx: SweepContext, input: QuestInput, opts: AddQuestOptions = {}): Promise<QuestResult> {
+  if (!input || typeof input.url !== "string" || !input.url.trim()) throw new Error("url は必須です");
+  const q = { ...input, url: input.url.trim() };
+  validateQuestFields(q);
+  const warnings: string[] = [];
+  const rewardType = q.rewardType ?? "other";
+  const distribution = q.distribution ?? "raffle";
+  if (!q.rewardType) warnings.push("rewardType 未指定のため other として登録しました");
+  if (!q.distribution) warnings.push("distribution 未指定のため raffle (抽選) として計算しました");
+
+  let fetchedText: string | null = null;
+  let fetchedAt: string | null = null;
+  let title = q.title;
+  if (opts.fetch) {
+    const fetcher = new PoliteFetcher({ fetch: opts.fetchImpl, sleep: ctx.sleep, random: ctx.random, log: ctx.log });
+    try {
+      const html = await fetcher.get(q.url);
+      const info = extractQuestPageInfo(html);
+      if (!title && info.title) title = info.title;
+      fetchedText = [info.title, info.description, info.text].filter(Boolean).join("\n").slice(0, FETCHED_TEXT_MAX) || null;
+      fetchedAt = ctx.now().toISOString();
+    } catch (e) {
+      warnings.push(`ページを取得できませんでした (取得なしで登録します): ${(e as Error).message}`);
+    }
+  }
+
+  const built = buildQuestCampaignInput(
+    { ...q, title, rewardType, distribution },
+    { usdJpy: ctx.config.usdJpy, fetchedText, fetchedAt },
+  );
+  warnings.push(...built.warnings);
+  return questResult(ctx, evaluateCampaign(built.input, ctx.now()), warnings);
+}
+
+const SCAM_CHECK_FLAGS: ReadonlySet<string> = new Set([
+  "typosquat_domain",
+  "seed_phrase_request",
+  "unlimited_approval",
+  "approval_request",
+  "unknown_platform",
+]);
+
+/** 登録済みクエストを部分更新して再採点する (undefined は変更なし、null は値を消す。URL は変更不可) */
+export function updateQuest(ctx: SweepContext, id: number, patch: QuestPatch): QuestResult {
+  const c = ctx.store.getCampaign(id);
+  if (!c) throw new Error(`キャンペーン #${id} が見つかりません`);
+  if (c.kind !== "crypto_quest") throw new Error(`#${id} は仮想通貨クエストではありません (${c.kind})`);
+  if ("url" in (patch as Record<string, unknown>)) throw new Error("URL は変更できません (別のクエストとして add してください)");
+  validateQuestFields(patch);
+  const merged = applyQuestPatch(questInputFromCampaign(c), patch);
+  const meta = c.conditions.quest;
+  // 換算レートは現在の SWEEP_USDJPY を優先し、未設定なら登録時のレートを使う
+  const built = buildQuestCampaignInput(merged, {
+    usdJpy: ctx.config.usdJpy ?? meta?.usdJpy ?? null,
+    fetchedText: c.conditions.terms ?? null,
+    fetchedAt: meta?.fetchedAt ?? null,
+  });
+  // 収集元の手順・タグなどは保持する
+  const { notes: _oldNotes, ...restConditions } = c.conditions;
+  void _oldNotes;
+  const input = {
+    ...built.input,
+    source: c.source,
+    conditions: { ...restConditions, ...built.input.conditions },
+    // 詐欺チェック由来のフラグは再計算するので外し、それ以外 (収集元が付けたもの) は保持
+    riskFlags: c.riskFlags.filter((f) => !SCAM_CHECK_FLAGS.has(f)),
+  };
+  return questResult(ctx, evaluateCampaign(input, ctx.now()), built.warnings);
+}
+
+/** 仮想通貨クエスト一覧 (対象 → その他、時給の高い順、価値不明は末尾) */
+export function listQuests(ctx: SweepContext): QuestListItem[] {
+  return sortQuests(ctx.store.listCampaigns({ kind: "crypto_quest" }).map((c) => ({ campaign: c, metrics: questMetricsOf(c) })));
 }
 
 // ---------------------------------------------------------------------------
