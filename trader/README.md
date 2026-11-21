@@ -14,6 +14,14 @@
 > - 実弾で運用する前に、必ず実データでバックテストとペーパー運用を十分に行ってください。少額から始めてください。
 > - 自分の資金を自分で運用する用途を想定しています。他人の資金を運用したり、売買シグナルを有償で提供したりする場合は、金融商品取引法上の登録 (投資運用業・投資助言業など) が必要になることがあります。
 
+## 共通コア (`packages/trading-core`)
+
+資産クラスによらない部分 (エンジン・リスク管理・学習・バックテスト・ダッシュボードなど) は、リポジトリの `packages/trading-core` (`@trading/core`) にあります。FX・株式のボットと共有するためです。trader は `"@trading/core": "file:../packages/trading-core"` で読み込み、`npm install` の postinstall がコアの実行時の依存を入れます。
+
+- trader の `src/` の多くのファイルは、コアの同じパスのファイルを再輸出するだけのファイルです。中身はコア側を見てください (`packages/trading-core/CLAUDE.md` に一覧)。
+- trader に残っているのは CLI・設定 (`src/appConfig.ts`)・組み立て (`src/engine/setup.ts`)・Jupiter / ccxt / bitbank の相場・暗号資産の情報源などです。
+- コアの試験: `cd ../packages/trading-core && npm install && npm test` (trader の `npm install` はコアの開発用の依存を入れないので、コアで `npm install` してから)。
+
 ## 全体の仕組み
 
 ```

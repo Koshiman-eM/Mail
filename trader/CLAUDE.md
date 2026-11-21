@@ -7,6 +7,14 @@
 - インターネットから情報を収集して戦略を立てる (`src/intel/`)。
 - 損益の要因を分析し、戦略配分・パラメータ・情報源の信頼度へフィードバックする (`src/learning/`)。
 
+### 共通コア (`packages/trading-core`)
+- 資産クラスによらない部分 (型・設定・リスク管理・エンジン・学習・バックテスト・ダッシュボードなど) は共通コア `@trading/core` (`../packages/trading-core/src/`) にある (FX・株式のボットと共有)。地図・不変条件は `packages/trading-core/CLAUDE.md`、FX・株式への移植は `packages/trading-core/docs/porting-guide.md`。
+- trader の `src/` の多くのファイル (`src/core/*`・`src/engine/engine.ts` など) は `export * from "@trading/core/<path>"` の 1 行の再輸出 (shim)。**中身を変えるときはコア側のファイルを直す** (コアの試験 `cd ../packages/trading-core && npm install && npm test` と trader の試験の両方を green に)。shim の一覧は `packages/trading-core/CLAUDE.md`。
+- trader に残るもの: `src/cli.ts`、設定 `src/appConfig.ts` (`defineAppConfig` で crypto・meme と VENUES / WATCHLIST / CCXT_* / JUPITER_* / GECKO_* / CRYPTOPANIC_TOKEN)、組み立て `src/engine/setup.ts` (`buildRuntime` → コアの `assembleRuntime`)、`src/execution/router.ts` (live は拒否)、`src/simulation.ts` (simulate の部品)、`src/intel/defaultSources.ts` と暗号資産の情報源 (coingecko・cryptopanic・fearGreed)、`src/market/feeds/{ccxt,bitbankCandles,jupiter,geckoHistory}.ts`、`src/market/jupiter/*`、`src/execution/jupiterFill.ts`、`src/engine/{jupiterWatch,fxRate}.ts`。
+- 資産クラスは `crypto`・`meme` を選んでいる (`src/appConfig.ts`。語彙は crypto / meme / fx / stock でクラス別の値はコアの `ASSET_CLASS_PROFILES`)。試験は `tests/setup.ts` で先に設定を読み込む。
+- 予想の Bonferroni のグループ数は `TRADER_FORECAST_LIVE_GROUPS` = 12 をエンジンに明示して固定している (`src/engine/setup.ts`)。
+- アプリのコードは decimal.js を直接 import しない (`@trading/core/core/decimal` 経由。コアの試験が検査する)。zod はコアの `z` (`src/core/config.ts` の再輸出) を使う。Jupiter の API の応答の解析 (`src/market/jupiter/` の parse・tokens・client・quote) だけは trader の zod を使う (コアのスキーマと合成しない)。
+
 ## 2. コマンド
 - `npm install` / `npm test` / `npm run typecheck`
 - `npm run simulate -- --days 1`: 合成データで高速にペーパー運転する (ネット不要)。構造フィルターの理由別の見送り数・エントリー/時・平均保有・テンポ・見送り件数・読みの答え合わせ・転換で決済の成績も表示
@@ -25,8 +33,8 @@
 - `npm run trader -- orders resolve <clientId> --none | --filled --qty <数量> --price <価格>`: 状態不明の注文を手動で確定する。escalated 以外は `--force` 必須。`--none` で取消に失敗したら保留のまま
 
 ## 3. 安全ガードレール (厳守)
-1. **実弾の二重ロック**: live になるのは `TRADING_MODE=live` と `LIVE_TRADING_CONFIRM=I_UNDERSTAND_REAL_MONEY_RISK` が揃ったときだけ (`src/core/config.ts` の `resolveMode`)。
-   - 実口座アダプターはコンストラクタの `assertLive` で、paper / test モードでの生成を拒否する (`src/execution/guard.ts`。いまは実口座アダプターが無いが、Jupiter の実弾のアダプターもこれを呼ぶ。試験 `tests/execution.guard.test.ts`)。
+1. **実弾の二重ロック**: live になるのは `TRADING_MODE=live` と `LIVE_TRADING_CONFIRM=I_UNDERSTAND_REAL_MONEY_RISK` が揃ったときだけ (コアの `src/core/config.ts` の `resolveMode`。アプリの設定は再定義できない)。
+   - 実口座アダプターはコンストラクタの `assertLive` で、paper / test モードでの生成を拒否する (コアの `src/execution/guard.ts`。いまは実口座アダプターが無いが、Jupiter の実弾のアダプターもこれを呼ぶ。試験はコアの `tests/execution.guard.test.ts`)。
    - このガードを弱める変更をしない。
 2. **テストは完全オフライン**: 実在の取引所・ブローカー・ニュース API へ送信しない。
    - fetch / ccxt インスタンスは注入してモックする。
@@ -139,6 +147,7 @@
    - 試験: `tests/jupiter.feed.test.ts` (ポーリング・backfill・出来高の取り込みで OHLC が変わらないこと・実行中の追加と削除)、`jupiter.fill.test.ts`、`jupiter.short.test.ts`、`jupiter.watch.test.ts`、`jupiter.backtest.test.ts` (7 日分の 1m・履歴が短いときの例外)、`jupiter.review.test.ts` (シンボルの保存 (TRUMP の重なり)・停止の保存・流動性の古さ・GeckoTerminal の再試行とキャッシュ・実際の代金のコスト・見積もりのキャッシュと中止・古い気配・USD/JPY の時刻・設定)、`fxRate.test.ts`、`strategies.volumeUnknown.test.ts`、`engine.jupiter.test.ts` (既定の VENUES・数時間の統合・ミームの流動性・互換の警告)。モックは `tests/helpers/jupiterMock.ts`。
 
 ## 4. 構成
+(ここに挙げるパスのうち、上の「共通コア」に挙げた trader に残るもの以外は、実体が `packages/trading-core/src/` の同じパスにある)
 - `src/core/`: 型の契約 (`types.ts`)、設定、decimal、HTTP リトライ、Claude 呼び出し (`ai.ts`。構造化出力、拒否時はサーバー側フォールバック、キー未設定時はルールベース)
 - `src/strategies/labels.ts`: 戦略・時間軸・腕のキーの日本語の表示名 (表示専用。id・kv キー・env の値・腕のキーは変えない。long / short は長期 / 短期の意味で売買の向きではない)。画面・レポートはここを通す
 - `src/indicators/`, `src/regime/`: 指標・リサンプル・相場環境の判定
