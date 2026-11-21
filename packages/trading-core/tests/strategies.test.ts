@@ -405,3 +405,19 @@ describe("全戦略共通", () => {
     }
   });
 });
+
+describe("withAssetClasses / selectStrategies (アプリが資産クラスを選ぶ)", async () => {
+  const { selectStrategies, withAssetClasses, getStrategy } = await import("../src/strategies/registry");
+  it("id とパラメータはそのままで資産クラスだけ置き換える", () => {
+    const base = getStrategy("short_ema_trend")!;
+    const fx = withAssetClasses(base, ["fx"]);
+    expect(fx.id).toBe("short_ema_trend");
+    expect(fx.assetClasses).toEqual(["fx"]);
+    expect(fx.defaultParams).toEqual(base.defaultParams);
+    expect(base.assetClasses).toEqual(["crypto", "meme"]);
+    expect(selectStrategies(["short_breakout", "pullback_15m"], ["stock"]).map((s) => [s.id, s.assetClasses])).toEqual([
+      ["short_breakout", ["stock"]], ["pullback_15m", ["stock"]],
+    ]);
+    expect(() => selectStrategies(["nope"])).toThrow(/未知の戦略/);
+  });
+});

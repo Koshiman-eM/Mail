@@ -54,8 +54,13 @@ export interface RuntimeAssembly {
   paperBroker?: BrokerDeps["paper"];
   /** 情報源 (省略時は情報収集なし) */
   intelSources?: IntelSource[];
-  /** 戦略の一覧 (省略時は登録戦略に構造フィルターを掛けたもの configuredStrategies) */
+  /** 戦略の一覧 (そのまま使う。構造フィルターは掛けない) */
   strategies?: readonly Strategy[];
+  /**
+   * 構造フィルター (STRUCTURE_MODE) を掛ける前の戦略の一覧 (省略時は登録戦略 ALL_STRATEGIES)。
+   * FX・株式は selectStrategies / withAssetClasses で自分の資産クラスの一覧を作って渡す
+   */
+  strategyBase?: readonly Strategy[];
   /** 取引時間 (省略時は常に開いている) */
   calendar?: MarketCalendar;
   /** 建玉の保有コスト (省略時は再現した空売りの借入コスト) */
@@ -145,7 +150,7 @@ export function hubTimeframesFor(
  * 設定の警告 (相場構造・転換で決済・観測専用の戦略 id) を出し、戦略の一覧を決める
  * (opts / assembly の strategies があればそのまま。無ければ登録戦略に構造フィルターを掛けたもの)
  */
-export function resolveStrategies(config: AppConfig, log: Logger, given?: readonly Strategy[]): readonly Strategy[] {
+export function resolveStrategies(config: AppConfig, log: Logger, given?: readonly Strategy[], base?: readonly Strategy[]): readonly Strategy[] {
   const env = config.env;
   // 相場構造のフィルター (STRUCTURE_MODE) は戦略のラップで掛ける。エンジン・パラメータ検証・計画が同じラップ済みの一覧を使う
   const structureSettings = structureSettingsFromEnv(env);
@@ -156,7 +161,7 @@ export function resolveStrategies(config: AppConfig, log: Logger, given?: readon
   for (const w of reversalConfigWarnings(reversalSettings, knownIds, env.STRUCTURE_EXIT_ON_REVERSAL === true)) log.warn(w);
   // 観測専用 (OBSERVE_ONLY_STRATEGIES): 廃止した戦略・未登録の id は警告する (集合の判定なので、残っていても何も起きない)
   for (const w of strategyIdListWarnings("OBSERVE_ONLY_STRATEGIES", env.OBSERVE_ONLY_STRATEGIES, knownIds)) log.warn(w);
-  return given ?? configuredStrategies(structureSettings);
+  return given ?? configuredStrategies(structureSettings, base);
 }
 
 /** アプリの部品 (assembly) とコアの部品から実行に必要な一式を組み立てる */
@@ -164,7 +169,7 @@ export async function assembleRuntime<C extends AppConfig>(config: C, assembly: 
   const log = opts.logger ?? createLogger("setup");
   const env = config.env;
   const clock = opts.clock ?? systemClock;
-  const strategies = resolveStrategies(config, log, opts.strategies ?? assembly.strategies);
+  const strategies = resolveStrategies(config, log, opts.strategies ?? assembly.strategies, assembly.strategyBase);
   const reversalSettings = reversalSettingsFromEnv(env);
   // live の発注先が無ければ、feed・DB に触れる前に起動を止める (fail-closed)。テストの偽の live ブローカー (opts.brokerSet) は通す
   if (config.mode === "live" && !opts.brokerSet && !assembly.createLiveBrokers) throw new Error(NO_LIVE_BROKERS_MESSAGE);
