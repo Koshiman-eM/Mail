@@ -1,6 +1,6 @@
 /** Jupiter の配線のレビュー指摘の修正の試験 (H1・H2・M1・M2・M4・M5・M6・L1・L2・L4・L5) */
 import { describe, expect, it } from "vitest";
-import { DEFAULT_RISK, loadConfig } from "../src/appConfig";
+import { loadConfig } from "../src/appConfig";
 import { D } from "../src/core/decimal";
 import type { Instrument, Quote, Signal } from "../src/core/types";
 import { createFxConverter, fxApproxReason } from "../src/engine/fx";
@@ -16,6 +16,8 @@ import { RiskManager } from "../src/risk/manager";
 import { MemoryStore } from "../src/storage/memory";
 import { createMockFetch, fakeClock } from "./fixtures/jupiter/mockFetch";
 import { BONK, createJupiterMock, MEMEA, MEMEB, SOL, USDC, type MockToken } from "./helpers/jupiterMock";
+
+const DEFAULT_RISK = loadConfig({}).risk;
 
 const T0 = Date.UTC(2026, 10, 20, 0, 0, 0);
 const MIN = 60_000;

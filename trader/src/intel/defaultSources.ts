@@ -8,7 +8,7 @@ import { createFearGreedSource } from "./sources/fearGreed";
 import { createRssSources } from "./sources/rss";
 
 /** trader の既定の RSS (NEWS_RSS_FEEDS の先頭 "=" で置き換え、それ以外は追加) */
-export const TRADER_RSS_FEEDS = [
+const TRADER_RSS_FEEDS = [
   "https://www.coindesk.com/arc/outboundfeeds/rss/",
   "https://cointelegraph.com/rss",
   "https://www.cnbc.com/id/100003114/device/rss/rss.html",

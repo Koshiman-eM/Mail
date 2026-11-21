@@ -4,7 +4,7 @@
  */
 import { loadConfig, type AppConfig } from "./appConfig";
 import {
-  assertSimulationDb as coreAssertSimulationDb, runSimulation as coreRunSimulation, simulationConfig as coreSimulationConfig,
+  assertSimulationDb as coreAssertSimulationDb, runSimulation as coreRunSimulation,
   type SimulationOptions, type SimulationRuntimeFactory,
 } from "./engine/simulate";
 import { buildRuntime, syntheticDbPath, type Runtime } from "./engine/setup";
@@ -12,7 +12,7 @@ import { buildRuntime, syntheticDbPath, type Runtime } from "./engine/setup";
 export * from "./engine/simulate";
 
 /** trader の simulate の部品 */
-export const TRADER_SIMULATION_FACTORY: SimulationRuntimeFactory = {
+const TRADER_SIMULATION_FACTORY: SimulationRuntimeFactory = {
   loadConfig: (env) => loadConfig(env),
   simulationEnv: { VENUES: "synthetic", WATCHLIST: "" },
   // 実運転用の DB_PATH と、その合成データ用 (<ベース名>-synthetic.db) は使えない
@@ -31,9 +31,4 @@ export async function runSimulation(
 /** simulate が使えない DB か (DB_PATH と合成データ用の DB は拒否) */
 export function assertSimulationDb(db: string, env: Record<string, string | undefined>): void {
   coreAssertSimulationDb(TRADER_SIMULATION_FACTORY, db, env);
-}
-
-/** シミュレーション用の設定 (paper・synthetic・AI なしに固定) */
-export function simulationConfig(env: Record<string, string | undefined>, db: string): AppConfig {
-  return coreSimulationConfig(TRADER_SIMULATION_FACTORY, env, db) as AppConfig;
 }

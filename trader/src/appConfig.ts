@@ -4,8 +4,6 @@
  * 使う資産クラスは crypto・meme。実弾の二重ロック・リスク上限などのコアの環境変数はここで定義しない (再定義すると例外)。
  */
 import { defineAppConfig, envHelpers, type AppConfig as CoreAppConfig, type CoreEnv } from "./core/config";
-import type { RiskSettingKey } from "./core/config";
-import type { RiskLimits } from "./core/types";
 
 export * from "./core/config";
 
@@ -84,9 +82,6 @@ export function loadConfig(source: Record<string, string | undefined> = process.
   return definition.loadConfig(source) as AppConfig;
 }
 
-export const DEFAULT_RISK: RiskLimits = definition.defaultRisk;
-/** ダッシュボード・CLI のリスク項目 (画面・CLI に出す順。資産クラスの上限は crypto・meme) */
-export const RISK_SETTING_KEYS: readonly RiskSettingKey[] = definition.riskSettingKeys;
 
 /**
  * 廃止した環境変数 (読まない)。.env に残っていても起動は止めず、status と run の起動時に知らせるだけ。

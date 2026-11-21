@@ -23,11 +23,12 @@ import { armKey, armKeyOf, armStateKey, StrategyAllocator } from "../src/learnin
 import { summarizeShadowTrades } from "../src/learning/shadow";
 import { learnableTrades } from "../src/learning/tuner";
 import { mulberry32, SyntheticFeed } from "../src/market/feeds/synthetic";
-import { DEFAULT_RISK } from "../src/appConfig";
 import { RiskManager } from "../src/risk/manager";
 import { MemoryStore } from "../src/storage/memory";
 import { buildEntrySignal } from "../src/strategies/common";
 import { FakeLiveBroker } from "./helpers/fakeLiveBroker";
+
+const DEFAULT_RISK = loadConfig({}).risk;
 
 const MIN = 60_000;
 const DAY = 86_400_000;

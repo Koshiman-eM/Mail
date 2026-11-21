@@ -5,7 +5,7 @@ import { TRADER_ASSET_CLASSES, type AppConfig } from "../appConfig";
 import { ASSET_CLASSES as ALL_ASSET_CLASSES } from "../core/assetClasses";
 import { createLogger, type Logger } from "../core/logger";
 import { systemClock, type AssetClass, type Clock, type Instrument, type MarketDataFeed, type Store, type Timeframe, type TradingMode } from "../core/types";
-import { LIVE_UNSUPPORTED_MESSAGE } from "../execution/router";
+import { createBrokers, LIVE_UNSUPPORTED_MESSAGE } from "../execution/router";
 import { createJupiterFillPricer } from "../execution/jupiterFill";
 import type { PaperSnapshot } from "../execution/paper";
 import { TradeJournal } from "../learning/journal";
@@ -187,7 +187,7 @@ export interface Runtime extends CoreRuntime<AppConfig> {
  * trader が使う資産クラスは crypto・meme の 2 つだが、保存済みの予想の LIVE の状態はこの 12 グループ (入る z ≥ 2.638) で
  * 判定してきたので固定する (6 グループに減らすと入る z ≈ 2.39 に緩む)。変えないこと
  */
-export const TRADER_FORECAST_LIVE_GROUPS = 3 * FORECAST_ASSET_CLASS_COUNT;
+const TRADER_FORECAST_LIVE_GROUPS = 3 * FORECAST_ASSET_CLASS_COUNT;
 
 const withClass = (inst: Instrument, cls?: AssetClass): Instrument => (cls && cls !== inst.assetClass ? { ...inst, assetClass: cls } : inst);
 
@@ -292,6 +292,8 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
     config,
     {
       markets,
+      // live の発注先: いまは無い (createBrokers の live の分岐は常に例外。Jupiter の実弾のアダプターはここに加える)
+      createLiveBrokers: ({ instruments }) => createBrokers(config, instruments),
       intelSources: createDefaultSources({ env: { NEWS_RSS_FEEDS: env.NEWS_RSS_FEEDS, CRYPTOPANIC_TOKEN: env.CRYPTOPANIC_TOKEN } }),
       // Jupiter は自動探索で後から crypto・meme の銘柄が増えるので、両方の資産クラスの時間足を取る
       ...(j ? { extraTimeframeClasses: ["crypto", "meme"] as AssetClass[], onTimeframes: (tfs: Timeframe[]) => j.feed.setTimeframes(tfs) } : {}),

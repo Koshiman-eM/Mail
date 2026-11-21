@@ -222,9 +222,7 @@ describe("エンジンの値動きの予想", () => {
 });
 
 describe("予想の多重検定のグループ数 (trader は 12 に固定)", async () => {
-  const { TRADER_FORECAST_LIVE_GROUPS } = await import("../src/engine/setup");
-  it("TRADER_FORECAST_LIVE_GROUPS = 3 × 4 = 12 をエンジンに渡す (入る z ≈ 2.638)", async () => {
-    expect(TRADER_FORECAST_LIVE_GROUPS).toBe(12);
+  it("liveGroups = 3 × 4 = 12 をエンジンに渡す (入る z ≈ 2.638)", async () => {
     const { rt } = await runtime({});
     const o = rt.engine.forecast!.summary(Date.UTC(2026, 0, 5)).options;
     expect(o.liveGroups).toBe(12);
