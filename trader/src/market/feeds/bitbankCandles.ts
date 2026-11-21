@@ -17,13 +17,7 @@
  */
 import type { Candle, Timeframe } from "../../core/types";
 import { TIMEFRAME_MS } from "../../core/types";
-
-const HOUR = 3_600_000;
-const DAY = 86_400_000;
-const JST_OFFSET = 9 * HOUR;
-
-/** bitbank の時間足の種類 */
-type FileKind = "day" | "year";
+import { collectFileCandles, DAY, fileKeyOf, JST_OFFSET, maxFilesFor, utcDayStart, utcYear, type FileKind } from "../fileCandles";
 
 /** bitbank が提供する時間足とファイルの単位 (公式仕様: 1min〜1hour は YYYYMMDD、4hour 以上は YYYY) */
 export const BITBANK_FILE_KIND: Partial<Record<Timeframe, FileKind>> = {
@@ -53,16 +47,6 @@ export interface BitbankFetchContext {
   /** 既に判定済みの境界 (kind ごと) */
   boundary: Partial<Record<FileKind, BitbankBoundary>>;
 }
-
-const pad = (n: number, w = 2) => String(n).padStart(w, "0");
-
-/** UTC 日の 0 時 (ms) */
-const utcDayStart = (t: number) => Math.floor(t / DAY) * DAY;
-const dayKey = (dayStart: number) => {
-  const d = new Date(dayStart);
-  return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}`;
-};
-const utcYear = (t: number) => new Date(t).getUTCFullYear();
 
 /**
  * 存在しない日付 (未来日・上場前・データなし) を表すエラーか。
@@ -127,9 +111,6 @@ function fileRange(kind: FileKind, boundary: BitbankBoundary | undefined, t: num
   return { oldest: Math.min(utcVal, jstVal), newest: Math.max(utcVal, jstVal) };
 }
 
-const step = (kind: FileKind) => (kind === "day" ? DAY : 1);
-const keyOf = (kind: FileKind, v: number) => (kind === "day" ? dayKey(v) : String(v));
-
 /**
  * bitbank のローソク足を limit 本取得する。
  * - since なし: 最新のファイルから 1 つずつさかのぼり、limit 本そろうか上限ファイル数で止めて末尾 limit 本を返す。
@@ -146,51 +127,23 @@ export async function fetchBitbankCandles(
   const kind = BITBANK_FILE_KIND[tf];
   if (!kind) throw new Error(`bitbank は時間足 ${tf} のローソク足を提供していません`);
   const want = Math.max(1, Math.floor(limit));
-  const ms = TIMEFRAME_MS[tf];
-  const period = kind === "day" ? DAY : 365 * DAY;
-  // 必要なファイル数の見積もり (+2 は境界の隣接ファイル分)。上限は BITBANK_MAX_FILES
-  const maxFiles = Math.min(BITBANK_MAX_FILES[kind], Math.ceil((want * ms) / period) + 2);
-  const byTs = new Map<number, Candle>();
-
-  const take = async (v: number) => {
-    const key = keyOf(kind, v);
-    const rows = await fetchFile(ctx, symbol, tf, key);
-    if (!ctx.boundary[kind]) {
-      const b = detectBoundary(kind, tf, key, rows);
-      if (b) ctx.boundary[kind] = b;
-    }
-    for (const c of rows) byTs.set(c.ts, c);
-  };
-  const sorted = () => [...byTs.values()].sort((a, b) => a.ts - b.ts);
-
-  const newest = fileRange(kind, ctx.boundary[kind], ctx.now).newest;
-  if (since === undefined) {
-    let v = newest;
-    for (let n = 0; n < maxFiles; n++, v -= step(kind)) {
-      await take(v);
-      if (byTs.size >= want) break;
-    }
-    return sorted().slice(-want);
-  }
-
-  const oldest = fileRange(kind, ctx.boundary[kind], since).oldest;
-  let v = oldest;
-  for (let n = 0; n < maxFiles && v <= newest; n++, v += step(kind)) {
-    await take(v);
-    let count = 0;
-    for (const ts of byTs.keys()) if (ts >= since) count++;
-    if (count >= want) break;
-  }
-  return sorted()
-    .filter((c) => c.ts >= since)
-    .slice(0, want);
-}
-
-/**
- * hub の毎回更新で、同じ (銘柄, 時間足) のファイル再取得の最短間隔。
- * 足の長さの 1/60 (1m → 1 秒 = 毎回、5m → 5 秒、15m → 15 秒、1h → 1 分、4h → 4 分) で上限 5 分。
- * 間の現在足は hub が気配で更新し、足の境界をまたいだら間隔に関係なく取り直す (確定足は取得値になる)。
- */
-export function bitbankRefreshIntervalMs(tf: Timeframe): number {
-  return Math.min(5 * 60_000, Math.floor(TIMEFRAME_MS[tf] / 60));
+  return collectFileCandles(
+    {
+      kind,
+      want,
+      maxFiles: maxFilesFor(kind, BITBANK_MAX_FILES, want, tf),
+      newest: fileRange(kind, ctx.boundary[kind], ctx.now).newest,
+      oldestFor: (t) => fileRange(kind, ctx.boundary[kind], t).oldest,
+      take: async (v, byTs) => {
+        const key = fileKeyOf(kind, v);
+        const rows = await fetchFile(ctx, symbol, tf, key);
+        if (!ctx.boundary[kind]) {
+          const b = detectBoundary(kind, tf, key, rows);
+          if (b) ctx.boundary[kind] = b;
+        }
+        for (const c of rows) byTs.set(c.ts, c);
+      },
+    },
+    since,
+  );
 }

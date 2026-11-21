@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import type { Candle } from "../src/core/types";
 import { loadConfig } from "../src/core/config";
 import { GmoApiError, GmoClient } from "../src/market/gmo/client";
-import { fetchGmoKlines, gmoDayKey, GmoNoKlinesError } from "../src/market/gmo/klines";
+import { fetchGmoKlines, GmoNoKlinesError } from "../src/market/gmo/klines";
+import { utcDayKey } from "../src/market/fileCandles";
 import { GmoFeed } from "../src/market/feeds/gmo";
 import { buildRuntime } from "../src/engine/setup";
 import { MemoryStore } from "../src/storage/memory";
@@ -95,7 +96,7 @@ describe("fetchGmoKlines (日付ファイルのさかのぼり)", () => {
   });
 
   it("日付キーは UTC 日付", () => {
-    expect(gmoDayKey(Date.UTC(2025, 1, 3, 23, 59))).toBe("20250203");
+    expect(utcDayKey(Date.UTC(2025, 1, 3, 23, 59))).toBe("20250203");
   });
 });
 

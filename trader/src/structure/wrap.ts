@@ -71,10 +71,6 @@ export type StructureFilterReason =
   | "structure_po"
   | "structure_stop";
 
-export const STRUCTURE_FILTER_REASONS: readonly StructureFilterReason[] = [
-  "structure_none", "structure_weakening", "structure_choppy", "structure_bias", "structure_mtf", "structure_po", "structure_stop",
-];
-
 /**
  * 構造を計算する足の本数 (各時間足の直近)。hub の履歴 (historyLimit 300) とバックテストの既定 (300 本以上) に合わせ、
  * 運用とバックテストで同じ長さの窓になるようにする

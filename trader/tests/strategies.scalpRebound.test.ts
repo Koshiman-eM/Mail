@@ -1,20 +1,15 @@
 /** scalp_rebound (15m の下降トレンド中の 1m の反発を買う) の単体テスト。合成データのみ (オフライン) */
 import { describe, expect, it } from "vitest";
-import type { Candle, Instrument, PositionView, RegimeFeatures, Signal, StrategyContext } from "../src/core/types";
+import type { AssetClass, Candle, Horizon, Instrument, PositionView, RegimeFeatures, Signal, StrategyContext } from "../src/core/types";
 import { TIMEFRAME_MS } from "../src/core/types";
 import { generateCandles, syntheticInstrument } from "../src/backtest/synthetic";
 import { runBacktest } from "../src/backtest/engine";
-import {
-  ALL_STRATEGIES,
-  createScalpRebound,
-  detectRebound,
-  getStrategy,
-  resolveParams,
-  SCALP_REBOUND_HOLD_BOUNDS,
-  scalpRebound,
-  strategiesFor,
-  trendDown15m,
-} from "../src/strategies";
+import { ALL_STRATEGIES, getStrategy, resolveParams } from "../src/strategies/registry";
+import { createScalpRebound, detectRebound, SCALP_REBOUND_HOLD_BOUNDS, scalpRebound, trendDown15m } from "../src/strategies/scalpRebound";
+
+/** 資産クラス (と時間軸) に対応する戦略 (登録順) */
+const strategiesFor = (assetClass: AssetClass, horizon?: Horizon) =>
+  ALL_STRATEGIES.filter((s) => s.assetClasses.includes(assetClass) && (horizon === undefined || s.horizon === horizon));
 
 const T0 = Date.UTC(2024, 0, 1);
 const MIN = TIMEFRAME_MS["1m"];

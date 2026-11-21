@@ -2,7 +2,7 @@
 import type { AiOptions } from "../core/ai";
 import { createLogger, type Logger } from "../core/logger";
 import type { EconEvent, IntelItem, MarketBrief, SourceReliability, Store, TradingMode } from "../core/types";
-import { sourceReliabilityKey } from "../learning/reliability";
+import { SOURCE_RELIABILITY_KV_KEY, sourceReliabilityKey } from "../learning/reliability";
 import { analyzeIntelDetailed } from "./analyzer";
 import type { TagOptions } from "./assetTagger";
 import { createCoinGeckoSource } from "./sources/coingecko";
@@ -13,15 +13,13 @@ import { createEconCalendarSource } from "./sources/econCalendar";
 import { createFearGreedSource } from "./sources/fearGreed";
 import { createRssSources } from "./sources/rss";
 
-/** 情報源信頼度の旧 KV キー (mode なし)。mode を渡したときは学習側と同じ mode 別キー `intel:sourceReliability:<mode>` を読む */
-export const RELIABILITY_KV_KEY = "intel:sourceReliability";
 const EVENTS_KV_KEY = "intel:events";
 
 export interface IntelServiceOptions {
   store: Store;
   sources: IntelSource[];
   ai?: AiOptions;
-  /** 既定は store.kvGet (mode があれば mode 別キー、無ければ RELIABILITY_KV_KEY) */
+  /** 既定は store.kvGet (mode があれば学習側と同じ mode 別キー `intel:sourceReliability:<mode>`、無ければ旧キー SOURCE_RELIABILITY_KV_KEY) */
   getReliability?: () => Record<string, SourceReliability>;
   /** 情報源の信頼度を読む mode (学習状態は mode 別) */
   mode?: TradingMode;
@@ -74,7 +72,7 @@ export class IntelService {
       return c ? { ...it, ...c } : it;
     });
 
-    const reliabilityKey = this.opts.mode ? sourceReliabilityKey(this.opts.mode) : RELIABILITY_KV_KEY;
+    const reliabilityKey = this.opts.mode ? sourceReliabilityKey(this.opts.mode) : SOURCE_RELIABILITY_KV_KEY;
     const reliability = this.opts.getReliability?.() ?? store.kvGet<Record<string, SourceReliability>>(reliabilityKey) ?? {};
     const lessons = store.listLessons({ status: "active", limit: 50 });
     const { brief, items, aiAnalyzedIds } = await analyzeIntelDetailed(merged, {

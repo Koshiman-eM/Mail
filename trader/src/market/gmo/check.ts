@@ -8,7 +8,7 @@
  */
 import { redactSecrets } from "../../core/http";
 import { GmoApiError, GmoClient, GmoShapeError, gmoToUnified, parseGmoSymbols, type GmoClientOptions } from "./client";
-import { gmoDayKey } from "./klines";
+import { utcDayKey } from "../fileCandles";
 
 export interface GmoCheckOptions {
   env: { GMO_API_KEY?: string; GMO_API_SECRET?: string; GMO_SYMBOLS?: string };
@@ -84,7 +84,7 @@ export async function runGmoCheck(o: GmoCheckOptions): Promise<number> {
   await step("GET /v1/status", () => client.getStatus(), (v) => `status=${v.status}`);
   const syms = await step("GET /v1/symbols", () => client.getSymbols(), (v) => `${v.length} 銘柄`);
   // klines の日付: 1hour 以下は前日 (日本時間 6:00 区切りで確定済みの日) の YYYYMMDD、4hour 以上は今年 (日本時間) の YYYY
-  const dayKey = gmoDayKey(now + 3 * HOUR - 24 * HOUR);
+  const dayKey = utcDayKey(now + 3 * HOUR - 24 * HOUR);
   const yearKey = String(new Date(now + JST).getUTCFullYear());
 
   for (const g of symbols) {

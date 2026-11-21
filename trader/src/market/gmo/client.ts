@@ -15,6 +15,7 @@
 import { createHmac } from "node:crypto";
 import { z } from "zod";
 import { fetchWithRetry, HttpError, redactSecrets } from "../../core/http";
+import { defaultSleep } from "../../core/util";
 
 export const GMO_PUBLIC_BASE = "https://api.coin.z.com/public";
 export const GMO_PRIVATE_BASE = "https://api.coin.z.com/private";
@@ -262,8 +263,6 @@ export interface GmoClientOptions {
 }
 
 type Query = Record<string, string | number | undefined>;
-
-const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 function queryString(q?: Query): string {
   if (!q) return "";

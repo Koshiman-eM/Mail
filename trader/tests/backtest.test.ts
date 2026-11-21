@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { Candle, Signal, Strategy, StrategyContext, Timeframe } from "../src/core/types";
 import { TIMEFRAME_MS } from "../src/core/types";
 import { resample } from "../src/indicators/resample";
-import { runBacktest, syntheticInstrument, generateCandles, inferTimeframe } from "../src/backtest";
+import { inferTimeframe, runBacktest } from "../src/backtest/engine";
+import { generateCandles, syntheticInstrument } from "../src/backtest/synthetic";
 
 const M = 60_000;
 const T0 = Date.UTC(2024, 0, 1);

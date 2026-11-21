@@ -2,17 +2,10 @@ import { describe, expect, it } from "vitest";
 import type { Candle, IntelBias, OrderBook, Timeframe } from "../src/core/types";
 import { TIMEFRAME_MS } from "../src/core/types";
 import { resample } from "../src/indicators/resample";
-import { ALL_STRATEGIES, getStrategy } from "../src/strategies";
-import {
-  createRng,
-  evaluateParams,
-  generateCandles,
-  generateSynthetic,
-  runBacktest,
-  sliceMetrics,
-  syntheticInstrument,
-  walkForward,
-} from "../src/backtest";
+import { ALL_STRATEGIES, getStrategy } from "../src/strategies/registry";
+import { runBacktest } from "../src/backtest/engine";
+import { evaluateParams, sliceMetrics, walkForward } from "../src/backtest/evaluate";
+import { createRng, generateCandles, generateSynthetic, syntheticInstrument } from "../src/backtest/synthetic";
 
 describe("synthetic", () => {
   it("同じシードなら同じ・違うシードなら違う", () => {

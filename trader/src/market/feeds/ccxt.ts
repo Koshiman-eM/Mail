@@ -1,6 +1,7 @@
 import { createRequire } from "node:module";
 import type { AssetClass, Candle, Instrument, MarketDataFeed, OrderBook, Quote, Timeframe, TradePrint } from "../../core/types";
-import { bitbankRefreshIntervalMs, fetchBitbankCandles, type BitbankBoundary } from "./bitbankCandles";
+import { fetchBitbankCandles, type BitbankBoundary } from "./bitbankCandles";
+import { fileCandleRefreshIntervalMs } from "../fileCandles";
 
 /** ccxt の exchange のうち使う部分だけの型 (テストでモック可能) */
 export interface CcxtLike {
@@ -158,7 +159,7 @@ export class CcxtFeed implements MarketDataFeed {
    * 正の値を返す feed には、hub は since (最後に持っている足の ts) を付けて差分を要求する。
    */
   candleRefreshIntervalMs(tf: Timeframe): number {
-    return this.exchange.id === "bitbank" ? bitbankRefreshIntervalMs(tf) : 0;
+    return this.exchange.id === "bitbank" ? fileCandleRefreshIntervalMs(tf) : 0;
   }
 
   async fetchQuote(symbol: string): Promise<Quote> {

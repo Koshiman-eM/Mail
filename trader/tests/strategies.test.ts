@@ -14,17 +14,11 @@ import type {
 } from "../src/core/types";
 import { TIMEFRAME_MS } from "../src/core/types";
 import { ema, macd } from "../src/indicators/series";
-import {
-  longMomentum,
-  memeMomentum,
-  midTrendFollow,
-  scalpMomentumBurst,
-  scalpObi,
-  scalpVwapRevert,
-  shortBreakout,
-  shortEmaTrend,
-  shortRsiRevert,
-} from "../src/strategies";
+import { longMomentum } from "../src/strategies/long";
+import { memeMomentum } from "../src/strategies/meme";
+import { midTrendFollow } from "../src/strategies/mid";
+import { scalpMomentumBurst, scalpObi, scalpVwapRevert } from "../src/strategies/scalp";
+import { shortBreakout, shortEmaTrend, shortRsiRevert } from "../src/strategies/short";
 import { createRng, syntheticInstrument } from "../src/backtest/synthetic";
 
 // ───────────────────────── ヘルパー ─────────────────────────

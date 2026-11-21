@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Candle, OrderBook, TradePrint } from "../src/core/types";
+import { microprice, orderBookImbalance, spreadBps, tradeFlowImbalance } from "../src/indicators/microstructure";
 import {
   adx,
   atr,
@@ -7,25 +8,16 @@ import {
   donchian,
   ema,
   emaLast,
-  last,
   macd,
-  microprice,
-  orderBookImbalance,
   percentileRank,
-  rollingPercentile,
-  rollingVwap,
   rsi,
   rsiLast,
   sma,
   smaLast,
-  spreadBps,
   stdev,
   stdevLast,
-  tradeFlowImbalance,
   vwapLast,
-  zscore,
-  zscoreLast,
-} from "../src/indicators";
+} from "../src/indicators/series";
 
 const bar = (i: number, o: number, h: number, l: number, c: number, v = 1): Candle => ({ ts: i * 60_000, open: o, high: h, low: l, close: c, volume: v });
 
@@ -118,19 +110,15 @@ describe("ボラティリティ・レンジ", () => {
 describe("VWAP・統計", () => {
   it("ローリング VWAP は典型価格の出来高加重", () => {
     const c = [bar(0, 10, 10, 10, 10, 1), bar(1, 20, 20, 20, 20, 3), bar(2, 30, 30, 30, 30, 1)];
-    const v = rollingVwap(c, 2);
-    expect(Number.isNaN(v[0])).toBe(true);
-    expect(v[1]).toBeCloseTo((10 + 60) / 4);
-    expect(v[2]).toBeCloseTo((60 + 30) / 4);
-    expect(vwapLast(c, 2)).toBeCloseTo(v[2]);
+    expect(Number.isNaN(vwapLast(c.slice(0, 1), 2))).toBe(true);
+    expect(vwapLast(c.slice(0, 2), 2)).toBeCloseTo((10 + 60) / 4);
+    expect(vwapLast(c, 2)).toBeCloseTo((60 + 30) / 4);
     // 出来高 0 は単純平均
     expect(vwapLast([bar(0, 1, 1, 1, 1, 0), bar(1, 3, 3, 3, 3, 0)], 2)).toBeCloseTo(2);
   });
-  it("標準偏差・z スコア", () => {
+  it("標準偏差", () => {
     expect(stdev([1, 2, 3], 3)[2]).toBeCloseTo(Math.sqrt(2 / 3));
     expect(stdevLast([1, 2, 3], 3)).toBeCloseTo(Math.sqrt(2 / 3));
-    expect(zscore([1, 2, 3], 3)[2]).toBeCloseTo(1 / Math.sqrt(2 / 3));
-    expect(zscoreLast([5, 5, 5], 3)).toBe(0);
     // 大きな価格でも桁落ちしない
     expect(stdevLast([60000.1, 60000.2, 60000.3], 3)).toBeCloseTo(Math.sqrt(2 / 3) * 0.1, 8);
   });
@@ -138,11 +126,10 @@ describe("VWAP・統計", () => {
     expect(percentileRank([1, 2, 3, 4], 5)).toBe(1);
     expect(percentileRank([1, 2, 3, 4], 0)).toBe(0);
     expect(percentileRank([1, 2, 3, 4], 2.5)).toBe(0.5);
-    const r = rollingPercentile([1, 2, 3, 4, 5, 0], 5);
-    expect(Number.isNaN(r[3])).toBe(true);
-    expect(r[4]).toBe(1);
-    expect(r[5]).toBe(0);
-    expect(last(rollingPercentile([3, 3, 3], 3))).toBe(0.5);
+    // 同値は 0.5 として数える・非有限は除く・空は NaN
+    expect(percentileRank([3, 3], 3)).toBe(0.5);
+    expect(percentileRank([1, NaN, 3], 2)).toBe(0.5);
+    expect(Number.isNaN(percentileRank([], 1))).toBe(true);
   });
 });
 

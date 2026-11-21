@@ -4,7 +4,7 @@
  * 実在の取引所へは送信しない (オフライン)。
  */
 import { describe, expect, it } from "vitest";
-import { runBacktest } from "../src/backtest";
+import { runBacktest } from "../src/backtest/engine";
 import { loadConfig } from "../src/core/config";
 import type { Candle, Clock, Strategy, TradeRecord } from "../src/core/types";
 import { createLogger } from "../src/core/logger";

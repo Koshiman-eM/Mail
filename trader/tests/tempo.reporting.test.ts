@@ -3,7 +3,8 @@
  * 再起動時の復元の時刻の選び方。すべて合成データ (オフライン)
  */
 import { describe, expect, it } from "vitest";
-import { runBacktest, syntheticInstrument } from "../src/backtest";
+import { runBacktest } from "../src/backtest/engine";
+import { syntheticInstrument } from "../src/backtest/synthetic";
 import { buildReportText, tempoStatusLine } from "../src/cli";
 import { loadConfig } from "../src/core/config";
 import type { Candle, Signal, Strategy, StrategyContext, TradeRecord } from "../src/core/types";

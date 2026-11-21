@@ -67,11 +67,6 @@ export function resample(candles: readonly Candle[], from: Timeframe, to: Timefr
   return out;
 }
 
-/** 足が now 時点で確定しているか */
-export function isClosed(c: Candle, tf: Timeframe, now: number): boolean {
-  return c.ts + TIMEFRAME_MS[tf] <= now;
-}
-
 /** 確定足だけを残す (ライブで取得した足の末尾が未確定な場合の除去用) */
 export function closedOnly(candles: readonly Candle[], tf: Timeframe, now: number): Candle[] {
   const ms = TIMEFRAME_MS[tf];

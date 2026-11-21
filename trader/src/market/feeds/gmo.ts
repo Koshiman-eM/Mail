@@ -14,7 +14,8 @@ import { createLogger } from "../../core/logger";
 import { QUOTE_FETCH_OPTIONS } from "../../core/http";
 import type { Candle, Instrument, MarketDataFeed, OrderBook, Quote, Timeframe, TradePrint } from "../../core/types";
 import { GmoClient, gmoToUnified, unifiedToGmo, type GmoClientOptions } from "../gmo/client";
-import { fetchGmoKlines, gmoRefreshIntervalMs, GmoNoKlinesError, GMO_INTERVALS } from "../gmo/klines";
+import { fetchGmoKlines, GmoNoKlinesError, GMO_INTERVALS } from "../gmo/klines";
+import { fileCandleRefreshIntervalMs } from "../fileCandles";
 
 const log = createLogger("gmo-feed");
 
@@ -151,7 +152,7 @@ export class GmoFeed implements MarketDataFeed {
 
   /** MarketHub の毎回更新で同じ (銘柄, 時間足) を取り直す最短間隔 (ファイル単位で返すので間引く) */
   candleRefreshIntervalMs(tf: Timeframe): number {
-    return gmoRefreshIntervalMs(tf);
+    return fileCandleRefreshIntervalMs(tf);
   }
 
   async fetchQuote(symbol: string): Promise<Quote> {

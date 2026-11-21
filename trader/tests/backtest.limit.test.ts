@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Candle, Signal, Strategy, StrategyContext } from "../src/core/types";
-import { runBacktest, syntheticInstrument } from "../src/backtest";
+import { runBacktest } from "../src/backtest/engine";
+import { syntheticInstrument } from "../src/backtest/synthetic";
 
 /** バックテストの指値 (maker): 越えたら約定・期限・maker 手数料・同じ足で損切りと利確に届いたら損切り優先 */
 

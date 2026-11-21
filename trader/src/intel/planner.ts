@@ -18,6 +18,7 @@ import type {
 } from "../core/types";
 import { EVENT_POST_MS, EVENT_PRE_MS } from "./aggregate";
 import { buildPlannerPrompt, formatLessons, isPlannerScope, PLANNER_SYSTEM } from "./prompts";
+import { clamp } from "../core/util";
 
 const log = createLogger("intel.planner");
 
@@ -56,7 +57,6 @@ export interface PlanInput {
 }
 
 const CLASS_PSEUDO: Record<AssetClass, string> = { crypto: "CRYPTO", meme: "MEME", fx: "FX", stock: "STOCKS" };
-const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
 /** 銘柄に対応するバイアス (個別 → クラス擬似資産の順。FX は base - quote) */
 export function biasForInstrument(

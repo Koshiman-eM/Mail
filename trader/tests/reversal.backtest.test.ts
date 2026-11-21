@@ -3,13 +3,17 @@
  * すべて合成データ (オフライン)
  */
 import { describe, expect, it } from "vitest";
-import { generateCandles, runBacktest, syntheticInstrument } from "../src/backtest";
+import { runBacktest } from "../src/backtest/engine";
+import { generateCandles, syntheticInstrument } from "../src/backtest/synthetic";
 import { TIMEFRAME_MS, type Candle, type Signal, type Strategy, type StrategyContext } from "../src/core/types";
 import { createParamValidator, HistoryCache } from "../src/engine/learningHooks";
-import { DEFAULT_REVERSAL_SETTINGS, REVERSAL_DISABLED, type ReversalSettings } from "../src/engine/reversalExit";
+import { DEFAULT_REVERSAL_SETTINGS, type ReversalSettings } from "../src/engine/reversalExit";
 import {
   barTs, H, INST, LONG_LOSS, LONG_LOSS_BREAK, LONG_PROFIT, LONG_PROFIT_BREAK, M, probe, scenarioBars,
 } from "./helpers/reversalScenario";
+
+/** 転換で決済を無効にした設定 (従来どおり) */
+const REVERSAL_DISABLED: Readonly<ReversalSettings> = { ...DEFAULT_REVERSAL_SETTINGS, enabled: false };
 
 const ON: ReversalSettings = { ...DEFAULT_REVERSAL_SETTINGS, strategies: [] };
 const COSTS = { spreadBps: 2, slippageBps: 1 };

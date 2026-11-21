@@ -6,6 +6,7 @@ import { normalizeReason } from "../engine/context";
 import { clampTempo, relaxToward } from "../engine/tempo";
 import type { AssetClass, Instrument, PositionView, Quote, RiskDecision, RiskLimits, RiskState, Signal, Store, TradingMode } from "../core/types";
 import { effectiveRiskLimits } from "./settings";
+import { isoDayKey } from "../core/util";
 
 const log = createLogger("risk");
 const DAY_MS = 86_400_000;
@@ -101,7 +102,6 @@ export function tempoEdgeRequirement(
 
 type InternalState = RiskState & { dayKey?: string };
 
-const dayKeyOf = (ts: number) => new Date(ts).toISOString().slice(0, 10);
 const nextUtcMidnight = (ts: number) => Math.floor(ts / DAY_MS) * DAY_MS + DAY_MS;
 
 const lookup = (m: EntryParams["instruments"], sym: string): Instrument | undefined =>
@@ -155,19 +155,6 @@ export function classExposure(
     exposure[cls] = exposure[cls].plus(D(p.qty).abs().mul(px).mul(cs).mul(rate));
   }
   return { exposure, unknown };
-}
-
-/** 資産クラス別エクスポージャー (口座通貨建ての建玉額)。換算できない建玉があるクラスは NaN (不明) */
-export function exposureByClass(
-  positions: RiskPosition[],
-  prices: Record<string, number> = {},
-  instruments?: EntryParams["instruments"],
-  toAccount: (ccy: string) => number = () => 1,
-): Record<AssetClass, number> {
-  const { exposure, unknown } = classExposure(positions, prices, instruments, toAccount);
-  const out = {} as Record<AssetClass, number>;
-  for (const cls of Object.keys(exposure) as AssetClass[]) out[cls] = unknown[cls] ? NaN : exposure[cls].toNumber();
-  return out;
 }
 
 /**
@@ -314,7 +301,7 @@ export class RiskManager {
       log.warn("評価額が不正なため無視します", { equity: String(equity) });
       return { halted: this.isHalted(now).halted, killSwitch: !!st.killSwitch, dailyLossPct: 0, drawdownPct: 0 };
     }
-    const key = dayKeyOf(now);
+    const key = isoDayKey(now);
     let changed = false;
     if (st.dayKey !== key || st.dayStartEquity <= 0) {
       st.dayKey = key;

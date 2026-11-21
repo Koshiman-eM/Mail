@@ -9,10 +9,16 @@ import { resample } from "../src/indicators/resample";
 import { mulberry32 } from "../src/market/feeds/synthetic";
 import { MemoryStore } from "../src/storage/memory";
 import { ALL_STRATEGIES, configuredStrategies, getStrategy } from "../src/strategies/registry";
+import { structureAt } from "../src/structure/machine";
+import { applyStructure, defaultStructureSettings, structureSettingsFromEnv } from "../src/structure/settings";
 import {
-  applyStructure, biasNum, resolveStructureFilterConfig, defaultStructureSettings, structureAt, isStructureWrapped, structureSettingsFromEnv, structureWarmupBars, withStructure,
+  biasNum,
+  isStructureWrapped,
+  resolveStructureFilterConfig,
   type StructureFilterConfig,
-} from "../src/structure";
+  structureWarmupBars,
+  withStructure,
+} from "../src/structure/wrap";
 import { lineBars, path, T0 } from "./helpers/structureBars";
 
 const M15 = TIMEFRAME_MS["15m"];
@@ -478,7 +484,7 @@ describe("比較コマンド (--structure-compare) と regime の構造の列", 
 
 describe("設定の警告・上限・比較条件", () => {
   it("structureConfigWarnings: 未登録の id と、purist での exitOnWeakening を警告する", async () => {
-    const { structureConfigWarnings } = await import("../src/structure");
+    const { structureConfigWarnings } = await import("../src/structure/settings");
     const known = ALL_STRATEGIES.map((x) => x.id);
     const base = structureSettingsFromEnv(loadConfig({}).env);
     expect(structureConfigWarnings(base, known)).toEqual([]);

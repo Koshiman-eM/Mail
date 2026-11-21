@@ -1,10 +1,13 @@
 /** 仮想トレード (見送ったシグナル) の転換で決済: 実際の建玉と同じ src/engine/reversalExit.ts の規則。合成データ (オフライン) */
 import { describe, expect, it } from "vitest";
 import type { Candle, ShadowTradeRecord, Timeframe } from "../src/core/types";
-import { DEFAULT_REVERSAL_SETTINGS, REVERSAL_DISABLED, type ReversalSettings } from "../src/engine/reversalExit";
+import { DEFAULT_REVERSAL_SETTINGS, type ReversalSettings } from "../src/engine/reversalExit";
 import { ShadowTracker, shadowOpenKey, type ShadowOpen, type ShadowRecordInput } from "../src/learning/shadow";
 import { MemoryStore } from "../src/storage/memory";
 import { barTs, H, LONG_PROFIT, LONG_PROFIT_BREAK, M, scenarioBars, SYM } from "./helpers/reversalScenario";
+
+/** 転換で決済を無効にした設定 (従来どおり) */
+const REVERSAL_DISABLED: Readonly<ReversalSettings> = { ...DEFAULT_REVERSAL_SETTINGS, enabled: false };
 
 const ON: ReversalSettings = { ...DEFAULT_REVERSAL_SETTINGS, strategies: [] };
 const TAIL = [102.0, 101.5, 101.0, 100.5, 100.0, 99.0, 98.0];

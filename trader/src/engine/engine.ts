@@ -2,7 +2,7 @@ import type { AiOptions } from "../core/ai";
 import { DEFAULT_OBSERVE_ONLY_STRATEGIES, type AppConfig } from "../core/config";
 import { equitySinceReset, latestPaperReset } from "../paper/walletReset";
 import { D, Decimal } from "../core/decimal";
-import { redactSecrets } from "../core/http";
+import { redactedErrMsg, redactSecrets } from "../core/http";
 import { createLogger, type Logger } from "../core/logger";
 import { DEFAULT_SHORT_BORROW_RATE_DAILY, isSimulatedShort } from "../core/short";
 import {
@@ -47,13 +47,12 @@ import {
   checkReversal, reversalAppliesTo, reversalDetailLabel, reversalSettingsFromEnv, reversalTimeframeFor, type ReversalSettings,
 } from "./reversalExit";
 import { effectiveLimitTakeProfit } from "./limitOrders";
+import { quoteMid } from "../core/util";
 
 export const PAPER_SNAPSHOT_KEY = "paper:snapshot";
 export const AUTO_MEME_KEY = "engine:autoMemeWatch";
 /** レジーム判定に必要な最低本数 (未満なら「レジーム不明」) */
 const MIN_REGIME_BARS = 30;
-/** エラー文 (ccxt は URL・署名を含みうる) は伏せてから記録する */
-const errMsg = (e: unknown) => redactSecrets(e instanceof Error ? e.message : String(e));
 
 export interface EngineOptions {
   /** 評価額の保存間隔 (既定 60 秒) */
@@ -366,8 +365,6 @@ export function downsample<T>(arr: T[], max: number): T[] {
   return out;
 }
 
-const midOf = (q: Quote) => (q.bid + q.ask) / 2;
-
 /**
  * 売買エンジン。依存はすべて注入する。
  * tick(now) は 1 回分の処理で、テスト・シミュレーションから直接呼べる。start()/stop() は実時間のループ。
@@ -542,7 +539,7 @@ export class TradingEngine {
         // 仮想トレードも実際の建玉と同じ読みの管理・転換で決済で決済する (腕の学習をそろえるため)
         options: { thesis: this.thesis, reversal: this.reversal, ...shadowOpts },
         onClosed: (t) => this.onShadowClosed(t),
-        onError: (where, e) => this.warnThrottled(where, this.clock.now(), "仮想トレードの処理に失敗 (取引は継続)", { error: errMsg(e) }),
+        onError: (where, e) => this.warnThrottled(where, this.clock.now(), "仮想トレードの処理に失敗 (取引は継続)", { error: redactedErrMsg(e) }),
       });
     }
     this.priceAt = createPriceAt(this.hub, this.clock);
@@ -623,7 +620,7 @@ export class TradingEngine {
         if (res.applied) applied++;
         this.log.warn(`手動の解消要求: ${res.message}`, { clientId: r.clientId, outcome: r.outcome, by: r.by });
       } catch (e) {
-        this.log.error("手動の解消要求の適用に失敗", { clientId: r.clientId, error: errMsg(e) });
+        this.log.error("手動の解消要求の適用に失敗", { clientId: r.clientId, error: redactedErrMsg(e) });
       }
     }
     removeResolveRequests(this.store, this.mode, reqs.map((r) => r.id));
@@ -644,14 +641,14 @@ export class TradingEngine {
 
   private priceOf(symbol: string): number | undefined {
     const q = this.hub.latestQuote(symbol);
-    return q && q.bid > 0 && q.ask > 0 ? midOf(q) : undefined;
+    return q && q.bid > 0 && q.ask > 0 ? quoteMid(q) : undefined;
   }
 
   private onTradeClosed(t: TradeRecord): void {
     try {
       this.learning.onTradeClosed(t);
     } catch (e) {
-      this.log.error("学習への反映に失敗", { tradeId: t.id, error: errMsg(e) });
+      this.log.error("学習への反映に失敗", { tradeId: t.id, error: redactedErrMsg(e) });
     }
     this.saveSnapshot();
     this.acctCache = undefined;
@@ -671,7 +668,7 @@ export class TradingEngine {
         paper.restore(snap);
         this.log.info("ペーパー口座を復元しました", { positions: snap.positions.length });
       } catch (e) {
-        this.log.warn("ペーパー口座の復元に失敗", { error: errMsg(e) });
+        this.log.warn("ペーパー口座の復元に失敗", { error: redactedErrMsg(e) });
       }
     }
     if (this.mode === "live" && this.config.env.LIMIT_TAKE_PROFIT === true) {
@@ -686,7 +683,7 @@ export class TradingEngine {
     try {
       await this.positions.pollAllTakeProfits(now);
     } catch (e) {
-      this.log.warn("利確の指値の照会に失敗", { error: errMsg(e) });
+      this.log.warn("利確の指値の照会に失敗", { error: redactedErrMsg(e) });
     }
     try {
       const brokerPositions = await this.brokerPositions();
@@ -699,14 +696,14 @@ export class TradingEngine {
         );
       }
     } catch (e) {
-      this.log.warn("建玉の突き合わせに失敗", { error: errMsg(e) });
+      this.log.warn("建玉の突き合わせに失敗", { error: redactedErrMsg(e) });
     }
     // 追跡していない建玉の利確の指値 (孤児) を取り消す
     try {
       const n = await this.positions.sweepTakeProfits(now);
       if (n > 0) this.log.warn("追跡していない建玉の利確の指値を取り消しました", { count: n });
     } catch (e) {
-      this.log.warn("利確の指値の整理に失敗", { error: errMsg(e) });
+      this.log.warn("利確の指値の整理に失敗", { error: redactedErrMsg(e) });
     }
     const tps = this.positions.restingTakeProfits();
     if (tps.length) this.log.info("板に置いた利確の指値を引き継ぎます", { orders: tps.map((t) => `${t.symbol} ${t.price} ${t.clientId}`) });
@@ -755,7 +752,7 @@ export class TradingEngine {
       tc.seed(ts);
       if (ts.length) this.log.info("テンポ: 直近のエントリーを復元しました", { entries: ts.length, target: tc.targetPerHour });
     } catch (e) {
-      this.log.warn("テンポの復元に失敗 (直近のエントリー 0 件として続行)", { error: errMsg(e) });
+      this.log.warn("テンポの復元に失敗 (直近のエントリー 0 件として続行)", { error: redactedErrMsg(e) });
     }
   }
 
@@ -910,7 +907,7 @@ export class TradingEngine {
           delete st.lastError;
         } catch (e) {
           st.failures++;
-          st.lastError = errMsg(e);
+          st.lastError = redactedErrMsg(e);
           this.warnThrottled(`acct|${b.venue}`, now, "口座情報の取得に失敗 (前回の値を使います)", { venue: b.venue, failures: st.failures, error: st.lastError });
           if (st.failures >= this.opt.accountFailLimit) degradedReason = `${b.venue}: 口座情報の取得に ${st.failures} 回連続で失敗 (${st.lastError})`;
           if (!st.balance) {
@@ -937,7 +934,7 @@ export class TradingEngine {
     const positions: RiskPosition[] = [];
     for (const p of raw) {
       const q = this.hub.latestQuote(p.symbol);
-      const price = q ? midOf(q) : p.avgPrice;
+      const price = q ? quoteMid(q) : p.avgPrice;
       prices[p.symbol] = price;
       positions.push({ symbol: p.symbol, qty: Number(p.qty), avgPrice: p.avgPrice, price });
     }
@@ -981,7 +978,7 @@ export class TradingEngine {
       const r = await this.hub.poll({ timeoutMs: this.opt.pollTimeoutMs });
       timedOut = new Set(r?.timedOutSymbols ?? []);
     } catch (e) {
-      this.log.error("市場データの取得に失敗", { error: errMsg(e) });
+      this.log.error("市場データの取得に失敗", { error: redactedErrMsg(e) });
     }
     const insts = this.hub.watched();
     const quotes = new Map<string, Quote>();
@@ -1000,7 +997,7 @@ export class TradingEngine {
       try {
         await this.positions.sweepTakeProfits(now);
       } catch (e) {
-        this.log.warn("利確の指値の整理に失敗", { error: errMsg(e) });
+        this.log.warn("利確の指値の整理に失敗", { error: redactedErrMsg(e) });
       }
     }
     // 気配が古い銘柄は判定しない (古い気配による取消は 7 の前に、新規を止める理由として行う)
@@ -1076,7 +1073,7 @@ export class TradingEngine {
             this.acctCache = undefined;
           }
         } catch (e) {
-          this.log.error("停止による指値のエントリーの取消に失敗", { error: errMsg(e) });
+          this.log.error("停止による指値のエントリーの取消に失敗", { error: redactedErrMsg(e) });
         }
       }
     }
@@ -1122,7 +1119,7 @@ export class TradingEngine {
       try {
         await this.processSymbol(inst, view, ctx);
       } catch (e) {
-        this.log.error("銘柄の処理に失敗", { symbol: inst.symbol, error: errMsg(e) });
+        this.log.error("銘柄の処理に失敗", { symbol: inst.symbol, error: redactedErrMsg(e) });
       }
     }
 
@@ -1159,7 +1156,7 @@ export class TradingEngine {
         const res = await this.positions.onQuote(pos.symbol, q, now);
         if (res.status === "closed" || res.status === "reduced") exits++;
       } catch (e) {
-        this.log.error("ポジション管理に失敗", { symbol: pos.symbol, error: errMsg(e) });
+        this.log.error("ポジション管理に失敗", { symbol: pos.symbol, error: redactedErrMsg(e) });
       }
     });
     return exits;
@@ -1176,7 +1173,7 @@ export class TradingEngine {
       try {
         await this.positions.placeTakeProfit(p, quotes.get(p.symbol) ?? this.hub.latestQuote(p.symbol), now);
       } catch (e) {
-        this.log.warn("利確の指値の発注に失敗 (次のティックで再試行)", { symbol: p.symbol, error: errMsg(e) });
+        this.log.warn("利確の指値の発注に失敗 (次のティックで再試行)", { symbol: p.symbol, error: redactedErrMsg(e) });
       }
     }
     this.recordLimitUnfilled(sync.limitUnfilled, now);
@@ -1207,7 +1204,7 @@ export class TradingEngine {
           ...(tf ? { exitTimeframe: tf } : {}),
         });
       } catch (e) {
-        this.warnThrottled("shadow.record", now, "仮想トレードの記録に失敗 (取引は継続)", { error: errMsg(e) });
+        this.warnThrottled("shadow.record", now, "仮想トレードの記録に失敗 (取引は継続)", { error: redactedErrMsg(e) });
       }
     }
   }
@@ -1238,7 +1235,7 @@ export class TradingEngine {
       const intel = this.intelFor(inst, ctx);
       signal = s.evaluate({ market: view, regime, ...(intel ? { intel } : {}), params: this.paramsFor(s, inst), mode: this.mode });
     } catch (e) {
-      this.warnThrottled(`limit.watch|${s.id}`, ctx.now, "指値の待機中の戦略の評価に失敗", { symbol: inst.symbol, error: errMsg(e) });
+      this.warnThrottled(`limit.watch|${s.id}`, ctx.now, "指値の待機中の戦略の評価に失敗", { symbol: inst.symbol, error: redactedErrMsg(e) });
       return;
     }
     if (!signal || (signal.direction !== "long" && signal.direction !== "short") || signal.direction === lim.direction) return;
@@ -1289,7 +1286,7 @@ export class TradingEngine {
         ctx.account = await this.account(ctx.now, true);
       }
     } catch (e) {
-      this.log.error("新規を止める理由による指値のエントリーの取消に失敗", { error: errMsg(e) });
+      this.log.error("新規を止める理由による指値のエントリーの取消に失敗", { error: redactedErrMsg(e) });
     }
   }
 
@@ -1360,14 +1357,14 @@ export class TradingEngine {
     try {
       await this.positions.pollAllTakeProfits(now);
     } catch (e) {
-      this.log.warn("利確の指値の照会に失敗", { error: errMsg(e) });
+      this.log.warn("利確の指値の照会に失敗", { error: redactedErrMsg(e) });
     }
     if (this.positions.list().length === 0 && !limitPending) return true;
     let bp: BrokerPosition[];
     try {
       bp = await this.brokerPositions();
     } catch (e) {
-      this.log.warn("建玉の突き合わせに失敗 (次回に再試行)", { error: errMsg(e) });
+      this.log.warn("建玉の突き合わせに失敗 (次回に再試行)", { error: redactedErrMsg(e) });
       return false;
     }
     const r = this.positions.reconcile(bp, now, {
@@ -1445,7 +1442,7 @@ export class TradingEngine {
         this.saveShadowIntel(now);
       }
     } catch (e) {
-      this.warnThrottled("shadow.record", now, "仮想トレードの記録に失敗 (取引は継続)", { error: errMsg(e) });
+      this.warnThrottled("shadow.record", now, "仮想トレードの記録に失敗 (取引は継続)", { error: redactedErrMsg(e) });
     }
   }
 
@@ -1482,7 +1479,7 @@ export class TradingEngine {
           this.saveShadowIntel(t.exitTs);
         }
       } catch (e) {
-        this.warnThrottled("shadow.intel", t.exitTs, "仮想トレードの情報バイアスの読み書きに失敗 (取引は継続)", { error: errMsg(e) });
+        this.warnThrottled("shadow.intel", t.exitTs, "仮想トレードの情報バイアスの読み書きに失敗 (取引は継続)", { error: redactedErrMsg(e) });
       }
     }
     this.learning.onShadowClosed(t, intelSentiment !== undefined ? { intelSentiment } : {});
@@ -1516,7 +1513,7 @@ export class TradingEngine {
       for (const f of filtered) if (f.signal.direction !== "flat") this.shadowRecord(`strategy_filter:${f.reason}`, inst, view, s, f.signal, regime, ctx.now);
       return signal;
     } catch (e) {
-      this.warnThrottled("shadow.evaluate", ctx.now, "仮想トレード用の戦略評価に失敗 (取引は継続)", { strategyId: s.id, symbol: inst.symbol, error: errMsg(e) });
+      this.warnThrottled("shadow.evaluate", ctx.now, "仮想トレード用の戦略評価に失敗 (取引は継続)", { strategyId: s.id, symbol: inst.symbol, error: redactedErrMsg(e) });
       return null;
     }
   }
@@ -1576,7 +1573,7 @@ export class TradingEngine {
         candlesOf: (sym, tf) => viewOf(sym)?.candles[tf],
       });
     } catch (e) {
-      this.warnThrottled("shadow.update", now, "仮想トレードの判定に失敗 (取引は継続)", { error: errMsg(e) });
+      this.warnThrottled("shadow.update", now, "仮想トレードの判定に失敗 (取引は継続)", { error: redactedErrMsg(e) });
     }
   }
 
@@ -1584,7 +1581,7 @@ export class TradingEngine {
     try {
       this.shadow?.flush();
     } catch (e) {
-      this.warnThrottled("shadow.flush", now, "仮想トレードの保存に失敗 (取引は継続)", { error: errMsg(e) });
+      this.warnThrottled("shadow.flush", now, "仮想トレードの保存に失敗 (取引は継続)", { error: redactedErrMsg(e) });
     }
   }
 
@@ -1594,7 +1591,7 @@ export class TradingEngine {
   private newsMarketInfo(inst: Instrument, now: number): NewsMarketInfo {
     const q = this.hub.latestQuote(inst.symbol);
     if (!q || !(q.bid > 0) || !(q.ask >= q.bid)) return { instrument: inst };
-    const mid = midOf(q);
+    const mid = quoteMid(q);
     let atrPctPerMin: number | undefined;
     const view = this.hub.getView(inst.symbol, now);
     const tfs = (Object.keys(view?.candles ?? {}) as Timeframe[]).sort((a, b) => TIMEFRAME_MS[a] - TIMEFRAME_MS[b]);
@@ -1620,7 +1617,7 @@ export class TradingEngine {
       const added = this.learning.news.ingest(items, markets, now);
       if (added > 0) this.log.debug("ニュースの答え合わせ待ちに追加", { added });
     } catch (e) {
-      this.warnThrottled("news.ingest", now, "ニュースの答え合わせの取り込みに失敗 (取引は継続)", { error: errMsg(e) });
+      this.warnThrottled("news.ingest", now, "ニュースの答え合わせの取り込みに失敗 (取引は継続)", { error: redactedErrMsg(e) });
     }
   }
 
@@ -1634,12 +1631,12 @@ export class TradingEngine {
         isWatched: (sym) => watched.has(sym),
         midNow: (sym) => {
           const q = quotes.get(sym) ?? this.hub.latestQuote(sym);
-          return q && q.bid > 0 && q.ask >= q.bid ? midOf(q) : undefined;
+          return q && q.bid > 0 && q.ask >= q.bid ? quoteMid(q) : undefined;
         },
         priceAt: this.priceAt,
       });
     } catch (e) {
-      this.warnThrottled("news.evaluate", now, "ニュースの答え合わせの判定に失敗 (取引は継続)", { error: errMsg(e) });
+      this.warnThrottled("news.evaluate", now, "ニュースの答え合わせの判定に失敗 (取引は継続)", { error: redactedErrMsg(e) });
     }
   }
 
@@ -1681,7 +1678,7 @@ export class TradingEngine {
       };
       const midNow = (sym: string) => {
         const q = quotes.get(sym) ?? this.hub.latestQuote(sym);
-        return q && q.bid > 0 && q.ask >= q.bid ? midOf(q) : undefined;
+        return q && q.bid > 0 && q.ask >= q.bid ? quoteMid(q) : undefined;
       };
       fc.evaluate(now, { isWatched: (sym) => watched.has(sym), midNow, priceAt: (sym, ts) => priceFromCandles(viewOf(sym)?.candles["1m"], ts) });
       for (const s of [...this.recentSignals.keys()]) if (!watched.has(s)) this.recentSignals.delete(s);
@@ -1697,18 +1694,18 @@ export class TradingEngine {
             instrument: inst,
             candles: view.candles,
             now,
-            mid: midOf(q),
+            mid: quoteMid(q),
             costPct: costBps(inst, q) / 10_000,
             news: b.found ? b.sentiment * b.confidence : 0,
             consensus: (h) => this.consensusFor(inst.symbol, h, now),
           });
         } catch (e) {
-          this.warnThrottled("forecast.symbol", now, "値動きの予想に失敗 (取引は継続)", { symbol: inst.symbol, error: errMsg(e) });
+          this.warnThrottled("forecast.symbol", now, "値動きの予想に失敗 (取引は継続)", { symbol: inst.symbol, error: redactedErrMsg(e) });
         }
       }
       fc.flush();
     } catch (e) {
-      this.warnThrottled("forecast.step", now, "値動きの予想・答え合わせに失敗 (取引は継続)", { error: errMsg(e) });
+      this.warnThrottled("forecast.step", now, "値動きの予想・答え合わせに失敗 (取引は継続)", { error: redactedErrMsg(e) });
     }
   }
 
@@ -1718,7 +1715,7 @@ export class TradingEngine {
     try {
       return this.forecast.multiplierFor(symbol, sig.direction, horizon, now);
     } catch (e) {
-      this.warnThrottled("forecast.multiplier", now, "予想の倍率の計算に失敗 (倍率 1 で続行)", { error: errMsg(e) });
+      this.warnThrottled("forecast.multiplier", now, "予想の倍率の計算に失敗 (倍率 1 で続行)", { error: redactedErrMsg(e) });
       return undefined;
     }
   }
@@ -1916,7 +1913,7 @@ export class TradingEngine {
       try {
         signal = s.evaluate(sctx);
       } catch (e) {
-        this.log.error("戦略の評価に失敗", { strategyId: s.id, symbol: sym, error: errMsg(e) });
+        this.log.error("戦略の評価に失敗", { strategyId: s.id, symbol: sym, error: redactedErrMsg(e) });
         continue;
       }
       for (const f of filtered) if (f.signal.direction !== "flat") this.shadowRecord(`strategy_filter:${f.reason}`, inst, view, s, f.signal, regime, ctx.now);
@@ -2091,7 +2088,7 @@ export class TradingEngine {
       this.brokerFor(sym); // 発注先が無い銘柄はリスク判定の前に見送る
     } catch (e) {
       this.shadowRecord("no_broker", inst, view, c.strategy, sig, c.regime, now);
-      return this.skip("no_broker", errMsg(e));
+      return this.skip("no_broker", redactedErrMsg(e));
     }
     const liquidityUsd = inst.assetClass === "meme" ? liquidityUsdFor(inst, view, (ccy) => this.fx.toUsd(ccy)) : undefined;
     const acct = ctx.account;
@@ -2236,7 +2233,7 @@ export class TradingEngine {
     try {
       r = await this.positions.enter(req, entry, now, limit);
     } catch (e) {
-      const msg = errMsg(e);
+      const msg = redactedErrMsg(e);
       this.log.error("エントリーの処理に失敗", { symbol: sym, error: msg });
       this.store.audit({ ts: now, type: "engine.order_error", data: { symbol: sym, strategyId: c.strategy.id, error: msg } });
       return this.skip("order_error", msg);
@@ -2256,7 +2253,7 @@ export class TradingEngine {
         try {
           await this.positions.placeTakeProfit(r.position, q, now);
         } catch (e) {
-          this.log.warn("利確の指値の発注に失敗 (次のティックで再試行)", { symbol: sym, error: errMsg(e) });
+          this.log.warn("利確の指値の発注に失敗 (次のティックで再試行)", { symbol: sym, error: redactedErrMsg(e) });
         }
       }
       this.saveSnapshot();
@@ -2364,7 +2361,7 @@ export class TradingEngine {
       if (this.config.env.AUTO_MEME_WATCH) await this.autoMemeWatch(brief, now);
       return plan;
     } catch (e) {
-      const msg = errMsg(e);
+      const msg = redactedErrMsg(e);
       this.log.warn("情報ループに失敗 (取引は継続)", { error: msg });
       if (!this.stopped) this.store.audit({ ts: now, type: "engine.intel_error", data: { error: msg } });
       return undefined;
@@ -2404,7 +2401,7 @@ export class TradingEngine {
       }
       return r;
     } catch (e) {
-      const msg = errMsg(e);
+      const msg = redactedErrMsg(e);
       this.log.warn("学習ループに失敗 (取引は継続)", { error: msg });
       if (!this.stopped) this.store.audit({ ts: now, type: "engine.learning_error", data: { error: msg } });
       return undefined;
@@ -2426,7 +2423,7 @@ export class TradingEngine {
       try {
         this.watchInstrument(await this.dexFeed!.trackPair(chainId, pairAddress));
       } catch (e) {
-        this.log.warn("自動監視ミームの復元に失敗", { key, error: errMsg(e) });
+        this.log.warn("自動監視ミームの復元に失敗", { key, error: redactedErrMsg(e) });
       }
     }
   }
@@ -2453,7 +2450,7 @@ export class TradingEngine {
         symbols.push(inst.symbol);
         this.store.audit({ ts: now, type: "engine.auto_meme_watch", data: { ...c, symbol: inst.symbol, trendingSymbol: c.symbol } });
       } catch (e) {
-        this.log.warn("ミームの自動監視に失敗", { key: c.key, error: errMsg(e) });
+        this.log.warn("ミームの自動監視に失敗", { key: c.key, error: redactedErrMsg(e) });
       }
     }
     this.store.kvSet(AUTO_MEME_KEY, added);
@@ -2476,7 +2473,7 @@ export class TradingEngine {
     try {
       await this.tick(this.clock.now());
     } catch (e) {
-      this.log.error("ティックの処理に失敗", { error: errMsg(e) });
+      this.log.error("ティックの処理に失敗", { error: redactedErrMsg(e) });
     }
   }
 
@@ -2523,19 +2520,19 @@ export class TradingEngine {
       const acct = await this.account(now, true);
       if (!acct.incomplete) this.store.saveEquity({ ts: now, equity: acct.equity, mode: this.mode });
     } catch (e) {
-      this.log.warn("停止時の評価額の保存に失敗", { error: errMsg(e) });
+      this.log.warn("停止時の評価額の保存に失敗", { error: redactedErrMsg(e) });
     }
     this.saveSnapshot();
     this.flushSkips(now);
     try {
       this.shadow?.flush();
     } catch (e) {
-      this.log.warn("停止時の仮想トレードの保存に失敗", { error: errMsg(e) });
+      this.log.warn("停止時の仮想トレードの保存に失敗", { error: redactedErrMsg(e) });
     }
     try {
       this.forecast?.flush();
     } catch (e) {
-      this.log.warn("停止時の予想の保存に失敗", { error: errMsg(e) });
+      this.log.warn("停止時の予想の保存に失敗", { error: redactedErrMsg(e) });
     }
     this.store.audit({ ts: now, type: "engine.stop", data: { openPositions: this.journal.list().length, pendingOrders: this.positions.pending.size } });
   }
@@ -2560,7 +2557,7 @@ export class TradingEngine {
     const positions: PositionStatus[] = this.positions.list().map((p) => {
       const inst = this.hub.instrument(p.symbol);
       const q = this.hub.latestQuote(p.symbol);
-      const last = q ? midOf(q) : p.lastPrice;
+      const last = q ? quoteMid(q) : p.lastPrice;
       const dir = p.direction === "long" ? 1 : -1;
       const upnl = D(last).minus(p.entryPrice).mul(p.qty).mul(p.contractSize).mul(dir);
       const ccy = inst?.quoteCurrency ?? "";
@@ -2599,7 +2596,7 @@ export class TradingEngine {
         symbol: i.symbol, venue: i.venue, assetClass: i.assetClass,
         ...((() => {
           const q = this.hub.latestQuote(i.symbol);
-          const px = q ? midOf(q) : NaN;
+          const px = q ? quoteMid(q) : NaN;
           return Number.isFinite(px) && px > 0 ? { lastPrice: px } : {};
         })()),
         ...(this.hub.lastError(i.symbol) ? { lastError: redactSecrets(this.hub.lastError(i.symbol)!) } : {}),

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_RISK } from "../src/core/config";
-import { classExposure, costBps, DEFAULT_TEMPO_MIN_EDGE_TO_COST, exposureByClass, MAX_SIZE_MULTIPLIER, MIN_STOP_DISTANCE_SPREADS, RiskManager, tempoEdgeRequirement, type EntryParams } from "../src/risk/manager";
+import { classExposure, costBps, DEFAULT_TEMPO_MIN_EDGE_TO_COST, MAX_SIZE_MULTIPLIER, MIN_STOP_DISTANCE_SPREADS, RiskManager, tempoEdgeRequirement, type EntryParams } from "../src/risk/manager";
 import type { AuditEvent, Instrument, RiskLimits, Signal, Store } from "../src/core/types";
 
 const NOW = Date.parse("2025-03-01T12:00:00Z");
@@ -220,15 +220,16 @@ describe("停止・再開", () => {
   });
 });
 
-describe("exposureByClass", () => {
+describe("classExposure", () => {
   it("資産クラス別の建玉額 (通貨換算・契約サイズ込み)", () => {
     const m = new Map<string, Instrument>([["BTC/USDT", btc], ["ETH/USDT:USDT", { ...btc, symbol: "ETH/USDT:USDT", contractSize: 0.01 }]]);
-    const e = exposureByClass(
+    const { exposure: e, unknown } = classExposure(
       [{ symbol: "BTC/USDT", qty: 2, avgPrice: 100 }, { symbol: "ETH/USDT:USDT", qty: -100, avgPrice: 10 }, { symbol: "PEPE", qty: 1, avgPrice: 1, assetClass: "meme" }, { symbol: "X", qty: 1, avgPrice: 1 }],
       { "BTC/USDT": 110 }, m, (c) => (c === "USDT" ? 2 : 1),
     );
-    expect(e.crypto).toBeCloseTo(2 * 110 * 2 + 100 * 10 * 0.01 * 2, 6);
-    expect(e.meme).toBe(1);
+    expect(e.crypto.toNumber()).toBeCloseTo(2 * 110 * 2 + 100 * 10 * 0.01 * 2, 6);
+    expect(e.meme.toNumber()).toBe(1);
+    expect(unknown.crypto).toBeUndefined();
   });
 });
 
@@ -243,8 +244,8 @@ describe("為替・非有限値で上限判定を素通りさせない", () => {
     const d = classExposure(pos, {}, insts, toAccount);
     expect(d.exposure.crypto.toNumber()).toBe(100);
     expect(d.unknown.crypto).toEqual(["ETH/BTC"]);
-    expect(Number.isNaN(exposureByClass(pos, {}, insts, toAccount).crypto)).toBe(true);
-    expect(exposureByClass(pos, {}, insts, toAccount).meme).toBe(0);
+    expect(d.exposure.meme.toNumber()).toBe(0);
+    expect(d.unknown.meme).toBeUndefined();
     // 価格が NaN の建玉も不明
     expect(classExposure([{ symbol: "BTC/USDT", qty: 1, avgPrice: NaN }], {}, insts).unknown.crypto).toEqual(["BTC/USDT"]);
   });

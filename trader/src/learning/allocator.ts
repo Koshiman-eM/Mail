@@ -1,5 +1,6 @@
 import type { ArmStats, AssetClass, RegimeLabel, ShadowTradeRecord, Store, TradeRecord, TradingMode } from "../core/types";
 import { tradeOutcome } from "./attribution";
+import { clamp } from "../core/util";
 
 /** paper で再現した空売りの腕のキーの接尾辞 */
 export const SIMULATED_SHORT_ARM_SUFFIX = "|short";
@@ -12,9 +13,6 @@ export const SIMULATED_SHORT_ARM_SUFFIX = "|short";
  */
 export const armKey = (strategyId: string, regime: RegimeLabel, assetClass: AssetClass, simulatedShort = false) =>
   `${strategyId}|${regime}|${assetClass}${simulatedShort ? SIMULATED_SHORT_ARM_SUFFIX : ""}`;
-
-/** paper で再現した空売りの腕か */
-export const isSimulatedShortArm = (key: string) => key.endsWith(SIMULATED_SHORT_ARM_SUFFIX);
 
 export const armKeyOf = (t: TradeRecord) => armKey(t.strategyId, t.entryContext.regime.label, t.assetClass, t.simulatedShort === true);
 
@@ -139,13 +137,10 @@ export interface ArmSnapshot extends ArmState {
 
 export type Rng = () => number;
 
-const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, x));
 /** 腕の状態の kv キー (mode 別。paper の学習を live に持ち込まない) */
 export const armStateKey = (mode: TradingMode, key: string) => `arm:${mode}:${key}`;
 /** 腕のキー一覧の kv キー (mode 別) */
 export const armIndexKey = (mode: TradingMode) => `arm:${mode}:index`;
-/** mode で分ける前の旧キー (移行元。読み書きしない) */
-export const LEGACY_ARM_INDEX_KEY = "arm:index";
 /** R の外れ値の影響を抑える */
 const R_CLIP = 10;
 

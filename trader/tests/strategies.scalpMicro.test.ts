@@ -1,19 +1,15 @@
 import { describe, expect, it } from "vitest";
-import type { Candle, Instrument, OrderBook, PositionView, RegimeFeatures, Signal, StrategyContext } from "../src/core/types";
+import type { AssetClass, Candle, Horizon, Instrument, OrderBook, PositionView, RegimeFeatures, Signal, StrategyContext } from "../src/core/types";
 import { TIMEFRAME_MS } from "../src/core/types";
 import { createRng, generateCandles, syntheticInstrument } from "../src/backtest/synthetic";
 import { runBacktest } from "../src/backtest/engine";
-import {
-  createScalpMicro,
-  detectBurst,
-  getStrategy,
-  microExpectedEdge,
-  resolveParams,
-  roundTripCostBps,
-  scalpMicro,
-  SCALP_MICRO_HOLD_BOUNDS,
-  strategiesFor,
-} from "../src/strategies";
+import { microExpectedEdge, roundTripCostBps } from "../src/strategies/netEdge";
+import { ALL_STRATEGIES, getStrategy, resolveParams } from "../src/strategies/registry";
+import { createScalpMicro, detectBurst, SCALP_MICRO_HOLD_BOUNDS, scalpMicro } from "../src/strategies/scalpMicro";
+
+/** 資産クラス (と時間軸) に対応する戦略 (登録順) */
+const strategiesFor = (assetClass: AssetClass, horizon?: Horizon) =>
+  ALL_STRATEGIES.filter((s) => s.assetClasses.includes(assetClass) && (horizon === undefined || s.horizon === horizon));
 
 // ───────────────────────── ヘルパー ─────────────────────────
 

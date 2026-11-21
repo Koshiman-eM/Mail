@@ -11,9 +11,9 @@ import {
   PULLBACK_MAX_STOP_ATR,
   PULLBACK_MIN_STOP_ATR,
   pullbackThresholds,
+  pullbackTrend,
   SCALP_PULLBACK_HOLD_BOUNDS,
   scalpPullback,
-  trend15m,
 } from "../src/strategies/scalpPullback";
 
 const T0 = Date.UTC(2024, 0, 1);
@@ -163,14 +163,14 @@ describe("scalp_pullback: 定義と既定値", () => {
 describe("scalp_pullback: 15m のトレンド", () => {
   it("上昇は long、下降は short、横ばい・傾きが小さい・本数不足は null", () => {
     const now = T0 + 200 * MIN;
-    expect(trend15m(fifteen(now, 1, 100), P)?.direction).toBe("long");
-    expect(trend15m(fifteen(now, -1, 100), P)?.direction).toBe("short");
-    expect(trend15m(fifteen(now, 1, 100, { step: 0 }), P)).toBeNull();
+    expect(pullbackTrend(fifteen(now, 1, 100), P)?.direction).toBe("long");
+    expect(pullbackTrend(fifteen(now, -1, 100), P)?.direction).toBe("short");
+    expect(pullbackTrend(fifteen(now, 1, 100, { step: 0 }), P)).toBeNull();
     // 傾き ≈ 2bps/本 < 3bps
     const gentle = fifteen(now, 1, 100, { step: 0.02 });
-    expect(Math.abs(trend15m(gentle, P, 0)!.slopeBps)).toBeLessThan(P.minTrendSlopeBps);
-    expect(trend15m(gentle, P)).toBeNull();
-    expect(trend15m(fifteen(now, 1, 100, { n: 10 }), P)).toBeNull();
+    expect(Math.abs(pullbackTrend(gentle, P, 0)!.slopeBps)).toBeLessThan(P.minTrendSlopeBps);
+    expect(pullbackTrend(gentle, P)).toBeNull();
+    expect(pullbackTrend(fifteen(now, 1, 100, { n: 10 }), P)).toBeNull();
   });
 });
 

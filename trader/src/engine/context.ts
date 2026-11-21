@@ -4,9 +4,9 @@ import {
   type StrategyPlan, type Timeframe,
 } from "../core/types";
 import { biasForInstrument } from "../intel/planner";
+import { clampOrZero } from "../core/util";
 
 const CLASS_PSEUDO: Record<AssetClass, string> = { crypto: "CRYPTO", meme: "MEME", fx: "FX", stock: "STOCKS" };
-const clamp = (v: number, lo: number, hi: number) => (Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : 0);
 const DAY_MS = 86_400_000;
 
 /** 情報収集がまだ無いときの空のブリーフ */
@@ -37,7 +37,7 @@ export function intelBiasFor(inst: Instrument, biases: Record<string, IntelBias>
   for (const [bias, sign] of used) {
     for (const id of bias.sourceIds ?? []) sourceIds.add(id);
     for (const [src, v] of Object.entries(bias.sourceContrib ?? {})) {
-      if (Number.isFinite(v)) sourceContrib[src] = clamp((sourceContrib[src] ?? 0) + sign * v, -1, 1);
+      if (Number.isFinite(v)) sourceContrib[src] = clampOrZero((sourceContrib[src] ?? 0) + sign * v, -1, 1);
     }
   }
   // ブラックアウト期限は関連する全資産の最大 (eventRisk と同じ範囲)
@@ -48,9 +48,9 @@ export function intelBiasFor(inst: Instrument, biases: Record<string, IntelBias>
   );
   return {
     asset: inst.assetClass === "fx" ? inst.symbol : (used[0]?.[0].asset ?? inst.baseCurrency),
-    sentiment: clamp(b.sentiment * k, -1, 1),
-    confidence: clamp(b.confidence * k, 0, 1),
-    eventRisk: clamp(b.eventRisk, 0, 1),
+    sentiment: clampOrZero(b.sentiment * k, -1, 1),
+    confidence: clampOrZero(b.confidence * k, 0, 1),
+    eventRisk: clampOrZero(b.eventRisk, 0, 1),
     ...(blackoutUntil !== undefined ? { blackoutUntil } : {}),
     sourceIds: [...sourceIds],
     sourceContrib,

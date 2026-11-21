@@ -1,4 +1,5 @@
 import type { AssetClass, IntelItem, SourceReliability, Store, TradeRecord, TradingMode } from "../core/types";
+import { clamp } from "../core/util";
 
 /**
  * 収集情報のフィードバック。
@@ -104,7 +105,6 @@ export const intelInfluenceKey = (mode: TradingMode, ac: AssetClass) => `intelIn
 export const sourceCreditsKey = (mode: TradingMode) => `sourceReliabilityCredits:${mode}`;
 /** 決済時の更新内容 (mode 別) */
 export const sourceAppliedKey = (mode: TradingMode) => `sourceReliabilityApplied:${mode}`;
-const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, x));
 
 export class SourceReliabilityTracker {
   readonly opts: ReliabilityOptions;

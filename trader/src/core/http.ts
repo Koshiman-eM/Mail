@@ -1,3 +1,4 @@
+import { defaultSleep } from "./util";
 /**
  * 外部 HTTP 呼び出しの共通ラッパー: タイムアウト + 指数バックオフ (ジッター付き) リトライ。
  * 429 / 5xx / ネットワークエラーのみ再試行し、4xx は即失敗。
@@ -22,6 +23,9 @@ export function redactSecrets(text: string): string {
       .replace(/[A-Za-z0-9_+=-]{32,}/g, (m) => (/[A-Za-z]/.test(m) && /\d/.test(m) && !UUID_RE.test(m) ? "***" : m))
   );
 }
+
+/** エラー文 (ccxt は URL・署名を含みうる) は伏せてから記録する */
+export const redactedErrMsg = (e: unknown): string => redactSecrets(e instanceof Error ? e.message : String(e));
 
 /** URL のクエリ文字列 (トークン等を含みうる) を伏せる。パスにキーを含む API もあるのでパスも redactSecrets に通す */
 export function redactUrl(url: string): string {
@@ -72,8 +76,6 @@ export class BodyTooLargeError extends Error {
     this.name = "BodyTooLargeError";
   }
 }
-
-const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export function backoffDelay(attempt: number, baseMs: number, rand: () => number = Math.random): number {
   const exp = baseMs * 2 ** attempt;

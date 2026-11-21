@@ -27,12 +27,6 @@ export const EXIT_REASON_LABEL: Record<ExitReason, string> = {
   wallet_reset: "リセットで決済",
 };
 
-/** 決済理由の表示名。転換で決済は方向が分かれば中身 (買い: 押し安値割れ / 売り: 戻り高値超え) を添える */
-export function exitReasonLabel(reason: string, direction?: "long" | "short"): string {
-  const base = EXIT_REASON_LABEL[reason as ExitReason] ?? reason;
-  return reason === "reversal" && direction ? `${base} (${reversalDetailLabel(direction)})` : base;
-}
-
 export const ADJUSTMENT_STATUS_LABEL: Record<string, string> = {
   proposed: "提案のみ",
   applied: "適用",
@@ -623,10 +617,8 @@ export function renderCauses(c: CauseSummary): string {
   return `${head}\n${table}`;
 }
 
-const SHADOW_EXIT_LABEL: Record<string, string> = {
-  stop: "損切り", take_profit: "利確", time: "時間切れ", unwatched: "監視終了", trailing: "トレーリング",
-  thesis_failed: "読み外れ(途中)", thesis_timeout: "読み外れ(期限)", thesis_cap: "延長の上限", reversal: REVERSAL_EXIT_LABEL,
-};
+/** 仮想トレードの決済理由の表示名 (取引と同じ + 監視終了 unwatched) */
+export const SHADOW_EXIT_LABEL: Record<string, string> = { ...EXIT_REASON_LABEL, unwatched: "監視終了" };
 
 function shadowGroupTable(title: string, rows: ShadowGroup[], limit: number, keyLabel: (key: string) => string = (k) => k): string {
   return formatTable(

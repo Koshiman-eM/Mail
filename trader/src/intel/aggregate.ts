@@ -1,5 +1,6 @@
 /** IntelItem 群 → 資産別 IntelBias (純粋関数) */
 import type { EconEvent, IntelBias, IntelItem, SourceReliability } from "../core/types";
+import { clamp } from "../core/util";
 
 export const DEFAULT_HALF_LIFE_MS = 6 * 3_600_000;
 /** 加重平均を 0 へ縮める事前質量 (少数・低重要度の記事で極端な値にならないように) */
@@ -36,8 +37,6 @@ export interface BuildBiasesOpts {
   reliability?: Record<string, SourceReliability>;
   events?: EconEvent[];
 }
-
-const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
 interface Acc {
   wSum: number;

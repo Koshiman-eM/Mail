@@ -2,8 +2,8 @@ import type { Candle, Params, Signal, Strategy, StrategyContext } from "../core/
 import { TIMEFRAME_MS } from "../core/types";
 import { atr, closesOf, ema, rsi } from "../indicators/series";
 import { buildEntrySignal, candlesOf, clamp, entryBlocked, exitSignal, period, positionSide, refPrice } from "./common";
-import { DEFAULT_WIN_EDGE_MAX, microExpectedEdge, roundTripCostBps } from "./scalpMicro";
-import { relaxToward, TEMPO_COST_MULT_FLOOR, tempoNetEdgeFloor } from "../engine/tempo";
+import { DEFAULT_WIN_EDGE_MAX, netEdgeEntry } from "./netEdge";
+import { relaxToward, TEMPO_COST_MULT_FLOOR } from "../engine/tempo";
 
 /**
  * scalp_rebound: 下降トレンドの中の短い反発を買いで取る超短期の逆張り (主時間足 1m、上位足 15m、買いのみ)。
@@ -310,43 +310,16 @@ export function createScalpRebound(opts: ScalpReboundOptions = {}): Strategy {
         reason: `15m 下降中の反発: RSI7 ${s.rsiMin.toFixed(0)}→${s.rsi.toFixed(0)} / 乖離 ${s.devAtr.toFixed(1)}ATR / 出来高 ${s.volRatio.toFixed(1)} 倍`,
         features,
       });
-      if (!sig || sig.takeProfit === undefined) return null;
-
-      // コスト
-      const q = ctx.market.quote;
-      const costBps = roundTripCostBps(ctx.market.instrument.takerFeeRate, q?.bid ?? NaN, q?.ask ?? NaN, p.slippageBps);
-      if (costBps === undefined) return null;
-      const spread = q.ask - q.bid;
-      const tpDist = Math.abs(sig.takeProfit - price);
-      const slDist = Math.abs(price - sig.stopLoss);
-      const tpBps = (tpDist / price) * 1e4;
-      const slBps = (slDist / price) * 1e4;
-      // インテルの補正後の confidence で勝率を推定する
-      const ev = microExpectedEdge({ tpBps, slBps, costBps, confidence: sig.confidence, winEdgeMax });
-      const full: Signal = {
-        ...sig,
-        expectedEdgeBps: ev.edgeBps,
-        edgeIsNet: true,
+      return netEdgeEntry({
+        ctx,
+        sig,
+        price,
+        // テンポ (ctx.tempo) では costMult だけを TEMPO_COST_MULT_FLOOR まで緩める (tempo 未指定・0 なら p.costMult そのもの)
+        costMult: relaxToward(p.costMult, TEMPO_COST_MULT_FLOOR, ctx.tempo ?? 0),
         maxHoldMs: holdBars * TIMEFRAME_MS["1m"],
-        features: { ...sig.features, costBps, tpBps, slBps, winProb: ev.p, winProbBase: ev.p0, netEdgeBps: ev.edgeBps },
-      };
-      // 見送ったシグナルを観測用に通知する (失敗しても戦略の結果は変えない)
-      const notify = (reason: string): null => {
-        if (ctx.onFiltered && Number.isFinite(ev.edgeBps) && Number.isFinite(sig.stopLoss) && Number.isFinite(sig.takeProfit)) {
-          try {
-            ctx.onFiltered(full, reason);
-          } catch {
-            /* 観測用。握りつぶす */
-          }
-        }
-        return null;
-      };
-      // テンポ (ctx.tempo) では costMult だけを TEMPO_COST_MULT_FLOOR まで緩める (tempo 未指定・0 なら p.costMult そのもの)
-      const costMult = relaxToward(p.costMult, TEMPO_COST_MULT_FLOOR, ctx.tempo ?? 0);
-      if (tpBps < Math.max(0, costMult) * costBps) return notify("cost");
-      if (slDist < Math.max(0, p.minStopSpreads) * spread) return notify("spread");
-      if (!(ev.edgeBps > tempoNetEdgeFloor(minNetEdgeBps, ctx.tempo, costBps, ctx.tempoExplore === true))) return notify("edge");
-      return full;
+        winEdgeMax,
+        minNetEdgeBps,
+      });
     },
   };
   return strategy;

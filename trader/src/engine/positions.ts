@@ -1,5 +1,5 @@
 import { D, Decimal } from "../core/decimal";
-import { redactSecrets } from "../core/http";
+import { redactedErrMsg, redactSecrets } from "../core/http";
 import { sweepOld } from "../core/sweep";
 import { createLogger, type Logger } from "../core/logger";
 import type {
@@ -16,6 +16,7 @@ import {
   bumpLimitStats, isFinalStatus, PendingOrders, RestingTakeProfits, type LimitCancelReason, type PendingEntry, type PendingOrder, type PositionVerdict,
   type ResolveRequest, type RestingTakeProfit,
 } from "./orders";
+import { quoteMid } from "../core/util";
 
 /** エントリー時に決まる決済ルール (TradeJournal に無い分) */
 export interface ExitPlan {
@@ -230,10 +231,6 @@ export interface ThesisView {
   netR?: number;
 }
 const AUDIT_THROTTLE_MS = 60_000;
-
-const midOf = (q: Quote) => (q.bid + q.ask) / 2;
-/** エラー文 (ccxt は URL・署名を含みうる) は伏せてから記録する */
-const errMsg = (e: unknown) => redactSecrets(e instanceof Error ? e.message : String(e));
 
 /** 銘柄ごとの符号付き数量の合計 (不正な値は無視) */
 function sumPositions(list: BrokerPosition[]): Map<string, Decimal> {
@@ -541,7 +538,7 @@ export class PositionManager {
     const d = decideThesis(
       {
         elapsedMs: now - p.entryTs, expectedMs: th.plan.expectedMs, maxHoldMs: th.plan.maxHoldMs, extended: false,
-        netR: thesisNetR(pricing, p.direction === "long" ? quote.bid : quote.ask), grossR: thesisGrossR(pricing, midOf(quote)),
+        netR: thesisNetR(pricing, p.direction === "long" ? quote.bid : quote.ask), grossR: thesisGrossR(pricing, quoteMid(quote)),
       },
       this.deps.thesis!,
     );
@@ -645,7 +642,7 @@ export class PositionManager {
       try {
         this.deps.onOpened({ ...p }, now ?? p.entryTs);
       } catch (e) {
-        this.log.warn("ポジション登録の通知に失敗 (取引は継続)", { symbol: p.symbol, error: errMsg(e) });
+        this.log.warn("ポジション登録の通知に失敗 (取引は継続)", { symbol: p.symbol, error: redactedErrMsg(e) });
       }
     }
     return p;
@@ -665,7 +662,7 @@ export class PositionManager {
     try {
       broker = this.deps.brokerFor(symbol);
     } catch (e) {
-      return { status: "rejected", reason: errMsg(e) };
+      return { status: "rejected", reason: redactedErrMsg(e) };
     }
     const o: PendingOrder = {
       clientId: req.clientId, symbol, side: req.side, qty: req.qty, kind: "entry", createdAt: now, status: "submitting", unknownCount: 0, entry,
@@ -678,7 +675,7 @@ export class PositionManager {
       res = await this.call(() => broker.placeOrder(req), "placeOrder");
     } catch (e) {
       this.deps.onOrder?.(now);
-      const msg = errMsg(e);
+      const msg = redactedErrMsg(e);
       this.log.error("発注の結果が不明です (保留中として照会を続けます)", { symbol, clientId: req.clientId, error: msg });
       this.deps.store?.audit({ ts: now, type: "engine.order_error", data: { symbol, strategyId: req.strategyId, clientId: req.clientId, error: msg, pending: true } });
       this.markUnknown(o, now, `発注で例外: ${msg}`);
@@ -756,7 +753,7 @@ export class PositionManager {
     const p0 = this.get(symbol);
     if (!p0) return { status: "none" };
     if (quote.bid > 0 && quote.ask > 0) {
-      this.deps.journal.mark(symbol, midOf(quote), now);
+      this.deps.journal.mark(symbol, quoteMid(quote), now);
       // 延長後の極値も気配で進める (journal の高値・安値と同じく、保留中の注文があっても記録する)
       this.advanceThesisPeak(p0, quote);
     }
@@ -821,7 +818,7 @@ export class PositionManager {
       try {
         broker = this.deps.brokerFor(symbol);
       } catch (e) {
-        const msg = errMsg(e);
+        const msg = redactedErrMsg(e);
         this.auditThrottled(`err|${symbol}`, now, "engine.exit_error", { symbol, reason, error: msg });
         this.log.error("決済の発注先が見つかりません", { symbol, reason, error: msg });
         return { status: "error", reason: msg };
@@ -862,7 +859,7 @@ export class PositionManager {
         res = await this.call(() => broker.placeOrder(req), "placeOrder");
       } catch (e) {
         this.deps.onOrder?.(now);
-        const msg = errMsg(e);
+        const msg = redactedErrMsg(e);
         this.auditThrottled(`err|${symbol}`, now, "engine.exit_error", { symbol, reason, error: msg, pending: true });
         this.log.error("決済注文の結果が不明です (保留中として照会を続けます)", { symbol, reason, error: msg });
         this.markUnknown(o, now, `発注で例外: ${msg}`);
@@ -924,7 +921,7 @@ export class PositionManager {
       try {
         out.set(p.id, await this.close(p.symbol, reason, intended, now));
       } catch (e) {
-        out.set(p.id, { status: "error", reason: errMsg(e) });
+        out.set(p.id, { status: "error", reason: redactedErrMsg(e) });
       }
     });
     return list.map((p) => out.get(p.id) ?? { status: "none" });
@@ -991,7 +988,7 @@ export class PositionManager {
       res = await this.call(() => broker.placeOrder(req), "placeOrder");
     } catch (e) {
       this.deps.onOrder?.(now);
-      this.markTpUnknown(rtp, now, `利確の指値の発注で例外: ${errMsg(e)}`);
+      this.markTpUnknown(rtp, now, `利確の指値の発注で例外: ${redactedErrMsg(e)}`);
       this.bumpStats(now, (s) => s.tpPlaced++);
       return true;
     }
@@ -1053,14 +1050,14 @@ export class PositionManager {
     try {
       broker = this.deps.brokerFor(rtp.symbol);
     } catch (e) {
-      this.markTpUnknown(rtp, now, `発注先が見つかりません: ${errMsg(e)}`);
+      this.markTpUnknown(rtp, now, `発注先が見つかりません: ${redactedErrMsg(e)}`);
       return { final: false };
     }
     let res: OrderResult | undefined;
     try {
       res = await this.call(() => broker.getOrder(rtp.clientId, rtp.symbol, rtp.orderId, { createdAt: rtp.createdAt, side: rtp.side, qty: rtp.qty }), "getOrder");
     } catch (e) {
-      this.markTpUnknown(rtp, now, `利確の指値の照会に失敗: ${errMsg(e)}`);
+      this.markTpUnknown(rtp, now, `利確の指値の照会に失敗: ${redactedErrMsg(e)}`);
       return { final: false };
     }
     const cur = this.tps.get(rtp.tradeId);
@@ -1184,7 +1181,7 @@ export class PositionManager {
     try {
       broker = this.deps.brokerFor(p.symbol);
     } catch (e) {
-      return { status: "error", reason: errMsg(e) };
+      return { status: "error", reason: redactedErrMsg(e) };
     }
     if (rtp.orderId && (rtp.canceledAt === undefined || now - rtp.canceledAt >= TP_RECANCEL_MS)) {
       const orderId = rtp.orderId;
@@ -1196,7 +1193,7 @@ export class PositionManager {
           this.tps.upsert(cur);
         }
       } catch (e) {
-        const msg = errMsg(e);
+        const msg = redactedErrMsg(e);
         this.auditThrottled(`tpcxl|${p.symbol}`, now, "engine.tp_cancel_failed", { symbol: p.symbol, tradeId: p.id, orderId, error: msg });
         this.log.warn("利確の指値の取消に失敗 (照会で確かめるまで成行の決済は送りません)", { symbol: p.symbol, orderId, error: msg });
       }
@@ -1226,7 +1223,7 @@ export class PositionManager {
         broker = this.deps.brokerFor(rtp.symbol);
       } catch (e) {
         // 発注先が無いと取消・照会で確かめられない: 記録は残す (板に残っているかもしれない注文を忘れない)
-        this.auditThrottled(`tporph|${rtp.symbol}`, now, "engine.tp_orphan_unverified", { symbol: rtp.symbol, tradeId: rtp.tradeId, clientId: rtp.clientId, error: errMsg(e) });
+        this.auditThrottled(`tporph|${rtp.symbol}`, now, "engine.tp_orphan_unverified", { symbol: rtp.symbol, tradeId: rtp.tradeId, clientId: rtp.clientId, error: redactedErrMsg(e) });
         continue;
       }
       if (rtp.orderId && (rtp.canceledAt === undefined || now - rtp.canceledAt >= TP_RECANCEL_MS)) {
@@ -1236,7 +1233,7 @@ export class PositionManager {
           rtp.canceledAt = now;
           this.tps.upsert(rtp);
         } catch (e) {
-          this.log.warn("孤児になった利確の指値の取消に失敗 (次回に再試行)", { symbol: rtp.symbol, orderId, error: errMsg(e) });
+          this.log.warn("孤児になった利確の指値の取消に失敗 (次回に再試行)", { symbol: rtp.symbol, orderId, error: redactedErrMsg(e) });
         }
       }
       const cur = this.tps.get(rtp.tradeId);
@@ -1259,7 +1256,7 @@ export class PositionManager {
         const r = await this.pollTakeProfit(rtp, now);
         if (r.applied && (r.applied.kind === "closed" || r.applied.kind === "reduced")) n++;
       } catch (e) {
-        this.log.warn("利確の指値の照会に失敗 (次回に再試行)", { symbol: rtp.symbol, error: errMsg(e) });
+        this.log.warn("利確の指値の照会に失敗 (次回に再試行)", { symbol: rtp.symbol, error: redactedErrMsg(e) });
       }
     }
     return n;
@@ -1291,7 +1288,7 @@ export class PositionManager {
         try {
           if (await this.runVerify(it.verify, now, memo)) out.reconciled++;
         } catch (e) {
-          this.log.warn("決済が約定しなかった後の建玉の確認に失敗", { symbol: it.verify.symbol, error: errMsg(e) });
+          this.log.warn("決済が約定しなかった後の建玉の確認に失敗", { symbol: it.verify.symbol, error: redactedErrMsg(e) });
         }
         return;
       }
@@ -1300,7 +1297,7 @@ export class PositionManager {
       try {
         a = await this.syncOne(o, now);
       } catch (e) {
-        this.markUnknown(o, now, `照会の処理に失敗: ${errMsg(e)}`);
+        this.markUnknown(o, now, `照会の処理に失敗: ${redactedErrMsg(e)}`);
         a = { kind: "pending", unknown: true };
       }
       if (a.kind === "pending" && a.unknown) {
@@ -1313,7 +1310,7 @@ export class PositionManager {
               out.resolved++;
             }
           } catch (e) {
-            this.log.warn("建玉による注文の確定に失敗 (次回に再試行)", { symbol: o.symbol, clientId: o.clientId, error: errMsg(e) });
+            this.log.warn("建玉による注文の確定に失敗 (次回に再試行)", { symbol: o.symbol, clientId: o.clientId, error: redactedErrMsg(e) });
           }
         }
       }
@@ -1394,7 +1391,7 @@ export class PositionManager {
     try {
       bumpLimitStats(this.deps.store, this.deps.journal.mode, now, fn);
     } catch (e) {
-      this.log.warn("指値の集計の保存に失敗 (取引は継続)", { error: errMsg(e) });
+      this.log.warn("指値の集計の保存に失敗 (取引は継続)", { error: redactedErrMsg(e) });
     }
   }
 
@@ -1417,7 +1414,7 @@ export class PositionManager {
     let p = memo.get(broker);
     if (!p) {
       p = this.call(() => broker.getPositions(), "getPositions").catch((e) => {
-        this.log.warn("建玉の照会に失敗 (次回に再試行)", { venue: broker.venue, error: errMsg(e) });
+        this.log.warn("建玉の照会に失敗 (次回に再試行)", { venue: broker.venue, error: redactedErrMsg(e) });
         return undefined;
       });
       memo.set(broker, p);
@@ -1434,7 +1431,7 @@ export class PositionManager {
         "getOrder",
       );
     } catch (e) {
-      this.markUnknown(o, now, `照会に失敗: ${errMsg(e)}`);
+      this.markUnknown(o, now, `照会に失敗: ${redactedErrMsg(e)}`);
       return "unknown";
     }
     if (!res) {
@@ -1456,7 +1453,7 @@ export class PositionManager {
     try {
       broker = this.deps.brokerFor(o.symbol);
     } catch (e) {
-      this.markUnknown(o, now, `発注先が見つかりません: ${errMsg(e)}`);
+      this.markUnknown(o, now, `発注先が見つかりません: ${redactedErrMsg(e)}`);
       return { kind: "pending", unknown: true };
     }
     let res = await this.query(broker, o, now);
@@ -1474,7 +1471,7 @@ export class PositionManager {
         const orderId = o.orderId;
         await this.call(() => broker.cancelOrder(orderId, o.symbol), "cancelOrder");
       } catch (e) {
-        this.log.warn("注文の取消に失敗 (約定済みの可能性があるため再照会します)", { symbol: o.symbol, clientId: o.clientId, error: errMsg(e) });
+        this.log.warn("注文の取消に失敗 (約定済みの可能性があるため再照会します)", { symbol: o.symbol, clientId: o.clientId, error: redactedErrMsg(e) });
       }
       if (first) {
         o.cancelRequestedAt = now;
@@ -1990,7 +1987,7 @@ export class PositionManager {
       try {
         found = await this.call(() => broker.getOrder(o.clientId, o.symbol, undefined, hint), "getOrder");
       } catch (e) {
-        return { kind: "open", why: `orderId が分からず、照会でも注文を特定できません: ${errMsg(e)}` };
+        return { kind: "open", why: `orderId が分からず、照会でも注文を特定できません: ${redactedErrMsg(e)}` };
       }
       if (!found) return { kind: "open", why: "orderId が分からず、照会でも取引所の注文を特定できません (取消できないため確定しません)" };
       if (isFinalStatus(found.status)) return applyFinal(found);
@@ -2008,13 +2005,13 @@ export class PositionManager {
       await this.call(() => broker.cancelOrder(id, o.symbol), "cancelOrder");
       canceled = true;
     } catch (e) {
-      this.log.warn("状態不明の指値のエントリーの取消に失敗 (照会で確かめます)", { symbol: o.symbol, clientId: o.clientId, orderId: id, error: errMsg(e) });
+      this.log.warn("状態不明の指値のエントリーの取消に失敗 (照会で確かめます)", { symbol: o.symbol, clientId: o.clientId, orderId: id, error: redactedErrMsg(e) });
     }
     let res: OrderResult | undefined;
     try {
       res = await this.call(() => broker.getOrder(o.clientId, o.symbol, id, hint), "getOrder");
     } catch (e) {
-      return { kind: "open", why: `取消${canceled ? "後" : "に失敗した後"}の照会に失敗: ${errMsg(e)}` };
+      return { kind: "open", why: `取消${canceled ? "後" : "に失敗した後"}の照会に失敗: ${redactedErrMsg(e)}` };
     }
     if (res && isFinalStatus(res.status)) return applyFinal(res);
     if (res) return { kind: "open", why: `取消${canceled ? "後" : "に失敗し"}も板に残っています (${res.status})` };
@@ -2029,7 +2026,7 @@ export class PositionManager {
       await this.call(() => broker.cancelOrder(orderId, o.symbol), "cancelOrder");
       return true;
     } catch (e) {
-      this.log.warn(`注文の取消に失敗 (${onFail})`, { symbol: o.symbol, clientId: o.clientId, orderId, error: errMsg(e) });
+      this.log.warn(`注文の取消に失敗 (${onFail})`, { symbol: o.symbol, clientId: o.clientId, orderId, error: redactedErrMsg(e) });
       return false;
     }
   }

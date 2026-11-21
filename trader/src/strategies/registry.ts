@@ -1,4 +1,4 @@
-import type { AssetClass, Horizon, Strategy } from "../core/types";
+import type { Strategy } from "../core/types";
 import { scalpMomentumBurst, scalpObi, scalpVwapRevert } from "./scalp";
 import { scalpMicro } from "./scalpMicro";
 import { scalpRebound } from "./scalpRebound";
@@ -40,11 +40,6 @@ const BY_ID = new Map(ALL_STRATEGIES.map((s) => [s.id, s]));
 /** ID から戦略を取得 (未登録なら undefined) */
 export function getStrategy(id: string): Strategy | undefined {
   return BY_ID.get(id);
-}
-
-/** 資産クラス (と時間軸) に対応する戦略 */
-export function strategiesFor(assetClass: AssetClass, horizon?: Horizon): Strategy[] {
-  return ALL_STRATEGIES.filter((s) => s.assetClasses.includes(assetClass) && (horizon === undefined || s.horizon === horizon));
 }
 
 /** 既定パラメータに上書きを合成し、paramBounds の範囲へクランプする */

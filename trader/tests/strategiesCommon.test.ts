@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
-import type { IntelBias, Signal } from "../src/core/types";
-import { ALL_STRATEGIES, applyIntelTilt, getStrategy, resolveParams, strategiesFor } from "../src/strategies";
+import type { AssetClass, Horizon, IntelBias, Signal } from "../src/core/types";
+import { applyIntelTilt } from "../src/strategies/common";
+import { ALL_STRATEGIES, getStrategy, resolveParams } from "../src/strategies/registry";
+
+/** 資産クラス (と時間軸) に対応する戦略 (登録順) */
+const strategiesFor = (assetClass: AssetClass, horizon?: Horizon) =>
+  ALL_STRATEGIES.filter((s) => s.assetClasses.includes(assetClass) && (horizon === undefined || s.horizon === horizon));
 
 const sig = (direction: Signal["direction"], confidence = 0.6): Signal => ({
   strategyId: "t",
@@ -88,7 +93,7 @@ describe("registry", () => {
     expect(getStrategy("nope")).toBeUndefined();
   });
 
-  it("strategiesFor は資産クラス・時間軸で絞り込む", () => {
+  it("資産クラス・時間軸の割り当て (登録順)", () => {
     const meme = strategiesFor("meme").map((s) => s.id);
     expect(meme).toContain("meme_momentum");
     expect(meme).not.toContain("scalp_obi");

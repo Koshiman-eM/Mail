@@ -105,10 +105,6 @@ export interface NewsCheckSummary {
   byHorizon: { horizon: string; n: number; hits: number; hitRate: number; noise: number; expired: number }[];
 }
 
-/** mode で分ける前の旧キー (移行元。読み書きしない) */
-export const NEWS_PENDING_KEY = "newsCheck:pending";
-export const NEWS_STATS_KEY = "newsCheck:stats";
-export const NEWS_SEEN_KEY = "newsCheck:seen";
 export const newsPendingKey = (mode: TradingMode) => `newsCheck:${mode}:pending`;
 export const newsStatsKey = (mode: TradingMode) => `newsCheck:${mode}:stats`;
 export const newsSeenKey = (mode: TradingMode) => `newsCheck:${mode}:seen`;

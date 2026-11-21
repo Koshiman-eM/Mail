@@ -18,6 +18,7 @@ import { pendingOrdersKey, resolveRequestsKey, restingTpKey } from "../engine/or
 import type { PaperSnapshot } from "../execution/paper";
 import { openKvKey, TradeJournal } from "../learning/journal";
 import { riskStateKey } from "../risk/manager";
+import { isoDayKey } from "../core/util";
 
 /** PaperBroker のスナップショットの kv キー (engine.ts の PAPER_SNAPSHOT_KEY と同じ値) */
 export const PAPER_SNAPSHOT_KV_KEY = "paper:snapshot";
@@ -225,8 +226,6 @@ export function freshPaperSnapshot(equity: number, prev?: PaperSnapshot): PaperS
   };
 }
 
-const dayKeyOf = (ts: number) => new Date(ts).toISOString().slice(0, 10);
-
 export interface WalletResetResult {
   plan: WalletResetPlan;
   closed: TradeRecord[];
@@ -302,7 +301,7 @@ function resetInTx(store: Store, o: { equity: number; now: number; by?: string }
   store.kvSet(resolveRequestsKey(MODE), undefined);
   store.kvSet(PAPER_SNAPSHOT_KV_KEY, freshPaperSnapshot(plan.toEquity, store.kvGet<PaperSnapshot>(PAPER_SNAPSHOT_KV_KEY)));
   // RiskManager の内部状態 (dayKey を含む) を新しい評価額で初期化する。上書きのリスク上限 (risk:limits:paper) は触らない
-  store.kvSet(riskStateKey(MODE), { dayStartEquity: plan.toEquity, peakEquity: plan.toEquity, recentOrderTs: [], dayKey: dayKeyOf(o.now) });
+  store.kvSet(riskStateKey(MODE), { dayStartEquity: plan.toEquity, peakEquity: plan.toEquity, recentOrderTs: [], dayKey: isoDayKey(o.now) });
   const record: PaperResetRecord = {
     at: o.now,
     ...(plan.fromEquity !== undefined ? { fromEquity: plan.fromEquity } : {}),

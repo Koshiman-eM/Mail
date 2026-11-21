@@ -5,7 +5,7 @@ import type { Candle } from "../src/core/types";
 import { createParamValidator, createPriceAt } from "../src/engine/learningHooks";
 import { brokerVenues, buildRuntime, hubTimeframesFor, parseVenues, parseWatchlist, resolveDbPath, syntheticDbPath } from "../src/engine/setup";
 import { assertSimulationDb } from "../src/engine/simulate";
-import { DEFAULT_REVERSAL_SETTINGS, REVERSAL_DISABLED } from "../src/engine/reversalExit";
+import { DEFAULT_REVERSAL_SETTINGS, type ReversalSettings } from "../src/engine/reversalExit";
 import { ClosedCandleCacheFeed } from "../src/engine/feedCache";
 import { CcxtFeed, PRECISION, type CcxtLike } from "../src/market/feeds/ccxt";
 import { PaperBroker } from "../src/execution/paper";
@@ -13,6 +13,9 @@ import { MarketHub } from "../src/market/hub";
 import { MemoryStore } from "../src/storage/memory";
 import { ALL_STRATEGIES, getStrategy } from "../src/strategies/registry";
 import { generateCandles, syntheticInstrument } from "../src/backtest/synthetic";
+
+/** 転換で決済を無効にした設定 (従来どおり) */
+const REVERSAL_DISABLED: Readonly<ReversalSettings> = { ...DEFAULT_REVERSAL_SETTINGS, enabled: false };
 
 const START = Date.UTC(2026, 0, 5);
 const mkClock = (t = START) => ({ t, now() { return this.t; } });

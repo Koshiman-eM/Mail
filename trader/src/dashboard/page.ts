@@ -3,6 +3,7 @@
  * 既定の「ボード」タブはコックピット風の一覧 (粒子の雲・SIGNAL STACK・チャート・ENGINE LOG など)。常に暗いテーマ。
  * 注意: テンプレート文字列なので、中の JS ではバッククォートとバックスラッシュを使わない。
  */
+import { ADJUSTMENT_STATUS_LABEL, EXIT_REASON_LABEL, SHADOW_EXIT_LABEL } from "../engine/report";
 import { HORIZON_LABELS, REGIME_LABEL_JA, STRATEGY_LABELS } from "../strategies/labels";
 
 export const DASHBOARD_HTML = `<!doctype html>
@@ -541,15 +542,16 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
 <script>
 (function () {
   "use strict";
-  var EXIT = { stop: "損切り", take_profit: "利確", trailing: "トレーリング", signal: "シグナル", time: "時間切れ", kill_switch: "キルスイッチ", manual: "手動",
-    thesis_failed: "読み外れ(途中)", thesis_timeout: "読み外れ(期限)", thesis_cap: "延長の上限", reversal: "転換で決済", wallet_reset: "リセットで決済" };
+  /** 決済理由・仮想トレードの決済理由・パラメータ調整の状態の表示名 (サーバーが engine/report.ts から埋め込む) */
+  var EXIT = ${JSON.stringify(EXIT_REASON_LABEL)};
+  var SH_EXIT = ${JSON.stringify(SHADOW_EXIT_LABEL)};
+  var ADJ = ${JSON.stringify(ADJUSTMENT_STATUS_LABEL)};
   /** 決済理由の表示名。転換で決済は方向で中身を添える (買い: 押し安値割れ / 売り: 戻り高値超え) */
   function exitLabel(reason, direction) {
     var b = EXIT[reason] || reason || "";
     if (reason === "reversal" && (direction === "long" || direction === "short")) return b + (direction === "long" ? " (押し安値割れ)" : " (戻り高値超え)");
     return b;
   }
-  var ADJ = { proposed: "提案のみ", applied: "適用", rejected: "却下", reverted: "差し戻し" };
   var DIR = { long: "買い", short: "売り" };
   /** paper で再現した空売り (live では実行できない取引・腕) */
   var SIM_SHORT = '空売り (paper 再現)';
@@ -575,7 +577,6 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
   var STRATS = Object.keys(SLAB);
   var REG = ["trend_up", "trend_down", "range", "high_vol", "low_liquidity"];
   var REG_L = { trend_up: "UP", trend_down: "DOWN", range: "RANGE", high_vol: "HIVOL", low_liquidity: "LOLIQ" };
-  var REG_J = { trend_up: "上昇トレンド", trend_down: "下降トレンド", range: "レンジ", high_vol: "高ボラティリティ", low_liquidity: "低流動性" };
   var C = { y: "#f5c542", g: "#3ddc97", r: "#ff5d6c", c: "#5ec8f2", b: "#5b7cfa", p: "#a78bfa", o: "#ff9f43", line: "#1a2335", line2: "#26324a", mut: "#7a89a3", dim: "#3b4862", hi: "#eef3fb", fg: "#c9d4e5" };
   var FONT = 'ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", "Noto Sans Mono CJK JP", monospace';
   var reduce = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
@@ -993,7 +994,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     var g = armGrid(), arms = (LE && LE.arms) || [], maxN = 1;
     g.rows.forEach(function (sid) { REG.forEach(function (rg) { var c = g.by[sid] && g.by[sid][rg]; if (c) maxN = Math.max(maxN, c.n); }); });
     var stepN = Math.max(1, Math.ceil(maxN / 12));
-    var h = "<span></span>" + REG.map(function (rg) { return '<span class="ch" title="' + esc(REG_J[rg]) + '">' + esc(REG_L[rg]) + "</span>"; }).join("");
+    var h = "<span></span>" + REG.map(function (rg) { return '<span class="ch" title="' + esc(RLAB[rg]) + '">' + esc(REG_L[rg]) + "</span>"; }).join("");
     var best = null, total = 0, off = 0;
     g.rows.forEach(function (sid) {
       h += '<span class="rl" title="' + esc(sid) + '">' + esc(slab(sid)) + "</span>";
@@ -1006,12 +1007,12 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
         }
         var sq = "";
         for (var i = 0; i < 12; i++) sq += i < fill ? '<i style="background:' + col + '"></i>' : "<i></i>";
-        h += '<span class="cell' + (dis ? " off" : "") + '" title="' + esc(slab(sid) + " [" + sid + "] × " + REG_J[rg] + (c ? " / " + c.n + " 件 / 期待R " + num(mr, 3) + (dis ? " / 無効" : "") : " / 未取引")) + '">' + sq + "</span>";
+        h += '<span class="cell' + (dis ? " off" : "") + '" title="' + esc(slab(sid) + " [" + sid + "] × " + RLAB[rg] + (c ? " / " + c.n + " 件 / 期待R " + num(mr, 3) + (dis ? " / 無効" : "") : " / 未取引")) + '">' + sq + "</span>";
       });
     });
     set("heat", h);
     set("heatSide", '<div class="hs"><div class="k">ARMS</div><div class="v">' + esc(arms.length) + '</div></div><div class="hs"><div class="k">TRADES</div><div class="v" style="color:' + C.c + '">' + esc(num(total, 0)) + "</div></div>" +
-      '<div class="hs"><div class="k">BEST R</div><div class="v" style="color:' + C.g + '" title="' + esc(best ? slab(best.sid) + " [" + best.sid + "] × " + REG_J[best.rg] : "") + '">' + esc(best ? signed(best.r, 2) : "-") + "</div></div>" +
+      '<div class="hs"><div class="k">BEST R</div><div class="v" style="color:' + C.g + '" title="' + esc(best ? slab(best.sid) + " [" + best.sid + "] × " + RLAB[best.rg] : "") + '">' + esc(best ? signed(best.r, 2) : "-") + "</div></div>" +
       '<div class="hs"><div class="k">OFF</div><div class="v" style="color:' + C.r + '">' + esc(off) + "</div></div>");
     set("heatSt", "● " + arms.length + " ARMS");
   }
@@ -1797,8 +1798,6 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
     safe("newsCheck", function () { renderNewsCheck(l.news); });
     safe("forecast", function () { renderForecast(l.forecast); });
   }
-  var SH_EXIT = { stop: "損切り", take_profit: "利確", time: "時間切れ", unwatched: "監視終了", trailing: "トレーリング",
-    thesis_failed: "読み外れ(途中)", thesis_timeout: "読み外れ(期限)", thesis_cap: "延長の上限", reversal: "転換で決済" };
   function shadowRows(rows, keyHtml) {
     return rows.slice(0, 20).map(function (g) {
       return [keyHtml ? keyHtml(g.key) : esc(g.key), esc(g.n), esc(pct(g.winRate, 1)), '<span class="' + cls(g.avgNetR) + '">' + esc(signed(g.avgNetR, 3)) + "</span>",

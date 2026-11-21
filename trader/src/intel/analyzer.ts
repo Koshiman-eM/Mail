@@ -7,6 +7,7 @@ import { buildBiases, DEFAULT_HALF_LIFE_MS } from "./aggregate";
 import { tagAssets } from "./assetTagger";
 import { ANALYZER_SYSTEM, buildAnalyzerPrompt, formatLessons, isIntelScope } from "./prompts";
 import { applyFallbackSentiment } from "./sentiment";
+import { clamp } from "../core/util";
 
 const log = createLogger("intel.analyzer");
 
@@ -38,7 +39,6 @@ const AiSchema = z.object({
   watchlist: z.array(z.string()),
 });
 
-const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 const normTitle = (t: string) => t.toLowerCase().replace(/[^a-z0-9぀-ヿ一-龯]+/g, " ").trim();
 
 /** id と正規化タイトルで重複除去 (先勝ち) */
@@ -142,8 +142,4 @@ export async function analyzeIntelDetailed(rawItems: IntelItem[], ctx: AnalyzeCo
     items: analyzed,
     aiAnalyzedIds,
   };
-}
-
-export async function analyzeIntel(items: IntelItem[], ctx: AnalyzeContext): Promise<MarketBrief> {
-  return (await analyzeIntelDetailed(items, ctx)).brief;
 }

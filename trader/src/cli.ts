@@ -31,6 +31,7 @@ import { effectiveLimitTakeProfit, limitOrdersFromEnv } from "./engine/limitOrde
 import { formatSimulationReport, runSimulation } from "./engine/simulate";
 import { formatTempoLine, TempoController, tempoSeedTimestamps, tempoStatusView } from "./engine/tempo";
 import { createDefaultSources, IntelService } from "./intel/service";
+import type { IntelSource } from "./intel/sources/common";
 import { TradeJournal } from "./learning/journal";
 import { LearningService } from "./learning/service";
 import { CcxtFeed } from "./market/feeds/ccxt";
@@ -590,16 +591,25 @@ async function cmdRegime(flags: ParsedArgs["flags"], io: Io): Promise<number> {
 /** 外部から集めた文字列を端末に出す前に、制御文字と双方向制御文字を取り除く (表示の乗っ取り防止) */
 const cleanText = (s: string) => s.replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F\u202A-\u202E\u2066-\u2069]/g, "");
 
+/**
+ * `intel` コマンドの IntelService。情報源の信頼度はエンジンと同じく現在の mode のキー (`intel:sourceReliability:<mode>`) を読む
+ * (mode なしの旧キーを読まない)。sources はテスト用 (既定は設定の情報源)
+ */
+export function createCliIntelService(config: AppConfig, store: Store, sources?: IntelSource[]): IntelService {
+  const ai = config.ai.enabled ? { apiKey: config.ai.apiKey, model: config.ai.model } : undefined;
+  return new IntelService({
+    store,
+    mode: config.mode,
+    sources: sources ?? createDefaultSources({ env: { NEWS_RSS_FEEDS: config.env.NEWS_RSS_FEEDS, CRYPTOPANIC_TOKEN: config.env.CRYPTOPANIC_TOKEN } }),
+    ...(ai ? { ai } : {}),
+  });
+}
+
 async function cmdIntel(io: Io): Promise<number> {
   const config = loadConfig();
   const store = createStore(resolveDbPath(config));
   try {
-    const ai = config.ai.enabled ? { apiKey: config.ai.apiKey, model: config.ai.model } : undefined;
-    const svc = new IntelService({
-      store,
-      sources: createDefaultSources({ env: { NEWS_RSS_FEEDS: config.env.NEWS_RSS_FEEDS, CRYPTOPANIC_TOKEN: config.env.CRYPTOPANIC_TOKEN } }),
-      ...(ai ? { ai } : {}),
-    });
+    const svc = createCliIntelService(config, store);
     io.out("情報収集を実行しています...");
     const now = Date.now();
     const b = await svc.refresh(now);

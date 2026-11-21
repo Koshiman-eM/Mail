@@ -2,8 +2,8 @@ import type { Candle, Horizon, Params, Signal, Strategy, StrategyContext, Timefr
 import { TIMEFRAME_MS } from "../core/types";
 import { atr, closesOf, ema, rsi } from "../indicators/series";
 import { buildEntrySignal, candlesOf, clamp, entryBlocked, exitSignal, period, positionSide, refPrice } from "./common";
-import { DEFAULT_WIN_EDGE_MAX, microExpectedEdge, roundTripCostBps } from "./scalpMicro";
-import { clampTempo, relaxToward, TEMPO_COST_MULT_FLOOR, tempoNetEdgeFloor } from "../engine/tempo";
+import { DEFAULT_WIN_EDGE_MAX, netEdgeEntry } from "./netEdge";
+import { clampTempo, relaxToward, TEMPO_COST_MULT_FLOOR } from "../engine/tempo";
 
 /**
  * 押し目買い・戻り売り (pullback) の戦略群: 上位足のトレンドの向きに、主時間足の押し目で買い・戻りで売る順張り
@@ -153,8 +153,6 @@ export interface PullbackTrend {
   /** 上位足の EMA(20) の最後の値 */
   ema: number;
 }
-/** 旧名 (scalp_pullback の 15m)。PullbackTrend と同じ */
-export type Trend15m = PullbackTrend;
 
 /** 上位足の判定に必要な最小本数 (EMA20 + trendSlopeBars。既定 23 本) */
 export function pullbackMinTrendBars(p: Params): number {
@@ -196,8 +194,6 @@ export function pullbackTrend(ct: readonly Candle[], p: Params, minSlopeBps: num
   if (slopeBps < 0 && gapBps < 0) return { direction: "short", slopeBps, gapBps, ema: now };
   return null;
 }
-/** 旧名 (scalp_pullback の 15m)。pullbackTrend と同じ */
-export const trend15m = pullbackTrend;
 
 export interface PullbackSetup {
   direction: "long" | "short";
@@ -494,42 +490,8 @@ export function createPullback(cfg: PullbackConfig): Strategy {
           ` / 出来高 ${s.volRatio.toFixed(1)} 倍${tempo > 0 ? ` / テンポ ${tempo.toFixed(2)}` : ""}`,
         features,
       });
-      if (!sig || sig.takeProfit === undefined) return null;
-
-      // コスト
-      const q = ctx.market.quote;
-      const costBps = roundTripCostBps(ctx.market.instrument.takerFeeRate, q?.bid ?? NaN, q?.ask ?? NaN, p.slippageBps);
-      if (costBps === undefined) return null;
-      const spread = q.ask - q.bid;
-      const tpDist = Math.abs(sig.takeProfit - price);
-      const slDist = Math.abs(price - sig.stopLoss);
-      const tpBps = (tpDist / price) * 1e4;
-      const slBps = (slDist / price) * 1e4;
-      // インテルの補正後の confidence で勝率を推定する
-      const ev = microExpectedEdge({ tpBps, slBps, costBps, confidence: sig.confidence, winEdgeMax });
-      const full: Signal = {
-        ...sig,
-        expectedEdgeBps: ev.edgeBps,
-        edgeIsNet: true,
-        maxHoldMs: holdBars * TIMEFRAME_MS[execTf],
-        features: { ...sig.features, costBps, tpBps, slBps, winProb: ev.p, winProbBase: ev.p0, netEdgeBps: ev.edgeBps },
-      };
-      // 見送ったシグナルを観測用に通知する (失敗しても戦略の結果は変えない)
-      const notify = (reason: string): null => {
-        if (ctx.onFiltered && Number.isFinite(ev.edgeBps) && Number.isFinite(sig.stopLoss) && Number.isFinite(sig.takeProfit)) {
-          try {
-            ctx.onFiltered(full, reason);
-          } catch {
-            /* 観測用。握りつぶす */
-          }
-        }
-        return null;
-      };
-      if (tpBps < Math.max(0, th.costMult) * costBps) return notify("cost");
-      if (slDist < Math.max(0, p.minStopSpreads) * spread) return notify("spread");
       // コスト控除後の期待値の条件はテンポでも緩めない (探索 ctx.tempoExplore のときだけ tempoNetEdgeFloor まで下げる)
-      if (!(ev.edgeBps > tempoNetEdgeFloor(minNetEdgeBps, ctx.tempo, costBps, ctx.tempoExplore === true))) return notify("edge");
-      return full;
+      return netEdgeEntry({ ctx, sig, price, costMult: th.costMult, maxHoldMs: holdBars * TIMEFRAME_MS[execTf], winEdgeMax, minNetEdgeBps });
     },
   };
   return strategy;

@@ -44,12 +44,6 @@ export function spreadBps(q: Pick<Quote, "bid" | "ask">): number {
   return ((q.ask - q.bid) / m) * 1e4;
 }
 
-/** 板から最良気配の Quote を作る */
-export function quoteFromBook(book: OrderBook): Quote | undefined {
-  if (book.bids.length === 0 || book.asks.length === 0) return undefined;
-  return { ts: book.ts, bid: book.bids[0][0], ask: book.asks[0][0], bidSize: book.bids[0][1], askSize: book.asks[0][1] };
-}
-
 /**
  * 約定フロー不均衡: (now - windowMs, now] の約定について (買い主導量 - 売り主導量) / 合計。
  * -1〜1。該当なしなら 0。

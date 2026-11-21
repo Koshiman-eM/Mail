@@ -6,8 +6,9 @@ import { describe, expect, it } from "vitest";
 import { buildReportText, main } from "../src/cli";
 import { loadConfig } from "../src/core/config";
 import { isSignalLikeExit, type EntryContext, type TradeRecord } from "../src/core/types";
-import { EXIT_REASON_LABEL, exitReasonLabel, renderReversalTable, summarizeReversal, tpCaptureOf } from "../src/engine/report";
+import { EXIT_REASON_LABEL, renderReversalTable, summarizeReversal, tpCaptureOf } from "../src/engine/report";
 import { formatSimulationReport, runSimulation } from "../src/engine/simulate";
+import { reversalDetailLabel } from "../src/engine/reversalExit";
 import { thesisOutcomeOf } from "../src/engine/thesis";
 import { attributeTrade } from "../src/learning/attribution";
 import { TUNER_RULES } from "../src/learning/tuner";
@@ -52,10 +53,9 @@ const TRADES: TradeRecord[] = [
 describe("転換で決済の集計と表示", () => {
   it("表示名: 転換で決済 (買いは押し安値割れ / 売りは戻り高値超え)", () => {
     expect(EXIT_REASON_LABEL.reversal).toBe("転換で決済");
-    expect(exitReasonLabel("reversal", "long")).toBe("転換で決済 (押し安値割れ)");
-    expect(exitReasonLabel("reversal", "short")).toBe("転換で決済 (戻り高値超え)");
-    expect(exitReasonLabel("reversal")).toBe("転換で決済");
-    expect(exitReasonLabel("signal", "long")).toBe("シグナル");
+    expect(reversalDetailLabel("long")).toBe("押し安値割れ");
+    expect(reversalDetailLabel("short")).toBe("戻り高値超え");
+    expect(EXIT_REASON_LABEL.signal).toBe("シグナル");
   });
 
   it("方向別と合計: 件数・勝率・純損益・平均R・含み益で決済・勝ちの取引の利確までの距離のうち取れた割合", () => {

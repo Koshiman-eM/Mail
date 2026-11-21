@@ -14,14 +14,13 @@
  */
 import type { AssetClass, Store, TradingMode } from "../core/types";
 import { intelInfluenceKey, type IntelInfluenceState, type ReliabilityOptions } from "./reliability";
+import { clamp } from "../core/util";
 
 /** 仮想トレード由来の更新の件数・重みの合計 (表示・確認用。無ければ 0) */
 export type WeightedInfluenceState = IntelInfluenceState & { shadowN?: number; shadowW?: number };
 
 /** 仮想トレード 1 件の既定の重み (実際の取引は 1) */
 export const DEFAULT_INFLUENCE_SHADOW_WEIGHT = 0.25;
-
-const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, x));
 
 /**
  * 情報の効き具合を重み w の観測 (x, y) で更新する。x = 情報バイアス (sentiment) × 取引方向 (+1 / −1)、y = R。

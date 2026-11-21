@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { analyzeIntel } from "../src/intel/analyzer";
-import { IntelService, RELIABILITY_KV_KEY } from "../src/intel/service";
+import { analyzeIntelDetailed, type AnalyzeContext } from "../src/intel/analyzer";
+import { IntelService } from "../src/intel/service";
+import { SOURCE_RELIABILITY_KV_KEY } from "../src/learning/reliability";
 import type { IntelSource } from "../src/intel/sources/common";
 import type { EconEvent, IntelItem, Lesson, MarketBrief, SourceReliability, Store } from "../src/core/types";
 
@@ -32,7 +33,8 @@ function fakeStore() {
   return { store, intel, kv, briefs };
 }
 
-describe("analyzeIntel (AI 無効)", () => {
+describe("analyzeIntelDetailed (AI 無効)", () => {
+  const analyzeIntel = async (items: IntelItem[], ctx: AnalyzeContext) => (await analyzeIntelDetailed(items, ctx)).brief;
   it("キー無しはフォールバック (stub: true) でバイアスを作る", async () => {
     const items = [
       item("1", "Bitcoin surges to record high"),
@@ -117,7 +119,7 @@ describe("IntelService", () => {
   it("store の信頼度 KV を分析に反映する", async () => {
     const run = async (w: number) => {
       const { store, kv } = fakeStore();
-      kv.set(RELIABILITY_KV_KEY, { "rss:a": { source: "rss:a", n: 1, hits: 1, ewmaScore: 0, weight: w, updatedAt: NOW } });
+      kv.set(SOURCE_RELIABILITY_KV_KEY, { "rss:a": { source: "rss:a", n: 1, hits: 1, ewmaScore: 0, weight: w, updatedAt: NOW } });
       const svc = new IntelService({ store, sources: [ok("s", [item("1", "Bitcoin surges to record high")])] });
       return (await svc.refresh(NOW)).biases.BTC.sentiment;
     };

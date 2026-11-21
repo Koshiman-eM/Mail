@@ -1,4 +1,5 @@
 import { isSignalLikeExit, isTimeLikeExit, type Cause, type CauseCode, type RegimeLabel, type TradeAttribution, type TradeRecord } from "../core/types";
+import { clamp } from "../core/util";
 
 /**
  * トレードの損益要因分析 (純粋関数)。比率・リターンはすべて小数 (0.01 = 1%)。
@@ -82,7 +83,6 @@ export interface AttributionOptions {
 }
 
 const T = ATTRIBUTION_THRESHOLDS;
-const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, x));
 const finite = (x: number | undefined | null): x is number => typeof x === "number" && Number.isFinite(x);
 
 export const pct = (x: number) => `${(x * 100).toFixed(2)}%`;

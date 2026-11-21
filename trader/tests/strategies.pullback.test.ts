@@ -4,14 +4,14 @@
  * 上位足の取り違えが無いことを中心に確かめる。合成データのみ (オフライン)
  */
 import { describe, expect, it } from "vitest";
-import type { Candle, Instrument, PositionView, RegimeFeatures, Signal, Strategy, StrategyContext, Timeframe } from "../src/core/types";
+import type { AssetClass, Candle, Horizon, Instrument, PositionView, RegimeFeatures, Signal, Strategy, StrategyContext, Timeframe } from "../src/core/types";
 import { TIMEFRAME_MS } from "../src/core/types";
 import { generateCandles, syntheticInstrument } from "../src/backtest/synthetic";
 import { runBacktest } from "../src/backtest/engine";
 import { DEFAULT_OBSERVE_ONLY_STRATEGIES, DEFAULT_STRUCTURE_STRATEGIES } from "../src/core/config";
 import { TEMPO_COST_MULT_FLOOR } from "../src/engine/tempo";
 import { hubTimeframesFor } from "../src/engine/setup";
-import { ALL_STRATEGIES, getStrategy, strategiesFor } from "../src/strategies/registry";
+import { ALL_STRATEGIES, getStrategy } from "../src/strategies/registry";
 import {
   createPullback,
   createPullback15m,
@@ -31,6 +31,10 @@ import {
   SCALP_PULLBACK_CONFIG,
   scalpPullback,
 } from "../src/strategies/scalpPullback";
+
+/** 資産クラス (と時間軸) に対応する戦略 (登録順) */
+const strategiesFor = (assetClass: AssetClass, horizon?: Horizon) =>
+  ALL_STRATEGIES.filter((s) => s.assetClasses.includes(assetClass) && (horizon === undefined || s.horizon === horizon));
 
 const T0 = Date.UTC(2024, 0, 1);
 

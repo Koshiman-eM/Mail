@@ -7,7 +7,7 @@ import type { Runtime } from "../src/engine/setup";
 import { loadConfig } from "../src/core/config";
 import type { EntryContext, Instrument, Store, TradeRecord } from "../src/core/types";
 import { tradesPayload } from "../src/dashboard/server";
-import { EXIT_REASON_LABEL, exitReasonLabel } from "../src/engine/report";
+import { EXIT_REASON_LABEL } from "../src/engine/report";
 import { acquireEngineLock, engineLockKey, type EngineLock } from "../src/engine/lock";
 import { pendingOrdersKey, resolveRequestsKey, restingTpKey } from "../src/engine/orders";
 import { PAPER_SNAPSHOT_KEY } from "../src/engine/engine";
@@ -348,7 +348,6 @@ describe("paper reset: 学習の各部品は wallet_reset の取引を使わな�
 
   it("表示名は「リセットで決済」", () => {
     expect(EXIT_REASON_LABEL.wallet_reset).toBe("リセットで決済");
-    expect(exitReasonLabel("wallet_reset", "long")).toBe("リセットで決済");
   });
 });
 

@@ -49,7 +49,6 @@ export interface ReversalSettings {
 
 /** 転換で決済の時間足のモード (REVERSAL_EXIT_TF) */
 export type ReversalTfMode = "lower" | "same";
-export const REVERSAL_TF_MODES = ["lower", "same"] as const;
 
 export const DEFAULT_REVERSAL_SETTINGS: Readonly<ReversalSettings> = { enabled: true, pivotN: 3, bufferAtr: 0, strategies: [], timeframe: "lower", fallback: false };
 
@@ -78,9 +77,6 @@ export function reversalBacktestTimeframe(s: Pick<ReversalSettings, "timeframe">
   const baseMs = TIMEFRAME_MS[baseTf];
   return ms >= baseMs && ms % baseMs === 0 ? tf : primary;
 }
-
-/** 無効 (従来どおり)。バックテスト・仮想トレードで設定を渡さないときの既定 */
-export const REVERSAL_DISABLED: Readonly<ReversalSettings> = { ...DEFAULT_REVERSAL_SETTINGS, enabled: false };
 
 /** ATR の期間と、ATR を求める足の本数 (最後の何本か) */
 export const REVERSAL_ATR_PERIOD = 14;

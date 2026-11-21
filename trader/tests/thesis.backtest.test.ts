@@ -4,7 +4,8 @@
  * 同じ値動きを、運用側には各足の終値の気配として渡し、決済理由・答え合わせの結果が同じになることを確かめる。
  */
 import { describe, expect, it } from "vitest";
-import { runBacktest, syntheticInstrument } from "../src/backtest";
+import { runBacktest } from "../src/backtest/engine";
+import { syntheticInstrument } from "../src/backtest/synthetic";
 import type { Candle, EntryContext, Instrument, Quote, Signal, Strategy, StrategyContext, TradeRecord } from "../src/core/types";
 import { PaperBroker } from "../src/execution/paper";
 import { PositionManager } from "../src/engine/positions";

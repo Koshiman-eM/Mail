@@ -7,8 +7,9 @@ import { describe, expect, it } from "vitest";
 import type { Candle, Timeframe } from "../src/core/types";
 import {
   clusterZ, DEFAULT_FORECAST_OPTIONS, forecastBaseModelKey, forecastModelKey, forecastPendingKey, forecastStatsKey, ForecastTracker, LIVE_RULE,
-  liveDecision, liveThresholds, normalCdf, normalQuantile, type ForecastCounts, type PendingForecast,
+  liveDecision, liveThresholds, normalQuantile, type ForecastCounts, type PendingForecast,
 } from "../src/learning/forecast";
+import { normalCdf } from "../src/learning/stats";
 import { MemoryStore } from "../src/storage/memory";
 
 const MIN = 60_000;

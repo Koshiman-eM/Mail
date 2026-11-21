@@ -3,9 +3,11 @@ import { describe, expect, it } from "vitest";
 import { generateCandles } from "../src/backtest/synthetic";
 import type { Candle } from "../src/core/types";
 import { createRng } from "../src/backtest/synthetic";
-import {
-  computeStructureSeries, detectPivots, higherCandles, perfectOrderSeries, structureAt, type StructureOptions,
-} from "../src/structure";
+import { computeStructureSeries, structureAt } from "../src/structure/machine";
+import { higherCandles } from "../src/structure/mtf";
+import { perfectOrderSeries } from "../src/structure/perfectOrder";
+import { detectPivots } from "../src/structure/pivots";
+import { type StructureOptions } from "../src/structure/types";
 import { lineBars, path, T0 } from "./helpers/structureBars";
 
 const N2: Partial<StructureOptions> = { pivotN: 2 };

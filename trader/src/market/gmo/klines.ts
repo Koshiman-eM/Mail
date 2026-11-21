@@ -13,14 +13,8 @@
  *   fetchCandlesPaged (ts + 足の長さ <= until) が行う。未来の openTime の足は捨てる。
  */
 import type { Candle, Timeframe } from "../../core/types";
-import { TIMEFRAME_MS } from "../../core/types";
+import { collectFileCandles, fileKeyOf, JST_OFFSET, maxFilesFor, utcDayStart, utcYear, type FileKind } from "../fileCandles";
 import { GmoApiError } from "./client";
-
-const HOUR = 3_600_000;
-const DAY = 86_400_000;
-const JST_OFFSET = 9 * HOUR;
-
-type FileKind = "day" | "year";
 
 /** 時間足 → GMO の interval とファイルの単位 */
 export const GMO_INTERVALS: Partial<Record<Timeframe, { interval: string; kind: FileKind }>> = {
@@ -50,21 +44,11 @@ export class GmoNoKlinesError extends Error {
 
 export type KlinesFetcher = (symbol: string, interval: string, date: string) => Promise<Candle[]>;
 
-const pad = (n: number) => String(n).padStart(2, "0");
-const utcDayStart = (t: number) => Math.floor(t / DAY) * DAY;
-export const gmoDayKey = (t: number) => {
-  const d = new Date(utcDayStart(t));
-  return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}`;
-};
-const utcYear = (t: number) => new Date(t).getUTCFullYear();
-
 /** 時刻 t を含みうるファイルの範囲 (UTC 日付 〜 JST 日付。年次は年) */
 function fileRange(kind: FileKind, t: number): { oldest: number; newest: number } {
   if (kind === "day") return { oldest: utcDayStart(t), newest: utcDayStart(t + JST_OFFSET) };
   return { oldest: utcYear(t), newest: utcYear(t + JST_OFFSET) };
 }
-const keyOf = (kind: FileKind, v: number) => (kind === "day" ? gmoDayKey(v) : String(v));
-const stepOf = (kind: FileKind) => (kind === "day" ? DAY : 1);
 
 /** ファイルを取らずにエラーにする取引所のエラーか (メンテナンス・リクエスト過多は投げる) */
 const isNoDataError = (e: unknown) => e instanceof GmoApiError && e.kind === "other";
@@ -86,57 +70,33 @@ export async function fetchGmoKlines(
   if (!spec) throw new Error(`GMO は時間足 ${tf} のローソク足を提供していません`);
   const { interval, kind } = spec;
   const want = Math.max(1, Math.floor(limit));
-  const ms = TIMEFRAME_MS[tf];
-  const period = kind === "day" ? DAY : 365 * DAY;
-  const maxFiles = Math.min(GMO_MAX_FILES[kind], Math.ceil((want * ms) / period) + 2);
-  const byTs = new Map<number, Candle>();
   let fetched = 0;
   let failed = 0;
   let lastErr: unknown;
 
-  const take = async (v: number) => {
-    fetched++;
-    let rows: Candle[];
-    try {
-      rows = await fetchFile(symbol, interval, keyOf(kind, v));
-    } catch (e) {
-      if (!isNoDataError(e)) throw e;
-      failed++;
-      lastErr = e;
-      return;
-    }
-    for (const c of rows) if (c.ts <= now) byTs.set(c.ts, c);
-  };
-  const sorted = () => [...byTs.values()].sort((a, b) => a.ts - b.ts);
-  const newest = fileRange(kind, now).newest;
-
-  if (since === undefined) {
-    let v = newest;
-    for (let n = 0; n < maxFiles; n++, v -= stepOf(kind)) {
-      await take(v);
-      if (byTs.size >= want) break;
-    }
-    if (fetched > 0 && failed === fetched) throw new GmoNoKlinesError(symbol, interval, lastErr);
-    return sorted().slice(-want);
-  }
-
-  let v = fileRange(kind, since).oldest;
-  for (let n = 0; n < maxFiles && v <= newest; n++, v += stepOf(kind)) {
-    await take(v);
-    let count = 0;
-    for (const ts of byTs.keys()) if (ts >= since) count++;
-    if (count >= want) break;
-  }
+  const out = await collectFileCandles(
+    {
+      kind,
+      want,
+      maxFiles: maxFilesFor(kind, GMO_MAX_FILES, want, tf),
+      newest: fileRange(kind, now).newest,
+      oldestFor: (t) => fileRange(kind, t).oldest,
+      take: async (v, byTs) => {
+        fetched++;
+        let rows: Candle[];
+        try {
+          rows = await fetchFile(symbol, interval, fileKeyOf(kind, v));
+        } catch (e) {
+          if (!isNoDataError(e)) throw e;
+          failed++;
+          lastErr = e;
+          return;
+        }
+        for (const c of rows) if (c.ts <= now) byTs.set(c.ts, c);
+      },
+    },
+    since,
+  );
   if (fetched > 0 && failed === fetched) throw new GmoNoKlinesError(symbol, interval, lastErr);
-  return sorted()
-    .filter((c) => c.ts >= since)
-    .slice(0, want);
-}
-
-/**
- * hub の毎回更新で、同じ (銘柄, 時間足) のファイル再取得の最短間隔 (bitbank と同じ: 足の長さの 1/60、上限 5 分)。
- * GMO も 1 回の取得でファイル (1 日 / 1 年分) を丸ごと返すため間引く。
- */
-export function gmoRefreshIntervalMs(tf: Timeframe): number {
-  return Math.min(5 * 60_000, Math.floor(TIMEFRAME_MS[tf] / 60));
+  return out;
 }

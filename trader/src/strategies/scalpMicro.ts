@@ -3,7 +3,8 @@ import { TIMEFRAME_MS } from "../core/types";
 import { atrLast } from "../indicators/series";
 import { orderBookImbalance, tradeFlowImbalance } from "../indicators/microstructure";
 import { buildEntrySignal, candlesOf, clamp, entryBlocked, exitSignal, period, positionSide, refPrice } from "./common";
-import { relaxToward, TEMPO_COST_MULT_FLOOR, tempoNetEdgeFloor } from "../engine/tempo";
+import { relaxToward, TEMPO_COST_MULT_FLOOR } from "../engine/tempo";
+import { DEFAULT_WIN_EDGE_MAX, netEdgeEntry } from "./netEdge";
 
 /**
  * scalp_micro: 5〜10 分で利確・損切りを繰り返す超短期のモメンタム戦略 (主時間足 1m、成行 = taker)。
@@ -58,39 +59,10 @@ import { relaxToward, TEMPO_COST_MULT_FLOOR, tempoNetEdgeFloor } from "../engine
 
 /** 保有本数 (1m) の範囲。maxHoldMs を必ず 10 分以内にする */
 export const SCALP_MICRO_HOLD_BOUNDS: readonly [number, number] = [5, 10];
-/** 既定の勝率の上乗せの上限 (ランダムウォークの勝率 p0 に対して) */
-export const DEFAULT_WIN_EDGE_MAX = 0.1;
 /** ATR の期間 (1m) */
 const ATR_PERIOD = 14;
 /** 約定フローの集計窓 */
 const FLOW_WINDOW_MS = 60_000;
-
-/** 往復コスト (bps)。気配が無効なら undefined */
-export function roundTripCostBps(takerFeeRate: number, bid: number, ask: number, slippageBps: number): number | undefined {
-  if (!(bid > 0) || !(ask >= bid) || !Number.isFinite(ask)) return undefined;
-  const mid = (bid + ask) / 2;
-  const spread = ((ask - bid) / mid) * 1e4;
-  const fee = Math.max(0, Number.isFinite(takerFeeRate) ? takerFeeRate : 0) * 2 * 1e4;
-  const slip = 2 * Math.max(0, Number.isFinite(slippageBps) ? slippageBps : 0);
-  return fee + spread + slip;
-}
-
-/**
- * 勝率を仮定した期待値 (bps, コスト控除後)。
- * p0 = sl / (tp + sl) (ランダムウォークで利確が先に届く確率)、p = p0 + winEdgeMax × strength。
- */
-export function microExpectedEdge(a: { tpBps: number; slBps: number; costBps: number; confidence: number; winEdgeMax: number }): {
-  p0: number;
-  p: number;
-  edgeBps: number;
-} {
-  const { tpBps, slBps, costBps } = a;
-  if (!(tpBps > 0) || !(slBps > 0)) return { p0: 0, p: 0, edgeBps: -Infinity };
-  const p0 = slBps / (tpBps + slBps);
-  const strength = clamp((a.confidence - 0.5) / 0.5);
-  const p = clamp(p0 + Math.max(0, a.winEdgeMax) * strength, 0, 0.99);
-  return { p0, p, edgeBps: p * tpBps - (1 - p) * slBps - costBps };
-}
 
 export interface Burst {
   direction: "long" | "short";
@@ -263,12 +235,6 @@ export function createScalpMicro(opts: ScalpMicroOptions = {}): Strategy {
         0.15 * clamp((Math.abs(burst.momentum) - th) / th) +
         0.15 * clamp(aligned);
 
-      // コスト
-      const q = ctx.market.quote;
-      const costBps = roundTripCostBps(ctx.market.instrument.takerFeeRate, q?.bid ?? NaN, q?.ask ?? NaN, p.slippageBps);
-      if (costBps === undefined) return null;
-      const spread = q.ask - q.bid;
-
       const sig = buildEntrySignal({
         ctx,
         strategy,
@@ -283,41 +249,17 @@ export function createScalpMicro(opts: ScalpMicroOptions = {}): Strategy {
           ...(micro.flow !== undefined ? { flow: micro.flow } : {}),
         },
       });
-      if (!sig || sig.takeProfit === undefined) return null;
-
-      const price = refPrice(ctx, dir, burst.close);
-      const tpDist = Math.abs(sig.takeProfit - price);
-      const slDist = Math.abs(price - sig.stopLoss);
-      const tpBps = (tpDist / price) * 1e4;
-      const slBps = (slDist / price) * 1e4;
-      // 利確幅がコストの costMult 倍未満、または損切りがスプレッドに近すぎるなら出さない
-      // インテルの補正後の confidence で勝率を推定する
-      const ev = microExpectedEdge({ tpBps, slBps, costBps, confidence: sig.confidence, winEdgeMax });
       const holdBars = Math.min(SCALP_MICRO_HOLD_BOUNDS[1], Math.max(SCALP_MICRO_HOLD_BOUNDS[0], period(p.maxHoldBars)));
-      const full: Signal = {
-        ...sig,
-        expectedEdgeBps: ev.edgeBps,
-        edgeIsNet: true,
+      return netEdgeEntry({
+        ctx,
+        sig,
+        price: refPrice(ctx, dir, burst.close),
+        // テンポ (ctx.tempo) では costMult だけを TEMPO_COST_MULT_FLOOR まで緩める (tempo 未指定・0 なら p.costMult そのもの)
+        costMult: relaxToward(p.costMult, TEMPO_COST_MULT_FLOOR, ctx.tempo ?? 0),
         maxHoldMs: holdBars * TIMEFRAME_MS["1m"],
-        features: { ...sig.features, costBps, tpBps, slBps, winProb: ev.p, winProbBase: ev.p0, netEdgeBps: ev.edgeBps },
-      };
-      // 見送ったシグナルを観測用に通知する (失敗しても戦略の結果は変えない)
-      const notify = (reason: string): null => {
-        if (ctx.onFiltered && Number.isFinite(ev.edgeBps) && Number.isFinite(sig.stopLoss) && Number.isFinite(sig.takeProfit)) {
-          try {
-            ctx.onFiltered(full, reason);
-          } catch {
-            /* 観測用。握りつぶす */
-          }
-        }
-        return null;
-      };
-      // テンポ (ctx.tempo) では costMult だけを TEMPO_COST_MULT_FLOOR まで緩める (tempo 未指定・0 なら p.costMult そのもの)
-      const costMult = relaxToward(p.costMult, TEMPO_COST_MULT_FLOOR, ctx.tempo ?? 0);
-      if (tpBps < Math.max(0, costMult) * costBps) return notify("cost");
-      if (slDist < Math.max(0, p.minStopSpreads) * spread) return notify("spread");
-      if (!(ev.edgeBps > tempoNetEdgeFloor(minNetEdgeBps, ctx.tempo, costBps, ctx.tempoExplore === true))) return notify("edge");
-      return full;
+        winEdgeMax,
+        minNetEdgeBps,
+      });
     },
   };
   return strategy;

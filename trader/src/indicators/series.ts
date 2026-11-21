@@ -15,12 +15,6 @@ export function last(series: readonly number[]): number {
   return series.length > 0 ? series[series.length - 1] : NaN;
 }
 
-/** 末尾から k 本前の値 (k=0 で末尾) */
-export function prev(series: readonly number[], k = 1): number {
-  const i = series.length - 1 - k;
-  return i >= 0 ? series[i] : NaN;
-}
-
 export const closesOf = (candles: readonly Candle[]): number[] => candles.map((c) => c.close);
 export const volumesOf = (candles: readonly Candle[]): number[] => candles.map((c) => c.volume);
 
@@ -285,32 +279,7 @@ export function donchian(candles: readonly Candle[], period = 20): DonchianResul
 
 const typical = (c: Candle) => (c.high + c.low + c.close) / 3;
 
-/** ローリング VWAP (典型価格 × 出来高)。出来高 0 の窓は典型価格の単純平均 */
-export function rollingVwap(candles: readonly Candle[], period = 20): number[] {
-  const p = toPeriod(period);
-  const n = candles.length;
-  const out = nanArray(n);
-  let pv = 0;
-  let v = 0;
-  let tp = 0;
-  for (let i = 0; i < n; i++) {
-    const c = candles[i];
-    const t = typical(c);
-    pv += t * c.volume;
-    v += c.volume;
-    tp += t;
-    if (i >= p) {
-      const o = candles[i - p];
-      const ot = typical(o);
-      pv -= ot * o.volume;
-      v -= o.volume;
-      tp -= ot;
-    }
-    if (i >= p - 1) out[i] = v > 1e-12 ? pv / v : tp / p;
-  }
-  return out;
-}
-
+/** 末尾 period 本の VWAP (典型価格 × 出来高)。出来高 0 の窓は典型価格の単純平均 */
 export function vwapLast(candles: readonly Candle[], period = 20): number {
   const p = toPeriod(period);
   const n = candles.length;
@@ -355,25 +324,6 @@ export function stdevLast(values: readonly number[], period = 20): number {
   return values.length >= p ? windowStats(values, values.length - 1, p).sd : NaN;
 }
 
-/** ローリング z スコア (現在値を含む窓の平均・標準偏差)。標準偏差 0 なら 0 */
-export function zscore(values: readonly number[], period = 20): number[] {
-  const p = toPeriod(period);
-  const n = values.length;
-  const out = nanArray(n);
-  for (let i = p - 1; i < n; i++) {
-    const { mean, sd } = windowStats(values, i, p);
-    out[i] = sd > 0 ? (values[i] - mean) / sd : 0;
-  }
-  return out;
-}
-
-export function zscoreLast(values: readonly number[], period = 20): number {
-  const p = toPeriod(period);
-  if (values.length < p) return NaN;
-  const { mean, sd } = windowStats(values, values.length - 1, p);
-  return sd > 0 ? (values[values.length - 1] - mean) / sd : 0;
-}
-
 /**
  * x の過去分布 (sample) 内でのパーセンタイル順位 0〜1。
  * (x より小さい数 + 等しい数×0.5) / 件数。sample が空なら NaN。
@@ -389,21 +339,6 @@ export function percentileRank(sample: readonly number[], x: number): number {
     else if (v === x) equal++;
   }
   return cnt > 0 ? (less + 0.5 * equal) / cnt : NaN;
-}
-
-/**
- * ローリングパーセンタイル: 現在値が「直前 period-1 本 + 自身」の窓内でどの位置か (0〜1)。
- * 自身を除いた他の値と比べるので、窓内の最大値なら 1、最小値なら 0、全て同値なら 0.5。
- */
-export function rollingPercentile(values: readonly number[], period = 100): number[] {
-  const p = Math.max(2, toPeriod(period));
-  const n = values.length;
-  const out = nanArray(n);
-  for (let i = p - 1; i < n; i++) {
-    if (!Number.isFinite(values[i])) continue;
-    out[i] = percentileRank(values.slice(i - p + 1, i), values[i]);
-  }
-  return out;
 }
 
 /** 平均 (空なら NaN) */

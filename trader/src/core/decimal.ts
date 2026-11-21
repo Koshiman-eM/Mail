@@ -26,4 +26,3 @@ export function roundToStep(value: Num, step: Num): Decimal {
 }
 
 export const toNum = (v: Num) => D(v).toNumber();
-export const toStr = (v: Num) => D(v).toString();

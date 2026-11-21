@@ -52,6 +52,8 @@ import {
 import { atrLast, ema, smaLast, stdevLast, vwapLast } from "../indicators/series";
 import type { PriceAt } from "./journal";
 import { horizonLabel, noiseThreshold } from "./newsCheck";
+import { normalCdf } from "./stats";
+import { clampOrZero } from "../core/util";
 
 export type { ForecastDirection } from "../core/types";
 
@@ -152,24 +154,23 @@ export interface ForecastModel {
 }
 
 const finite = (x: unknown): x is number => typeof x === "number" && Number.isFinite(x);
-const clamp = (v: number, lo: number, hi: number) => (Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : 0);
 const round = (x: number, d = 4) => (Number.isFinite(x) ? Math.round(x * 10 ** d) / 10 ** d : 0);
 
-export const sigmoid = (z: number) => 1 / (1 + Math.exp(-clamp(z, -50, 50)));
+export const sigmoid = (z: number) => 1 / (1 + Math.exp(-clampOrZero(z, -50, 50)));
 
 export function initialModel(initialWeight = DEFAULT_FORECAST_OPTIONS.initialWeight): ForecastModel {
   const w = Object.fromEntries(FORECAST_FEATURES.map((k) => [k, initialWeight])) as ForecastFeatures;
   return { w, b: 0, updates: 0 };
 }
 
-export const featureArray = (f: ForecastFeatures): number[] => FORECAST_FEATURES.map((k) => round(clamp(f[k], -1, 1)));
+export const featureArray = (f: ForecastFeatures): number[] => FORECAST_FEATURES.map((k) => round(clampOrZero(f[k], -1, 1)));
 export const featureObject = (a: readonly number[]): ForecastFeatures =>
-  Object.fromEntries(FORECAST_FEATURES.map((k, i) => [k, clamp(Number(a[i]), -1, 1)])) as ForecastFeatures;
+  Object.fromEntries(FORECAST_FEATURES.map((k, i) => [k, clampOrZero(Number(a[i]), -1, 1)])) as ForecastFeatures;
 
 /** 線形結合 z = Σ w_i f_i + b */
 export function logit(m: ForecastModel, f: ForecastFeatures): number {
   let z = m.b;
-  for (const k of FORECAST_FEATURES) z += (m.w[k] ?? 0) * clamp(f[k], -1, 1);
+  for (const k of FORECAST_FEATURES) z += (m.w[k] ?? 0) * clampOrZero(f[k], -1, 1);
   return z;
 }
 
@@ -186,7 +187,7 @@ export function classifyForecast(pUp: number, flatThreshold: number): ForecastDi
 
 /**
  * オンラインのロジスティック回帰の 1 ステップ (y: 上昇 1 / 下落 0)。新しいモデルを返す。
- * w ← clamp(w − lr ((p − y) f + l2 w), ±maxWeight)、b ← clamp(b − lr (p − y), ±maxBias)
+ * w ← clampOrZero(w − lr ((p − y) f + l2 w), ±maxWeight)、b ← clampOrZero(b − lr (p − y), ±maxBias)
  */
 export function sgdUpdate(
   m: ForecastModel,
@@ -198,8 +199,8 @@ export function sgdUpdate(
   const p = predictUp(m, f);
   const g = p - y;
   const w = { ...m.w };
-  for (const k of FORECAST_FEATURES) w[k] = clamp((w[k] ?? 0) - o.learningRate * (g * clamp(f[k], -1, 1) + o.l2 * (w[k] ?? 0)), -o.maxWeight, o.maxWeight);
-  const b = clamp(m.b - o.learningRate * g, -o.maxBias, o.maxBias);
+  for (const k of FORECAST_FEATURES) w[k] = clampOrZero((w[k] ?? 0) - o.learningRate * (g * clampOrZero(f[k], -1, 1) + o.l2 * (w[k] ?? 0)), -o.maxWeight, o.maxWeight);
+  const b = clampOrZero(m.b - o.learningRate * g, -o.maxBias, o.maxBias);
   return { w, b, updates: m.updates + 1, ...(now !== undefined ? { updatedAt: now } : {}) };
 }
 
@@ -220,15 +221,6 @@ export function skillConfirmed(n: number, hits: number, o: Pick<ForecastOptions,
 
 /** 予想の重複の度合い (予想時間 ÷ 予想の間隔、1 以上) */
 export const forecastOverlap = (horizonMs: number, intervalMs: number) => (horizonMs > 0 && intervalMs > 0 ? Math.max(1, horizonMs / intervalMs) : 1);
-
-/** 標準正規分布の累積分布関数 (Abramowitz-Stegun 7.1.26、誤差 1.5e-7 程度) */
-export function normalCdf(z: number): number {
-  if (!Number.isFinite(z)) return z > 0 ? 1 : 0;
-  const x = Math.abs(z) / Math.SQRT2;
-  const t = 1 / (1 + 0.3275911 * x);
-  const y = 1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
-  return z >= 0 ? 0.5 * (1 + y) : 0.5 * (1 - y);
-}
 
 /** 標準正規分布の分位点 (Acklam の近似、相対誤差 1.2e-9 程度) */
 export function normalQuantile(p: number): number {
@@ -258,7 +250,7 @@ export const FORECAST_ASSET_CLASS_COUNT = 4;
 /** LIVE に入る/止める z の閾値 (Bonferroni 補正とヒステリシス) */
 export function liveThresholds(o: Pick<ForecastOptions, "zCritical" | "liveGroups" | "liveHysteresisZ" | "horizonsMs">): { zOn: number; zOff: number; groups: number; alpha: number } {
   const groups = o.liveGroups > 0 ? Math.floor(o.liveGroups) : Math.max(1, o.horizonsMs.length * FORECAST_ASSET_CLASS_COUNT);
-  const alpha = clamp(1 - normalCdf(o.zCritical), 1e-12, 0.5);
+  const alpha = clampOrZero(1 - normalCdf(o.zCritical), 1e-12, 0.5);
   const zOn = normalQuantile(1 - alpha / groups);
   return { zOn, zOff: zOn - Math.max(0, finite(o.liveHysteresisZ) ? o.liveHysteresisZ : 0), groups, alpha };
 }
@@ -302,9 +294,9 @@ export function forecastSizeMultiplier(
   o: Pick<ForecastOptions, "maxBoost" | "maxCut">,
 ): number {
   if (!live || !f || f.direction === "flat" || !finite(f.pUp)) return 1;
-  const strength = clamp(Math.abs(f.pUp - 0.5) * 2, 0, 1);
+  const strength = clampOrZero(Math.abs(f.pUp - 0.5) * 2, 0, 1);
   const agree = (signal === "long" && f.direction === "up") || (signal === "short" && f.direction === "down");
-  return agree ? 1 + clamp(o.maxBoost, 0, 1) * strength : 1 - clamp(o.maxCut, 0, 1) * strength;
+  return agree ? 1 + clampOrZero(o.maxBoost, 0, 1) * strength : 1 - clampOrZero(o.maxCut, 0, 1) * strength;
 }
 
 /** 戦略の時間軸 → 使う予想時間の目安 (scalp 15 分 / short 1 時間 / mid・long 4 時間) */
@@ -452,13 +444,13 @@ export function computeForecastFeatures(input: FeatureInput): FeatureResult | un
     trend += w * t;
     wsum += w;
   });
-  const k = clamp(Math.round(horizonMs / TIMEFRAME_MS[primary]), 3, 12);
+  const k = clampOrZero(Math.round(horizonMs / TIMEFRAME_MS[primary]), 3, 12);
   const features: ForecastFeatures = {
-    trend: wsum > 0 ? clamp(trend / wsum, -1, 1) : 0,
-    momentum: clamp(momentumFeature(pc, k) ?? 0, -1, 1),
-    meanRevert: clamp(meanRevertFeature(pc) ?? 0, -1, 1),
-    news: clamp(input.news ?? 0, -1, 1),
-    consensus: clamp(input.consensus ?? 0, -1, 1),
+    trend: wsum > 0 ? clampOrZero(trend / wsum, -1, 1) : 0,
+    momentum: clampOrZero(momentumFeature(pc, k) ?? 0, -1, 1),
+    meanRevert: clampOrZero(meanRevertFeature(pc) ?? 0, -1, 1),
+    news: clampOrZero(input.news ?? 0, -1, 1),
+    consensus: clampOrZero(input.consensus ?? 0, -1, 1),
   };
   const rangePct = (a / mid) * Math.sqrt(Math.max(1, horizonMs / TIMEFRAME_MS[primary]));
   return { features, timeframe: primary, rangePct };
@@ -520,7 +512,7 @@ function addCounts(into: ForecastCounts, x: ForecastCounts): void {
   }
 }
 
-export const calBin = (p: number) => Math.min(CAL_BINS - 1, Math.max(0, Math.floor(clamp(p, 0, 1) * CAL_BINS)));
+export const calBin = (p: number) => Math.min(CAL_BINS - 1, Math.max(0, Math.floor(clampOrZero(p, 0, 1) * CAL_BINS)));
 
 /** 1 件の結果を集計に加える (純粋関数ではなく counts を更新する) */
 export function recordOutcome(c: ForecastCounts, pred: ForecastDirection, pUp: number, outcome: ForecastDirection | "expired"): void {

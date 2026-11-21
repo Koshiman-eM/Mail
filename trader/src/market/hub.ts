@@ -4,6 +4,7 @@ import {
   type Timeframe, type TradePrint,
 } from "../core/types";
 import { aggregateCandles, CandleBuilder, closedCandles, mergeCandles } from "./candles";
+import { defaultSleep } from "../core/util";
 
 const log = createLogger("market-hub");
 
@@ -49,8 +50,6 @@ interface RefreshThrottledFeed {
 
 /** 足の境界をまたいだ後、この時間内に取得した足は確定値でない可能性があるので取り直す */
 const BOUNDARY_GRACE_MS = 10_000;
-
-const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export class MarketHub {
   private readonly feeds: MarketDataFeed[];
