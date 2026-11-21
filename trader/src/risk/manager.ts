@@ -66,6 +66,12 @@ export interface EntryParams {
    * 控除前の期待値のシグナル (edgeIsNet なし) には影響しない。tempo が無ければ無視する
    */
   tempoExplore?: boolean;
+  /**
+   * 予定の約定代金 (クオート通貨建て) での往復コスト (bps)。Jupiter の銘柄だけエンジンが渡す (固定手数料の率と価格影響が代金で変わるため)。
+   * 渡すと、サイズを決めた後にその代金のコストで期待値の判定 (上と同じ規則) をもう一度行い、満たさなければ拒否する。
+   * 省略時は従来どおり (気配のスプレッドと代表的な代金のコストだけ)
+   */
+  costBpsAt?: (notionalQuote: number) => number | undefined;
 }
 
 /**
@@ -364,6 +370,57 @@ export class RiskManager {
     this.audit("risk.reject", p.now, { symbol: p.instrument.symbol, strategyId: p.signal.strategyId, reason });
   }
 
+  /**
+   * 期待値とコストの比の判定 (純期待値の規則・テンポ)。cost は往復コスト (bps)。
+   * 気配のコストで 1 回、Jupiter (costBpsAt あり) はサイズを決めた後に実際の代金のコストでもう 1 回使う
+   */
+  private edgeCheck(signal: Signal, cost: number, L: RiskLimits, p: Pick<EntryParams, "tempo" | "tempoExplore">): { ok: true; note: string } | { ok: false; reason: string } {
+    if (p.tempo === undefined) {
+      if (signal.edgeIsNet === true) {
+        // コスト控除後の期待値のシグナル: テンポの有無によらず「純 ≥ max(0, 比率 − 1) × コスト かつ 純 > 0」
+        // (控除前に直すと「控除前 ≥ 比率 × コスト」。コストを二重に数えない。NaN は通さない)
+        const edge = signal.expectedEdgeBps;
+        const min = netEdgeMinBps(L.minEdgeToCostRatio, cost);
+        if (!(edge > 0)) return { ok: false, reason: `期待値 (コスト控除後) ${edge.toFixed(1)}bps が 0 以下` };
+        if (!(edge >= min)) {
+          return { ok: false, reason: `期待値 (コスト控除後) ${edge.toFixed(1)}bps < コスト ${cost.toFixed(1)}bps × (${L.minEdgeToCostRatio} - 1)` };
+        }
+        return { ok: true, note: `edge ${edge.toFixed(1)}bps (net) / cost ${cost.toFixed(1)}bps` };
+      } else {
+        if (signal.expectedEdgeBps < L.minEdgeToCostRatio * cost) {
+          return { ok: false, reason: `期待値幅 ${signal.expectedEdgeBps.toFixed(1)}bps < コスト ${cost.toFixed(1)}bps × ${L.minEdgeToCostRatio}` };
+        }
+        return { ok: true, note: `edge ${signal.expectedEdgeBps.toFixed(1)}bps / cost ${cost.toFixed(1)}bps` };
+      }
+    } else {
+      // テンポのモード: 比率を下限まで緩める。コスト控除後の期待値のシグナルはコストを二重に数えない (比率 - 1)。
+      // NaN の期待値は通さない (fail-closed)
+      // 探索 (tempoExplore) はコスト控除後の期待値のシグナルにだけ効き、「> 0」を外して下限を tempo × cost 下げる
+      const t = clampTempo(p.tempo);
+      const net = signal.edgeIsNet === true;
+      const explore = net && p.tempoExplore === true;
+      const req = tempoEdgeRequirement(L, t, cost, net, explore);
+      const edge = signal.expectedEdgeBps;
+      const tag = `テンポ ${t.toFixed(2)}${explore ? " (探索)" : ""}`;
+      if (net) {
+        if (req.requirePositive && !(edge > 0)) {
+          return { ok: false, reason: `${tag}: 期待値 (コスト控除後) ${edge.toFixed(1)}bps が 0 以下` };
+        }
+        if (!(edge >= req.minEdgeBps)) {
+          return {
+            ok: false,
+            reason: explore
+              ? `${tag}: 期待値 (コスト控除後) ${edge.toFixed(1)}bps < コスト ${cost.toFixed(1)}bps × (${req.ratio.toFixed(2)} - 1 - ${t.toFixed(2)})`
+              : `${tag}: 期待値 (コスト控除後) ${edge.toFixed(1)}bps < コスト ${cost.toFixed(1)}bps × (${req.ratio.toFixed(2)} - 1)`,
+          };
+        }
+      } else if (!(edge >= req.minEdgeBps)) {
+        return { ok: false, reason: `${tag}: 期待値幅 ${edge.toFixed(1)}bps < コスト ${cost.toFixed(1)}bps × ${req.ratio.toFixed(2)}` };
+      }
+      return { ok: true, note: `edge ${edge.toFixed(1)}bps${net ? " (net)" : ""} / cost ${cost.toFixed(1)}bps / ${tag} (比率 ${req.ratio.toFixed(2)})` };
+    }
+  }
+
   evaluateEntry(p: EntryParams): RiskDecision {
     const d = this.decide(p);
     if (!d.ok) this.auditReject(p, d.reason);
@@ -392,52 +449,11 @@ export class RiskManager {
     const existing = open.find((x) => x.symbol === inst.symbol);
     if (!existing && open.length >= L.maxOpenPositions) return { ok: false, reason: `最大保有数 ${L.maxOpenPositions} に到達` };
 
-    // コスト比
+    // コスト比 (気配のスプレッドと代表的な代金でのコスト。Jupiter は下でサイズを決めてから実際の代金のコストでも確かめる)
     const cost = costBps(inst, quote);
-    if (p.tempo === undefined) {
-      if (signal.edgeIsNet === true) {
-        // コスト控除後の期待値のシグナル: テンポの有無によらず「純 ≥ max(0, 比率 − 1) × コスト かつ 純 > 0」
-        // (控除前に直すと「控除前 ≥ 比率 × コスト」。コストを二重に数えない。NaN は通さない)
-        const edge = signal.expectedEdgeBps;
-        const min = netEdgeMinBps(L.minEdgeToCostRatio, cost);
-        if (!(edge > 0)) return { ok: false, reason: `期待値 (コスト控除後) ${edge.toFixed(1)}bps が 0 以下` };
-        if (!(edge >= min)) {
-          return { ok: false, reason: `期待値 (コスト控除後) ${edge.toFixed(1)}bps < コスト ${cost.toFixed(1)}bps × (${L.minEdgeToCostRatio} - 1)` };
-        }
-        notes.push(`edge ${edge.toFixed(1)}bps (net) / cost ${cost.toFixed(1)}bps`);
-      } else {
-        if (signal.expectedEdgeBps < L.minEdgeToCostRatio * cost) {
-          return { ok: false, reason: `期待値幅 ${signal.expectedEdgeBps.toFixed(1)}bps < コスト ${cost.toFixed(1)}bps × ${L.minEdgeToCostRatio}` };
-        }
-        notes.push(`edge ${signal.expectedEdgeBps.toFixed(1)}bps / cost ${cost.toFixed(1)}bps`);
-      }
-    } else {
-      // テンポのモード: 比率を下限まで緩める。コスト控除後の期待値のシグナルはコストを二重に数えない (比率 - 1)。
-      // NaN の期待値は通さない (fail-closed)
-      // 探索 (tempoExplore) はコスト控除後の期待値のシグナルにだけ効き、「> 0」を外して下限を tempo × cost 下げる
-      const t = clampTempo(p.tempo);
-      const net = signal.edgeIsNet === true;
-      const explore = net && p.tempoExplore === true;
-      const req = tempoEdgeRequirement(L, t, cost, net, explore);
-      const edge = signal.expectedEdgeBps;
-      const tag = `テンポ ${t.toFixed(2)}${explore ? " (探索)" : ""}`;
-      if (net) {
-        if (req.requirePositive && !(edge > 0)) {
-          return { ok: false, reason: `${tag}: 期待値 (コスト控除後) ${edge.toFixed(1)}bps が 0 以下` };
-        }
-        if (!(edge >= req.minEdgeBps)) {
-          return {
-            ok: false,
-            reason: explore
-              ? `${tag}: 期待値 (コスト控除後) ${edge.toFixed(1)}bps < コスト ${cost.toFixed(1)}bps × (${req.ratio.toFixed(2)} - 1 - ${t.toFixed(2)})`
-              : `${tag}: 期待値 (コスト控除後) ${edge.toFixed(1)}bps < コスト ${cost.toFixed(1)}bps × (${req.ratio.toFixed(2)} - 1)`,
-          };
-        }
-      } else if (!(edge >= req.minEdgeBps)) {
-        return { ok: false, reason: `${tag}: 期待値幅 ${edge.toFixed(1)}bps < コスト ${cost.toFixed(1)}bps × ${req.ratio.toFixed(2)}` };
-      }
-      notes.push(`edge ${edge.toFixed(1)}bps${net ? " (net)" : ""} / cost ${cost.toFixed(1)}bps / ${tag} (比率 ${req.ratio.toFixed(2)})`);
-    }
+    const edgeCheck = this.edgeCheck(signal, cost, L, p);
+    if (!edgeCheck.ok) return { ok: false, reason: edgeCheck.reason };
+    notes.push(edgeCheck.note);
 
     // サイジング
     const entry = signal.entry.type === "limit" && signal.entry.price ? signal.entry.price : isLong ? quote.ask : quote.bid;
@@ -530,6 +546,17 @@ export class RiskManager {
     if (inst.minNotional !== undefined && D(entry).mul(qty).mul(cs).lt(inst.minNotional)) {
       return { ok: false, reason: `約定代金 ${D(entry).mul(qty).mul(cs)} が最小 ${inst.minNotional} 未満` };
     }
+    // 実際の代金でのコスト (Jupiter: 固定手数料 / 代金 と 代金・流動性による価格影響)。満たさなければ拒否する (サイズは小さくしない)
+    let sizedCost: number | undefined;
+    if (p.costBpsAt) {
+      const notional = D(entry).mul(qty).mul(cs).toNumber();
+      const c = p.costBpsAt(notional);
+      if (c === undefined || !Number.isFinite(c) || c < 0) return { ok: false, reason: `代金 ${notional.toFixed(2)} でのコストが計算できないため拒否` };
+      const sized = this.edgeCheck(signal, c, L, p);
+      if (!sized.ok) return { ok: false, reason: `代金 ${notional.toFixed(2)} ${inst.quoteCurrency} でのコスト: ${sized.reason}` };
+      notes.push(`代金 ${notional.toFixed(2)} ${inst.quoteCurrency}: ${sized.note}`);
+      sizedCost = c;
+    }
 
     if (inst.assetClass === "meme") {
       const liq = p.liquidityUsd;
@@ -542,6 +569,6 @@ export class RiskManager {
     if (recent >= L.maxOrdersPerMinute) return { ok: false, reason: `1分あたり発注数上限 ${L.maxOrdersPerMinute} に到達` };
 
     notes.push(`qty ${qty.toString()}`);
-    return { ok: true, qty: qty.toString(), notes };
+    return { ok: true, qty: qty.toString(), notes, ...(sizedCost !== undefined ? { costBps: sizedCost } : {}) };
   }
 }

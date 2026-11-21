@@ -44,7 +44,7 @@ describe("paper の Jupiter の約定 (PaperBroker + 見積もり)", () => {
     // モックの見積もりは 10bps 不利 (= 実効価格 ≈ 価格 × 1.001)。気配 ± 2bps の従来の約定ではない
     expect(f.price / px).toBeCloseTo(1.001, 4);
     expect(f.fee).toBe("0.02");
-    expect(pricer.stats).toEqual({ quote: 1, cached: 0, fallback: 0 });
+    expect(pricer.stats).toMatchObject({ quote: 1, cached: 0, fallback: 0 });
     // 同じ向き・同じ金額の帯 (2 倍以内) は 15 秒キャッシュ
     const r2 = await broker.placeOrder({ clientId: "b", symbol: "SOL/USDC", side: "buy", type: "market", qty: "0.25", strategyId: "t" });
     expect(r2.status).toBe("filled");

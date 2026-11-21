@@ -3,7 +3,7 @@
  *
  * - `GET https://api.frankfurter.app/latest?from=USD&to=JPY` → `{ amount, base, date: "YYYY-MM-DD", rates: { JPY: number } }`。
  * - 1 時間ごとに取り直し (engine の定期の処理)、最後に取れた値を kv `fx:usdjpy` に保存する (再起動直後もその値を使う)。
- * - 換算 (src/engine/fx.ts) には "USD/JPY" の気配として渡す (bid = ask = レート、ts = 最後に取れた時刻)。
+ * - 換算 (src/engine/fx.ts) には "USD/JPY" の気配として渡す (bid = ask = レート、ts = レートの日付の 00:00 UTC。取得時刻ではない)。
  *   1 度も取れていなければ気配を返さず、fx.ts は従来どおり概算表 (1 USD = 150 JPY、source "fallback") を使う。
  * - paper はこのレートで換算する (気配の古さでは止めない。paper の新規エントリーは fxApproxReason を見ない)。
  *   live は従来どおり fxApproxReason が概算表・古い気配 (5 分超) を拒否する。日次のレートは live の「新しい気配」には当たらないので、
@@ -75,11 +75,17 @@ export class UsdJpyRateSource {
     return { ...(this.last ?? {}), ...(this.lastError ? { lastError: this.lastError } : {}) };
   }
 
-  /** 換算用の気配 (USD/JPY のときだけ) */
+  /**
+   * 換算用の気配 (USD/JPY のときだけ)。ts はレートの日付 (欧州中央銀行の参照レートの日の 00:00 UTC。取得した時刻ではない) で、
+   * 日付が読めなければ取得の 1 日前にする。日次のレートを「新しい気配」に見せないため (live の fxApproxReason は常に古いと判定する)。
+   * paper の換算 (rate) は ts を見ないので変わらない
+   */
   quote(symbol: string): Quote | undefined {
     if (symbol !== FX_RATE_SYMBOL || !this.last) return undefined;
     const r = this.last.rate;
-    return { ts: this.last.fetchedAt, bid: r, ask: r, last: r };
+    const d = /^\d{4}-\d{2}-\d{2}$/.test(this.last.date) ? Date.parse(`${this.last.date}T00:00:00Z`) : NaN;
+    const ts = Number.isFinite(d) ? Math.min(d, this.last.fetchedAt) : this.last.fetchedAt - 86_400_000;
+    return { ts, bid: r, ask: r, last: r };
   }
 
   /** 前回の試行から refreshMs 以上経っていれば (force なら常に) 取り直す。失敗しても例外にしない (最後の値を使い続ける) */

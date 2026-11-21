@@ -215,8 +215,14 @@ const EnvSchema = z.object({
   JUPITER_API_KEY: str(),
   /** 1 秒あたりの呼び出しの上限 (空 = キーなし 0.5 / キーあり 1)。プランに合わせて変える */
   JUPITER_RPS: optRanged("JUPITER_RPS", 0.05, 50),
-  /** 価格 (Price V3) の取得間隔 (ミリ秒、1000〜60000、既定 5000)。監視中の全 mint を 50 件ずつ一括で取る */
-  JUPITER_POLL_MS: ranged("JUPITER_POLL_MS", 5_000, 1_000, 60_000, true),
+  /**
+   * 価格 (Price V3) の取得間隔 (ミリ秒、1000〜15000、既定 5000)。監視中の全 mint を 50 件ずつ一括で取る。
+   * 上限はエンジンの気配の古さの上限 (30 秒) の半分 (それより長いと取得の合間に気配が古くなり、新規エントリーが止まる)
+   */
+  JUPITER_POLL_MS: checkedNum(
+    "JUPITER_POLL_MS", 5_000, (x) => Number.isInteger(x) && x >= 1_000 && x <= 15_000,
+    "1000 以上 15000 以下のミリ秒の整数で指定してください (気配の古さの上限 30 秒の半分以下。それより長いと取得の合間に気配が古くなり新規エントリーが止まります)",
+  ),
   /** GeckoTerminal (過去の足・出来高) の 1 分あたりの呼び出しの上限 (1〜30、既定 10) */
   GECKO_CALLS_PER_MIN: ranged("GECKO_CALLS_PER_MIN", 10, 1, 30),
   /**

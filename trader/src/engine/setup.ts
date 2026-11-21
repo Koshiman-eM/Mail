@@ -1,4 +1,5 @@
 /** 設定 (VENUES / WATCHLIST) から実行に必要な部品一式を組み立てる */
+import { existsSync } from "node:fs";
 import { basename, dirname, extname, join } from "node:path";
 import type { AiOptions } from "../core/ai";
 import type { AppConfig } from "../core/config";
@@ -153,6 +154,26 @@ export function resolveDbPath(config: Pick<AppConfig, "env">): string {
   const venues = config.env.VENUES.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
   const syntheticOnly = venues.length > 0 && venues.every((v) => v === "synthetic");
   return syntheticOnly ? syntheticDbPath(config.env.DB_PATH) : config.env.DB_PATH;
+}
+
+/**
+ * 既定の VENUES が synthetic から jupiter に変わったことの警告。VENUES を設定していない (既定を使っている) のに、
+ * DB_PATH の隣に合成データ用の DB (<ベース名>-synthetic.db) があれば、以前はそちらを使っていたので知らせる
+ * (自動では移さない。VENUES=synthetic にすれば以前の DB を使う)。該当しなければ undefined
+ */
+export function syntheticDbSwitchWarning(
+  config: Pick<AppConfig, "env">,
+  rawEnv: Record<string, string | undefined>,
+  exists: (path: string) => boolean = existsSync,
+): string | undefined {
+  if ((rawEnv.VENUES ?? "").trim() !== "") return undefined;
+  const db = config.env.DB_PATH;
+  const syn = syntheticDbPath(db);
+  if (syn === db || !exists(syn)) return undefined;
+  return (
+    `VENUES が未設定のため既定の jupiter で動き、DB は ${db} を使います。以前の既定 (VENUES=synthetic) は ${syn} を使っていました ` +
+    `(合成データの学習・建玉はそちらに残っています。自動では移しません)。以前の DB を使うなら .env.local に VENUES=synthetic を書いてください`
+  );
 }
 
 export interface RuntimeOptions {
@@ -358,6 +379,8 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
                 limiter: jupiter.client.limiter,
                 tokenOf: (sym) => jupiter!.feed.tokenOf(sym),
                 now: () => clock.now(),
+                // 古い気配 (エンジンの maxQuoteAgeMs 超) では代わりのモデルで値付けしない (決済は次のティックで再試行)
+                maxQuoteAgeMs: opts.engine?.maxQuoteAgeMs ?? 30_000,
               }),
             },
           }
@@ -430,6 +453,7 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
             venues: [JUPITER_VENUE],
             liquidityUsd: (sym: string) => jupiter!.feed.liquidityUsd(sym),
             entryBlock: (sym: string) => jupiter!.feed.entryBlock(sym),
+            costBpsAt: (sym: string, n: number) => jupiter!.feed.costBpsAt(sym, n),
           },
         }
       : {}),
@@ -507,13 +531,14 @@ async function setupJupiter(
   // paper のスナップショットに残る Jupiter の建玉の銘柄定義 (mint・decimals) から、一覧に無い保有中の銘柄も戻す
   const held = new Set(heldSymbols());
   const snap = mode === "paper" ? store.kvGet<PaperSnapshot>(PAPER_SNAPSHOT_KEY) : undefined;
-  const extraKeep: JupiterTokenSpec[] = [];
+  const extraKeep: (JupiterTokenSpec & { instSymbol: string })[] = [];
   for (const i of snap?.instruments ?? []) {
     if (i.venue !== JUPITER_VENUE || !held.has(i.symbol)) continue;
     const mint = i.meta?.mint;
     const decimals = Number(i.meta?.decimals);
     if (typeof mint !== "string" || !Number.isInteger(decimals)) continue;
-    extraKeep.push({ mint, symbol: i.baseCurrency, decimals, assetClass: i.assetClass, source: "discovered" });
+    // スナップショットの統一シンボル (i.symbol) をそのまま使う (保有中の建玉のシンボル → mint の対応を変えない)
+    extraKeep.push({ mint, symbol: i.baseCurrency.split("-")[0], decimals, assetClass: i.assetClass, source: "discovered", instSymbol: i.symbol });
   }
   const insts = watch.restore(extraKeep);
   log.info("Jupiter の監視銘柄", { symbols: insts.map((i) => `${i.symbol} (${i.assetClass})`), apiKey: client.hasApiKey ? "あり" : "なし", gecko: gecko ? "あり" : "なし" });

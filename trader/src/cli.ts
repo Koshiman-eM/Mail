@@ -26,7 +26,9 @@ import {
   peekResolveRequests, PendingOrders, readLimitStats, requestResolve, RestingTakeProfits, type PendingOrder, type ResolveRequest,
 } from "./engine/orders";
 import { acquireEngineLock, releaseEngineLock, startEngineLockHeartbeat, type LockOwner } from "./engine/lock";
-import { assertLiveSupported, buildRuntime, effectiveVenues, isRemovedVenue, parseWatchlist, resolveDbPath, type Runtime } from "./engine/setup";
+import {
+  assertLiveSupported, buildRuntime, effectiveVenues, isRemovedVenue, parseWatchlist, resolveDbPath, syntheticDbSwitchWarning, type Runtime,
+} from "./engine/setup";
 import { effectiveLimitTakeProfit, limitOrdersFromEnv } from "./engine/limitOrders";
 import { formatSimulationReport, runSimulation } from "./engine/simulate";
 import { formatTempoLine, TempoController, tempoSeedTimestamps, tempoStatusView } from "./engine/tempo";
@@ -458,6 +460,8 @@ async function cmdRun(io: Io): Promise<number> {
   }
   m.warn.forEach((l) => io.err(l));
   for (const w of removedEnvWarnings(process.env)) io.err(`警告: ${w}`);
+  const synDb = syntheticDbSwitchWarning(config, process.env);
+  if (synDb) io.err(`警告: ${synDb}`);
   io.out(venuesLine(config));
   // 同じ mode のエンジンの二重起動防止 (同じ DB の kv にロックを書き、15 秒ごとに heartbeat を更新する)。
   // 状態を読み込む前にロックを取る (paper reset との競合防止)
@@ -1061,6 +1065,8 @@ function cmdStatus(io: Io): number {
   m.out.forEach((l) => io.out(l));
   m.warn.forEach((l) => io.err(l));
   configCompatWarnings(config).forEach((l) => io.err(l));
+  const synDb = syntheticDbSwitchWarning(config, process.env);
+  if (synDb) io.err(`警告: ${synDb}`);
   io.out(venuesLine(config));
   io.out(`監視銘柄 (WATCHLIST): ${config.env.WATCHLIST || "(既定)"}`);
   if (config.env.VENUES.split(",").some((v) => v.trim().toLowerCase() === JUPITER_VENUE)) formatJupiterSettings(jupiterSettingsFromEnv(config.env)).forEach((l) => io.out(l));

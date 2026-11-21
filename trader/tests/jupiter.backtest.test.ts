@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { parseBacktestArgs, main } from "../src/cli";
-import { runBacktestCommand } from "../src/engine/backtestCommand";
+import { fetchCandlesPaged, runBacktestCommand } from "../src/engine/backtestCommand";
 import { GeckoHistoryFeed } from "../src/market/feeds/geckoHistory";
 import { jupiterInstrument } from "../src/market/feeds/jupiter";
 import { GeckoTerminalClient } from "../src/market/jupiter/gecko";
 import { scalpPullback } from "../src/strategies/scalpPullback";
-import { fakeClock } from "./fixtures/jupiter/mockFetch";
+import { createMockFetch, fakeClock } from "./fixtures/jupiter/mockFetch";
 import { BONK, createJupiterMock, poolOf } from "./helpers/jupiterMock";
 
 const T0 = Date.UTC(2026, 10, 20, 0, 0, 0);
@@ -30,6 +30,29 @@ describe("backtest --source jupiter (GeckoTerminal の足)", () => {
     const ohlcv = mock.calls.filter((c) => c.path.includes("/ohlcv/minute"));
     expect(ohlcv.length).toBeGreaterThanOrEqual(3);
     if (rows[0].metrics && rows[0].metrics.trades > 0) expect(rows[0].metrics.fees).toBeGreaterThan(0);
+  });
+
+  it("7 日分の 1m を全部返す (クライアントの足のキャッシュ (3000 本) で切り詰めない)。履歴が短ければ分かりやすい例外", async () => {
+    const clock = fakeClock(T0);
+    const mock = createJupiterMock({ now: clock.now });
+    const gecko = new GeckoTerminalClient({ fetchImpl: mock.fetchImpl, now: clock.now, sleep: clock.sleep, callsPerMinute: 6000, burst: 100, retries: 0 });
+    const inst = jupiterInstrument({ mint: BONK, symbol: "BONK", decimals: 5, assetClass: "meme", liquidityUsd: 2e6, source: "fixed" }, { quoteSizeUsd: 50, networkFeeUsd: 0.02, minNotionalUsd: 5 });
+    const feed = new GeckoHistoryFeed(gecko, inst, poolOf(BONK), clock.now);
+    const from = T0 - 7 * 86_400_000;
+    const got = await fetchCandlesPaged(feed, inst.symbol, "1m", from, T0);
+    expect(got.length).toBe(7 * 1440);
+    expect(got[0].ts).toBe(from);
+    expect(got.at(-1)!.ts).toBe(T0 - 60_000);
+    // 履歴の先頭が 2 日前のプール
+    const short = createMockFetch(async (call) => {
+      const r = await mock.fetchImpl(call.url);
+      const body = (await r.json()) as { data: { attributes: { ohlcv_list: number[][] } } };
+      body.data.attributes.ohlcv_list = body.data.attributes.ohlcv_list.filter((row) => row[0] * 1000 >= T0 - 2 * 86_400_000);
+      return { body };
+    }, clock.now);
+    const g2 = new GeckoTerminalClient({ fetchImpl: short.fetchImpl, now: clock.now, sleep: clock.sleep, callsPerMinute: 6000, burst: 100, retries: 0 });
+    const f2 = new GeckoHistoryFeed(g2, inst, poolOf(BONK), clock.now);
+    await expect(fetchCandlesPaged(f2, inst.symbol, "1m", from, T0)).rejects.toThrow(/履歴が要求より短い/);
   });
 
   it("jupiter check の引数 (サブコマンドは check だけ)", async () => {

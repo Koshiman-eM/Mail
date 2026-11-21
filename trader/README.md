@@ -316,10 +316,10 @@ TARGET_ENTRIES_PER_HOUR=6 MAX_HOLD_MINUTES=30 npm run simulate -- --days 2
 - **銘柄**: 固定の銘柄 `JUPITER_TOKENS` (既定 `SOL,JUP,BONK,WIF,POPCAT,MEW`。mint か symbol) と、自動探索 (`JUPITER_DISCOVERY=true`) で見つけたミームコイン。シンボルは `SOL/USDC` の形 (クオートは USDC = USD とみなす。口座通貨は JPY のまま)。SOL・JUP は資産クラス `crypto`、それ以外は `meme`。数量の刻み・最小数量はトークンの decimals から、最小の約定代金は `JUPITER_MIN_NOTIONAL_USD` (既定 $5)。
 - **現物だけ**: 空売りしません (paper の空売りの再現 `PAPER_SIMULATE_SHORT` も Jupiter は対象外)。指値もありません (新規は常に成行。`LIMIT_ENTRY`・`LIMIT_TAKE_PROFIT` は Jupiter の銘柄には効きません)。
 - **価格と気配**: Price V3 で全銘柄を `JUPITER_POLL_MS` (既定 5 秒) ごとに 1 回で取ります。仲値 = 価格、買い・売り気配は「代わりのスリッページのモデル」(固定 bps + 2 × 代金 / 流動性。主要銘柄 5bps・ミーム 30bps) を代表的な代金 `JUPITER_QUOTE_SIZE_USD` (既定 $50) で評価した価格です。全部の取得に失敗したら新規エントリーを止め、一部の銘柄だけ取れないときはその銘柄の気配が古くなって新規を止めます。
-- **約定 (paper)**: 成行は見積もり (`swap/v1/quote`) の実効価格で約定します (15 秒・同じ金額の帯はキャッシュ。取れなければ代わりのモデル)。経路の手数料は見積もりの価格に含まれるので手数料率は 0、手数料は 1 回あたりのネットワーク手数料 `JUPITER_NETWORK_FEE_USD` (既定 $0.02) です。期待値とコストの比較・仮想トレード・バックテストも同じ前提 (代わりのモデル + ネットワーク手数料を代表的な代金で率にした値) です。
+- **約定 (paper)**: 成行は見積もり (`swap/v1/quote`) の実効価格で約定します (15 秒・同じ金額の帯はキャッシュ。取れなければ代わりのモデル)。経路の手数料は見積もりの価格に含まれるので手数料率は 0、手数料は 1 回あたりのネットワーク手数料 `JUPITER_NETWORK_FEE_USD` (既定 $0.02) です。期待値とコストの比較・仮想トレード・バックテストも同じ前提 (代わりのモデル + ネットワーク手数料を代表的な代金で率にした値) です。さらにリスク管理は、サイズを決めた後の実際の代金でのコスト (ネットワーク手数料 ÷ 代金と、代金・流動性による価格影響) でも期待値を確かめ、足りなければ見送ります。気配が 30 秒より古いときは代わりのモデルで約定させず、決済は次のティックで再試行します。
 - **足**: 価格から 1 分足を作り (出来高は不明)、上位足はその集約です。起動後に裏で GeckoTerminal (`GECKO_CALLS_PER_MIN`、既定 10 回/分) から履歴 (1 分足と、15 分・1 時間・4 時間・5 分足) を取ります。起動は待たせず、足が揃うまで戦略はシグナルを出しません (6 銘柄で 4 分ほど)。出来高は銘柄を順に回って GeckoTerminal から取り、確定から 3 分以上たった足にだけ入れます。一度出した足の始値・高値・安値・終値は書き換えません (先読み・リペイントをしない。変わるのは「出来高が不明 → 分かった」だけ)。
-- **ミームの流動性**: `MEME_MIN_LIQUIDITY_USD` の判定には Jupiter のトークン情報の流動性 (1 時間ごとに取り直す) を使います。`MAX_EXPOSURE_MEME` の上限も効きます。
-- **自動探索**: `JUPITER_DISCOVERY_MINUTES` (既定 20 分) ごとに、上位のトークン (toptrending・toporganicscore の 1 時間) を選別し (流動性・保有者数・上場からの日数・organicScore・ミント権限 / 凍結権限・上位保有者の比率・疑わしいトークン)、合格した銘柄を期限つき (`JUPITER_DISCOVERY_TTL_HOURS`、既定 6 時間) で監視に加えます。期限まで再合格しなければ外します (保有中・注文中の銘柄は外しません)。監視中の銘柄が後で選別に落ちたら、新規エントリーだけ止めます (建玉の管理は続けます)。一覧は DB の kv `jupiter:watch:<mode>` に保存し、追加・削除・不合格の理由は監査ログ (`jupiter.watch_add` / `jupiter.watch_remove` / `jupiter.discovery` / `jupiter.watch_screen_failed`) に残します。
+- **ミームの流動性**: `MEME_MIN_LIQUIDITY_USD` の判定には Jupiter のトークン情報の流動性 (1 時間ごとに取り直す) を使います。3 時間より古い値は「不明」として新規エントリーしません。`MAX_EXPOSURE_MEME` の上限も効きます。
+- **自動探索**: `JUPITER_DISCOVERY_MINUTES` (既定 20 分) ごとに、上位のトークン (toptrending・toporganicscore の 1 時間) を選別し (流動性・保有者数・上場からの日数・organicScore・ミント権限 / 凍結権限・上位保有者の比率・疑わしいトークン)、合格した銘柄を期限つき (`JUPITER_DISCOVERY_TTL_HOURS`、既定 6 時間) で監視に加えます。期限まで再合格しなければ外します (保有中・注文中の銘柄は外しません)。監視中の銘柄が後で選別に落ちたら、新規エントリーだけ止めます (建玉の管理は続けます。止めた状態は再起動後も続きます)。同じ symbol の別のトークン (例: TRUMP が 2 つ) は `TRUMP-<mint の先頭 4 文字>/USDC` になり、使ったシンボルは保存するので、再起動しても保有中の建玉の銘柄は入れ替わりません。一覧は DB の kv `jupiter:watch:<mode>` に保存し、追加・削除・不合格の理由は監査ログ (`jupiter.watch_add` / `jupiter.watch_remove` / `jupiter.discovery` / `jupiter.watch_screen_failed`) に残します。
 - **USD→JPY**: frankfurter.app の日次のレート (キー不要) を 1 時間ごとに取り直し、最後の値を DB にキャッシュします。取れなければ概算表 (1 USD = 150 JPY) です。
 - **学習によるパラメータ調整**: Jupiter の銘柄は長い履歴を取れない (GeckoTerminal の枠では 14 日分の 1 分足を取れない) ので検証できず、調整は適用されません (検証できない変更は適用しない規則のため)。
 - **確認**: `npm run trader -- jupiter check` で、各 API の応答の形・既定の銘柄の mint・USD/JPY のレートを確かめます (読み取りだけ。API キーは表示しません)。API の仕様は公式資料の記述に基づくもので、実際の応答とはまだ照合していません。初回は必ず実行してください。
@@ -328,7 +328,7 @@ TARGET_ENTRIES_PER_HOUR=6 MAX_HOLD_MINUTES=30 npm run simulate -- --days 2
 |---|---|---|
 | `JUPITER_API_KEY` | (空) | API キー (任意)。あればキーありの上限 (既定 1 回/秒) で呼びます。表示・ログには出しません |
 | `JUPITER_RPS` | (空) | 1 秒あたりの上限。空ならキーなし 0.5 / キーあり 1 |
-| `JUPITER_POLL_MS` | 5000 | 価格の取得間隔 (ミリ秒、1000〜60000) |
+| `JUPITER_POLL_MS` | 5000 | 価格の取得間隔 (ミリ秒、1000〜15000。気配の古さの上限 30 秒の半分以下) |
 | `GECKO_CALLS_PER_MIN` | 10 | GeckoTerminal の 1 分あたりの上限 (1〜30) |
 | `JUPITER_TOKENS` | `SOL,JUP,BONK,WIF,POPCAT,MEW` | 固定の銘柄 (mint か symbol) |
 | `JUPITER_DISCOVERY` | `true` | 自動探索 |
@@ -355,6 +355,8 @@ API の呼び出しの目安 (1 分あたり): Jupiter は価格 12 回 (5 秒�
 4. `npm run trader -- jupiter check` (応答の形・既定の銘柄の mint・USD/JPY を確認。NG があれば内容を確認)
 5. `npm run trader -- paper reset --equity 100000 --confirm` (推奨。以前の bitbank の建玉には価格が来ないため。学習データは残ります)
 6. `sudo systemctl start trader`
+
+`VENUES` を書いていない (既定のまま) で合成データ用の DB (`<DB_PATH のベース名>-synthetic.db`) が残っていると、起動時と `npm run status` に「いまは DB_PATH を使う。以前の DB を使うなら VENUES=synthetic」と警告します (以前の既定は synthetic でした。自動では移しません)。
 
 5 を省いても起動はします。いまの `VENUES` に無い取引先の建玉は、起動時のログと `npm run status` に警告が出て、価格が取れないため損切り・決済が動きません (建玉は消しません)。
 

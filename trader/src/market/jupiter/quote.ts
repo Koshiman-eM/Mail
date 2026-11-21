@@ -59,8 +59,12 @@ export interface SwapQuote {
 
 export interface QuoteProvider {
   readonly name: string;
-  getQuote(req: QuoteRequest): Promise<SwapQuote>;
+  /** signal: 中止 (時間切れの見積もりを捨てるとき)。見積もりの再試行は 1 回まで */
+  getQuote(req: QuoteRequest, opts?: { signal?: AbortSignal }): Promise<SwapQuote>;
 }
+
+/** 見積もりの再試行の回数 (時間切れまでに次の機会が来るので 1 回まで) */
+const QUOTE_RETRIES = 1;
 
 const atomic = z.unknown().transform(toAtomicString).optional();
 
@@ -138,11 +142,11 @@ function validateRequest(req: QuoteRequest): void {
 export class JupiterSwapQuoteProvider implements QuoteProvider {
   readonly name = "swap/v1/quote";
   constructor(private readonly client: JupiterClient) {}
-  async getQuote(req: QuoteRequest): Promise<SwapQuote> {
+  async getQuote(req: QuoteRequest, opts: { signal?: AbortSignal } = {}): Promise<SwapQuote> {
     validateRequest(req);
     const raw = await this.client.getJson("/swap/v1/quote", {
       inputMint: req.inputMint, outputMint: req.outputMint, amount: req.amount, slippageBps: req.slippageBps,
-    });
+    }, { retries: QUOTE_RETRIES, ...(opts.signal ? { signal: opts.signal } : {}) });
     return parseSwapQuote(raw, this.name);
   }
 }
@@ -151,9 +155,13 @@ export class JupiterSwapQuoteProvider implements QuoteProvider {
 export class JupiterUltraOrderProvider implements QuoteProvider {
   readonly name = "ultra/v1/order";
   constructor(private readonly client: JupiterClient) {}
-  async getQuote(req: QuoteRequest): Promise<SwapQuote> {
+  async getQuote(req: QuoteRequest, opts: { signal?: AbortSignal } = {}): Promise<SwapQuote> {
     validateRequest(req);
-    const raw = await this.client.getJson("/ultra/v1/order", { inputMint: req.inputMint, outputMint: req.outputMint, amount: req.amount });
+    const raw = await this.client.getJson(
+      "/ultra/v1/order",
+      { inputMint: req.inputMint, outputMint: req.outputMint, amount: req.amount },
+      { retries: QUOTE_RETRIES, ...(opts.signal ? { signal: opts.signal } : {}) },
+    );
     return parseSwapQuote(raw, this.name);
   }
 }

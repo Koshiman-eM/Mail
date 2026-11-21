@@ -229,6 +229,9 @@ export interface GeckoClientOptions extends HttpJsonClientOptions {
   maxCachedCandles?: number;
   /** 1 回の fetchOhlcv のページ数の上限 (既定 5) */
   maxPages?: number;
+  /** キャッシュの件数の上限 (足は (プール, 時間足) ごと、既定 200。プールの検索は mint ごと、既定 500)。超えたら古い順に捨てる */
+  maxOhlcvEntries?: number;
+  maxPoolEntries?: number;
 }
 
 export interface FetchOhlcvOptions {
@@ -286,7 +289,9 @@ export class GeckoTerminalClient {
       if (e instanceof HttpError && e.status === 404) pools = [];
       else throw e;
     }
+    this.poolCache.delete(mint);
     this.poolCache.set(mint, { at: t, pools });
+    capMap(this.poolCache, this.o.maxPoolEntries ?? 500);
     return pools.map((p) => ({ ...p }));
   }
 
@@ -365,16 +370,38 @@ export class GeckoTerminalClient {
         exhausted = r.exhausted;
       }
       e = { candles: merged, bucket, exhausted };
+      this.ohlcvCache.delete(key);
       this.ohlcvCache.set(key, e);
+      capMap(this.ohlcvCache, this.o.maxOhlcvEntries ?? 200);
     }
     const arr = e.candles;
     const out = o.since !== undefined ? arr.filter((c) => c.ts >= o.since!).slice(0, limit) : arr.slice(-limit);
     return out.map((c) => ({ ...c }));
   }
 
+  /** 監視から外した銘柄のキャッシュ (プールの検索と、そのプールの足) を捨てる */
+  forgetToken(mint: string, pool?: string): void {
+    this.poolCache.delete(mint);
+    if (pool) for (const k of [...this.ohlcvCache.keys()]) if (k.startsWith(`${pool}|`)) this.ohlcvCache.delete(k);
+  }
+
+  /** キャッシュの件数 (テスト・状態表示) */
+  cacheSize(): { pools: number; ohlcv: number } {
+    return { pools: this.poolCache.size, ohlcv: this.ohlcvCache.size };
+  }
+
   /** キャッシュを捨てる (テスト・監視から外した銘柄) */
   clearCache(): void {
     this.poolCache.clear();
     this.ohlcvCache.clear();
+  }
+}
+
+/** Map を max 件まで (挿入の古い順に捨てる。使うたびに入れ直すので、おおむね最近使っていない順) */
+function capMap<K, V>(m: Map<K, V>, max: number): void {
+  const n = Math.max(1, Math.floor(max));
+  while (m.size > n) {
+    const k = m.keys().next().value as K;
+    m.delete(k);
   }
 }

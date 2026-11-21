@@ -118,6 +118,8 @@ export interface MarketExtras {
   /** この取引先の銘柄に liquidityUsd を使う */
   venues: readonly string[];
   liquidityUsd(symbol: string): number | undefined;
+  /** 予定の約定代金 (クオート通貨建て) での往復コスト (bps)。RiskManager がサイズを決めた後の判定に使う (EntryParams.costBpsAt) */
+  costBpsAt?(symbol: string, notionalQuote: number): number | undefined;
   entryBlock?(symbol: string): string | undefined;
 }
 
@@ -2185,6 +2187,10 @@ export class TradingEngine {
       toAccount: (ccy) => this.fx.toAccount(ccy),
       // テンポのモードのときだけ渡す (コスト比の判定だけが変わる。無ければ従来どおり)
       ...(ctx.tempo ? { tempo: ctx.tempo.level, tempoExplore: ctx.tempo.explore } : {}),
+      // Jupiter: 実際の代金でのコスト (固定手数料 / 代金 + 代金と流動性の価格影響) でも期待値を確かめる
+      ...(this.marketExtras?.costBpsAt && this.marketExtras.venues.includes(inst.venue)
+        ? { costBpsAt: (n: number) => this.marketExtras!.costBpsAt!(sym, n) }
+        : {}),
     });
     if (!decision.ok) {
       const key = `risk: ${normalizeReason(decision.reason)}`;
@@ -2194,7 +2200,8 @@ export class TradingEngine {
 
     const side = sig.direction === "long" ? "buy" : "sell";
     const intended = side === "buy" ? q.ask : q.bid;
-    const cost = costBps(inst, q);
+    // 実際の代金でのコスト (Jupiter) があればそれを記録する (要因分析のコストもそろえる)
+    const cost = decision.costBps ?? costBps(inst, q);
     const entryContext: EntryContext = {
       regime: c.regime,
       ...(c.intel ? { intel: c.intel } : {}),
@@ -2512,7 +2519,7 @@ export class TradingEngine {
     if (this.hub.instrument(inst.symbol)) return false;
     this.hub.watch(inst, feed);
     this.brokerSet.paper?.addInstrument(inst);
-    this.store.audit({ ts: this.clock.now(), type: "engine.watch_add", data: { symbol: inst.symbol, venue: inst.venue, assetClass: inst.assetClass } });
+    // 監査ログは呼び出し側 (Jupiter の自動探索の jupiter.watch_add) が残す
     return true;
   }
 
@@ -2525,7 +2532,7 @@ export class TradingEngine {
     if (this.positions.get(symbol) || this.positions.hasPending(symbol) || this.positions.hasOrphanTakeProfit(symbol)) return false;
     if (!this.hub.unwatch(symbol)) return false;
     for (const k of [...this.lastEval.keys()]) if (k.startsWith(`${symbol}|`)) this.lastEval.delete(k);
-    this.store.audit({ ts: this.clock.now(), type: "engine.watch_remove", data: { symbol } });
+    // 監査ログは呼び出し側 (jupiter.watch_remove) が残す
     return true;
   }
 

@@ -1,21 +1,26 @@
 /**
  * バックテスト用: GeckoTerminal のプールの OHLCV を MarketDataFeed の形で返す (`backtest --source jupiter --token <mint|symbol>`)。
- * - fetchCandles(symbol, tf, limit, since) は GeckoTerminalClient.fetchOhlcv (新しい順にさかのぼるページング・確定足のキャッシュ) を呼ぶ。
- *   since があればそこまでさかのぼる (1 ページ 1000 本。GECKO_CALLS_PER_MIN の枠で待つ。1m の 30 日分は約 44 回)。
- * - 気配は無い (バックテストは足だけを使う)。銘柄は 1 つ (jupiterInstrument で作ったもの。コストは costModel とネットワーク手数料)。
- * - GeckoTerminal が古い 1m の足をどこまで返すかは未確認 (要確認)。足りなければ「足を取得できませんでした」・短い期間になる。
+ * - 最初に要求された since から今までを、before_timestamp でさかのぼるページング (1 ページ 1000 本) で一度に取り、
+ *   この feed 専用のバッファ (本数の上限なし) に持つ。GeckoTerminalClient.fetchOhlcv のキャッシュ (3000 本で切り詰める) は使わない
+ *   (前向きのページングで古い足が消え、--days の期間が欠けるため)。以後の呼び出しはバッファから返す。
+ * - GeckoTerminal の履歴が要求より短ければ (先頭に達しても since まで届かない)、分かりやすい文言で例外にする (短い期間で黙って回さない)。
+ * - 呼び出しは GECKO_CALLS_PER_MIN の枠で待つ (1m の 30 日分は約 44 回)。気配は無い (バックテストは足だけを使う)。
+ * - GeckoTerminal が古い 1m の足をどこまで返すかは未確認 (要確認)。
  */
-import { GECKO_MAX_LIMIT, type GeckoTerminalClient } from "../jupiter/gecko";
+import { GECKO_MAX_LIMIT, pageCandlesBackward, type GeckoTerminalClient } from "../jupiter/gecko";
 import { TIMEFRAME_MS, type Candle, type Instrument, type MarketDataFeed, type Quote, type Timeframe } from "../../core/types";
 
 export class GeckoHistoryFeed implements MarketDataFeed {
   readonly venue: string;
+  private readonly buffers = new Map<Timeframe, { from: number; candles: Candle[] }>();
 
   constructor(
     private readonly gecko: GeckoTerminalClient,
     private readonly inst: Instrument,
     private readonly pool: string,
     private readonly now: () => number = Date.now,
+    /** ページ数の上限 (既定 400 = 1m で約 277 日) */
+    private readonly maxPages = 400,
   ) {
     this.venue = inst.venue;
   }
@@ -24,11 +29,35 @@ export class GeckoHistoryFeed implements MarketDataFeed {
     return [this.inst];
   }
 
+  private async load(tf: Timeframe, from: number): Promise<Candle[]> {
+    const have = this.buffers.get(tf);
+    if (have && have.from <= from) return have.candles;
+    const ms = TIMEFRAME_MS[tf];
+    const bars = Math.ceil((this.now() - from) / ms) + 2;
+    const pages = Math.ceil(bars / GECKO_MAX_LIMIT) + 1;
+    if (pages > this.maxPages) throw new Error(`GeckoTerminal: ${tf} の ${bars} 本は多すぎます (ページの上限 ${this.maxPages})。--days を短くしてください`);
+    const r = await pageCandlesBackward(
+      (beforeSec, limit) => this.gecko.fetchOhlcvPage(this.pool, tf, { ...(beforeSec !== undefined ? { beforeSec } : {}), limit }),
+      { limit: bars, stopAt: from, maxPages: pages },
+    );
+    const closed = r.candles.filter((c) => c.ts + ms <= this.now());
+    const oldest = closed[0]?.ts;
+    if (oldest === undefined || oldest > from + ms) {
+      throw new Error(
+        `GeckoTerminal の ${tf} の履歴が要求より短いです (要求 ${new Date(from).toISOString()} 以降、取得できたのは ` +
+          `${oldest !== undefined ? `${new Date(oldest).toISOString()} 以降` : "0 本"}${r.exhausted ? "。プールの履歴の先頭に達しました" : ""})。--days を短くしてください`,
+      );
+    }
+    this.buffers.set(tf, { from, candles: closed });
+    return closed;
+  }
+
   async fetchCandles(symbol: string, tf: Timeframe, limit: number, since?: number): Promise<Candle[]> {
     if (symbol !== this.inst.symbol) return [];
-    const bars = since !== undefined ? Math.ceil((this.now() - since) / TIMEFRAME_MS[tf]) + 2 : limit;
-    const maxPages = Math.min(200, Math.ceil(bars / GECKO_MAX_LIMIT) + 1);
-    return this.gecko.fetchOhlcv(this.pool, tf, { limit: Math.max(1, limit), ...(since !== undefined ? { since } : {}), maxPages });
+    const from = since ?? this.now() - Math.max(1, limit) * TIMEFRAME_MS[tf];
+    const all = await this.load(tf, from);
+    const out = since !== undefined ? all.filter((c) => c.ts >= since).slice(0, Math.max(1, limit)) : all.slice(-Math.max(1, limit));
+    return out.map((c) => ({ ...c }));
   }
 
   async fetchQuote(): Promise<Quote> {

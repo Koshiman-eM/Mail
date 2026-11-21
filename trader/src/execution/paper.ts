@@ -39,13 +39,16 @@ export interface PaperBrokerOptions {
   marketOnlyVenues?: readonly string[];
 }
 
-/** 成行の約定価格の見積もり (price はクオート通貨建て・1 単位あたり。source は監査・ログ用) */
+/**
+ * 成行の約定価格の見積もり (price はクオート通貨建て・1 単位あたり。source は監査・ログ用)。
+ * reject を返したらその注文を拒否する (例: 気配が古くて見積もりの代わりのモデルで値付けできない。決済は次のティックで再試行される)
+ */
 export type MarketPricer = (
   inst: Instrument,
   side: "buy" | "sell",
   qty: Decimal,
   quote: Quote,
-) => Promise<{ price: number; source: string } | undefined>;
+) => Promise<{ price: number; source: string } | { reject: string } | undefined>;
 
 interface Pos {
   qty: Decimal;
@@ -335,6 +338,10 @@ export class PaperBroker implements Broker {
       if (this.o.marketPricer) {
         try {
           const est = await this.o.marketPricer(inst, req.side, qty, q);
+          if (est && "reject" in est) {
+            const done = this.results.get(req.clientId);
+            return done ?? this.reject(req, est.reject);
+          }
           if (est && Number.isFinite(est.price) && est.price > 0) px = D(est.price);
         } catch (e) {
           this.warnOnce(`pricer:${inst.symbol}`, "成行の見積もりに失敗したため気配で約定します", { symbol: inst.symbol, error: e instanceof Error ? e.message : String(e) });

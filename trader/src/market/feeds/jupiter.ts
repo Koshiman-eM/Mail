@@ -37,6 +37,11 @@ import { DEFAULT_FALLBACK_SLIPPAGE, estimateFillFallback, type FallbackSlippageS
 import { searchTokens, type JupiterToken } from "../jupiter/tokens";
 
 export const JUPITER_VENUE = "jupiter";
+/** 流動性 (トークン情報) をこれより古いなら「不明」とみなす (ミームの最低流動性は拒否、気配は流動性不明の bps) */
+export const LIQUIDITY_MAX_AGE_MS = 3 * 3_600_000;
+/** GeckoTerminal の失敗 (プールの検索・履歴) の再試行の間隔 (1 回目 5 分、2 回目 15 分、以後 60 分) */
+export const GECKO_RETRY_BACKOFF_MS: readonly number[] = [5 * 60_000, 15 * 60_000, 60 * 60_000];
+const backoffMs = (failures: number) => GECKO_RETRY_BACKOFF_MS[Math.min(GECKO_RETRY_BACKOFF_MS.length - 1, Math.max(0, failures - 1))];
 const JUPITER_QUOTE_CURRENCY = "USDC";
 const USDC_DECIMALS = 6;
 const MIN = 60_000;
@@ -129,10 +134,14 @@ interface TokenState {
   lastPrice?: JupiterPrice;
   /** ポーリングで最初に価格を入れた 1m の足 (これより前にだけ 1m の履歴を入れる) */
   firstPolledTs?: number;
-  /** GeckoTerminal のプール (null = 見つからない) */
+  /** GeckoTerminal のプール (null = 見つからない・失敗。poolRetryAt 以降に取り直す) */
   pool?: string | null;
-  /** 取得済みの履歴の時間足 */
+  poolFailures: number;
+  poolRetryAt?: number;
+  /** 取得済み (成功した) の履歴の時間足 */
   backfilled: Set<Timeframe>;
+  /** 履歴の取得に失敗した時間足 (失敗回数と再試行の時刻) */
+  backfillFail: Map<Timeframe, { failures: number; retryAt: number }>;
   /** GeckoTerminal の時間足ごとの履歴 (確定足) */
   geckoHist: Map<Timeframe, Candle[]>;
   /** 1m の出来高 (ts → 出来高。確定から volumeLagMs 以上経った足だけ) */
@@ -217,15 +226,24 @@ export class JupiterFeed implements MarketDataFeed {
 
   // ───────── 銘柄 ─────────
 
-  /** 銘柄を加える (既にあればその Instrument)。シンボルが他の mint と重なれば mint の先頭 4 文字を付ける */
-  addToken(spec: JupiterTokenSpec): Instrument {
+  /**
+   * 銘柄を加える (既にあればその Instrument)。シンボルが他の mint と重なれば mint の先頭 4 文字を付ける。
+   * forcedSymbol (前回の起動で使った統一シンボル。kv `jupiter:watch:<mode>`・paper のスナップショット) があれば、空いている限りそれを使う
+   * (保有中の建玉のシンボル → mint の対応を再起動で変えないため。空いていなければ警告して通常の規則)
+   */
+  addToken(spec: JupiterTokenSpec, forcedSymbol?: string): Instrument {
     const have = this.byMint.get(spec.mint);
     if (have) return have.inst;
     const opts = { quoteSizeUsd: this.quoteSizeUsd, networkFeeUsd: this.networkFeeUsd, minNotionalUsd: this.minNotionalUsd };
-    let inst = jupiterInstrument(spec, opts);
-    if (this.bySymbol.has(inst.symbol)) inst = jupiterInstrument(spec, { ...opts, symbol: `${spec.symbol.toUpperCase()}-${spec.mint.slice(0, 4)}/${JUPITER_QUOTE_CURRENCY}` });
+    let inst: Instrument;
+    if (forcedSymbol && !this.bySymbol.has(forcedSymbol)) inst = jupiterInstrument(spec, { ...opts, symbol: forcedSymbol });
+    else {
+      if (forcedSymbol) this.warn(`forced:${spec.mint}`, "前回のシンボルが他の銘柄に使われているため別のシンボルにします", { mint: spec.mint, symbol: forcedSymbol });
+      inst = jupiterInstrument(spec, opts);
+      if (this.bySymbol.has(inst.symbol)) inst = jupiterInstrument(spec, { ...opts, symbol: `${spec.symbol.toUpperCase()}-${spec.mint.slice(0, 4)}/${JUPITER_QUOTE_CURRENCY}` });
+    }
     const st: TokenState = {
-      spec, inst, backfilled: new Set(), geckoHist: new Map(), geckoVol: new Map(), frozen: new Map(), version: 0,
+      spec, inst, poolFailures: 0, backfilled: new Set(), backfillFail: new Map(), geckoHist: new Map(), geckoVol: new Map(), frozen: new Map(), version: 0,
       ...(spec.liquidityUsd !== undefined ? { liquidityUsd: spec.liquidityUsd, liquidityAt: this.now() } : {}),
     };
     this.bySymbol.set(inst.symbol, st);
@@ -240,6 +258,8 @@ export class JupiterFeed implements MarketDataFeed {
     this.byMint.delete(mint);
     this.bySymbol.delete(st.inst.symbol);
     this.store.delete(mint);
+    // GeckoTerminal のキャッシュ (プール・足) も捨てる (自動探索で入れ替わる銘柄でメモリが増え続けないように)
+    this.o.gecko?.forgetToken(mint, typeof st.pool === "string" ? st.pool : undefined);
     return true;
   }
 
@@ -254,7 +274,8 @@ export class JupiterFeed implements MarketDataFeed {
   tokenOf(symbol: string): (JupiterTokenSpec & { liquidityUsd?: number; fallback: FallbackSlippageSettings }) | undefined {
     const st = this.bySymbol.get(symbol);
     if (!st) return undefined;
-    return { ...st.spec, ...(st.liquidityUsd !== undefined ? { liquidityUsd: st.liquidityUsd } : {}), fallback: fallbackSettingsFor(st.spec.assetClass) };
+    const liq = this.freshLiquidity(st);
+    return { ...st.spec, ...(liq !== undefined ? { liquidityUsd: liq } : { liquidityUsd: undefined }), fallback: fallbackSettingsFor(st.spec.assetClass) };
   }
 
   mints(): string[] {
@@ -268,7 +289,26 @@ export class JupiterFeed implements MarketDataFeed {
 
   /** RiskManager の MEME_MIN_LIQUIDITY_USD の判定に使う流動性 (Jupiter のトークン情報の liquidity。無ければ undefined = 拒否) */
   liquidityUsd(symbol: string): number | undefined {
-    return this.bySymbol.get(symbol)?.liquidityUsd;
+    const st = this.bySymbol.get(symbol);
+    return st ? this.freshLiquidity(st) : undefined;
+  }
+
+  /** LIQUIDITY_MAX_AGE_MS (3 時間) より古い流動性は不明 (undefined) */
+  private freshLiquidity(st: TokenState): number | undefined {
+    if (st.liquidityUsd === undefined || st.liquidityAt === undefined) return undefined;
+    return this.now() - st.liquidityAt <= LIQUIDITY_MAX_AGE_MS ? st.liquidityUsd : undefined;
+  }
+
+  /**
+   * 予定の約定代金 (USD) での往復コスト (bps) = 2 × (代わりのモデルの片道 bps (その代金と流動性で評価) + ネットワーク手数料 / 代金)。
+   * 気配の仮のスプレッド (JUPITER_QUOTE_SIZE_USD で評価) ではなく、実際のサイズのコストで期待値を確かめる (RiskManager)。
+   * 銘柄が無い・代金が不正なら undefined
+   */
+  costBpsAt(symbol: string, notionalUsd: number): number | undefined {
+    const st = this.bySymbol.get(symbol);
+    if (!st || !(Number.isFinite(notionalUsd) && notionalUsd > 0)) return undefined;
+    const oneWay = fallbackBps(st.spec.assetClass, notionalUsd, this.freshLiquidity(st));
+    return 2 * oneWay + 2 * (this.networkFeeUsd / notionalUsd) * 10_000;
   }
 
   setEntryBlock(mint: string, reason: string | undefined): void {
@@ -362,8 +402,9 @@ export class JupiterFeed implements MarketDataFeed {
   /** 仲値 = 価格、買い・売り気配 = 代表的な約定代金での代わりのスリッページ */
   private synthQuote(st: TokenState, p: JupiterPrice): Quote {
     const s = fallbackSettingsFor(st.spec.assetClass);
-    const ask = estimateFillFallback("buy", this.quoteSizeUsd, p.usd, st.liquidityUsd, s).effectivePrice;
-    const bid = estimateFillFallback("sell", this.quoteSizeUsd, p.usd, st.liquidityUsd, s).effectivePrice;
+    const liq = this.freshLiquidity(st);
+    const ask = estimateFillFallback("buy", this.quoteSizeUsd, p.usd, liq, s).effectivePrice;
+    const bid = estimateFillFallback("sell", this.quoteSizeUsd, p.usd, liq, s).effectivePrice;
     return { ts: p.ts, bid, ask, last: p.usd };
   }
 
@@ -479,24 +520,43 @@ export class JupiterFeed implements MarketDataFeed {
   private nextTask(): (() => Promise<void>) | undefined {
     const gecko = this.o.gecko!;
     const states = [...this.byMint.values()];
-    const noPool = states.find((s) => s.pool === undefined);
+    const t = this.now();
+    const noPool = states.find((s) => s.pool === undefined || (s.pool === null && s.poolRetryAt !== undefined && t >= s.poolRetryAt));
     if (noPool) {
       return async () => {
         this.geckoCalls++;
-        const p = await gecko.bestPoolFor(noPool.spec.mint).catch((e) => {
-          noPool.pool = null; // 失敗したら今回は見送る (プールのキャッシュが期限切れになれば取り直す)
+        // 失敗・見つからないときは 5 分 → 15 分 → 60 分 (以後 60 分ごと) の後に取り直す
+        const fail = () => {
+          noPool.pool = null;
+          noPool.poolFailures++;
+          noPool.poolRetryAt = this.now() + backoffMs(noPool.poolFailures);
+        };
+        let p;
+        try {
+          p = await gecko.bestPoolFor(noPool.spec.mint);
+        } catch (e) {
+          fail();
           throw e;
-        });
-        noPool.pool = p?.address ?? null;
-        if (!p) this.warn(`nopool:${noPool.spec.mint}`, "GeckoTerminal にプールが見つからない銘柄 (履歴・出来高なし)", { symbol: noPool.inst.symbol });
+        }
+        if (!p) {
+          fail();
+          this.warn(`nopool:${noPool.spec.mint}`, "GeckoTerminal にプールが見つからない銘柄 (後で取り直します。それまで履歴・出来高なし)", { symbol: noPool.inst.symbol });
+          return;
+        }
+        noPool.pool = p.address;
+        noPool.poolFailures = 0;
+        delete noPool.poolRetryAt;
       };
     }
     for (const tf of BACKFILL_ORDER) {
       if (!this.tfs.includes(tf) || !this.needsGeckoHistory(tf)) continue;
-      const st = states.find((s) => typeof s.pool === "string" && !s.backfilled.has(tf));
+      const st = states.find((s) => {
+        if (typeof s.pool !== "string" || s.backfilled.has(tf)) return false;
+        const f = s.backfillFail.get(tf);
+        return f === undefined || t >= f.retryAt;
+      });
       if (st) return () => this.backfill(st, tf);
     }
-    const t = this.now();
     let best: TokenState | undefined;
     for (const s of states) {
       if (typeof s.pool !== "string" || !s.backfilled.has("1m")) continue;
@@ -518,11 +578,21 @@ export class JupiterFeed implements MarketDataFeed {
 
   private async backfill(st: TokenState, tf: Timeframe): Promise<void> {
     const pool = st.pool as string;
-    st.backfilled.add(tf); // 失敗しても同じ時間足を続けて叩かない
     this.geckoCalls++;
     const ms = TIMEFRAME_MS[tf];
     const want = tf === "1m" ? Math.min(1000, this.maxCandles) : Math.min(1000, this.historyBars + 5);
-    const rows = await this.o.gecko!.fetchOhlcv(pool, tf, { limit: want, maxPages: 1 });
+    let rows: Candle[];
+    try {
+      rows = await this.o.gecko!.fetchOhlcv(pool, tf, { limit: want, maxPages: 1 });
+    } catch (e) {
+      // 失敗した時間足は 5 分 → 15 分 → 60 分の後に取り直す (成功するまで取得済みにしない)
+      const f = st.backfillFail.get(tf);
+      const failures = (f?.failures ?? 0) + 1;
+      st.backfillFail.set(tf, { failures, retryAt: this.now() + backoffMs(failures) });
+      throw e;
+    }
+    st.backfilled.add(tf);
+    st.backfillFail.delete(tf);
     if (!this.byMint.has(st.spec.mint)) return;
     const t = this.now();
     const closed = rows.filter((c) => c.ts + ms <= t);

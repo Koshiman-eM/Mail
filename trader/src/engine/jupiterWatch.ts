@@ -161,10 +161,18 @@ export async function resolveFixedTokens(client: JupiterClient, items: readonly 
   return out;
 }
 
-/** kv に保存する一覧 (WatchEntry に decimals を足す) */
+/**
+ * kv に保存する一覧の 1 件。WatchEntry に次を足す:
+ * - decimals: 再起動で銘柄定義を作り直すため
+ * - instSymbol: 使った統一シンボル (`X/USDC` か、重なったときの `X-<mint 先頭 4 文字>/USDC`)。再起動で同じシンボルを使う
+ *   (保有中の建玉のシンボル → mint の対応を変えない)
+ * - screenBlock: 最後の選別で落ちた (新規エントリーを止めている) なら理由の種類と文言。再起動後も止め続ける
+ */
+export type StoredWatchEntry = WatchEntry & { decimals?: number; instSymbol?: string; screenBlock?: { codes: string[]; reason: string } };
+
 export interface PersistedWatch {
   updatedAt: number;
-  entries: (WatchEntry & { decimals?: number })[];
+  entries: StoredWatchEntry[];
 }
 
 export interface JupiterWatchDeps {
@@ -195,7 +203,7 @@ export interface DiscoveryResult {
 const reasonsText = (r: readonly Rejection[]) => r.map((x) => x.label);
 
 export class JupiterWatchManager {
-  private entries: (WatchEntry & { decimals?: number })[] = [];
+  private entries: StoredWatchEntry[] = [];
   private running = false;
   private lastRunAt?: number;
 
@@ -206,7 +214,7 @@ export class JupiterWatchManager {
     return new Set(this.d.fixed.map((f) => f.mint));
   }
 
-  list(): (WatchEntry & { decimals?: number })[] {
+  list(): StoredWatchEntry[] {
     return this.entries.map((e) => ({ ...e }));
   }
 
@@ -218,38 +226,73 @@ export class JupiterWatchManager {
     });
   }
 
-  private persist(now: number): void {
-    const v: PersistedWatch = { updatedAt: now, entries: this.entries };
+  private persist(now: number, extra: readonly StoredWatchEntry[] = []): void {
+    const v: PersistedWatch = { updatedAt: now, entries: [...this.entries, ...extra] };
     this.d.store.kvSet(jupiterWatchKey(this.d.mode), v);
   }
 
   /**
-   * 起動時: 固定の銘柄と、kv の一覧のうち期限内 (または保有中の銘柄 keepMints) の自動追加の銘柄を加える。
-   * extraKeep は保有中だが一覧に無い銘柄 (paper のスナップショットの銘柄定義から mint・decimals が分かったもの)
+   * 起動時: 固定の銘柄と、kv の一覧のうち期限内 (または保有中) の自動追加の銘柄を加える。
+   * - 保有中の銘柄を最初に、前回と同じ統一シンボル (instSymbol。paper のスナップショットの銘柄定義の symbol も) で加える。
+   *   シンボルが重なる銘柄 (同じ symbol の別の mint) があっても、保有中の建玉のシンボル → mint の対応は再起動で変わらない。
+   * - 次に固定の銘柄、最後に期限内の自動追加の銘柄 (どちらも前回のシンボルが空いていればそれ)。
+   * - 最後の選別で落ちていた銘柄 (screenBlock) は新規エントリーを止めたまま戻す。
+   * extraKeep は保有中だが一覧に無い銘柄 (paper のスナップショットの銘柄定義から mint・decimals・symbol が分かったもの)
    */
-  restore(extraKeep: readonly (JupiterTokenSpec & { symbol: string })[] = []): Instrument[] {
+  restore(extraKeep: readonly (JupiterTokenSpec & { instSymbol: string })[] = []): Instrument[] {
     const now = this.d.now();
+    const { feed } = this.d;
     const out: Instrument[] = [];
-    for (const f of this.d.fixed) out.push(this.d.feed.addToken(f));
-    const saved = this.d.store.kvGet<PersistedWatch>(jupiterWatchKey(this.d.mode));
+    const saved = this.d.store.kvGet<PersistedWatch>(jupiterWatchKey(this.d.mode))?.entries ?? [];
+    const savedBy = new Map(saved.map((e) => [e.mint, e]));
     const keepSyms = new Set(this.d.keepSymbols());
-    const fixed = this.fixedMints();
-    const restored: (WatchEntry & { decimals?: number })[] = [];
-    for (const e of saved?.entries ?? []) {
-      if (e.source !== "discovered" || fixed.has(e.mint) || typeof e.decimals !== "number" || !e.symbol) continue;
-      const alive = (e.expiresAt ?? 0) > now;
-      const sym = `${e.symbol.toUpperCase()}/USDC`;
-      if (!alive && !keepSyms.has(sym) && !extraKeep.some((k) => k.mint === e.mint)) continue;
-      out.push(this.d.feed.addToken({ mint: e.mint, symbol: e.symbol, decimals: e.decimals, assetClass: "meme", source: "discovered" }));
-      restored.push(e);
+    const fixedBy = new Map(this.d.fixed.map((f) => [f.mint, f]));
+    const specOf = (e: StoredWatchEntry): JupiterTokenSpec | undefined =>
+      fixedBy.get(e.mint) ??
+      (typeof e.decimals === "number" && e.symbol ? { mint: e.mint, symbol: e.symbol, decimals: e.decimals, assetClass: "meme", source: "discovered" } : undefined);
+    const added = new Set<string>();
+    const add = (spec: JupiterTokenSpec, forced: string | undefined) => {
+      if (added.has(spec.mint)) return;
+      added.add(spec.mint);
+      out.push(feed.addToken(spec, forced));
+    };
+    // 1. 保有中の銘柄 (前回のシンボルのまま)
+    for (const e of saved) {
+      const spec = specOf(e);
+      if (spec && e.instSymbol && keepSyms.has(e.instSymbol)) add(spec, e.instSymbol);
+    }
+    for (const k of extraKeep) if (keepSyms.has(k.instSymbol)) add(fixedBy.get(k.mint) ?? k, k.instSymbol);
+    // 2. 固定の銘柄
+    for (const f of this.d.fixed) add(f, savedBy.get(f.mint)?.instSymbol);
+    // 3. 期限内の自動追加の銘柄
+    const restored: StoredWatchEntry[] = [];
+    for (const e of saved) {
+      if (e.source !== "discovered" || fixedBy.has(e.mint)) continue;
+      const spec = specOf(e);
+      if (!spec) continue;
+      if (!added.has(e.mint) && !((e.expiresAt ?? 0) > now)) continue;
+      add(spec, e.instSymbol);
+      restored.push({ ...e });
     }
     for (const k of extraKeep) {
-      if (fixed.has(k.mint) || restored.some((e) => e.mint === k.mint)) continue;
-      out.push(this.d.feed.addToken(k));
+      if (fixedBy.has(k.mint) || restored.some((e) => e.mint === k.mint) || !added.has(k.mint)) continue;
       restored.push({ mint: k.mint, symbol: k.symbol, source: "discovered", decimals: k.decimals, lastSeenAt: now, addedAt: now, expiresAt: now });
     }
-    this.entries = [...this.d.fixed.map((f): WatchEntry & { decimals?: number } => ({ mint: f.mint, symbol: f.symbol, source: "fixed", decimals: f.decimals })), ...restored];
+    for (const e of restored) if (e.screenBlock) feed.setEntryBlock(e.mint, e.screenBlock.reason);
+    this.entries = [
+      ...this.d.fixed.map((f): StoredWatchEntry => ({ mint: f.mint, symbol: f.symbol, source: "fixed", decimals: f.decimals })),
+      ...restored,
+    ].map((e) => this.withSymbol(e));
+    // 使ったシンボルを保存する。戻さなかった (期限切れの) 前回の銘柄も kv には残す (次の探索で期限切れとして外れる)
+    const kept = new Set(this.entries.map((e) => e.mint));
+    this.persist(now, saved.filter((e) => e.source === "discovered" && !kept.has(e.mint)));
     return out;
+  }
+
+  /** 使っている統一シンボルを記録する */
+  private withSymbol(e: StoredWatchEntry): StoredWatchEntry {
+    const sym = this.d.feed.instrumentOf(e.mint)?.symbol ?? e.instSymbol;
+    return sym ? { ...e, instSymbol: sym } : { ...e };
   }
 
   /** 前回から everyMs 以上経っていれば (force なら常に) 探索する */
@@ -304,23 +347,35 @@ export class JupiterWatchManager {
     const rejectedBy = new Map(sr.rejected.map((r) => [r.token.mint, r.reasons]));
     const infoBy = new Map(candidates.map((t) => [t.mint, t]));
 
-    // 監視中の自動追加の銘柄を最新の情報で選別し直す (落ちたら新規エントリーを止める。建玉の管理は続ける)
+    // 監視中の自動追加の銘柄を最新の情報で選別し直す (落ちたら新規エントリーを止める。建玉の管理は続ける)。
+    // 止めた理由は kv に保存し (再起動後も止める)、トークン情報が無いときは前回の判定のまま止め続ける (fail-closed)。
+    // 監査ログは理由の種類 (code) の組が変わったときだけ (値の変化では書かない)
     const screenFailed: string[] = [];
     for (const e of this.entries) {
       if (e.source !== "discovered") continue;
-      const tok = infoBy.get(e.mint) ?? feed.tokenInfo(e.mint);
       const inst = feed.instrumentOf(e.mint);
-      if (!tok || !inst) continue;
+      const tok = infoBy.get(e.mint) ?? feed.tokenInfo(e.mint);
+      if (!tok) {
+        if (e.screenBlock) {
+          feed.setEntryBlock(e.mint, e.screenBlock.reason);
+          if (inst) screenFailed.push(inst.symbol);
+        }
+        continue;
+      }
       const reasons = rejectionsFor(tok, screen, now).filter((r) => r.code !== "excluded");
-      const was = feed.entryBlock(inst.symbol);
+      const symbol = inst?.symbol ?? e.instSymbol ?? e.symbol ?? e.mint;
       if (reasons.length > 0) {
+        const codes = [...new Set(reasons.map((r) => r.code as string))].sort();
         const msg = `選別に落ちたため新規エントリーしません: ${reasonsText(reasons).join(" / ")}`;
+        const changed = e.screenBlock?.codes.join(",") !== codes.join(",");
+        e.screenBlock = { codes, reason: msg };
         feed.setEntryBlock(e.mint, msg);
-        screenFailed.push(inst.symbol);
-        if (was !== msg) this.d.store.audit({ ts: now, type: "jupiter.watch_screen_failed", data: { mint: e.mint, symbol: inst.symbol, reasons: reasonsText(reasons) } });
-      } else if (was) {
+        screenFailed.push(symbol);
+        if (changed) this.d.store.audit({ ts: now, type: "jupiter.watch_screen_failed", data: { mint: e.mint, symbol, codes, reasons: reasonsText(reasons) } });
+      } else if (e.screenBlock) {
+        delete e.screenBlock;
         feed.setEntryBlock(e.mint, undefined);
-        this.d.store.audit({ ts: now, type: "jupiter.watch_screen_ok", data: { mint: e.mint, symbol: inst.symbol } });
+        this.d.store.audit({ ts: now, type: "jupiter.watch_screen_ok", data: { mint: e.mint, symbol } });
       }
     }
 
@@ -332,7 +387,7 @@ export class JupiterWatchManager {
 
     const added: string[] = [];
     const removed: string[] = [];
-    const next: (WatchEntry & { decimals?: number })[] = [];
+    const next: StoredWatchEntry[] = [];
     for (const e of merged.entries) {
       const decimals = decimalsOf.get(e.mint);
       if (e.source === "discovered" && merged.added.includes(e.mint)) {
@@ -361,7 +416,7 @@ export class JupiterWatchManager {
         const tok = infoBy.get(e.mint);
         if (tok) feed.applyTokenInfo([tok]);
       }
-      next.push({ ...e, ...(decimals !== undefined ? { decimals } : {}) });
+      next.push(this.withSymbol({ ...e, ...(decimals !== undefined ? { decimals } : {}) }));
     }
     for (const mint of [...merged.expired, ...merged.evicted]) {
       const inst = feed.instrumentOf(mint);

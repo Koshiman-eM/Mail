@@ -516,7 +516,8 @@ export interface RiskLimits {
 }
 
 export type RiskDecision =
-  | { ok: true; qty: string; notes: string[] }
+  /** costBps: サイズを決めた後の実際の代金での往復コスト (bps。EntryParams.costBpsAt を渡したときだけ) */
+  | { ok: true; qty: string; notes: string[]; costBps?: number }
   | { ok: false; reason: string };
 
 export interface RiskState {

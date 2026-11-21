@@ -43,6 +43,8 @@ export class TokenBucket {
   private tokens: number;
   private last: number;
   private chain: Promise<void> = Promise.resolve();
+  /** acquire を呼んでまだ枠を取れていない数 (待ちの列) */
+  private pending = 0;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
 
@@ -63,10 +65,14 @@ export class TokenBucket {
     this.last = t;
   }
 
-  /** 次の 1 回を取れるまでの待ち時間 (ミリ秒。待ちの列は考えない) */
+  /**
+   * 今 acquire を呼んだら枠を取れるまでの待ち時間 (ミリ秒)。先に待っている acquire (待ちの列) の分も含める
+   * (列が空なら次の 1 回の待ち時間)
+   */
   waitMs(): number {
     this.refill();
-    return this.tokens >= 1 - 1e-9 ? 0 : Math.ceil(((1 - this.tokens) * 1000) / this.ratePerSec);
+    const need = this.pending + 1;
+    return this.tokens >= need - 1e-9 ? 0 : Math.ceil(((need - this.tokens) * 1000) / this.ratePerSec);
   }
 
   /** 待たずに取れれば取って true */
@@ -81,10 +87,16 @@ export class TokenBucket {
 
   /** 1 回分を取る (足りなければ補充まで待つ。呼び出し順) */
   acquire(): Promise<void> {
+    this.pending++;
     const next = this.chain.then(async () => {
-      for (;;) {
-        if (this.tryAcquire()) return;
-        await this.sleep(Math.max(1, this.waitMs()));
+      try {
+        for (;;) {
+          if (this.tryAcquire()) return;
+          this.refill();
+          await this.sleep(Math.max(1, Math.ceil(((1 - this.tokens) * 1000) / this.ratePerSec)));
+        }
+      } finally {
+        this.pending--;
       }
     });
     this.chain = next.catch(() => undefined);
@@ -171,6 +183,16 @@ export function scrubSecret(e: unknown, secret: string | undefined): unknown {
   return hide(String(e));
 }
 
+/** 1 回の呼び出しの追加の指定 (見積もりの打ち切り・再試行の回数) */
+export interface CallOptions {
+  /** 中止したら、枠を取る前・送る前・再試行の前で止める (送信中の fetch も中止する) */
+  signal?: AbortSignal;
+  /** 再試行の回数 (クライアントの既定より優先) */
+  retries?: number;
+}
+
+const abortError = () => Object.assign(new Error("中止しました"), { name: "AbortError" });
+
 /** レート制限つきで GET して JSON を返す (Jupiter・GeckoTerminal の共通部分) */
 export async function limitedGetJson(
   url: string,
@@ -179,23 +201,35 @@ export async function limitedGetJson(
   limiter: TokenBucket,
   o: HttpJsonClientOptions,
   secret?: string,
+  call: CallOptions = {},
 ): Promise<unknown> {
   const sleep = o.sleep ?? defaultSleep;
+  const signal = call.signal;
+  if (signal?.aborted) throw abortError();
   await limiter.acquire();
+  // 枠を待つ間に中止された (時間切れの見積もりなど): 送らない (枠は使ったが、それ以上の呼び出しはしない)
+  if (signal?.aborted) throw abortError();
+  const baseFetch = o.fetchImpl ?? fetch;
+  const fetchImpl: typeof fetch | undefined = signal
+    ? (((input: string | URL | Request, init?: RequestInit) =>
+        baseFetch(input, { ...(init ?? {}), signal: init?.signal ? AbortSignal.any([init.signal, signal]) : signal })) as typeof fetch)
+    : o.fetchImpl;
   let text: string;
   try {
     const res = await fetchWithRetry(url, {
       method: "GET",
       headers,
-      retries: o.retries ?? 3,
+      retries: call.retries ?? o.retries ?? 3,
       baseDelayMs: o.baseDelayMs ?? 1000,
       timeoutMs: o.timeoutMs ?? 10_000,
       ...(o.maxBodyBytes !== undefined ? { maxBodyBytes: o.maxBodyBytes } : {}),
-      ...(o.fetchImpl ? { fetchImpl: o.fetchImpl } : {}),
-      // 再試行の前にも枠を取り直す (バックオフ・Retry-After の待ちの後)
+      ...(fetchImpl ? { fetchImpl } : {}),
+      // 再試行の前にも枠を取り直す (バックオフ・Retry-After の待ちの後)。中止されていれば再試行しない
       sleep: async (ms) => {
         await sleep(ms);
+        if (signal?.aborted) throw abortError();
         await limiter.acquire();
+        if (signal?.aborted) throw abortError();
       },
     });
     text = await res.text();
@@ -239,13 +273,13 @@ export class JupiterClient {
     return this.#apiKey !== undefined;
   }
 
-  /** 読み取り専用の GET。JSON をそのまま返す (形の検証は呼び出し側) */
-  async getJson(path: string, query?: Query): Promise<unknown> {
+  /** 読み取り専用の GET。JSON をそのまま返す (形の検証は呼び出し側)。call で中止・再試行の回数を指定できる */
+  async getJson(path: string, query?: Query, call: CallOptions = {}): Promise<unknown> {
     assertReadOnlyPath(path, query);
     const url = `${this.baseUrl}${path}${buildQuery(query)}`;
     const headers: Record<string, string> = { accept: "application/json" };
     if (this.#apiKey) headers["x-api-key"] = this.#apiKey;
-    return limitedGetJson(url, path, headers, this.limiter, this.o, this.#apiKey);
+    return limitedGetJson(url, path, headers, this.limiter, this.o, this.#apiKey, call);
   }
 
   /** GET して zod で検証する。形が違えば JupiterShapeError */
