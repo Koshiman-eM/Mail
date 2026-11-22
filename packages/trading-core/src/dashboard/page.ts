@@ -636,7 +636,7 @@ ul.plain { margin: 0; padding-left: 18px; } ul.plain li { margin: 3px 0; }
   var S = null, TR = null, LE = null, EV = [], evSince = 0, evBooted = false, evSeen = {}, evInflight = null, cur = "board";
   // ポーリングの状態 (status の連続失敗数・最後に status を取れた時刻・learning の最終取得)
   var POLL = { busy: false, timer: 0, fails: 0, lastOk: 0, lastLearn: 0 };
-  var POLL_MS = 5000, LEARN_MS = 45000, LEARN_TAB_MS = 15000, STALE_FAILS = 3, STALE_DEFAULT_MS = 20000;
+  var POLL_MS = 2500, LEARN_MS = 45000, LEARN_TAB_MS = 15000, STALE_FAILS = 3, STALE_DEFAULT_MS = 20000;
   function animOK() { return cur === "board" && !document.hidden; }
   function tradeStats() {
     var o = { n: 0, wins: 0, losses: 0, pnl: 0, fees: 0, winRate: null };
