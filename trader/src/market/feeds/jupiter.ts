@@ -367,7 +367,10 @@ export class JupiterFeed implements MarketDataFeed {
   /** 価格を一括で取り直す (間隔内なら何もしない。同時の呼び出しは 1 回にまとめる) */
   async refresh(force = false): Promise<void> {
     const t = this.now();
-    if (!force && this.lastPollAt !== undefined && t - this.lastPollAt < this.effectivePollMs()) return;
+    // ループの刻み (SCALP_LOOP_MS) と同じ間隔だと、タイマーのわずかな遅れ・早まりで「間隔未満」になり 1 回おきに飛ばされる。
+    // 間隔の 10% (最大 250ms) の余裕を見る (API の上限は limiter が別に守る)
+    const interval = this.effectivePollMs();
+    if (!force && this.lastPollAt !== undefined && t - this.lastPollAt < interval - Math.min(250, interval * 0.1)) return;
     if (this.pollInflight) return this.pollInflight;
     this.lastPollAt = t;
     const p = this.pollOnce().finally(() => {

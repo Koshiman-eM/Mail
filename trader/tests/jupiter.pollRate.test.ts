@@ -95,10 +95,11 @@ describe("JupiterFeed の価格の取得間隔", () => {
   it("既定 (2.5 秒) では 2.5 秒ごとに 1 回だけ取る (50 銘柄まで = 1 回の呼び出し)", async () => {
     const { clock, mock, feed } = mkFeed({});
     await feed.fetchQuote("SOL/USDC");
-    clock.advance(2_400);
+    clock.advance(2_000);
     await feed.fetchQuote("BONK/USDC");
     expect(priceCalls(mock.calls)).toBe(1);
-    clock.advance(100);
+    // ループの刻み (2.5 秒) がわずかに早く来ても (間隔の 10% = 250ms の余裕) 取り損ねない
+    clock.advance(400);
     await feed.fetchQuote("BONK/USDC");
     expect(priceCalls(mock.calls)).toBe(2);
   });
