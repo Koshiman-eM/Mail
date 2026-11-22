@@ -617,6 +617,15 @@ export interface TradeRecord {
   /** 保有中の最大含み益・最大含み損 (エントリー価格比, 正の値) */
   mfePct: number;
   maePct: number;
+  /**
+   * エントリー約定時点の仲値 (気配の中値)。古い取引には無い。
+   * mfePct/maePct は約定価格 (買いは ask + 価格影響) 比なので、仲値がエントリーのコスト分だけ動くまで MFE が 0 のまま。
+   * 値動きそのもの (方向の正誤) は仲値基準の mfeMidPct/maeMidPct で見る
+   */
+  entryMid?: number;
+  /** 保有中の仲値の最大の有利・不利な動き (entryMid 比, 正の値。決済の約定価格は含めない)。古い取引には無い */
+  mfeMidPct?: number;
+  maeMidPct?: number;
   exitReason: ExitReason;
   entryContext: EntryContext;
   /** エグジット後一定時間の値動き (方向付き, エントリー方向に有利なら正)。後から埋める */

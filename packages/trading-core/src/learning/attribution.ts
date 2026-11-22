@@ -27,7 +27,10 @@ export const ATTRIBUTION_THRESHOLDS = {
   lateExitMinMfeStopFrac: 0.5,
   /** 十分な含み益のこの割合を超えて吐き出したら late_exit (損失なら常に該当) */
   lateExitGiveback: 0.6,
-  /** MFE がストップ幅のこの割合未満なら「一度も有利に動かなかった」(wrong_direction) */
+  /**
+   * MFE がストップ幅のこの割合未満なら「一度も有利に動かなかった」(wrong_direction)。
+   * 仲値の記録 (entryMid・mfeMidPct) があれば仲値基準 (コスト抜きの値動き) で判定する
+   */
   wrongDirMfeStopFrac: 0.25,
   /** 戦略が明示的に対応していない限り不利とみなすレジーム */
   hostileRegimes: ["high_vol", "low_liquidity"] as RegimeLabel[],
@@ -182,13 +185,33 @@ export function attributeTrade(trade: TradeRecord, opts: AttributionOptions = {}
   let wrongDirection = false;
   if (loss) {
     const limit = stopWidthPct > 0 ? T.wrongDirMfeStopFrac * stopWidthPct : costPct;
-    if (mfe < limit) {
+    const severity = mae >= stopWidthPct && stopWidthPct > 0 ? 1.5 : 1;
+    const entryMid = finite(t.entryMid) && t.entryMid > 0 ? t.entryMid : undefined;
+    if (entryMid !== undefined && finite(t.mfeMidPct)) {
+      // 仲値基準: mfePct は約定価格 (買いは ask + 価格影響) 比なので、値動きがエントリーのコスト未満だと 0 のまま。
+      // 方向の正誤はコスト抜きの仲値の動きで判定し、方向は合っていたがコストを越えなかった損失は手数料負け (fee_drag) とする
+      const mfeMid = Math.max(0, t.mfeMidPct);
+      const stopWidthMid = Math.abs(entryMid - t.initialStop) / entryMid;
+      const limitMid = stopWidthMid > 0 ? T.wrongDirMfeStopFrac * stopWidthMid : costPct;
+      if (mfeMid < limitMid) {
+        wrongDirection = true;
+        add(
+          "wrong_direction",
+          severity,
+          `仲値の最大の有利な動き ${pct(mfeMid)} (基準 ${pct(limitMid)} 未満)、最大含み損 ${pct(mae)} — 一度も有利に動かなかった`,
+        );
+      } else if (mfe < limit) {
+        const entryCost = Math.abs(t.entryPrice - entryMid) / entryMid;
+        const evidence = `仲値は有利に ${pct(mfeMid)} 動いたが、エントリーのコスト (スプレッド・価格影響 ${pct(entryCost)}) を越えなかった (約定価格比の最大含み益 ${pct(mfe)})`;
+        // fee_drag が既にあれば根拠を足す (同じ要因を 2 回数えない)
+        const cur = raw.find((c) => c.code === "fee_drag");
+        if (cur) cur.evidence += ` / ${evidence}`;
+        else add("fee_drag", 1, evidence);
+      }
+    } else if (mfe < limit) {
+      // 仲値の記録が無い古い取引は従来どおり約定価格比の MFE で判定する
       wrongDirection = true;
-      add(
-        "wrong_direction",
-        mae >= stopWidthPct && stopWidthPct > 0 ? 1.5 : 1,
-        `最大含み益 ${pct(mfe)} (基準 ${pct(limit)} 未満)、最大含み損 ${pct(mae)} — 一度も有利に動かなかった`,
-      );
+      add("wrong_direction", severity, `最大含み益 ${pct(mfe)} (基準 ${pct(limit)} 未満)、最大含み損 ${pct(mae)} — 一度も有利に動かなかった`);
     }
   }
 

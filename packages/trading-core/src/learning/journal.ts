@@ -43,6 +43,8 @@ export interface OpenTradeInput {
   entryOrderType?: "market" | "limit";
   /** エントリーの手数料の liquidity 別の内訳 (クオート通貨建て。entryFees の内訳) */
   feesByLiquidity?: FeesByLiquidity;
+  /** 約定時点の仲値 (TradeRecord.entryMid へ引き継ぐ。仲値基準の MFE/MAE の起点。無ければ仲値基準は記録しない) */
+  entryMid?: number;
 }
 
 /** 手数料の liquidity 別の内訳 (クオート通貨建て。maker は受け取りなら負) */
@@ -62,6 +64,12 @@ export interface OpenTrade extends OpenTradeInput {
   lowWater: number;
   lastPrice: number;
   lastTs: number;
+  /**
+   * 保有中の仲値の最高値・最安値 (entryMid を含む。mark の仲値だけで更新し、一部決済の約定価格は含めない)。
+   * entryMid がある建玉だけ (古い保存状態には無い)
+   */
+  midHigh?: number;
+  midLow?: number;
   /** 一部決済 (reduce) の回数 */
   partials?: number;
   /**
@@ -152,9 +160,12 @@ export class TradeJournal {
     if (!(input.entryPrice > 0)) throw new Error(`entryPrice が不正です: ${input.entryPrice}`);
     const id = input.id ?? randomUUID();
     if (this.open_.has(id)) throw new Error(`ポジション ${id} は既に追跡中です`);
-    const { feesByLiquidity: fl, ...rest } = input;
+    const { feesByLiquidity: fl, entryMid: mid, ...rest } = input;
+    // 仲値は正の有限値のときだけ記録する (無ければ仲値基準の MFE/MAE は付けない)
+    const entryMid = typeof mid === "number" && Number.isFinite(mid) && mid > 0 ? mid : undefined;
     const p: OpenTrade = {
       ...rest,
+      ...(entryMid !== undefined ? { entryMid, midHigh: entryMid, midLow: entryMid } : {}),
       ...(fl ? { makerFees: D(fl.maker).toString(), takerFees: D(fl.taker).toString() } : {}),
       id,
       entryFees: input.entryFees ?? 0,
@@ -169,7 +180,10 @@ export class TradeJournal {
     return { ...p };
   }
 
-  /** 価格を反映して高値・安値 (MFE/MAE の元) を更新。更新したポジション数を返す */
+  /**
+   * 価格を反映して高値・安値 (MFE/MAE の元) を更新。更新したポジション数を返す。
+   * price は気配の仲値 (engine は quoteMid を渡す) なので、仲値の高値・安値 (仲値基準の MFE/MAE の元) も同じ値で更新する
+   */
   mark(symbol: string, price: number, ts: number): number {
     if (!(price > 0)) return 0;
     let n = 0;
@@ -183,6 +197,14 @@ export class TradeJournal {
       }
       if (price < p.lowWater) {
         p.lowWater = price;
+        changed = true;
+      }
+      if (p.midHigh !== undefined && price > p.midHigh) {
+        p.midHigh = price;
+        changed = true;
+      }
+      if (p.midLow !== undefined && price < p.midLow) {
+        p.midLow = price;
         changed = true;
       }
       p.lastPrice = price;
@@ -249,7 +271,7 @@ export class TradeJournal {
     if (input.exitOrderType === "limit") p.exitLimit = true;
     p.qty = D(p.qty).minus(qty).toNumber();
     p.partials = (p.partials ?? 0) + 1;
-    // 一部決済の価格も MFE/MAE に含める
+    // 一部決済の価格も MFE/MAE に含める (約定価格なので仲値の高値・安値には含めない)
     if (input.exitPrice > p.highWater) p.highWater = input.exitPrice;
     if (input.exitPrice < p.lowWater) p.lowWater = input.exitPrice;
     if (input.estimated) p.estimated = true;
@@ -293,6 +315,7 @@ export function buildTradeRecord(p: OpenTrade, c: CloseTradeInput): TradeRecord 
   const adverse = dir === 1 ? entry.minus(low) : D(high).minus(entry);
   const mfePct = nonNeg(favorable.div(entry));
   const maePct = nonNeg(adverse.div(entry));
+  const mid = midExcursion(p, dir);
 
   return {
     id: p.id,
@@ -319,6 +342,7 @@ export function buildTradeRecord(p: OpenTrade, c: CloseTradeInput): TradeRecord 
     rMultiple: rMultiple.toNumber(),
     mfePct,
     maePct,
+    ...mid,
     exitReason: c.exitReason,
     entryContext: p.entryContext,
     ...(p.estimated || c.estimated ? { estimated: true } : {}),
@@ -349,6 +373,25 @@ function thesisFields(t: TradeThesisFields | undefined): TradeThesisFields {
   if (t.thesisStopExit === true) out.thesisStopExit = true;
   return out;
 }
+
+/**
+ * 仲値基準の MFE/MAE (entryMid 比)。仲値の高値・安値は mark の仲値だけ (決済・一部決済の約定価格は含めない)。
+ * entryMid の無い建玉 (古い保存状態・仲値を渡さないエントリー) は何も付けない
+ */
+function midExcursion(p: OpenTrade, dir: 1 | -1): Pick<TradeRecord, "entryMid" | "mfeMidPct" | "maeMidPct"> {
+  const m = p.entryMid;
+  if (typeof m !== "number" || !Number.isFinite(m) || !(m > 0)) return {};
+  const entryMid = D(m);
+  const high = midHighOf(p.midHigh, m);
+  const low = midLowOf(p.midLow, m);
+  const favorable = dir === 1 ? high.minus(entryMid) : entryMid.minus(low);
+  const adverse = dir === 1 ? entryMid.minus(low) : high.minus(entryMid);
+  return { entryMid: m, mfeMidPct: nonNeg(favorable.div(entryMid)), maeMidPct: nonNeg(adverse.div(entryMid)) };
+}
+
+/** 仲値の高値・安値 (不正・未設定なら entryMid) */
+const midHighOf = (v: number | undefined, m: number) => D(typeof v === "number" && Number.isFinite(v) && v > m ? v : m);
+const midLowOf = (v: number | undefined, m: number) => D(typeof v === "number" && Number.isFinite(v) && v > 0 && v < m ? v : m);
 
 /** 負なら 0 */
 const nonNeg = (v: Decimal) => (v.gt(0) ? v.toNumber() : 0);

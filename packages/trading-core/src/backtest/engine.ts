@@ -121,6 +121,11 @@ interface OpenPos {
   entryTs: number;
   entryPrice: number;
   intendedEntryPrice: number;
+  /**
+   * 約定の基準にした価格 (成行は始値 = 半スプレッド・スリッページを足す前。指値は指値の価格)。
+   * TradeRecord.entryMid (要因分析の仲値基準の MFE) に使う
+   */
+  entryMid: number;
   entryFee: Decimal;
   initialStop: number;
   takeProfit?: number;
@@ -319,6 +324,13 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
     const minLow = Math.min(p.minLow, px);
     const fav = p.dir === 1 ? maxHigh - p.entryPrice : p.entryPrice - minLow;
     const adv = p.dir === 1 ? p.entryPrice - minLow : maxHigh - p.entryPrice;
+    // 仲値基準の MFE/MAE (ライブの journal の仲値の高値・安値に合わせる): 保有中の足の高値・安値と想定決済価格
+    // (損切り・利確・始値など、足の値動きが届いた基準の価格) を使い、スプレッド・スリッページ込みの決済の約定価格は含めない
+    const ref = Number.isFinite(intended) && intended > 0 ? intended : p.entryMid;
+    const midHigh = Math.max(p.entryMid, p.maxHigh, ref);
+    const midLow = Math.min(p.entryMid, p.minLow, ref);
+    const favMid = p.dir === 1 ? midHigh - p.entryMid : p.entryMid - midLow;
+    const advMid = p.dir === 1 ? p.entryMid - midLow : midHigh - p.entryMid;
     trades.push({
       id: `${idPrefix}-${strategy.id}-${instrument.symbol}-${p.entryTs}`,
       mode: "backtest",
@@ -344,6 +356,9 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
       rMultiple: risk.gt(0) ? net.div(risk).toNumber() : 0,
       mfePct: Math.max(0, fav / p.entryPrice),
       maePct: Math.max(0, adv / p.entryPrice),
+      ...(p.entryMid > 0 && Number.isFinite(p.entryMid)
+        ? { entryMid: p.entryMid, mfeMidPct: Math.max(0, favMid / p.entryMid), maeMidPct: Math.max(0, advMid / p.entryMid) }
+        : {}),
       exitReason: reason,
       entryContext: p.context,
       ...(() => {
@@ -440,6 +455,7 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
           entryTs: bar.ts,
           entryPrice: px,
           intendedEntryPrice: pd.intended,
+          entryMid: bar.open,
           entryFee,
           initialStop: pd.signal.stopLoss,
           takeProfit: pd.signal.takeProfit,
@@ -469,6 +485,8 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
             entryTs: bar.ts,
             entryPrice: pd.price,
             intendedEntryPrice: pd.intended,
+            // 指値の maker 約定はスプレッドを払わないので、約定価格そのものを基準にする
+            entryMid: pd.price,
             entryFee,
             initialStop: pd.signal.stopLoss,
             takeProfit: pd.signal.takeProfit,

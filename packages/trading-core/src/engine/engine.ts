@@ -2302,6 +2302,8 @@ export class TradingEngine {
         ...(isSimulatedShort(inst, this.mode, sig.direction) ? { simulatedShort: true } : {}),
         entryTs: now,
         intendedEntryPrice: intended,
+        // シグナル時点の仲値 (約定時に現在の仲値が取れればそちらで上書きする。要因分析の仲値基準の MFE の起点)
+        entryMid: quoteMid(q),
         initialStop: sig.stopLoss,
         ...(sig.takeProfit !== undefined ? { takeProfit: sig.takeProfit } : {}),
         entryContext,

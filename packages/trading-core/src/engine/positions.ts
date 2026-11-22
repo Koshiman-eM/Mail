@@ -1574,6 +1574,16 @@ export class PositionManager {
     return { kind: "rejected", reason };
   }
 
+  /**
+   * 約定を反映する時点の仲値 (TradeRecord.entryMid。仲値基準の MFE/MAE の起点)。
+   * 現在値 (priceOf = 最新の気配の仲値) があればそれ、無ければシグナル時点の仲値 (指値で後から約定した場合のずれを避けるため現在値を優先)
+   */
+  private entryMidAt(symbol: string, signalMid: number | undefined): { entryMid?: number } {
+    const now = this.deps.priceOf?.(symbol);
+    if (now !== undefined && Number.isFinite(now) && now > 0) return { entryMid: now };
+    return signalMid !== undefined && Number.isFinite(signalMid) && signalMid > 0 ? { entryMid: signalMid } : {};
+  }
+
   /** 約定を journal に反映する */
   private settle(o: PendingOrder, sum: FillSummary, now: number): Applied {
     const delayed = o.createdAt !== now;
@@ -1586,6 +1596,7 @@ export class PositionManager {
       const opened = this.open(
         {
           ...e.input, qty: sum.qty.toNumber(), entryPrice: sum.price, entryFees: sum.fee.toNumber(), feesByLiquidity: byLiquidity(sum.maker, sum.taker),
+          ...this.entryMidAt(o.symbol, e.input.entryMid),
           ...(e.input.entryOrderType === undefined ? { entryOrderType: o.limit ? "limit" : "market" } : {}),
         },
         e.plan,
@@ -2092,7 +2103,11 @@ export class PositionManager {
         if (!e) throw new Error(`エントリー情報がありません: ${o.clientId}`);
         if (this.has(o.symbol)) a = this.entryConflict(o, r.qty, r.price, now);
         else {
-          const opened = this.open({ ...e.input, qty: r.qty.toNumber(), entryPrice: r.price, entryFees: 0, estimated: true }, e.plan, now);
+          const opened = this.open(
+            { ...e.input, qty: r.qty.toNumber(), entryPrice: r.price, entryFees: 0, estimated: true, ...this.entryMidAt(o.symbol, e.input.entryMid) },
+            e.plan,
+            now,
+          );
           this.deps.store?.audit({
             ts: now,
             type: "engine.entry",
