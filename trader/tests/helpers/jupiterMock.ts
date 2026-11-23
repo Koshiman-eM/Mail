@@ -63,6 +63,10 @@ export interface JupiterMockOptions {
   omitPrices?: () => string[];
   /** swap/v1/quote を失敗させる */
   failQuote?: boolean;
+  /** swap/v1/quote をこの mint (base) だけ失敗させる */
+  failQuoteFor?: (mint: string) => boolean;
+  /** 見積もりの不利な方向の影響 (片道 bps。既定 10) */
+  quoteImpactBps?: (mint: string) => number;
   /** frankfurter の USD/JPY */
   usdJpy?: number;
 }
@@ -98,11 +102,13 @@ export function createJupiterMock(o: JupiterMockOptions) {
       const outMint = call.query.get("outputMint")!;
       const amount = BigInt(call.query.get("amount")!);
       const base = inMint === USDC ? find(outMint)! : find(inMint)!;
+      if (o.failQuoteFor?.(base.mint)) return { status: 500, body: { error: "no route" } };
       const px = priceAt(base, o.now());
-      // 影響 10bps の見積もり
+      // 影響 10bps (既定) の見積もり
+      const k = (o.quoteImpactBps?.(base.mint) ?? 10) / 10_000;
       let outAmount: bigint;
-      if (inMint === USDC) outAmount = BigInt(Math.floor((Number(amount) / 1e6 / (px * 1.001)) * 10 ** base.decimals));
-      else outAmount = BigInt(Math.floor((Number(amount) / 10 ** base.decimals) * px * 0.999 * 1e6));
+      if (inMint === USDC) outAmount = BigInt(Math.floor((Number(amount) / 1e6 / (px * (1 + k))) * 10 ** base.decimals));
+      else outAmount = BigInt(Math.floor((Number(amount) / 10 ** base.decimals) * px * (1 - k) * 1e6));
       return {
         body: {
           inputMint: inMint, outputMint: outMint, inAmount: amount.toString(), outAmount: outAmount.toString(), otherAmountThreshold: outAmount.toString(),

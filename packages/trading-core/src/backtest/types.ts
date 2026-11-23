@@ -14,6 +14,7 @@ import type {
 import type { RegimeOptions } from "../regime/detect";
 import type { ThesisSettings } from "../engine/thesis";
 import type { ReversalSettings } from "../engine/reversalExit";
+import type { BreakevenSettings } from "../engine/breakeven";
 
 export interface SizerArgs {
   /** 現在の評価額 (クオート通貨) */
@@ -119,6 +120,11 @@ export interface BacktestOptions {
    * (理由 reversal。戦略の決済シグナルと同じタイミング。同じバーで決済シグナルも出たら signal を優先)
    */
   reversal?: ReversalSettings;
+  /**
+   * 建値ストップ (ライブの BREAKEVEN_TRIGGER_R と同じ src/engine/breakeven.ts の規則。省略・0 なら従来どおり)。
+   * バーの終値で発動を判定し、往復コスト込みの建値のストップは次のバーから効く
+   */
+  breakeven?: BreakevenSettings;
 }
 
 export interface BacktestMetrics {

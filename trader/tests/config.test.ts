@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { DEFAULT_OBSERVE_ONLY_STRATEGIES, DEFAULT_STRUCTURE_STRATEGIES, LIVE_CONFIRM_PHRASE, loadConfig, removedEnvWarnings, resolveMode } from "../src/appConfig";
 import { ALL_STRATEGIES } from "../src/strategies/registry";
 import { strategyIdListWarnings } from "../src/strategies/retired";
+import { observeOnlyWarnings } from "@trading/core/strategies/observeOnly";
 import { D, floorToStep } from "../src/core/decimal";
 import { effectiveLimitTakeProfit, limitOrdersFromEnv } from "../src/engine/limitOrders";
 
@@ -88,9 +89,9 @@ describe("リスク値の範囲検証", () => {
 });
 
 describe("OBSERVE_ONLY_STRATEGIES (観測専用の戦略)", () => {
-  it("未設定なら既定値 scalp_rebound (中長期の戦略は廃止)", () => {
-    expect(loadConfig({}).env.OBSERVE_ONLY_STRATEGIES).toEqual(["scalp_rebound"]);
-    expect(DEFAULT_OBSERVE_ONLY_STRATEGIES).toBe("scalp_rebound");
+  it("未設定なら既定値 scalp_rebound と short_ema_trend の meme だけ (中長期の戦略は廃止)", () => {
+    expect(loadConfig({}).env.OBSERVE_ONLY_STRATEGIES).toEqual(["scalp_rebound", "short_ema_trend:meme"]);
+    expect(DEFAULT_OBSERVE_ONLY_STRATEGIES).toBe("scalp_rebound,short_ema_trend:meme");
   });
   it("空文字 (空白だけも) なら観測専用なし", () => {
     expect(loadConfig({ OBSERVE_ONLY_STRATEGIES: "" }).env.OBSERVE_ONLY_STRATEGIES).toEqual([]);
@@ -107,11 +108,12 @@ describe("OBSERVE_ONLY_STRATEGIES (観測専用の戦略)", () => {
       "OBSERVE_ONLY_STRATEGIES に廃止した戦略 id があります (無視されます): meme_momentum",
       "OBSERVE_ONLY_STRATEGIES に未登録の戦略 id があります (無視されます): scalp_rebond",
     ]);
-    expect(strategyIdListWarnings("OBSERVE_ONLY_STRATEGIES", loadConfig({}).env.OBSERVE_ONLY_STRATEGIES, ids)).toEqual([]);
+    expect(observeOnlyWarnings("OBSERVE_ONLY_STRATEGIES", loadConfig({}).env.OBSERVE_ONLY_STRATEGIES, ids)).toEqual([]);
   });
   it("既定の観測専用・構造フィルターの対象はすべて登録している戦略", () => {
     const ids = new Set(ALL_STRATEGIES.map((s) => s.id));
-    for (const id of [...DEFAULT_OBSERVE_ONLY_STRATEGIES.split(","), ...DEFAULT_STRUCTURE_STRATEGIES.split(",")]) expect(ids.has(id)).toBe(true);
+    // 観測専用は `<id>:<資産クラス>` も書ける (id の部分を確かめる)
+    for (const id of [...DEFAULT_OBSERVE_ONLY_STRATEGIES.split(",").map((x) => x.split(":")[0]), ...DEFAULT_STRUCTURE_STRATEGIES.split(",")]) expect(ids.has(id)).toBe(true);
   });
   it("カンマ区切り。前後の空白・空要素・重複を除く", () => {
     expect(loadConfig({ OBSERVE_ONLY_STRATEGIES: " scalp_rebound , scalp_micro,,scalp_rebound " }).env.OBSERVE_ONLY_STRATEGIES).toEqual(["scalp_rebound", "scalp_micro"]);
@@ -184,5 +186,18 @@ describe("指値 (maker) の設定", () => {
     expect(limitOrdersFromEnv(env, "live")).toEqual({ entry: true, takeProfit: false, entryTimeoutMs: 30_000 });
     // 手組みの設定で未設定なら既定値と同じ
     expect(limitOrdersFromEnv({}, "paper")).toEqual({ entry: true, takeProfit: false });
+  });
+});
+
+describe("status: 観測専用の設定の表示", () => {
+  it("解釈した設定の行と、戦略ごとの範囲 (全クラス / meme のみ) を出す", async () => {
+    const { strategyStatusLines } = await import("../src/cli");
+    const lines = strategyStatusLines(loadConfig({ NODE_ENV: "test", DB_PATH: "memory" }));
+    expect(lines).toContain("観測専用 (OBSERVE_ONLY_STRATEGIES): scalp_rebound (全クラス), short_ema_trend (meme のみ)");
+    expect(lines.find((l) => l.includes("[short_ema_trend]"))).toContain("観測専用 (meme のみ)");
+    expect(lines.find((l) => l.includes("[scalp_rebound]"))).toMatch(/観測専用(?! \()/);
+    const none = strategyStatusLines(loadConfig({ NODE_ENV: "test", DB_PATH: "memory", OBSERVE_ONLY_STRATEGIES: "" }));
+    expect(none).toContain("観測専用 (OBSERVE_ONLY_STRATEGIES): なし");
+    expect(none.some((l) => l.includes(" / 観測専用"))).toBe(false);
   });
 });

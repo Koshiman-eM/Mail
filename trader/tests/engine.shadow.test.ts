@@ -14,7 +14,8 @@ const START = Date.UTC(2026, 0, 5);
 
 const mkClock = (t = START): Clock & { t: number } => ({ t, now() { return this.t; } });
 const testConfig = (env: Record<string, string> = {}) =>
-  loadConfig({ NODE_ENV: "test", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "JPY", ...env });
+  // 建値ストップ (BREAKEVEN_TRIGGER_R) は無効にして、仮想トレードの決済理由を従来の範囲 (stop / take_profit / time) に固定する
+  loadConfig({ NODE_ENV: "test", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "JPY", BREAKEVEN_TRIGGER_R: "0", ...env });
 
 /** 常に同じ方向のシグナルを出すテスト用戦略 (保有中は何もしない) */
 function fixedStrategy(id: string, o: { classes?: AssetClass[]; direction?: "long" | "short"; confidence?: number; edge?: number; stopPct?: number; holdMs?: number }): Strategy {

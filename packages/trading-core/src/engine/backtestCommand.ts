@@ -44,6 +44,8 @@ export interface BacktestCommandOptions {
   thesis?: BacktestOptions["thesis"];
   /** 転換で決済 (実運用の REVERSAL_* に合わせる。省略で従来どおり) */
   reversal?: BacktestOptions["reversal"];
+  /** 建値ストップ (実運用の BREAKEVEN_TRIGGER_R に合わせる。省略で従来どおり) */
+  breakeven?: BacktestOptions["breakeven"];
 }
 
 export interface BacktestRow {
@@ -210,6 +212,7 @@ export async function runBacktestCommand(o: BacktestCommandOptions): Promise<Bac
       ...(holdOn && !isHoldLimitedHorizon(s.horizon) ? { maxHoldMinutes: o.maxHoldMinutes } : {}),
       ...(o.thesis ? { thesis: o.thesis } : {}),
       ...(o.reversal ? { reversal: o.reversal } : {}),
+      ...(o.breakeven ? { breakeven: o.breakeven } : {}),
     });
     const notes = [
       ...(r.metrics.trades === 0 ? [r.stats.evaluations === 0 ? "ウォームアップ不足" : "シグナルなし"] : []),

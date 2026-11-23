@@ -664,6 +664,11 @@ export interface TradeRecord {
   thesisNetRAtDeadline?: number;
   thesisStopExit?: boolean;
   /**
+   * 建値ストップ (BREAKEVEN_TRIGGER_R。src/engine/breakeven.ts) での決済 (exitReason は trailing。戦略のトレーリングとは別。
+   * ParamTuner はトレーリングの調整の根拠に使わない)。古い取引には無い
+   */
+  breakevenStopExit?: boolean;
+  /**
    * 学習・成績の集計から除く (paper の口座のリセット `wallet_reset` で記帳上だけ閉じた建玉)。
    * 判定は isLearningExcludedTrade を使う
    */

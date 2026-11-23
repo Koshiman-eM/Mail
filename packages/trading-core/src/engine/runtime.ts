@@ -23,7 +23,7 @@ import { MarketHub } from "../market/hub";
 import { RiskManager } from "../risk/manager";
 import { createStore } from "../storage";
 import { ALL_STRATEGIES, configuredStrategies } from "../strategies/registry";
-import { strategyIdListWarnings } from "../strategies/retired";
+import { observeOnlyWarnings } from "../strategies/observeOnly";
 import { structureConfigWarnings, structureSettingsFromEnv } from "../structure/settings";
 import { TradingEngine, type EngineOptions, type MarketExtras, type PeriodicTask } from "./engine";
 import { ClosedCandleCacheFeed } from "./feedCache";
@@ -31,6 +31,7 @@ import { createFxConverter, type FxConverter } from "./fx";
 import { createParamValidator, createPriceAt, type ValidatorOptions } from "./learningHooks";
 import { limitOrdersFromEnv } from "./limitOrders";
 import { thesisSettingsFromEnv } from "./thesis";
+import { breakevenSettingsFromEnv } from "./breakeven";
 import { reversalAppliesTo, reversalConfigWarnings, reversalSettingsFromEnv, reversalTimeframeFor, type ReversalSettings } from "./reversalExit";
 
 /** live の発注先 (実口座アダプター) が無いアプリで live を起動しようとしたときの文言 */
@@ -160,7 +161,8 @@ export function resolveStrategies(config: AppConfig, log: Logger, given?: readon
   const knownIds = [...new Set([...ALL_STRATEGIES.map((x) => x.id), ...(given ?? []).map((x) => x.id)])];
   for (const w of reversalConfigWarnings(reversalSettings, knownIds, env.STRUCTURE_EXIT_ON_REVERSAL === true)) log.warn(w);
   // 観測専用 (OBSERVE_ONLY_STRATEGIES): 廃止した戦略・未登録の id は警告する (集合の判定なので、残っていても何も起きない)
-  for (const w of strategyIdListWarnings("OBSERVE_ONLY_STRATEGIES", env.OBSERVE_ONLY_STRATEGIES, knownIds)) log.warn(w);
+  // `<id>:<資産クラス>` の資産クラスが使えない指定も警告して無視する
+  for (const w of observeOnlyWarnings("OBSERVE_ONLY_STRATEGIES", env.OBSERVE_ONLY_STRATEGIES, knownIds)) log.warn(w);
   return given ?? configuredStrategies(structureSettings, base);
 }
 
@@ -251,6 +253,8 @@ export async function assembleRuntime<C extends AppConfig>(config: C, assembly: 
       thesis: thesisSettingsFromEnv(env),
       // 転換で決済 (REVERSAL_*) も実運用と同じ規則で検証する
       reversal: reversalSettings,
+      // 建値ストップ (BREAKEVEN_TRIGGER_R) も実運用と同じ規則で検証する
+      breakeven: breakevenSettingsFromEnv(env),
       ...(opts.validation ?? {}),
     }),
     priceAt: createPriceAt(hub, clock),

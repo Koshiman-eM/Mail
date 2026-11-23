@@ -111,6 +111,8 @@ export interface CloseTradeInput {
   exitOrderType?: "market" | "limit";
   /** 読みの管理の記録 (TradeRecord にそのまま付ける。読みの管理を使った建玉だけ) */
   thesis?: TradeThesisFields;
+  /** 建値ストップ (BREAKEVEN_TRIGGER_R) での決済 (exitReason が trailing のときだけ TradeRecord.breakevenStopExit を付ける) */
+  breakevenStopExit?: boolean;
   /** 学習・成績の集計から除く (paper の口座のリセット wallet_reset。TradeRecord.learningExcluded) */
   learningExcluded?: boolean;
 }
@@ -357,6 +359,7 @@ export function buildTradeRecord(p: OpenTrade, c: CloseTradeInput): TradeRecord 
         }
       : {}),
     ...thesisFields(c.thesis),
+    ...(c.breakevenStopExit === true && c.exitReason === "trailing" ? { breakevenStopExit: true } : {}),
     ...(c.learningExcluded ? { learningExcluded: true } : {}),
   };
 }

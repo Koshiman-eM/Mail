@@ -30,6 +30,10 @@
  *   決済する (理由 reversal、約定は時間切れと同じ 決済側の気配 ∓ 約定ずれ)。足は呼び出し側 (engine) が hub の確定足をそのまま渡す
  *   (hub は全戦略の時間足と転換で決済の時間足を持つので、1m 以外もリサンプルしない)。その時間足の足が無い・エントリーより新しい足しか無いときは判定しない。
  *   損切り・利確・読みの管理 (ティックごと) が先。reversalTf の無い古い記録・無効のときは従来どおり。
+ * - 建値ストップ (options.breakeven の triggerR > 0。src/engine/breakeven.ts): 実際の建玉と同じ規則。気配の仲値が entryMid から
+ *   triggerR × 1R 有利に動いたら、保護ストップを往復コスト込みの建値 (エントリーの約定 (仲値 ± 半スプレッド ± 約定ずれ)・
+ *   往復の手数料・発動時の半スプレッド) へ引き上げる (breakevenArmedAt / breakevenStop。一度上げたら戻さない)。
+ *   発動した判定ではストップを判定せず、発動した時刻以降に始まった 1m 足と、次の判定以降の気配だけで判定する。決済理由は trailing。
  */
 import { randomUUID } from "node:crypto";
 import { defaultCosts } from "../backtest/engine";
@@ -40,6 +44,7 @@ import {
 import { D } from "../core/decimal";
 import type { HoldingCostModel } from "../core/holdingCost";
 import { checkReversal, reversalAppliesTo, type ReversalSettings } from "../engine/reversalExit";
+import { breakevenEnabled, breakevenStopPrice, breakevenTriggered, type BreakevenSettings } from "../engine/breakeven";
 import {
   TIMEFRAME_MS, type AssetClass, type Candle, type Horizon, type Instrument, type Quote, type RegimeLabel, type ShadowExitReason, type ShadowTradeRecord,
   type Signal, type Store, type Timeframe, type TradingMode,
@@ -61,6 +66,8 @@ export interface ShadowOptions {
   thesis?: ThesisSettings;
   /** 転換で決済 (省略・無効なら判定しない = 従来どおり) */
   reversal?: ReversalSettings;
+  /** 建値ストップ (省略・0 なら発動しない = 従来どおり。発動済みの仮想トレードは保存したストップで守る) */
+  breakeven?: BreakevenSettings;
   /**
    * 建玉の保有コストのモデル (src/core/holdingCost.ts。FX のスワップ・株式の信用の金利など)。
    * 省略時は従来どおり、記録した再現の空売りの借入コスト (simulatedShort・borrowRateDaily) だけ
@@ -91,6 +98,10 @@ export interface ShadowOpen extends Omit<ShadowTradeRecord, "exitTs" | "exitPric
   thesisPeak?: number;
   /** 延長後の保護ストップ (きつくなる方へだけ更新する。決済の記録には残さない) */
   thesisStop?: number;
+  /** 建値ストップを発動した時刻 (決済の記録には残さない) */
+  breakevenArmedAt?: number;
+  /** 建値ストップ (往復コスト込みの建値。発動時に決めて戻さない。決済の記録には残さない) */
+  breakevenStop?: number;
   /** 転換で決済を判定する時間足 (戦略の主時間足。転換で決済が有効で戦略が対象のときだけ。決済の記録には残さない) */
   reversalTf?: Timeframe;
   /** 転換で決済を最後に判定した確定足の開始時刻 (確定足ごとに 1 回。決済の記録には残さない) */
@@ -396,6 +407,7 @@ export class ShadowTracker {
       let adverse: PriceRange | undefined;
       let favorable: PriceRange | undefined;
       let thesisFav: PriceRange | undefined;
+      let breakevenRange: PriceRange | undefined;
       try {
         if (opts.rangeOf) {
           if (o.lastCandleTs === undefined) {
@@ -410,6 +422,10 @@ export class ShadowTracker {
           if (o.thesisExtendedAt !== undefined) {
             thesisFav = opts.rangeOf(o.symbol, o.lastCandleTs !== undefined ? Math.max(o.lastCandleTs + 1, o.thesisExtendedAt) : o.thesisExtendedAt);
           }
+          // 建値ストップは、発動した時刻以降に始まった足だけで判定する (発動より前の安値・高値で決済しない)
+          if (o.breakevenArmedAt !== undefined) {
+            breakevenRange = opts.rangeOf(o.symbol, o.lastCandleTs !== undefined ? Math.max(o.lastCandleTs + 1, o.breakevenArmedAt) : o.breakevenArmedAt);
+          }
         }
       } catch (e) {
         this.onError?.("shadow.range", e);
@@ -421,9 +437,9 @@ export class ShadowTracker {
       } catch (e) {
         this.onError?.("shadow.candles", e);
       }
-      const key = () => `${o.mfeR}|${o.maeR}|${o.lastCandleTs ?? ""}|${o.thesisExtendedAt ?? ""}|${o.thesisPeak ?? ""}|${o.thesisStop ?? ""}`;
+      const key = () => `${o.mfeR}|${o.maeR}|${o.lastCandleTs ?? ""}|${o.thesisExtendedAt ?? ""}|${o.thesisPeak ?? ""}|${o.thesisStop ?? ""}|${o.breakevenStop ?? ""}`;
       const before = key();
-      const res = this.step(o, q, now, adverse, favorable, thesisFav, revCandles);
+      const res = this.step(o, q, now, adverse, favorable, thesisFav, revCandles, breakevenRange);
       if (!res) {
         if (before !== key()) this.dirty = true;
         keep.push(o);
@@ -452,11 +468,12 @@ export class ShadowTracker {
    * 1 件の判定 (決済したら記録を返す)。o の MFE / MAE は更新する。
    * adverse: 不利側 (損切り・MAE) に使う足の値幅、favorable: 有利側 (利確・MFE) に使う足の値幅 (どちらも仲値ベース)。
    * thesisFav: 延長した時刻以降に始まった足の値幅 (延長後の極値と、延長後の保護ストップの判定に使う)。
-   * revCandles: 転換で決済の判定に使う時間足 (o.reversalTf) の確定足 (無ければ判定しない)
+   * revCandles: 転換で決済の判定に使う時間足 (o.reversalTf) の確定足 (無ければ判定しない)。
+   * breakevenRange: 建値ストップを発動した時刻以降に始まった足の値幅 (建値ストップの判定に使う)
    */
   private step(
     o: ShadowOpen, q: Pick<Quote, "bid" | "ask">, now: number, adverse?: PriceRange, favorable?: PriceRange, thesisFav?: PriceRange,
-    revCandles?: readonly Candle[],
+    revCandles?: readonly Candle[], breakevenRange?: PriceRange,
   ): ShadowTradeRecord | undefined {
     const long = o.direction === "long";
     const dir = long ? 1 : -1;
@@ -498,6 +515,11 @@ export class ShadowTracker {
     o.maeR = Math.max(o.maeR, (dir * (o.entryMid - advMid)) / o.risk, 0);
 
     const thesisHit = thesisStop !== undefined && (long ? thesisAdvExit <= thesisStop : thesisAdvExit >= thesisStop);
+    // 建値ストップ (発動済みで当初の損切りより有利なときだけ。発動した時刻以降に始まった足と今の気配で判定する)
+    const beStop = finite(o.breakevenStop) && (long ? o.breakevenStop > o.stopLoss : o.breakevenStop < o.stopLoss) ? o.breakevenStop : undefined;
+    const br = ok(breakevenRange) ? breakevenRange : undefined;
+    const beAdvExit = long ? Math.min(q.bid, br ? br.low - half : Infinity) : Math.max(q.ask, br ? br.high + half : -Infinity);
+    const beHit = beStop !== undefined && (long ? beAdvExit <= beStop : beAdvExit >= beStop);
     const stopHit = long ? advExit <= o.stopLoss : advExit >= o.stopLoss;
     const tp = o.takeProfit;
     const tpHit = tp !== undefined && (long ? favExit >= tp : favExit <= tp);
@@ -511,10 +533,10 @@ export class ShadowTracker {
     };
     let reason: ShadowExitReason | undefined;
     let exit: ShadowExitFill | undefined;
-    if (thesisHit) {
-      // 延長後の保護ストップ (当初の損切りより建玉に近いので先に触れる)
+    if (thesisHit || beHit) {
+      // 延長後の保護ストップ・建値ストップ (当初の損切りより建玉に近いので先に触れる。両方に触れたらきつい方 = 先に触れた方)
       reason = "trailing";
-      exit = stopFill(thesisStop!);
+      exit = stopFill(thesisHit && beHit ? tighterStop(o.direction, thesisStop, beStop)! : thesisHit ? thesisStop! : beStop!);
     } else if (stopHit) {
       // 保守的に損切りを先にする
       reason = "stop";
@@ -571,10 +593,23 @@ export class ShadowTracker {
         o.thesisPeak = advancePeak(o.direction, o.thesisPeak, px);
         o.thesisStop = tighterStop(o.direction, o.thesisStop, thesisTrailStop(pricing, o.thesisPeak ?? Number.NaN, thesis.trailR));
       }
+      // 建値ストップの発動 (今の気配の仲値で判定。この判定ではストップを判定しない = 次の判定から効く)
+      if (o.breakevenStop === undefined && breakevenEnabled(this.opts.breakeven) && breakevenTriggered(this.opts.breakeven, o.direction, o.entryMid, o.risk, mid)) {
+        const st = breakevenStopPrice({
+          direction: o.direction, entryPrice: entryFill, entryFeePerUnit: Math.max(0, o.takerFeeRate) * entryFill,
+          exitFeeRate: Math.max(0, o.takerFeeRate), halfSpreadRate: mid > 0 ? half / mid : 0,
+        });
+        if (st !== undefined) {
+          o.breakevenArmedAt = now;
+          o.breakevenStop = st;
+          this.urgent = true;
+        }
+      }
       return undefined;
     }
     const r = this.closeR(o, exit, now);
-    const { risk: _risk, lastCandleTs: _l, mfeR, maeR, thesisPeak: _tp, thesisStop: _ts, reversalTf: _rt, reversalBarTs: _rb, ...base } = o;
+    const { risk: _risk, lastCandleTs: _l, mfeR, maeR, thesisPeak: _tp, thesisStop: _ts, reversalTf: _rt, reversalBarTs: _rb,
+      breakevenArmedAt: _ba, breakevenStop: _bs, ...base } = o;
     return {
       ...base, exitTs: now, exitPrice: exit.fill, exitReason: reason, ...r, mfeR, maeR,
       ...(thesis ? { thesisOutcome: thesisOutcomeOf(reason, o.thesisExtendedAt !== undefined) } : {}),

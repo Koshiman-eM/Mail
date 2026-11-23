@@ -132,7 +132,10 @@ describe("エンジン (paper): 転換で決済", () => {
 
   it("REVERSAL_EXIT=false は従来どおり (押し安値を割っても持ち続け、損切りで決済)。対象外の戦略 (REVERSAL_EXIT_STRATEGIES) も同じ", async () => {
     const results: TradeRecord[] = [];
-    const envs: Record<string, string>[] = [{ REVERSAL_EXIT: "false" }, { REVERSAL_EXIT_STRATEGIES: "other_strategy" }];
+    // 建値ストップ (BREAKEVEN_TRIGGER_R) は無効にして、従来どおり損切りまで持つことを確かめる
+    const envs: Record<string, string>[] = [
+      { REVERSAL_EXIT: "false", BREAKEVEN_TRIGGER_R: "0" }, { REVERSAL_EXIT_STRATEGIES: "other_strategy", BREAKEVEN_TRIGGER_R: "0" },
+    ];
     for (const env of envs) {
       const logs: string[] = [];
       const w = await runtime(scenarioBars(LONG_PROFIT, TAIL), probe(), env, logs);

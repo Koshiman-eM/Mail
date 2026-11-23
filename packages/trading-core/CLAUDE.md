@@ -31,7 +31,7 @@
 - `intel/`: 情報収集の汎用部分 (RSS・経済指標・分析・資産別バイアス・計画)。暗号資産の情報源 (CoinGecko・CryptoPanic・Fear&Greed) は trader 側
 - `learning/`: 要因分析・腕の配分・情報源の信頼度・ParamTuner・振り返り・仮想トレード・ニュースの答え合わせ・予想・移行
 - `backtest/`: イベント駆動バックテスト・区間検証・合成データ
-- `engine/`: `TradingEngine` (`engine.ts`)、建玉・注文・指値・テンポ・読みの管理・転換で決済、組み立て (`runtime.ts`: `assembleRuntime`)、simulate (`simulate.ts`: `runSimulation` は `SimulationRuntimeFactory` を受け取る)、backtest コマンド (`backtestCommand.ts`: 取得元の登録 `registerBacktestSource`)、レポート
+- `engine/`: `TradingEngine` (`engine.ts`)、建玉・注文・指値・テンポ・読みの管理・建値ストップ (`breakeven.ts`: `BREAKEVEN_TRIGGER_R`。純粋な判定。PositionManager・backtest・仮想トレードが同じ規則を使う)・転換で決済、組み立て (`runtime.ts`: `assembleRuntime`)、simulate (`simulate.ts`: `runSimulation` は `SimulationRuntimeFactory` を受け取る)、backtest コマンド (`backtestCommand.ts`: 取得元の登録 `registerBacktestSource`)、レポート
 - `dashboard/`: 閲覧 + リスク設定の書き込み (`server.ts`・`page.ts` の `DASHBOARD_HTML`)
 - `paper/walletReset.ts`: paper の口座の作り直し
 - `storage/`: Store (node:sqlite / memory)
@@ -45,6 +45,8 @@
 - **保有コスト** (`core/holdingCost.ts`): `HoldingCostModel { accrue({inst, qty, avgPrice, from, to, mode}) → Decimal; appliesTo(inst, qty) }`。既定 `simulatedShortBorrowModel(rate)`。PaperBroker (`holdingCost`) と仮想トレード (`shadow.holdingCost`) が使う。
 - **取引時間** (`core/calendar.ts`): `MarketCalendar { isOpen, nextOpen, nextClose, tradingDayKey, nextTradingDayStart }`、`ALWAYS_OPEN`、`weeklySessionCalendar({tz, sessions, weekdays, holidays?, dayRollover?})`、`openDurationMs`。エンジンは閉まっている間は新規エントリーしない (`market_closed`)、テンポは取引時間だけで測る、RiskManager の日の区切りは取引日。決済は閉まっていても従来どおり出す (閉まっている間の決済の待ち合わせは未実装。下の「残っている課題」)。
 - **組み立て** (`engine/runtime.ts`): `assembleRuntime(config, assembly, opts)`。`RuntimeAssembly` = markets (feed + 銘柄)・createLiveBrokers?・paperBroker?・intelSources?・strategies? / strategyBase?・calendar?・holdingCost?・venueLeverageCaps?・periodic?・marketExtras?・extraTimeframeClasses?・onTimeframes?・fallbackQuote?・validationFeed?・onClose?。
+- **発注前の見積もりのコスト** (`MarketExtras.entryQuoteCost`、`engine/engine.ts`): venue の銘柄だけ、evaluateEntry の承認後・発注前に承認された数量・向きで呼ぶ。`{costBps}` なら `RiskManager.recheckEdge` (同じ `edgeCheck`) で確かめ直し (追加の判定)、通れば entryContext.costBps に記録。`{unavailable}`・例外は見送り (risk.reject)、undefined は従来どおり。フックの無い venue は従来と同一。
+- **観測専用** (`strategies/observeOnly.ts`): `OBSERVE_ONLY_STRATEGIES` の `<id>` (全資産クラス) / `<id>:<資産クラス>`。`parseObserveOnly`・`isObserveOnly`・`observeOnlyWarnings`。既定 `scalp_rebound,short_ema_trend:meme`。
 - **simulate** (`engine/simulate.ts`): `runSimulation({factory, ...})`。`SimulationRuntimeFactory` = loadConfig・simulationEnv・guardedDbPaths・buildRuntime。
 - **backtest の取得元** (`engine/backtestCommand.ts`): `synthetic` / `feed` + `registerBacktestSource({name, label, open, marketOnly})`。
 - **予想の多重検定**: `ForecastOptions.liveGroups` (グループ数。既定 3 × 4 = 12)。

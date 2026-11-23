@@ -4,9 +4,9 @@ import { basename, dirname, extname, join } from "node:path";
 import { TRADER_ASSET_CLASSES, type AppConfig } from "../appConfig";
 import { ASSET_CLASSES as ALL_ASSET_CLASSES } from "../core/assetClasses";
 import { createLogger, type Logger } from "../core/logger";
-import { systemClock, type AssetClass, type Clock, type Instrument, type MarketDataFeed, type Store, type Timeframe, type TradingMode } from "../core/types";
+import { systemClock, type AssetClass, type Clock, type Instrument, type MarketDataFeed, type Quote, type Side, type Store, type Timeframe, type TradingMode } from "../core/types";
 import { createBrokers, LIVE_UNSUPPORTED_MESSAGE } from "../execution/router";
-import { createJupiterFillPricer } from "../execution/jupiterFill";
+import { createJupiterFillPricer, jupiterEntryQuoteCost } from "../execution/jupiterFill";
 import type { PaperSnapshot } from "../execution/paper";
 import { TradeJournal } from "../learning/journal";
 import { JupiterFeed, JUPITER_VENUE, type JupiterTokenSpec } from "../market/feeds/jupiter";
@@ -285,6 +285,17 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
     if (j.settings.discovery) periodic.push({ name: "jupiter.discovery", everyMs: j.settings.discoveryEveryMs, run: () => j.watch.run() });
   }
   const j = jupiter;
+  // Jupiter の成行の約定価格 (見積もり。エントリー前のコストの確認 entryQuoteCost とキャッシュを共有する)
+  const jupiterPricer = j
+    ? createJupiterFillPricer({
+        provider: new JupiterSwapQuoteProvider(j.client),
+        limiter: j.client.limiter,
+        tokenOf: (sym) => j.feed.tokenOf(sym),
+        now: () => clock.now(),
+        // 古い気配 (エンジンの maxQuoteAgeMs 超) では代わりのモデルで値付けしない (決済は次のティックで再試行)
+        maxQuoteAgeMs: opts.engine?.maxQuoteAgeMs ?? 30_000,
+      })
+    : undefined;
   const { markets: _m, createCcxtFeed: _c, jupiter: _j, fxRate: _f, seed: _s, syntheticHistoryMs: _h, ...assembleOpts } = opts;
   // 値動きの予想の多重検定 (Bonferroni) のグループ数は 12 に固定する (予想時間 3 × 資産クラス 4。TRADER_FORECAST_LIVE_GROUPS)
   const engineOpts = { ...(opts.engine ?? {}), forecast: { liveGroups: TRADER_FORECAST_LIVE_GROUPS, ...(opts.engine?.forecast ?? {}) } };
@@ -303,20 +314,15 @@ export async function buildRuntime(config: AppConfig, opts: RuntimeOptions = {})
         ? {
             paperBroker: {
               marketOnlyVenues: [JUPITER_VENUE],
-              marketPricer: createJupiterFillPricer({
-                provider: new JupiterSwapQuoteProvider(j.client),
-                limiter: j.client.limiter,
-                tokenOf: (sym) => j.feed.tokenOf(sym),
-                now: () => clock.now(),
-                // 古い気配 (エンジンの maxQuoteAgeMs 超) では代わりのモデルで値付けしない (決済は次のティックで再試行)
-                maxQuoteAgeMs: opts.engine?.maxQuoteAgeMs ?? 30_000,
-              }),
+              marketPricer: jupiterPricer!,
             },
             marketExtras: {
               venues: [JUPITER_VENUE],
               liquidityUsd: (sym: string) => j.feed.liquidityUsd(sym),
               entryBlock: (sym: string) => j.feed.entryBlock(sym),
               costBpsAt: (sym: string, n: number) => j.feed.costBpsAt(sym, n),
+              // 発注前に承認された数量・向きの見積もり (約定と同じキャッシュ・枠・4 秒の中止) のコストで期待値を確かめ直す
+              entryQuoteCost: (inst: Instrument, side: Side, qty: string, q: Quote) => jupiterEntryQuoteCost(jupiterPricer!, inst, side, qty, q),
             },
             onClose: () => j.feed.stop(),
           }

@@ -139,10 +139,12 @@ const idList = (def: string) =>
   str(def).transform((v) => [...new Set(v.split(",").map((x) => x.trim()).filter(Boolean))]);
 
 /**
- * 観測専用 (発注せず仮想トレードだけ記録する) 戦略の既定値。scalp_rebound (効果の測定中)。
+ * 観測専用 (発注せず仮想トレードだけ記録する) 戦略の既定値。scalp_rebound (効果の測定中) と、
+ * short_ema_trend の meme だけ (上昇トレンドで急騰後の天井を買って負け続けたため。crypto は従来どおり取引する)。
+ * 要素は `<戦略 id>` (全資産クラス) か `<戦略 id>:<資産クラス>` (そのクラスだけ。src/strategies/observeOnly.ts)。
  * 観測専用でも保有中の建玉は従来どおり管理・決済する (止めるのは新規エントリーだけ)
  */
-export const DEFAULT_OBSERVE_ONLY_STRATEGIES = "scalp_rebound";
+export const DEFAULT_OBSERVE_ONLY_STRATEGIES = "scalp_rebound,short_ema_trend:meme";
 
 /**
  * 相場構造 (ダウ理論) のフィルターを掛ける戦略の既定値 (トレンド・ブレイク系だけ)。
@@ -244,8 +246,10 @@ const coreStaticShape = {
   MEME_MIN_LIQUIDITY_USD: num(250_000),
   /**
    * 観測専用の戦略 id (カンマ区切り)。評価とシグナルの生成は通常どおり行うが、新規エントリーは発注せず
-   * 仮想トレード (reason "observe_only") としてだけ記録する。既定は scalp_rebound。
-   * 保有中の建玉は従来どおり管理・決済する。空文字なら観測専用なし。未登録 (廃止した戦略を含む) の id は起動時に警告して無視する
+   * 仮想トレード (reason "observe_only") としてだけ記録する。既定は scalp_rebound,short_ema_trend:meme。
+   * `<id>:<資産クラス>` はそのクラスの銘柄だけを観測専用にする (`<id>` だけなら全クラス)。
+   * 保有中の建玉は従来どおり管理・決済する。空文字なら観測専用なし。未登録 (廃止した戦略を含む) の id・使えない資産クラスの指定は
+   * 起動時に警告して無視する
    */
   OBSERVE_ONLY_STRATEGIES: idList(DEFAULT_OBSERVE_ONLY_STRATEGIES),
 
@@ -341,6 +345,17 @@ const coreStaticShape = {
   THESIS_TRAIL_R: checkedNum(
     "THESIS_TRAIL_R", 0.5, (x) => x >= 0.1 && x <= 3,
     "0.1 以上 3 以下の R で指定してください (延長後、最も有利な価格からこれだけ戻したら決済)",
+  ),
+
+  // 建値ストップ (src/engine/breakeven.ts)
+  /**
+   * エントリーの仲値からの有利な仲値の動きが 当初のリスク × これ に達したら、保護ストップを往復コスト込みの建値
+   * (エントリー手数料 + 決済の taker 手数料・固定手数料 + 半スプレッド) へ引き上げる (0 または 0.2〜3、既定 0.5。0 で無効)。
+   * 一度引き上げたら戻さない (決済計画に保存)。決済理由は trailing (TradeRecord.breakevenStopExit)
+   */
+  BREAKEVEN_TRIGGER_R: checkedNum(
+    "BREAKEVEN_TRIGGER_R", 0.5, (x) => x === 0 || (x >= 0.2 && x <= 3),
+    "0 (無効) または 0.2 以上 3 以下の R で指定してください (この R だけ有利に動いたらストップを建値 (往復コスト込み) へ引き上げる)",
   ),
 
   // 転換で決済 (src/engine/reversalExit.ts)

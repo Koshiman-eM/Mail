@@ -28,6 +28,7 @@ import { clampMaxHoldMs } from "../engine/tempo";
 import {
   activeThesisMs, advancePeak, decideThesis, initialRiskPerUnit, THESIS_DISABLED, thesisGrossR, thesisNetR, thesisOutcomeOf, thesisTrailStop, type ThesisPricing,
 } from "../engine/thesis";
+import { breakevenEnabled, breakevenStopPrice, breakevenTriggered } from "../engine/breakeven";
 import { checkReversal, entryBarIndex, REVERSAL_ATR_WINDOW, reversalAppliesTo, reversalBacktestTimeframe } from "../engine/reversalExit";
 import { netEdgeMinBps } from "../risk/manager";
 import type { BacktestOptions, BacktestResult, BacktestStats, IntelSource, Sizer } from "./types";
@@ -61,6 +62,11 @@ import type { BacktestOptions, BacktestResult, BacktestStats, IntelSource, Sizer
  *     (従来の時間切れと同じタイミング。始値で損切りを越えていれば損切りの理由)。
  *   - 延長した建玉の保護ストップ (建値・トレーリング) はバー i+1 から効く。極値は延長から測り (判定した終値の決済できる価格から始め、
  *     バー i+1 以降の高値・安値 ∓ 半スプレッドで進める)、前バーまでの値を使う (先読みしない)。理由は trailing (thesisStopExit)。
+ * 建値ストップ (opts.breakeven。省略・0 なら従来どおり。ライブの BREAKEVEN_TRIGGER_R と同じ src/engine/breakeven.ts の規則):
+ *   - バー i の終値 (仲値とみなす) が エントリーの基準 (entryMid: 成行は始値、指値は指値の価格) から triggerR × 当初のリスク 有利に動いたら発動。
+ *     ストップ = 往復コスト込みの建値 (エントリー手数料/単位 + 決済の taker・固定手数料 (1 単位換算) + 半スプレッド)。
+ *   - バー i の損切りの判定の後に発動するので、ストップはバー i+1 から効く (先読みしない)。一度上げたら戻さない。
+ *     実効のストップは当初・トレーリング・読みの管理の保護ストップ・建値ストップのうち最もきついもの。理由は trailing (breakevenStopExit)。
  * 転換で決済 (opts.reversal。省略・無効・戦略が対象外なら従来どおり。ライブの REVERSAL_* と同じ src/engine/reversalExit.ts の規則):
  *   - 判定の時間足 (REVERSAL_EXIT_TF。lower = 主時間足の 1 つ下、same = 主時間足) が確定したバー i の終値で、
  *     エントリー後に確定した押し安値 (売りは戻り高値。REVERSAL_EXIT_FALLBACK なら無いときエントリーした足の安値・高値) を終値が越えたかを判定し、
@@ -151,6 +157,8 @@ interface OpenPos {
    * 延長を判定した終値の決済できる価格から始め、延長した足以降の高値・安値だけで進める (その足の判定には使わない)
    */
   thesisPeak?: number;
+  /** 建値ストップ (発動したバーの次のバーから効く。一度上げたら戻さない) */
+  breakevenStop?: number;
 }
 
 type Pending =
@@ -208,6 +216,8 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
     : undefined;
   const limitTp = limitOpts?.takeProfit === true;
   const thesis = opts.thesis ?? THESIS_DISABLED;
+  // 建値ストップ (有効なときだけ。無ければ従来どおり)
+  const breakeven = breakevenEnabled(opts.breakeven) ? opts.breakeven : undefined;
   // 転換で決済 (有効で、この戦略が対象のときだけ。無ければ従来どおり)
   const reversal = opts.reversal && reversalAppliesTo(opts.reversal, strategy.id) ? opts.reversal : undefined;
   if (reversal) stats.reversalExits = 0;
@@ -287,10 +297,11 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
   /** 読みの管理を使う建玉なら期限 (ms) */
   const thesisMsOf = (p: OpenPos) => activeThesisMs(thesis, p.expectedMs, p.maxHoldMs, initialRiskPerUnit(p.entryPrice, p.initialStop));
 
-  const currentStop = (p: OpenPos): { stop: number; reason: ExitReason; byThesis: boolean } => {
+  const currentStop = (p: OpenPos): { stop: number; reason: ExitReason; byThesis: boolean; byBreakeven: boolean } => {
     let stop = p.initialStop;
     let reason: ExitReason = "stop";
     let byThesis = false;
+    let byBreakeven = false;
     if (p.trailPct !== undefined && p.trailPct > 0) {
       const trail = p.dir === 1 ? p.highWater * (1 - p.trailPct) : p.lowWater * (1 + p.trailPct);
       if (p.dir === 1 ? trail > p.initialStop : trail < p.initialStop) {
@@ -307,11 +318,36 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
         byThesis = true;
       }
     }
-    return { stop, reason, byThesis };
+    // 建値ストップ (発動済みなら。きつい方を使う)
+    if (p.breakevenStop !== undefined && (p.dir === 1 ? p.breakevenStop > stop : p.breakevenStop < stop)) {
+      stop = p.breakevenStop;
+      reason = "trailing";
+      byThesis = false;
+      byBreakeven = true;
+    }
+    return { stop, reason, byThesis, byBreakeven };
   };
 
-  /** byThesis: 延長後の保護ストップでの決済 (TradeRecord.thesisStopExit) */
-  const closePosition = (i: number, px: number, ts: number, reason: ExitReason, intended: number, liq: "maker" | "taker" = "taker", byThesis = false) => {
+  /** 建値ストップの発動 (バーの終値で判定。発動したらストップを保存し、次のバーから効く) */
+  const armBreakeven = (p: OpenPos, close: number) => {
+    if (!breakeven || p.breakevenStop !== undefined) return;
+    const risk = initialRiskPerUnit(p.entryPrice, p.initialStop);
+    if (!breakevenTriggered(breakeven, p.dir === 1 ? "long" : "short", p.entryMid > 0 ? p.entryMid : p.entryPrice, risk, close)) return;
+    const units = p.qtyNum * cs;
+    const st = breakevenStopPrice({
+      direction: p.dir === 1 ? "long" : "short",
+      entryPrice: p.entryPrice,
+      entryFeePerUnit: units > 0 ? p.entryFee.toNumber() / units : 0,
+      exitFeeRate: costFeeRate(instrument, units > 0 ? p.entryPrice * units : undefined),
+      halfSpreadRate: hs,
+    });
+    if (st !== undefined) p.breakevenStop = st;
+  };
+
+  /** byThesis: 延長後の保護ストップでの決済 (TradeRecord.thesisStopExit) / byBreakeven: 建値ストップでの決済 (TradeRecord.breakevenStopExit) */
+  const closePosition = (
+    i: number, px: number, ts: number, reason: ExitReason, intended: number, liq: "maker" | "taker" = "taker", byThesis = false, byBreakeven = false,
+  ) => {
     const p = pos!;
     const exitFee = D(px).mul(p.qty).mul(csD).mul(liq === "maker" ? makerRate : feeRate).plus(fixedFee);
     const gross = D(px).minus(p.entryPrice).mul(p.qty).mul(csD).mul(p.dir);
@@ -373,6 +409,7 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
           ...(byThesis && reason === "trailing" ? { thesisStopExit: true } : {}),
         };
       })(),
+      ...(byBreakeven && reason === "trailing" ? { breakevenStopExit: true } : {}),
       ...(limitOpts
         ? {
             entryOrderType: p.entryLiq === "maker" ? ("limit" as const) : ("market" as const),
@@ -391,34 +428,34 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
 
   const checkStops = (i: number, bar: Candle) => {
     const p = pos!;
-    const { stop, reason, byThesis } = currentStop(p);
+    const { stop, reason, byThesis, byBreakeven: byBe } = currentStop(p);
     // 指値で約定した足では利確を判定しない (足の中で約定と利確の順序が分からない。損切りは判定する = 保守的)
     const tp = p.limitFillIdx === i ? undefined : p.takeProfit;
     const end = bar.ts + baseMs;
     if (limitTp) {
       // 利確は板に置いた指値: 価格が利確価格を越えたときだけ利確価格で maker 約定 (触れただけでは約定しない)。損切りを先に判定する
       if (p.dir === 1) {
-        if (bar.open <= stop) return closePosition(i, marketFill(bar.open, false), bar.ts, reason, stop, "taker", byThesis);
+        if (bar.open <= stop) return closePosition(i, marketFill(bar.open, false), bar.ts, reason, stop, "taker", byThesis, byBe);
         if (tp !== undefined && bar.open > tp) return closePosition(i, tp, bar.ts, "take_profit", tp, "maker");
-        if (bar.low <= stop) return closePosition(i, marketFill(stop, false), end, reason, stop, "taker", byThesis);
+        if (bar.low <= stop) return closePosition(i, marketFill(stop, false), end, reason, stop, "taker", byThesis, byBe);
         if (tp !== undefined && bar.high > tp) return closePosition(i, tp, end, "take_profit", tp, "maker");
       } else {
-        if (bar.open >= stop) return closePosition(i, marketFill(bar.open, true), bar.ts, reason, stop, "taker", byThesis);
+        if (bar.open >= stop) return closePosition(i, marketFill(bar.open, true), bar.ts, reason, stop, "taker", byThesis, byBe);
         if (tp !== undefined && bar.open < tp) return closePosition(i, tp, bar.ts, "take_profit", tp, "maker");
-        if (bar.high >= stop) return closePosition(i, marketFill(stop, true), end, reason, stop, "taker", byThesis);
+        if (bar.high >= stop) return closePosition(i, marketFill(stop, true), end, reason, stop, "taker", byThesis, byBe);
         if (tp !== undefined && bar.low < tp) return closePosition(i, tp, end, "take_profit", tp, "maker");
       }
       return;
     }
     if (p.dir === 1) {
-      if (bar.open <= stop) return closePosition(i, marketFill(bar.open, false), bar.ts, reason, stop, "taker", byThesis);
+      if (bar.open <= stop) return closePosition(i, marketFill(bar.open, false), bar.ts, reason, stop, "taker", byThesis, byBe);
       if (tp !== undefined && bar.open * (1 - hs) >= tp) return closePosition(i, bar.open * (1 - hs), bar.ts, "take_profit", tp);
-      if (bar.low <= stop) return closePosition(i, marketFill(stop, false), end, reason, stop, "taker", byThesis);
+      if (bar.low <= stop) return closePosition(i, marketFill(stop, false), end, reason, stop, "taker", byThesis, byBe);
       if (tp !== undefined && bar.high * (1 - hs) >= tp) return closePosition(i, tp, end, "take_profit", tp);
     } else {
-      if (bar.open >= stop) return closePosition(i, marketFill(bar.open, true), bar.ts, reason, stop, "taker", byThesis);
+      if (bar.open >= stop) return closePosition(i, marketFill(bar.open, true), bar.ts, reason, stop, "taker", byThesis, byBe);
       if (tp !== undefined && bar.open * (1 + hs) <= tp) return closePosition(i, bar.open * (1 + hs), bar.ts, "take_profit", tp);
-      if (bar.high >= stop) return closePosition(i, marketFill(stop, true), end, reason, stop, "taker", byThesis);
+      if (bar.high >= stop) return closePosition(i, marketFill(stop, true), end, reason, stop, "taker", byThesis, byBe);
       if (tp !== undefined && bar.low * (1 + hs) <= tp) return closePosition(i, tp, end, "take_profit", tp);
     }
   };
@@ -537,9 +574,11 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
       }
       if (d.exit) {
         if (d.exit.reason === "thesis_timeout" && d.exit.netR !== undefined) p.netRAtDeadline = d.exit.netR;
-        const { stop, reason, byThesis } = currentStop(p);
+        const { stop, reason, byThesis, byBreakeven } = currentStop(p);
         const gapped = p.dir === 1 ? bar.open <= stop : bar.open >= stop;
-        closePosition(i, marketFill(bar.open, p.dir === -1), bar.ts, gapped ? reason : d.exit.reason, gapped ? stop : bar.open, "taker", gapped && byThesis);
+        closePosition(
+          i, marketFill(bar.open, p.dir === -1), bar.ts, gapped ? reason : d.exit.reason, gapped ? stop : bar.open, "taker", gapped && byThesis, gapped && byBreakeven,
+        );
       }
     }
 
@@ -574,6 +613,8 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
       if (p.extendedAt !== undefined && p.extendedAt <= bar.ts) {
         p.thesisPeak = advancePeak(p.dir === 1 ? "long" : "short", p.thesisPeak, p.dir === 1 ? bar.high * (1 - hs) : bar.low * (1 + hs));
       }
+      // 建値ストップの発動 (この足の終値で判定。この足の損切りの判定の後なので次の足から効く)
+      armBreakeven(p, bar.close);
     }
 
     // 5. 最終バーで決済

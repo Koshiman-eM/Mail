@@ -24,6 +24,7 @@ import {
 import { readExitPlans } from "./engine/positions";
 import { activeThesisMs, formatThesisSettings, initialRiskPerUnit, thesisSettingsFromEnv } from "./engine/thesis";
 import { formatReversalSettings, reversalSettingsFromEnv } from "./engine/reversalExit";
+import { breakevenEnabled, breakevenSettingsFromEnv, formatBreakevenSettings } from "@trading/core/engine/breakeven";
 import { D } from "./core/decimal";
 import {
   peekResolveRequests, PendingOrders, readLimitStats, requestResolve, RestingTakeProfits, type PendingOrder, type ResolveRequest,
@@ -57,7 +58,7 @@ import { ALL_STRATEGIES, configuredStrategies, getStrategy } from "./strategies/
 import { structureSettingsFromEnv } from "./structure/settings";
 import { TIMEFRAME_MS, type ExitReason, type Timeframe } from "./core/types";
 import { horizonLabel, strategyLabel, strategyLabelWithId } from "./strategies/labels";
-import { strategyIdListWarnings } from "./strategies/retired";
+import { formatObserveOnly, observeOnlyScope, observeOnlyWarnings, parseObserveOnly } from "@trading/core/strategies/observeOnly";
 import {
   assertPaperOnly, equitySinceReset, executeWalletReset, formatWalletResetPlan, isDbBusyError, latestPaperReset, paperEngineRunning, performanceTrades,
   planWalletReset, validateResetEquity, WalletResetError,
@@ -300,7 +301,7 @@ export function configCompatWarnings(c: AppConfig, rawEnv: Record<string, string
   }
   for (const w of removedEnvWarnings(rawEnv)) warn.push(`警告: ${w}`);
   const ids = ALL_STRATEGIES.map((x) => x.id);
-  for (const w of strategyIdListWarnings("OBSERVE_ONLY_STRATEGIES", c.env.OBSERVE_ONLY_STRATEGIES ?? [], ids)) warn.push(`警告: ${w}`);
+  for (const w of observeOnlyWarnings("OBSERVE_ONLY_STRATEGIES", c.env.OBSERVE_ONLY_STRATEGIES ?? [], ids)) warn.push(`警告: ${w}`);
   return warn;
 }
 
@@ -626,13 +627,16 @@ async function cmdBacktest(flags: ParsedArgs["flags"], io: Io): Promise<number> 
   // 読みの管理 (THESIS_*)・転換で決済 (REVERSAL_*) も実運用と同じ規則にする
   const thesis = thesisSettingsFromEnv(config.env);
   const reversal = reversalSettingsFromEnv(config.env);
+  // 建値ストップ (BREAKEVEN_TRIGGER_R) も実運用と同じ規則にする
+  const breakeven = breakevenSettingsFromEnv(config.env);
   const rows = await runBacktestCommand({
-    ...common, strategies: configuredStrategies(structure), ...(maxHold !== undefined ? { maxHoldMinutes: maxHold } : {}), thesis, reversal,
+    ...common, strategies: configuredStrategies(structure), ...(maxHold !== undefined ? { maxHoldMinutes: maxHold } : {}), thesis, reversal, breakeven,
   });
   io.out(
     `バックテスト: ${symbol} / ${a.days} 日 / ${sourceLabel} / 構造フィルター ${structure.mode === "filter" ? "あり" : "なし"}` +
       (maxHold !== undefined ? ` / 最大保有 ${maxHold} 分` : "") +
-      ` / 読みの管理 ${thesis.enabled ? "有効" : "無効"} / 転換で決済 ${reversal.enabled ? "有効" : "無効"}`,
+      ` / 読みの管理 ${thesis.enabled ? "有効" : "無効"} / 転換で決済 ${reversal.enabled ? "有効" : "無効"}` +
+      ` / 建値ストップ ${breakevenEnabled(breakeven) ? `${breakeven.triggerR}R で発動` : "無効"}`,
   );
   io.out(formatBacktestRows(rows));
   io.out("※ 損益はクオート通貨建て (初期評価額 1,000,000)。期間の前にウォームアップ用の足を付けています。");
@@ -1059,17 +1063,22 @@ export function tempoStatusLine(config: AppConfig, store: Pick<Store, "listTrade
  * status 用の戦略一覧。表示名に id を [] で添える (OBSERVE_ONLY_STRATEGIES / STRUCTURE_STRATEGIES は id で指定するため)。
  * 観測専用・相場構造フィルターの対象かどうかも付ける
  */
+function observeScopeTag(rules: ReturnType<typeof parseObserveOnly>, id: string): string {
+  const scope = observeOnlyScope(rules, id);
+  return scope === undefined ? "" : scope === "全クラス" ? "観測専用" : `観測専用 (${scope})`;
+}
+
 export function strategyStatusLines(config: AppConfig): string[] {
-  const observe = new Set(config.env.OBSERVE_ONLY_STRATEGIES ?? []);
+  const observe = parseObserveOnly(config.env.OBSERVE_ONLY_STRATEGIES ?? []);
   const structure = structureSettingsFromEnv(config.env);
   const filtering = structure.mode === "filter" ? new Set(structure.strategies) : new Set<string>();
-  const out = [`戦略 (${ALL_STRATEGIES.length} 本。環境変数では [ ] の id で指定):`];
+  const out = [`戦略 (${ALL_STRATEGIES.length} 本。環境変数では [ ] の id で指定):`, formatObserveOnly(observe)];
   // VENUES が jupiter だけなら、板 (order book) が必要な戦略は評価されない (Jupiter の feed に板が無い)
   const venues = effectiveVenues(config.env.VENUES).map((v) => v.split(":")[0].trim().toLowerCase());
   const jupiterOnly = venues.length > 0 && venues.every((v) => v === JUPITER_VENUE);
   for (const s of ALL_STRATEGIES) {
     const tags = [
-      observe.has(s.id) ? "観測専用" : "", filtering.has(s.id) ? "構造フィルター対象" : "",
+      observeScopeTag(observe, s.id), filtering.has(s.id) ? "構造フィルター対象" : "",
       jupiterOnly && s.requiresBook ? "板が必要: Jupiter では動きません" : "",
     ].filter(Boolean);
     out.push(`  ${strategyLabelWithId(s.id)} / ${horizonLabel(s.horizon)}${tags.length ? ` / ${tags.join("・")}` : ""}`);
@@ -1127,7 +1136,9 @@ function cmdStatus(io: Io): number {
         : plan?.thesis?.extendedAt !== undefined
           ? ` / 読みの期限 ${fmtTime(p.entryTs + ms)} → 延長中 (上限 ${fmtTime(p.entryTs + ms * Math.max(1, thesis.extendMult))})`
           : ` / 読みの期限 ${fmtTime(p.entryTs + ms)} (監視中)`;
-      io.out(`  ${p.symbol} ${p.direction === "long" ? "買い" : "売り"} ${p.qty} @ ${p.entryPrice} (${strategyLabel(p.strategyId)}, ${fmtTime(p.entryTs)})${th}`);
+      // 建値ストップ (発動済みの建玉だけ)
+      const be = plan?.breakeven ? ` / 建値ストップ ${plan.breakeven.stop} (${fmtTime(plan.breakeven.armedAt)} に発動)` : "";
+      io.out(`  ${p.symbol} ${p.direction === "long" ? "買い" : "売り"} ${p.qty} @ ${p.entryPrice} (${strategyLabel(p.strategyId)}, ${fmtTime(p.entryTs)})${th}${be}`);
     }
     const pending = new PendingOrders({ store, mode }).list();
     if (pending.length) {
@@ -1136,6 +1147,7 @@ function cmdStatus(io: Io): number {
     }
     io.out(tempoStatusLine(config, store, mode, open.map((p) => p.entryTs), now));
     io.out(`読みの管理 (THESIS_EXIT): ${formatThesisSettings(thesis)}${thesis.enabled && (config.env.MAX_HOLD_MINUTES ?? 0) > 0 ? ` / 読みの期限の上限 ${config.env.MAX_HOLD_MINUTES} 分 (MAX_HOLD_MINUTES)` : ""}`);
+    io.out(`建値ストップ (BREAKEVEN_TRIGGER_R=${breakevenSettingsFromEnv(config.env).triggerR}): ${formatBreakevenSettings(breakevenSettingsFromEnv(config.env))}`);
     const rev = reversalSettingsFromEnv(config.env);
     io.out(
       `転換で決済 (REVERSAL_EXIT): ${formatReversalSettings(rev)} — REVERSAL_EXIT=${rev.enabled} / REVERSAL_EXIT_PIVOT_N=${rev.pivotN} / ` +

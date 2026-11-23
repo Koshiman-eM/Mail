@@ -175,3 +175,66 @@ describe("エンジン: 観測専用の戦略", () => {
     }
   });
 });
+
+describe("エンジン: 資産クラスごとの観測専用 (<id>:<資産クラス>)", () => {
+  /** 建玉が無ければ毎回買う (crypto・meme の両方) */
+  function anyBuyer(id: string): Strategy {
+    return {
+      id, horizon: "scalp", assetClasses: ["crypto", "meme"], regimes: [...LABELS], primaryTimeframe: "1m", timeframes: ["1m", "1h"],
+      warmup: 1, defaultParams: { stopAtr: 1 }, paramBounds: { stopAtr: [0.5, 3] },
+      evaluate(ctx: StrategyContext): Signal | null {
+        if (ctx.position) return null;
+        const px = ctx.market.quote.ask;
+        return {
+          strategyId: id, horizon: "scalp", symbol: ctx.market.instrument.symbol, direction: "long", confidence: 0.8, expectedEdgeBps: 500,
+          entry: { type: "market" }, stopLoss: px * 0.95, takeProfit: px * 1.05, maxHoldMs: 60 * MIN, reason: `test ${id}`, features: {},
+        };
+      },
+    };
+  }
+  const WATCH = { WATCHLIST: "synthetic|BTC/USDT,synthetic|PEPE/USDT|meme" };
+  const observed = (rt: Awaited<ReturnType<typeof setup>>["rt"], store: MemoryStore) =>
+    [...rt.engine.shadow!.list(), ...store.listShadowTrades()].filter((t) => t.reason === "observe_only").map((t) => t.symbol);
+  const entered = (store: MemoryStore) => store.listAudit({ type: "engine.entry" }).map((a) => a.data.symbol);
+
+  it("short_ema_trend:meme は meme の銘柄だけ発注せず observe_only にし、crypto は通常どおり発注する", async () => {
+    const { rt, store, run } = await setup([anyBuyer("short_ema_trend")], { ...WATCH, OBSERVE_ONLY_STRATEGIES: "short_ema_trend:meme" });
+    expect(rt.instruments.map((i) => [i.symbol, i.assetClass])).toEqual([["BTC/USDT", "crypto"], ["PEPE/USDT", "meme"]]);
+    await run(START, START + 3 * MIN);
+    expect(entered(store)).toContain("BTC/USDT");
+    expect(entered(store)).not.toContain("PEPE/USDT");
+    expect(observed(rt, store)).toContain("PEPE/USDT");
+    expect(observed(rt, store)).not.toContain("BTC/USDT");
+  });
+
+  it("既定 (未設定) でも short_ema_trend は meme だけ観測専用", async () => {
+    const { rt, store, run } = await setup([anyBuyer("short_ema_trend")], WATCH);
+    await run(START, START + 3 * MIN);
+    expect(entered(store)).toContain("BTC/USDT");
+    expect(observed(rt, store)).toEqual(["PEPE/USDT"]);
+  });
+
+  it("id だけの指定は従来どおり全クラスを観測専用にする", async () => {
+    const { rt, store, run } = await setup([anyBuyer("short_ema_trend")], { ...WATCH, OBSERVE_ONLY_STRATEGIES: "short_ema_trend" });
+    await run(START, START + 3 * MIN);
+    expect(entered(store)).toEqual([]);
+    expect(new Set(observed(rt, store))).toEqual(new Set(["BTC/USDT", "PEPE/USDT"]));
+  });
+
+  it("空文字を明示すれば既定の short_ema_trend:meme も無効 (meme でも observe_only にしない)", async () => {
+    const { rt, store, run } = await setup([anyBuyer("short_ema_trend")], { ...WATCH, OBSERVE_ONLY_STRATEGIES: "" });
+    await run(START, START + 3 * MIN);
+    expect(observed(rt, store)).toEqual([]);
+  });
+
+  it("使えない資産クラスの指定は起動時に警告して無視する (起動は止めない)", async () => {
+    const logs: string[] = [];
+    const logger = { ...createLogger("test"), warn: (m: string) => void logs.push(m) };
+    const rt = await buildRuntime(
+      loadConfig({ NODE_ENV: "test", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "JPY", OBSERVE_ONLY_STRATEGIES: "short_ema_trend:fx,short_ema_trend:meme" }),
+      { clock: { now: () => START }, store: new MemoryStore(), intelSources: [], ai: null, seed: 3, syntheticHistoryMs: 86_400_000, strategies: [], logger },
+    );
+    expect(logs).toContain("OBSERVE_ONLY_STRATEGIES に使えない資産クラスの指定があります (無視されます。使えるのは crypto / meme): short_ema_trend:fx");
+    rt.close();
+  });
+});

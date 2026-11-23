@@ -28,6 +28,8 @@ export interface PendingExit {
   intendedPrice: number;
   /** 読みの管理の延長後の保護ストップでの決済 (TradeRecord.thesisStopExit。約定したこの注文の判定にだけ付く) */
   thesisStop?: boolean;
+  /** 建値ストップ (BREAKEVEN_TRIGGER_R) での決済 (TradeRecord.breakevenStopExit。約定したこの注文の判定にだけ付く) */
+  breakevenStop?: boolean;
 }
 
 export interface PendingOrder {
@@ -124,7 +126,7 @@ export interface RestingTakeProfit {
   unknownCount: number;
   unknownSince?: number;
   lastError?: string;
-  exit?: { reason: ExitReason; intendedPrice: number; requestedAt: number; thesisStop?: boolean };
+  exit?: { reason: ExitReason; intendedPrice: number; requestedAt: number; thesisStop?: boolean; breakevenStop?: boolean };
   /** 取消の依頼に成功した時刻 (失敗したら次の照会の前に再度取り消す) */
   canceledAt?: number;
 }

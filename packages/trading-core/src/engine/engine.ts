@@ -2,6 +2,7 @@ import { enabledProfile } from "../core/assetClasses";
 import type { MarketCalendar } from "../core/calendar";
 import type { AiOptions } from "../core/ai";
 import { DEFAULT_OBSERVE_ONLY_STRATEGIES, type AppConfig } from "../core/config";
+import { isObserveOnly, parseObserveOnly, type ObserveOnlyRules } from "../strategies/observeOnly";
 import { equitySinceReset, latestPaperReset } from "../paper/walletReset";
 import { D, Decimal } from "../core/decimal";
 import { redactedErrMsg, redactSecrets } from "../core/http";
@@ -10,7 +11,7 @@ import { DEFAULT_SHORT_BORROW_RATE_DAILY, isSimulatedShort } from "../core/short
 import {
   systemClock, type Balance, type Broker, type BrokerPosition, type Clock, type EntryContext, type Instrument, type IntelBias, type MarketBrief,
   type IntelItem, type MarketDataFeed, type MarketView, type OrderRequest, type Candle, type Params, type Quote, type RegimeFeatures, type Signal, type Store, type Strategy,
-  type ShadowTradeRecord, type StrategyContext, type StrategyPlan, type Timeframe, type TradeRecord, TIMEFRAME_MS, isLearningExcludedTrade,
+  type ShadowTradeRecord, type Side, type StrategyContext, type StrategyPlan, type Timeframe, type TradeRecord, TIMEFRAME_MS, isLearningExcludedTrade,
 } from "../core/types";
 import type { BrokerSet } from "../execution/brokerSet";
 import type { PaperSnapshot } from "../execution/paper";
@@ -28,7 +29,7 @@ import type { LearningService, PeriodicResult } from "../learning/service";
 import type { MarketHub } from "../market/hub";
 import { detectRegime, regimeOptionsFor } from "../regime/detect";
 import { clearResumeRequest, peekResumeRequest } from "../risk/resumeRequest";
-import { costBps, type RiskManager, type RiskPosition } from "../risk/manager";
+import { costBps, type EntryParams, type RiskManager, type RiskPosition } from "../risk/manager";
 import { volumeWindowUnknown } from "../strategies/common";
 import { ALL_STRATEGIES, resolveParams } from "../strategies/registry";
 import { RETIRED_STRATEGIES } from "../strategies/retired";
@@ -45,6 +46,7 @@ import {
 import { DEFAULT_ORDER_POLICY, PositionManager, type EntryResult, type OrderPolicy, type SyncResult, type ThesisView } from "./positions";
 import { clampMaxHoldMs, isHoldLimitedHorizon, TempoController, tempoSeedTimestamps, tempoStatusView, type TempoStatusView } from "./tempo";
 import { thesisSettingsFromEnv, type ThesisSettings } from "./thesis";
+import { breakevenSettingsFromEnv, type BreakevenSettings } from "./breakeven";
 import {
   checkReversal, reversalAppliesTo, reversalDetailLabel, reversalSettingsFromEnv, reversalTimeframeFor, type ReversalSettings,
 } from "./reversalExit";
@@ -126,7 +128,19 @@ export interface MarketExtras {
   /** 予定の約定代金 (クオート通貨建て) での往復コスト (bps)。RiskManager がサイズを決めた後の判定に使う (EntryParams.costBpsAt) */
   costBpsAt?(symbol: string, notionalQuote: number): number | undefined;
   entryBlock?(symbol: string): string | undefined;
+  /**
+   * 発注前の見積もりのコスト (任意)。RiskManager.evaluateEntry が承認した後・発注の前に、承認された数量 (decimal の文字列)・向きで呼ぶ。
+   * - `{ costBps }`: その往復コスト (bps) で同じ期待値の規則をもう一度確かめ (RiskManager.recheckEdge)、満たさなければ発注しない。
+   *   通れば entryContext.costBps にこの値を記録する
+   * - `{ unavailable }`: 見送る (理由を risk.reject に残す。fail closed)
+   * - undefined: 追加の確認なし (承認時のコストのまま)
+   * 例外も見送り (fail closed)。どの資産クラスで見送るか・代わりのコストに落とすかはアプリが決める
+   */
+  entryQuoteCost?(inst: Instrument, side: Side, qty: string, quote: Quote): Promise<EntryQuoteCost | undefined>;
 }
+
+/** MarketExtras.entryQuoteCost の結果 */
+export type EntryQuoteCost = { costBps: number; source: "quote" | "fallback" } | { unavailable: string };
 
 export interface EngineDeps {
   config: AppConfig;
@@ -431,7 +445,7 @@ export class TradingEngine {
   private readonly rng: () => number;
   private readonly timeframes?: Timeframe[];
   /** 観測専用の戦略 id (OBSERVE_ONLY_STRATEGIES)。新規エントリーは発注せず仮想トレード (reason "observe_only") としてだけ記録する */
-  private readonly observeOnly: ReadonlySet<string>;
+  private readonly observeOnly: ObserveOnlyRules;
   /** エントリー頻度の目標 (TARGET_ENTRIES_PER_HOUR > 0 のときだけ)。無ければテンポのモードではない (従来どおり) */
   readonly tempo?: TempoController;
   /** 探索を許すか (paper、または live で TEMPO_ALLOW_LIVE_EXPLORE=true)。テンポのモードのときだけ意味を持つ */
@@ -442,6 +456,8 @@ export class TradingEngine {
   private readonly maxHoldMs?: number;
   /** 読みの管理 (THESIS_*。手組みの設定 (テスト) で未設定の項目は config の既定値) */
   readonly thesis: ThesisSettings;
+  /** 建値ストップ (BREAKEVEN_TRIGGER_R。src/engine/breakeven.ts) */
+  readonly breakeven: BreakevenSettings;
   /** 転換で決済 (REVERSAL_*。手組みの設定 (テスト) で未設定の項目は config の既定値) */
   readonly reversal: ReversalSettings;
   /** 建玉 (trade id) ごとに、転換で決済を最後に判定した確定足の開始時刻 (確定足ごとに 1 回だけ判定する。メモリのみ) */
@@ -511,7 +527,7 @@ export class TradingEngine {
     this.marketExtras = deps.marketExtras;
     this.calendar = deps.calendar;
     // 手組みの設定 (テスト) で未設定なら config の既定値と同じ扱い
-    this.observeOnly = new Set(deps.config.env.OBSERVE_ONLY_STRATEGIES ?? DEFAULT_OBSERVE_ONLY_STRATEGIES.split(","));
+    this.observeOnly = parseObserveOnly(deps.config.env.OBSERVE_ONLY_STRATEGIES ?? DEFAULT_OBSERVE_ONLY_STRATEGIES.split(","));
     const env = deps.config.env;
     // テンポと最大保有 (手組みの設定 (テスト) で未設定なら無効 = 従来どおり)
     const target = env.TARGET_ENTRIES_PER_HOUR ?? 0;
@@ -522,6 +538,7 @@ export class TradingEngine {
     const mh = env.MAX_HOLD_MINUTES ?? 0;
     if (Number.isFinite(mh) && mh > 0) this.maxHoldMs = Math.round(mh * 60_000);
     this.thesis = thesisSettingsFromEnv(env);
+    this.breakeven = breakevenSettingsFromEnv(env);
     this.reversal = reversalSettingsFromEnv(env);
     const o = deps.options ?? {};
     this.opt = {
@@ -566,6 +583,7 @@ export class TradingEngine {
       limitTakeProfit: effectiveLimitTakeProfit(env, deps.brokerSet.mode),
       // 読みの管理: 期限で答え合わせをして決済・延長する (無効なら従来の時間切れ)
       thesis: this.thesis,
+      breakeven: this.breakeven,
     });
     const { enabled: shadowEnabled, ...shadowOpts } = o.shadow ?? {};
     if (shadowEnabled !== false) {
@@ -574,7 +592,7 @@ export class TradingEngine {
         mode: deps.brokerSet.mode,
         // 仮想トレードも実際の建玉と同じ読みの管理・転換で決済で決済する (腕の学習をそろえるため)
         // 保有コストのモデル (shadow.holdingCost。省略時は再現の空売りの借入コストだけ) には実際の発注先の mode を渡す
-        options: { thesis: this.thesis, reversal: this.reversal, holdingCostMode: deps.brokerSet.mode, ...shadowOpts },
+        options: { thesis: this.thesis, breakeven: this.breakeven, reversal: this.reversal, holdingCostMode: deps.brokerSet.mode, ...shadowOpts },
         onClosed: (t) => this.onShadowClosed(t),
         onError: (where, e) => this.warnThrottled(where, this.clock.now(), "仮想トレードの処理に失敗 (取引は継続)", { error: redactedErrMsg(e) }),
       });
@@ -1933,8 +1951,9 @@ export class TradingEngine {
         continue;
       }
       const regime = this.regimeFor(view, s.primaryTimeframe, ctx);
-      if (!pos && this.observeOnly.has(s.id)) {
-        // 観測専用 (OBSERVE_ONLY_STRATEGIES): 評価とシグナルの生成は通常どおり行い、新規エントリーは発注せず
+      if (!pos && isObserveOnly(this.observeOnly, s.id, inst.assetClass)) {
+        // 観測専用 (OBSERVE_ONLY_STRATEGIES。`<id>` は全資産クラス、`<id>:<資産クラス>` はそのクラスの銘柄だけ):
+        // 評価とシグナルの生成は通常どおり行い、新規エントリーは発注せず
         // 仮想トレード (reason "observe_only") としてだけ記録する。candidates に入れないので発注・RiskManager には届かず、
         // 腕の乱数 (armWeight) も引かない。
         // 判定は腕・計画の判定 (gate) より前に置く: gate の後ろだと、腕が止まっているときは arm_disabled として
@@ -2208,7 +2227,7 @@ export class TradingEngine {
     // 注文の種類 (指値なら価格を決め、RiskManager のサイズの計算にもその価格を使う)
     const limitPrice = this.entryOrderFor(c.strategy, sig, inst) === "limit" ? this.limitPriceFor(inst, sig, q) : undefined;
     const riskSignal: Signal = limitPrice !== undefined ? { ...sig, entry: { type: "limit", price: limitPrice } } : sig;
-    const decision = this.risk.evaluateEntry({
+    const entryParams: EntryParams = {
       signal: riskSignal,
       instrument: inst,
       quote: q,
@@ -2227,7 +2246,8 @@ export class TradingEngine {
       ...(this.marketExtras?.costBpsAt && this.marketExtras.venues.includes(inst.venue)
         ? { costBpsAt: (n: number) => this.marketExtras!.costBpsAt!(sym, n) }
         : {}),
-    });
+    };
+    const decision = this.risk.evaluateEntry(entryParams);
     if (!decision.ok) {
       const key = `risk: ${normalizeReason(decision.reason)}`;
       this.shadowRecord(key, inst, view, c.strategy, sig, c.regime, now);
@@ -2236,8 +2256,36 @@ export class TradingEngine {
 
     const side = sig.direction === "long" ? "buy" : "sell";
     const intended = side === "buy" ? q.ask : q.bid;
-    // 実際の代金でのコスト (Jupiter) があればそれを記録する (要因分析のコストもそろえる)
-    const cost = decision.costBps ?? costBps(inst, q);
+    // 発注前の見積もりのコスト (取引先のフックがあるときだけ。Jupiter): 承認された数量・向きで見積もりを取り、
+    // そのコストで同じ期待値の規則をもう一度確かめる (evaluateEntry の後の追加の判定。代わりにはしない)
+    let quotedCost: number | undefined;
+    const quoteHook = this.marketExtras?.entryQuoteCost && this.marketExtras.venues.includes(inst.venue) ? this.marketExtras.entryQuoteCost : undefined;
+    if (quoteHook) {
+      let qc: EntryQuoteCost | undefined;
+      try {
+        qc = await quoteHook.call(this.marketExtras, inst, side, decision.qty, q);
+      } catch (e) {
+        qc = { unavailable: `見積もりの取得に失敗したため見送り (${redactedErrMsg(e)})` };
+      }
+      if (qc && "unavailable" in qc) {
+        this.risk.rejectAfterApproval(entryParams, qc.unavailable);
+        const key = `risk: ${normalizeReason(qc.unavailable)}`;
+        this.shadowRecord(key, inst, view, c.strategy, sig, c.regime, now);
+        return this.skip(key, `${sym} ${c.strategy.id}: ${qc.unavailable}`);
+      }
+      if (qc) {
+        const chk = this.risk.recheckEdge(entryParams, qc.costBps);
+        if (!chk.ok) {
+          const key = `risk: ${normalizeReason(chk.reason)}`;
+          this.shadowRecord(key, inst, view, c.strategy, sig, c.regime, now);
+          return this.skip(key, `${sym} ${c.strategy.id}: ${chk.reason}`);
+        }
+        decision.notes.push(`${chk.note} (${qc.source === "quote" ? "見積もり" : "代わりのモデル"})`);
+        quotedCost = qc.costBps;
+      }
+    }
+    // 見積もりのコスト、無ければ実際の代金でのコスト (Jupiter) を記録する (要因分析のコストもそろえる)
+    const cost = quotedCost ?? decision.costBps ?? costBps(inst, q);
     const entryContext: EntryContext = {
       regime: c.regime,
       ...(c.intel ? { intel: c.intel } : {}),

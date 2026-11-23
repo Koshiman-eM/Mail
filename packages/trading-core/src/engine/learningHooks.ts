@@ -92,6 +92,8 @@ export interface ValidatorOptions {
   thesis?: BacktestOptions["thesis"];
   /** 転換で決済 (実運用の REVERSAL_* と同じ。省略で従来どおり) */
   reversal?: BacktestOptions["reversal"];
+  /** 建値ストップ (実運用の BREAKEVEN_TRIGGER_R と同じ。省略で従来どおり) */
+  breakeven?: BacktestOptions["breakeven"];
   /** 区間数 (既定 5) */
   folds?: number;
   /** 主時間足での履歴の本数 (horizon 別) */
@@ -213,6 +215,7 @@ export function createParamValidator(o: ValidatorOptions): ParamValidator {
         ...(o.maxHoldMinutes !== undefined && o.maxHoldMinutes > 0 && !isHoldLimitedHorizon(s.horizon) ? { maxHoldMinutes: o.maxHoldMinutes } : {}),
         ...(o.thesis ? { thesis: o.thesis } : {}),
         ...(o.reversal ? { reversal: o.reversal } : {}),
+        ...(o.breakeven ? { breakeven: o.breakeven } : {}),
       });
       runs.forEach((r, i) => {
         agg[i].trades += r.trades.length;

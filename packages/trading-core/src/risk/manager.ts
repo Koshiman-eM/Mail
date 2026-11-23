@@ -486,6 +486,32 @@ export class RiskManager {
     return d;
   }
 
+  /**
+   * evaluateEntry が承認した後の追加の (より厳しい) 判定: 発注前に取った実際の見積もりの往復コスト (bps) で、
+   * 同じ期待値の規則 (edgeCheck。テンポ・純期待値の扱いも同じ) をもう一度確かめる。evaluateEntry の代わりにはしない。
+   * p は evaluateEntry に渡したものと同じ。満たさない・コストが不正なら拒否し、risk.reject を監査ログに残す
+   */
+  recheckEdge(p: EntryParams, cost: number): { ok: true; note: string } | { ok: false; reason: string } {
+    if (!Number.isFinite(cost) || cost < 0) {
+      const reason = `実際の見積もりのコストが不正 (${cost}) のため拒否`;
+      this.auditReject(p, reason);
+      return { ok: false, reason };
+    }
+    const r = this.edgeCheck(p.signal, cost, this.limits, p);
+    if (!r.ok) {
+      // 見送りの診断 (scripts/diagNoTrades.mjs) が `<期待値>bps < コスト <コスト>bps` を読めるよう、edgeCheck の理由をそのまま後ろに付ける
+      const reason = `実際の見積もりのコスト ${cost.toFixed(1)}bps で ${r.reason}`;
+      this.auditReject(p, reason);
+      return { ok: false, reason };
+    }
+    return { ok: true, note: `実際の見積もり: ${r.note}` };
+  }
+
+  /** evaluateEntry の承認後に、発注前の確認 (見積もりが取れないなど) で見送ったときの監査ログ (risk.reject) */
+  rejectAfterApproval(p: EntryParams, reason: string): void {
+    this.auditReject(p, reason);
+  }
+
   private decide(p: EntryParams): RiskDecision {
     const { signal, instrument: inst, quote, equity, available, now } = p;
     const L = this.limits;

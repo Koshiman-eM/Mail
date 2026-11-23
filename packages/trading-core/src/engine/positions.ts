@@ -18,6 +18,14 @@ import {
   type ResolveRequest, type RestingTakeProfit,
 } from "./orders";
 import { quoteMid } from "../core/util";
+import { breakevenEnabled, breakevenStopPrice, breakevenTriggered, type BreakevenSettings } from "./breakeven";
+
+/** 決済の注文に付ける保護ストップの印 (thesisStop: 読みの管理の延長後の保護ストップ / breakevenStop: 建値ストップ)。true のものだけ残す */
+type StopMarks = { thesisStop?: boolean; breakevenStop?: boolean };
+const stopMarks = (x: StopMarks | undefined): StopMarks => ({
+  ...(x?.thesisStop ? { thesisStop: true } : {}),
+  ...(x?.breakevenStop ? { breakevenStop: true } : {}),
+});
 
 /** エントリー時に決まる決済ルール (TradeJournal に無い分) */
 export interface ExitPlan {
@@ -38,8 +46,16 @@ export interface ExitPlan {
     extendedAt?: number; netRAtDeadline?: number; peak?: number; stop?: number;
     exit?: { reason: ThesisExitReason; netR?: number; at: number };
   };
-  /** 一部約定で残った分は、決済判定に該当しなくても次のティックで同じ理由で決済する (thesisStop: 延長後の保護ストップでの決済) */
-  retryExit?: { reason: ExitReason; intendedPrice: number; thesisStop?: boolean };
+  /**
+   * 建値ストップ (BREAKEVEN_TRIGGER_R。src/engine/breakeven.ts) の状態 (再起動しても続ける)。armedAt: 発動した時刻 /
+   * stop: 往復コスト込みの建値 (発動時に決めて保存。設定・手数料が変わっても緩めない。BREAKEVEN_TRIGGER_R=0 で再起動しても保護に使う)
+   */
+  breakeven?: { armedAt: number; stop: number };
+  /**
+   * 一部約定で残った分は、決済判定に該当しなくても次のティックで同じ理由で決済する
+   * (thesisStop: 延長後の保護ストップでの決済 / breakevenStop: 建値ストップでの決済)
+   */
+  retryExit?: { reason: ExitReason; intendedPrice: number; thesisStop?: boolean; breakevenStop?: boolean };
   /** 利確の指値を (もう) 板に置かない (決済のために取り消した・置けなかった) */
   noRestingTp?: boolean;
   /** 利確の指値を置こうとした回数 (取引所に拒否・取消されても無限に置き直さない) */
@@ -61,6 +77,8 @@ export interface ExitDecision {
   netR?: number;
   /** 延長後の保護ストップ (建値・トレーリング) での決済 (reason は trailing) */
   thesisStop?: boolean;
+  /** 建値ストップ (BREAKEVEN_TRIGGER_R) での決済 (reason は trailing) */
+  breakevenStop?: boolean;
   /** 延長していない建玉が延長の上限に届いた (期限で読み当たり → 同時に上限)。決済の前に延長を記録する */
   thesisExtend?: { netR: number };
 }
@@ -206,6 +224,10 @@ export interface PositionManagerDeps {
    * 有効なら、決済計画に maxHoldMs (または expectedMs) がある建玉は、期限で答え合わせをして決済・延長する
    */
   thesis?: ThesisSettings;
+  /**
+   * 建値ストップ (BREAKEVEN_TRIGGER_R。src/engine/breakeven.ts)。省略・0 なら発動しない (保存済みの建値ストップは引き続き守る)
+   */
+  breakeven?: BreakevenSettings;
 }
 
 /** 旧キー (mode なし)。paper 用として扱う */
@@ -450,7 +472,58 @@ export class PositionManager {
     }
     const t = this.thesisStop(p);
     if (t !== undefined && (long ? t > p.initialStop : t < p.initialStop) && (out === undefined || (long ? t > out : t < out))) out = t;
+    const be = this.breakevenStop(p);
+    if (be !== undefined && (long ? be > p.initialStop : be < p.initialStop) && (out === undefined || (long ? be > out : be < out))) out = be;
     return out;
+  }
+
+  // ───────── 建値ストップ ─────────
+
+  /** 発動済みの建値ストップ (発動していなければ undefined)。保存した値をそのまま使う (緩めない) */
+  private breakevenStop(p: OpenTrade): number | undefined {
+    const s = this.plans[p.id]?.breakeven?.stop;
+    return typeof s === "number" && Number.isFinite(s) && s > 0 ? s : undefined;
+  }
+
+  /**
+   * 建値ストップを発動するか判定し、発動したら決済計画に保存する (監査ログ position.breakeven_armed を建玉ごとに 1 回)。
+   * 判定は仲値: 方向 × (仲値 − エントリーの仲値 (無ければ建値)) ≥ BREAKEVEN_TRIGGER_R × 当初のリスク。
+   * ストップ = 往復コスト込みの建値 (エントリー手数料/単位 + 決済の taker・固定手数料 (1 単位換算) + 今の半スプレッド)。
+   * onQuote が決済判定の後に呼ぶ (発動した気配ではストップを判定しない = 次のティックから効く)。発動したら true
+   */
+  private armBreakeven(p: OpenTrade, quote: Pick<Quote, "bid" | "ask">, now: number): boolean {
+    const s = this.deps.breakeven;
+    if (!breakevenEnabled(s)) return false;
+    const plan = this.plans[p.id];
+    if (!plan || plan.breakeven) return false;
+    if (!(quote.bid > 0) || !(quote.ask > 0) || !(quote.ask >= quote.bid)) return false;
+    const risk = initialRiskPerUnit(p.entryPrice, p.initialStop);
+    const mid = (quote.bid + quote.ask) / 2;
+    const ref = typeof p.entryMid === "number" && Number.isFinite(p.entryMid) && p.entryMid > 0 ? p.entryMid : p.entryPrice;
+    if (!breakevenTriggered(s, p.direction, ref, risk, mid)) return false;
+    const units = D(p.qty).plus(p.exitedQty ?? 0).mul(p.contractSize).toNumber();
+    const inst = this.deps.instrumentOf?.(p.symbol);
+    // 決済の手数料率: taker + 約定ごとの固定手数料をこの建玉の約定代金で 1 単位あたりに換算 (src/core/fees.ts)
+    const exitFeeRate = inst?.takerFeeRate !== undefined && Number.isFinite(inst.takerFeeRate)
+      ? costFeeRate({ ...inst, takerFeeRate: inst.takerFeeRate }, units > 0 ? p.entryPrice * units : undefined)
+      : 0;
+    const stop = breakevenStopPrice({
+      direction: p.direction,
+      entryPrice: p.entryPrice,
+      entryFeePerUnit: units > 0 && Number.isFinite(p.entryFees) ? p.entryFees / units : 0,
+      exitFeeRate,
+      halfSpreadRate: mid > 0 ? (quote.ask - quote.bid) / 2 / mid : 0,
+    });
+    if (stop === undefined) return false;
+    this.plans[p.id] = { ...plan, breakeven: { armedAt: now, stop } };
+    this.persist();
+    const data = {
+      tradeId: p.id, symbol: p.symbol, strategyId: p.strategyId, direction: p.direction, entryPrice: p.entryPrice, entryRef: ref, mid,
+      initialStop: p.initialStop, stop, triggerR: s.triggerR, moveR: Number((((p.direction === "long" ? 1 : -1) * (mid - ref)) / risk).toFixed(4)),
+    };
+    this.deps.store?.audit({ ts: now, type: "position.breakeven_armed", data });
+    this.log.info("有利に動いたためストップを建値 (往復コスト込み) へ引き上げます", data);
+    return true;
   }
 
   // ───────── 読みの管理 ─────────
@@ -708,7 +781,9 @@ export class PositionManager {
     const trail = this.trailingStop(p);
     // 実効のトレーリングが読みの管理の保護ストップ (延長後の建値・トレーリング) か
     const ts = trail !== undefined ? this.thesisStop(p) : undefined;
-    const byThesis = ts !== undefined && trail === ts ? { thesisStop: true } : {};
+    // 実効のトレーリングが建値ストップか (読みの管理の保護ストップと同じ値なら読みの管理の印を優先)
+    const bs = trail !== undefined && !(ts !== undefined && trail === ts) ? this.breakevenStop(p) : undefined;
+    const byThesis: StopMarks = ts !== undefined && trail === ts ? { thesisStop: true } : bs !== undefined && trail === bs ? { breakevenStop: true } : {};
     const hit = (stop: number) => (long ? bid <= stop : ask >= stop);
     if (hit(p.initialStop)) {
       // 引き上げ済みのトレーリングストップを飛び越えて当初ストップまで動いた場合は、先に触れたトレーリング側で記録する
@@ -764,7 +839,7 @@ export class PositionManager {
     let reduced: OpenTrade | undefined;
     const rtp = this.tps.get(p0.id);
     if (rtp) {
-      if (rtp.exit) return this.close(symbol, rtp.exit.reason, rtp.exit.intendedPrice, now, rtp.exit.thesisStop ? { thesisStop: true } : {});
+      if (rtp.exit) return this.close(symbol, rtp.exit.reason, rtp.exit.intendedPrice, now, stopMarks(rtp.exit));
       const long = p0.direction === "long";
       const touched = quote.bid > 0 && quote.ask > 0 && (long ? quote.bid >= rtp.price : quote.ask <= rtp.price);
       const due = rtp.lastCheckedAt === undefined || now - rtp.lastCheckedAt >= this.policy.tpPollMs || rtp.status === "submitting" || rtp.status === "unknown";
@@ -781,14 +856,16 @@ export class PositionManager {
     if (d) {
       // 読みの決済は決済計画に保存して、約定するまで同じ理由で再試行する (延長の上限に先に届いた建玉は延長を記録してから)
       this.noteThesisExit(p, d, quote, now);
-      return this.close(symbol, d.reason, d.intendedPrice, now, d.thesisStop ? { thesisStop: true } : {});
+      return this.close(symbol, d.reason, d.intendedPrice, now, stopMarks(d));
     }
     // 決済に該当しないときだけ、読みの期限で利益が出ていれば延長を記録する (延長した気配では保護ストップを判定しない =
     // 延長そのもので決済しない。決済の再試行中は延長しない)
     this.markThesisExtension(p, quote, now);
+    // 建値ストップの発動も決済に該当しないときだけ (発動した気配では判定しない = 次のティックから効く)
+    this.armBreakeven(p, quote, now);
     // 一部約定で残った分
     const retry = this.plans[p.id]?.retryExit;
-    if (retry) return this.close(symbol, retry.reason, retry.intendedPrice, now, retry.thesisStop ? { thesisStop: true } : {});
+    if (retry) return this.close(symbol, retry.reason, retry.intendedPrice, now, stopMarks(retry));
     await this.placeTakeProfit(p, quote, now);
     return reduced ? { status: "reduced", position: reduced } : { status: "none" };
   }
@@ -803,7 +880,7 @@ export class PositionManager {
    * 発注が締め切りを過ぎたら状態不明の保留として扱う (保留は発注前に書き込み済み)。
    * 拒否された場合の建玉の確認は、その場で待たずに次のティック (syncPending) へ回す。
    */
-  async close(symbol: string, reason: ExitReason, intendedPrice: number, now: number, opts: { maxQty?: Decimal; thesisStop?: boolean } = {}): Promise<CloseResult> {
+  async close(symbol: string, reason: ExitReason, intendedPrice: number, now: number, opts: { maxQty?: Decimal; thesisStop?: boolean; breakevenStop?: boolean } = {}): Promise<CloseResult> {
     const p = this.get(symbol);
     if (!p) return { status: "none", reason: "ポジションがありません" };
     if (this.closing.has(p.id)) return { status: "none", reason: "決済中" };
@@ -829,7 +906,7 @@ export class PositionManager {
       // 板に置いた利確の指値があれば、先に取り消して結果 (または約定) を照会で確かめる。
       // 確定するまで成行は送らない (取消に失敗・状態不明のまま成行を送ると、利確の約定と重なって過剰決済・ドテンになりうる)
       if (this.tps.get(p.id)) {
-        const c = await this.clearTakeProfit(p, reason, intendedPrice, now, opts.thesisStop === true);
+        const c = await this.clearTakeProfit(p, reason, intendedPrice, now, stopMarks(opts));
         if (c !== "cleared") return c;
       }
       const cur = this.get(symbol);
@@ -853,7 +930,7 @@ export class PositionManager {
       };
       const o: PendingOrder = {
         clientId: req.clientId, symbol, side: req.side, qty: req.qty, kind: "exit", createdAt: now, status: "submitting", unknownCount: 0,
-        exit: { tradeId: p.id, reason, intendedPrice, ...(opts.thesisStop ? { thesisStop: true } : {}) },
+        exit: { tradeId: p.id, reason, intendedPrice, ...stopMarks(opts) },
       };
       this.pending.upsert(o);
       this.exitOrderTs.push(now);
@@ -1172,11 +1249,11 @@ export class PositionManager {
    * - 全量が利確で約定していたら closed
    * - 取消に失敗した・状態不明・取消が照会に反映されていない間は pending (成行を送らない。次のティックで照会を続ける)
    */
-  private async clearTakeProfit(p: OpenTrade, reason: ExitReason, intendedPrice: number, now: number, thesisStop = false): Promise<"cleared" | CloseResult> {
+  private async clearTakeProfit(p: OpenTrade, reason: ExitReason, intendedPrice: number, now: number, marks: StopMarks = {}): Promise<"cleared" | CloseResult> {
     const rtp = this.tps.get(p.id);
     if (!rtp) return "cleared";
     if (!rtp.exit) {
-      rtp.exit = { reason, intendedPrice, requestedAt: now, ...(thesisStop ? { thesisStop: true } : {}) };
+      rtp.exit = { reason, intendedPrice, requestedAt: now, ...stopMarks(marks) };
       this.plans[p.id] = { ...(this.plans[p.id] ?? {}), noRestingTp: true };
       this.persist();
       this.deps.store?.audit({ ts: now, type: "engine.tp_cancel", data: { symbol: p.symbol, tradeId: p.id, clientId: rtp.clientId, orderId: rtp.orderId, exitReason: reason } });
@@ -1675,6 +1752,7 @@ export class PositionManager {
     const input = {
       exitPrice: f.price, intendedExitPrice: x.intendedPrice, exitTs: now, exitReason: x.reason, fees: (f.fee ?? D(0)).toNumber(),
       ...(thesis ? { thesis } : {}),
+      ...(x.breakevenStop && x.reason === "trailing" ? { breakevenStopExit: true } : {}),
       ...(f.estimated ? { estimated: true } : {}),
       ...(f.feesByLiquidity ? { feesByLiquidity: f.feesByLiquidity } : {}),
       ...(f.exitOrderType ? { exitOrderType: f.exitOrderType } : {}),
@@ -1699,7 +1777,7 @@ export class PositionManager {
           this.log.info("利確の指値が一部約定しました。残りは指値のまま追跡を続けます", { symbol: o.symbol, filled: f.qty.toString(), remaining: remain.toString() });
         } else {
           this.plans[p.id] = {
-            ...(this.plans[p.id] ?? {}), retryExit: { reason: x.reason, intendedPrice: x.intendedPrice, ...(x.thesisStop ? { thesisStop: true } : {}) },
+            ...(this.plans[p.id] ?? {}), retryExit: { reason: x.reason, intendedPrice: x.intendedPrice, ...stopMarks(x) },
           };
           this.log.warn("決済が一部約定のみ。残りは次のティックで決済します", { symbol: o.symbol, filled: f.qty.toString(), remaining: remain.toString() });
         }

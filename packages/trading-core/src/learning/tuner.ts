@@ -206,11 +206,11 @@ export const TUNER_RULES: readonly Rule[] = [
     pick: (p) => (has(p, "tpAtr") ? { param: "tpAtr", direction: "up" } : undefined),
   },
   // 十分な含み益を吐き出した → トレーリングを詰める (無効なら利確幅を縮める)。
-  // 読みの管理の延長後の保護ストップでの決済 (thesisStopExit) は戦略のトレーリング・利確幅の結果ではないので数えない
+  // 読みの管理の延長後の保護ストップでの決済 (thesisStopExit)・建値ストップでの決済 (breakevenStopExit) は戦略のトレーリング・利確幅の結果ではないので数えない
   {
     id: "exit_sooner",
     label: "late_exit (含み益の吐き出し)",
-    evidence: (t, a) => hasCause(a, "late_exit") && t.thesisStopExit !== true,
+    evidence: (t, a) => hasCause(a, "late_exit") && t.thesisStopExit !== true && t.breakevenStopExit !== true,
     pick: (p) =>
       has(p, "trailAtr") && p.trailAtr > 0
         ? { param: "trailAtr", direction: "down" }
@@ -219,7 +219,7 @@ export const TUNER_RULES: readonly Rule[] = [
           : undefined,
   },
   // トレーリングで決済した後、実現リターン以上に有利方向へ伸びた (トレーリングが近すぎる) → トレーリングを緩める。
-  // 読みの管理の延長後の保護ストップでの決済 (thesisStopExit) は戦略のトレーリング (trailAtr) の結果ではないので数えない
+  // 読みの管理の延長後の保護ストップ (thesisStopExit)・建値ストップ (breakevenStopExit) での決済は戦略のトレーリング (trailAtr) の結果ではないので数えない
   {
     id: "trail_loosen",
     label: "トレーリング決済後にさらに伸びた",
@@ -266,10 +266,11 @@ export const TUNER_RULES: readonly Rule[] = [
 
 /**
  * 戦略のトレーリング (trailingStopPct / trailAtr) による決済か。読みの管理の延長後の保護ストップ (建値・トレーリング) での
- * 決済 (TradeRecord.thesisStopExit) は除く (トレーリングの調整の根拠にしない)
+ * 決済 (TradeRecord.thesisStopExit) と建値ストップ (BREAKEVEN_TRIGGER_R) での決済 (TradeRecord.breakevenStopExit) は除く
+ * (トレーリングの調整の根拠にしない)
  */
-export function isStrategyTrailingExit(t: Pick<TradeRecord, "exitReason" | "thesisStopExit">): boolean {
-  return t.exitReason === "trailing" && t.thesisStopExit !== true;
+export function isStrategyTrailingExit(t: Pick<TradeRecord, "exitReason" | "thesisStopExit" | "breakevenStopExit">): boolean {
+  return t.exitReason === "trailing" && t.thesisStopExit !== true && t.breakevenStopExit !== true;
 }
 
 /** 学習済みパラメータの kv キー (mode 別) */
