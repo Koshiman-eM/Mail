@@ -8,7 +8,7 @@
 
 ## セットアップ
 
-Node.js 22.13 以上が必要です (`node:sqlite` を使うため。ネイティブモジュールは使いません)。
+Node.js 22.13 以上が必要です (`node:sqlite` を使うため。ネイティブモジュールは使いません。`npm run sweep` / `npm run mcp` が使う `--env-file-if-exists` は 22.9 以上)。Windows PC で常用する場合は「[Windows PC で運用する](#windows-pc-で運用する)」を参照してください。
 
 ```bash
 cd sweepstakes
@@ -18,7 +18,9 @@ cp profile.example.json profile.json # 自分の情報に書き換える
 npm test                             # テスト (外部サイトには一切アクセスしません)
 ```
 
-`data/` (DB・スクリーンショット) と `profile.json` は `.gitignore` 済みです。
+`data/` (DB・スクリーンショット・ログ・ロックファイル)、`profile.json`、`.env` は `.gitignore` 済みです。
+
+`npm run sweep` / `npm run mcp` は `sweepstakes/.env` があれば読み込みます (Node の `--env-file-if-exists`。OS の環境変数に同じ名前があればそちらが優先)。ひな形は `.env.example`。`.env` が無いと Node が `.env not found. Continuing without it.` と表示しますが無害です。
 
 ### 環境変数
 
@@ -28,7 +30,9 @@ npm test                             # テスト (外部サイトには一切ア
 | `SWEEP_PROFILE` | `./profile.json` | プロフィールのパス |
 | `SWEEP_SCREENSHOT_DIR` | `./data/screenshots` | スクリーンショット保存先 |
 | `SWEEP_MIN_INTERVAL_SEC` / `SWEEP_MAX_INTERVAL_SEC` | `60` / `180` | 送信間隔 (この範囲でランダム) |
-| `SWEEP_DAILY_LIMIT` | `30` | 1 日 (ローカル時刻 0 時起点) の送信上限 |
+| `SWEEP_DAILY_LIMIT` | `30` | 1 日 (`SWEEP_TIMEZONE` の 0 時起点) の送信上限 |
+| `SWEEP_TIMEZONE` | `Asia/Tokyo` | 日次上限の「1 日」の境界のタイムゾーン。OS のタイムゾーンや `TZ` (Windows では効かない場合がある) に依存しません。締切 (`YYYY-MM-DD` → その日の 23:59:59) は OS のローカル時刻で判定します |
+| `SWEEP_LOCK_PATH` | DB と同じフォルダの `browser.lock` | ブラウザ操作・収集のプロセス間ロックファイル (下記) |
 | `SWEEP_HEADLESS` | `1` | `0` でブラウザを表示 |
 | `SWEEP_CHROMIUM_PATH` | なし | 使用する Chromium の実行ファイルを明示 |
 | `SWEEP_NAV_TIMEOUT_MS` | `30000` | ページ操作のタイムアウト |
@@ -272,6 +276,17 @@ SWEEP_MCP_TOKEN=$(openssl rand -hex 32) npm run mcp
 
 - `collect_sweepstakes` / `run_web_forms` は送信間隔の待機で数分〜数十分かかるため、ジョブとして実行します (メモリ内。完了済みは直近 50 件を保持。サーバー再起動で消えます)
 - ブラウザ操作・収集は同時に 1 ジョブまでです (`enter_campaign` も含む)。実行中に開始しようとするとエラーを返します
+- さらに、定期実行 (CLI の `collect` / `run` / `enter`) とはファイルロックで排他します (下記「プロセス間ロック」)。CLI 側が実行中ならジョブを作らずに「他の処理が実行中です」と返します
+
+### プロセス間ロック (`src/core/lock.ts`)
+
+収集・応募 (`collect` / `enter` / `run`) は、service 関数の入口で `data/browser.lock` (`SWEEP_LOCK_PATH`) を取得します。Linux / Windows 共通で、`flock` には依存しません。
+
+- `fs.openSync(path, "wx")` で排他的に作成し、pid・ホスト名・処理名・開始時刻を JSON で書きます。保持中は 5 分ごとに更新時刻を更新します
+- 取得できなければ**待たずに**エラー (`他の処理が実行中です`)。CLI は終了コード **75** で終わり、定期実行スクリプト (`deploy/sweep-run.sh` / `deploy/windows/run-once.ps1`) は「見送り」として正常終了します
+- 保持プロセスが存在しない、または最終更新から 2 時間を超えたロックは stale とみなして奪取します (強制終了・停電の後も自動で回復)
+- 正常終了・例外時は `finally` で、`Ctrl+C` (SIGINT) / SIGTERM / プロセス終了時はハンドラで解放します
+- MCP サーバーでは `JobManager.start` がプロセス内の排他を確認した後にロックを取得し、ジョブ終了時に解放します。ジョブ内の service 関数はロックを取り直しません (`browserLockHeld`)。`runAll` 内部の 1 件ごとの応募もロックを取り直さないので、二重取得でデッドロック・自己 busy になることはありません
 - `submit` は既定 `false` (dry-run)。サーバーの instructions でも「利用者が明示的に指示したときだけ submit=true」と伝えています
 
 ## サーバー導入 (Oracle Cloud)
@@ -309,8 +324,111 @@ Oracle Cloud の Always Free の Ampere A1 (aarch64) / Ubuntu 24.04 を想定し
 
 - 更新: `git pull` して `sudo ./deploy/setup.sh` を再実行 (env と data は上書きしません)
 - ログ: `journalctl -u sweep-mcp -f`。設定変更後は `sudo systemctl restart sweep-mcp`
-- MCP サーバーのジョブと定期実行 (`sweep-run`) は別プロセスなので、両者が同時にブラウザを動かすことはあり得ます。日次上限・送信間隔・重複は DB で判定されますが、時間帯が重なる場合は MCP からの一括応募を避けてください
+- MCP サーバーのジョブと定期実行 (`sweep-run`) は別プロセスですが、ファイルロック (`/opt/sweep/data/browser.lock`) で排他されます。重なった側は「他の処理が実行中」で即終了します (定期実行は見送り、MCP はエラーを返す)
 - メモリ 1GB 程度のシェイプではスワップを追加してください (A1 は 6GB 以上にできるので、余裕があれば 2 OCPU / 12GB 程度を推奨)
+
+## Windows PC で運用する
+
+自宅の Windows PC (Windows 11 / x64 想定) で、MCP サーバーと定期実行を常時動かす手順です。資材は `deploy/windows/` にあります (Oracle Cloud 用の `deploy/` 直下の資材はそのまま使えます)。
+
+| ファイル | 内容 |
+| --- | --- |
+| `setup.ps1` | Node.js LTS (winget `OpenJS.NodeJS.LTS`、ユーザー範囲) → `npm ci` → `npx playwright install chromium` → `data\` 作成 → `.env` 作成 (初回のみ、トークンを暗号学的乱数で 64 桁生成) → `profile.json` をひな形から作成。何度実行しても同じ結果になります |
+| `start-mcp.ps1` | MCP サーバー起動 (`npm run mcp`)。ログは `data\logs\mcp.log`。異常終了したら待って再起動 (`-Once` で 1 回だけ) |
+| `run-once.ps1` | 定期実行 1 回分: `npm run sweep -- collect --source koubo` → `npm run sweep -- run` (`SWEEP_AUTO_SUBMIT=1` のときだけ `--submit`)。ログは `data\logs\run-YYYYMMDD.log`。他の処理が実行中 (ロック) なら見送って正常終了 |
+| `start-tunnel.ps1` | cloudflared の名前付きトンネル起動 (ログ `data\logs\tunnel.log`)。終了したら待って再起動 |
+| `register-tasks.ps1` | タスク スケジューラに `SweepMcp` (ログオン時) / `SweepRun` (毎日 9:10・13:10・20:10) / `SweepTunnel` (`-Tunnel` 指定時) を登録。`-Unregister` で削除 |
+| `power.ps1` | (任意) AC 電源時のスリープ・休止を無効化。実行前に確認します。ふたを閉じたときの動作の案内 |
+| `cloudflared-config.example.yml` | 名前付きトンネルの設定例 (`/mcp*` と `/healthz` だけ `http://127.0.0.1:8787` へ、それ以外は 404) |
+
+スクリプトは Windows PowerShell 5.1 と PowerShell 7 の両方で動くように書いており、文字化け対策として UTF-8 (BOM 付き) で保存しています。
+
+### 前提
+
+- Windows 10 / 11 (x64)、winget (「アプリ インストーラー」。Windows 11 は標準で入っています)
+- このリポジトリを clone 済み (例: `C:\Users\<ユーザー名>\src\<リポジトリ>`)。パスに日本語や空白があっても動くようにしていますが、トラブルを避けるなら英数字のみのパスが無難です
+- 管理者権限は不要です (Node.js のインストーラーがユーザー範囲に対応していない場合だけ UAC の確認が出ます)
+- タスクは「ログオン中のみ」実行されます。サインアウトせず、離席時は `Win+L` でロックしてください (ロック中も動きます)
+
+### 手順
+
+以下は PowerShell で `sweepstakes` フォルダに移動してから実行します。
+
+```powershell
+cd C:\Users\<ユーザー名>\src\<リポジトリ>\sweepstakes
+```
+
+1. **セットアップ**
+   ```powershell
+   powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy\windows\setup.ps1
+   ```
+   Node.js を新しく入れた場合、PowerShell を開き直してから `node --version` で 22.13 以上になっていることを確認してください。
+2. **プロフィール**: `notepad .\profile.json` で自分の情報に書き換えて **UTF-8** で保存します (Muse から `update_profile` で登録しても構いません)
+3. **`.env` の確認**: `notepad .\.env`。`SWEEP_MCP_TOKEN` (自動生成済み) は Muse の登録に使います。**まず `SWEEP_AUTO_SUBMIT=0` (dry-run) のまま**にしてください
+4. **MCP サーバーの起動確認**
+   ```powershell
+   powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy\windows\start-mcp.ps1 -Once
+   # 別の PowerShell で
+   Invoke-RestMethod http://127.0.0.1:8787/healthz     # → ok
+   ```
+   確認できたら `Ctrl+C` で止めます。
+5. **トンネル (外部から Muse が接続できるようにする)**: Cloudflare Tunnel を使います。PC 側でポートを開ける必要はありません
+   ```powershell
+   winget install --id Cloudflare.cloudflared
+   ```
+   - **お試し (クイック トンネル)**: ドメイン不要。`cloudflared tunnel --url http://127.0.0.1:8787` を実行すると `https://<ランダム>.trycloudflare.com` が表示されます。**URL は起動するたびに変わる**ので、Muse の登録もその都度やり直しになります。常用には向きません
+   - **常用 (名前付きトンネル)**: **Cloudflare に登録したドメインが必要**です (ネームサーバーを Cloudflare に向ける)
+     ```powershell
+     cloudflared tunnel login                                # ブラウザでドメインを選んで許可
+     cloudflared tunnel create sweep                         # <UUID>.json が %USERPROFILE%\.cloudflared に作られる
+     cloudflared tunnel route dns sweep sweep.example.com    # DNS を登録
+     Copy-Item .\deploy\windows\cloudflared-config.example.yml $env:USERPROFILE\.cloudflared\config.yml
+     notepad $env:USERPROFILE\.cloudflared\config.yml        # <UUID>・ユーザー名・ドメインを書き換える
+     cloudflared tunnel ingress validate
+     cloudflared tunnel run sweep                            # 動作確認 (Ctrl+C で止める)
+     Invoke-RestMethod https://sweep.example.com/healthz     # → ok
+     ```
+   - URL パス方式 (`/mcp/<トークン>`) を使うと、トークンが URL に含まれるため **Cloudflare 側のログ・分析やクライアントの履歴に残り得ます**。Muse でヘッダーを設定できるなら `Authorization: Bearer` 方式を使ってください
+   - `<UUID>.json` と `cert.pem` はトンネルの秘密情報です。共有・コミットしないでください
+6. **Muse に登録**: 下記「Meta Muse への接続」の URL を `https://sweep.example.com/...` (クイック トンネルなら `https://<ランダム>.trycloudflare.com/...`) にして登録します
+7. **タスク登録**
+   ```powershell
+   # MCP サーバー + 定期実行 (9:10 / 13:10 / 20:10)
+   powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy\windows\register-tasks.ps1
+   # 名前付きトンネルも常駐させる / 時刻を変える場合
+   powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy\windows\register-tasks.ps1 -Tunnel -TunnelName sweep -RunTimes 08:30,12:30,21:00
+   # 確認
+   Get-ScheduledTask -TaskName Sweep* | Get-ScheduledTaskInfo
+   Start-ScheduledTask -TaskName SweepRun       # 定期実行を今すぐ試す (ログ: data\logs\run-YYYYMMDD.log)
+   ```
+   タスクは Windows PowerShell 5.1 (`powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ...`) で起動します (`-UsePwsh` で PowerShell 7)。起動時に一瞬ウィンドウが表示されることがあります。
+8. **電源設定 (任意)**: スリープすると止まるので、AC 電源時はスリープしないようにします
+   ```powershell
+   powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy\windows\power.ps1
+   ```
+   スリープ中に予定時刻を過ぎた定期実行は、復帰後に 1 回実行されます (StartWhenAvailable)。
+9. **様子を見る**: 数日は dry-run のまま、`data\logs\run-*.log` とスクリーンショット (`data\screenshots\`) を確認します。問題なければ `.env` で `SWEEP_AUTO_SUBMIT=1` にします (次回の定期実行から反映。MCP サーバーの再起動は不要)
+
+### 更新
+
+```powershell
+Stop-ScheduledTask -TaskName SweepMcp
+git pull
+npm ci
+Start-ScheduledTask -TaskName SweepMcp
+```
+
+依存関係・Chromium のバージョンが変わった場合は `setup.ps1` を再実行してください (`.env` と `profile.json` は上書きしません)。`.env` を変更したら `SweepMcp` を再起動します (定期実行は次回から反映)。
+
+### トラブルシュート
+
+- **「このシステムではスクリプトの実行が無効になっている」**: 実行ポリシーです。上記のように `powershell -NoProfile -ExecutionPolicy Bypass -File ...` で起動するか、`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` を設定します。ダウンロードした zip から展開した場合は `Get-ChildItem -Recurse .\deploy\windows | Unblock-File` も実行します。会社の PC でグループ ポリシーにより制限されている場合は管理者に相談してください
+- **文字化け**: スクリプトは UTF-8 (BOM 付き) で保存しています。エディタで編集して BOM を消すと Windows PowerShell 5.1 で日本語が化けます (VS Code なら「UTF-8 with BOM」で保存)。ログ (`data\logs\*.log`) は UTF-8 (BOM なし) なので、メモ帳または `Get-Content -Encoding UTF8` で開いてください。`profile.json` も UTF-8 で保存します
+- **ポート 8787 が使用中**: `Get-NetTCPConnection -LocalPort 8787 -State Listen | Select-Object OwningProcess` で使用中のプロセスを確認し、前回の `node.exe` が残っていれば終了します。別のアプリなら `.env` の `SWEEP_MCP_PORT` と `cloudflared` の設定の両方を変えます
+- **「他の処理が実行中です」**: 定期実行と MCP のジョブが重なっただけなら正常です (後から来た側が見送り)。強制終了などでロックが残っても、保持プロセスがいなければ次回自動で回収されます (2 時間経過でも回収)。手動で消す場合は他の処理が動いていないことを確認してから `data\browser.lock` を削除します
+- **定期実行が動かない**: `Get-ScheduledTaskInfo -TaskName SweepRun` の `LastTaskResult` を確認します (`0` = 成功、`267009` = 実行中)。サインアウト中・スリープ中は動きません。Windows Update の再起動後はサインインするまで動かないので、自動ログオンを使わない場合はアクティブ時間を設定してください
+- **ログの場所**: `data\logs\mcp.log` (MCP サーバー。10MB を超えると `mcp.log.1` に退避)、`data\logs\run-YYYYMMDD.log` (定期実行)、`data\logs\tunnel.log` (cloudflared)
+- **タイムゾーン**: 日次上限の日付境界は `SWEEP_TIMEZONE` (既定 `Asia/Tokyo`) で計算するので、Windows で `TZ` を設定する必要はありません。締切は PC のローカル時刻で判定するので、PC のタイムゾーンは「(UTC+09:00) 大阪、札幌、東京」にしておいてください
 
 ## Meta Muse への接続
 
@@ -334,7 +452,7 @@ npx tsc --noEmit  # 型チェック
 ```
 
 - テストは `node:http` で `tests/fixtures/forms/` のフォーム HTML (合成データ) をローカル配信し、Playwright で検証します。ブラウザからの通信は `127.0.0.1` 以外を遮断しています
-- 検証内容: 公募ガイドの一覧/詳細パース・種別判定・締切切れ除外・403 で中止・robots Disallow で中止・取得間隔、通常フォームの入力・送信値、確認画面付き 2 段階フォーム、CAPTCHA → needs_manual、規約で自動応募禁止 → skipped、不明な必須欄 → needs_manual、dry-run で未送信、重複応募・日次上限・送信間隔、欄推定・採点・詐欺チェックの単体テスト、仮想通貨クエストの登録・更新・円換算・distribution 別期待値・ガス差し引き・時給・unknown_platform・致命フラグでの除外・`--fetch` (モック)・todo の安全注意・CLI 引数パース (`tests/quest.test.ts`)、MCP サーバー (`tests/mcpServer.test.ts`: ランダムポートで起動し SDK クライアントで接続。認証なし/誤トークン 401・Bearer/パス方式・tools/list・各ツールの往復・プロフィールの形式検証・ジョブ開始→get_job (収集はモック fetch、応募はローカルフォーム)・同時ジョブのロック・enter のタイムアウト・認証失敗のレート制限)
+- 検証内容: 公募ガイドの一覧/詳細パース・種別判定・締切切れ除外・403 で中止・robots Disallow で中止・取得間隔、通常フォームの入力・送信値、確認画面付き 2 段階フォーム、CAPTCHA → needs_manual、規約で自動応募禁止 → skipped、不明な必須欄 → needs_manual、dry-run で未送信、重複応募・日次上限・送信間隔、欄推定・採点・詐欺チェックの単体テスト、仮想通貨クエストの登録・更新・円換算・distribution 別期待値・ガス差し引き・時給・unknown_platform・致命フラグでの除外・`--fetch` (モック)・todo の安全注意・CLI 引数パース (`tests/quest.test.ts`)、MCP サーバー (`tests/mcpServer.test.ts`: ランダムポートで起動し SDK クライアントで接続。認証なし/誤トークン 401・Bearer/パス方式・tools/list・各ツールの往復・プロフィールの形式検証・ジョブ開始→get_job (収集はモック fetch、応募はローカルフォーム)・同時ジョブのロック・CLI が保持するファイルロックとの排他・enter のタイムアウト・認証失敗のレート制限)、プロセス間ファイルロック (`tests/lock.test.ts`: 二重取得・stale 奪取 (pid 不在 / 時間超過)・ハートビート・例外時/プロセス終了時/SIGINT での解放・collect/enter/run の入口での取得・runAll の自己 busy なし・JobManager との整合・日本時間の日付境界・Windows 向けの rename 再試行)
 
 ## 構成
 
@@ -345,7 +463,7 @@ src/
   mcp/
     server.ts         MCP サーバー (Streamable HTTP・認証・healthz)
     tools.ts          ツール定義 (service.ts の薄いラッパー)
-    jobs.ts           メモリ内ジョブ管理と排他ロック
+    jobs.ts           メモリ内ジョブ管理と排他 (プロセス間ロックの取得・解放も行う)
     auth.ts           トークン検証・認証失敗のレート制限
     profileStore.ts   profile.json の部分更新・形式検証
   core/
@@ -354,6 +472,7 @@ src/
     quest.ts          仮想通貨クエストの入力検証・円換算・ページ情報抽出・並び順 (純粋関数)
     types.ts          Campaign / Entry / Profile など
     config.ts         環境変数
+    lock.ts           プロセス間ファイルロック (data/browser.lock)
     db.ts             node:sqlite の保存層 (URL で重複排除)
     profile.ts        profile.json の読み込み・検証
     collector.ts      Collector インターフェースと例示用 HTML パーサー
@@ -366,6 +485,8 @@ src/
     score.ts          採点・詐欺チェック (純粋関数)
     todo.ts           「今日やること」(純粋関数)
 deploy/               Oracle Cloud 向け導入資材 (setup.sh・systemd・Caddyfile・env.example)
+  windows/            Windows PC 向け (setup / run-once / start-mcp / start-tunnel / register-tasks / power .ps1、cloudflared 設定例)
+.env.example          .env のひな形 (Windows 向けの値例)
 tests/
   fixtures/           合成 HTML
   helpers/            ローカル HTTP サーバー・テスト用コンテキスト
