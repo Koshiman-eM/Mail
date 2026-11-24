@@ -18,6 +18,7 @@ export interface StructureSettings {
  * 既定の対象 (トレンド・ブレイク系)。目線の方向に乗ること自体が前提なので、目線と逆向きのシグナルを除くフィルターと噛み合う。
  * - scalp_momentum_burst / scalp_micro: 1m の勢い・ブレイクに乗る
  * - short_ema_trend / short_breakout: EMA の順張り・チャネルのブレイク
+ * - mid_trend_follow: 4 時間足の EMA の順張り (廃止前と同じく対象。上位足は 1d。hub に 1d が無ければ 4h から確定分だけ集約する)
  */
 export const DEFAULT_STRUCTURE_TARGETS: readonly string[] = DEFAULT_STRUCTURE_STRATEGIES.split(",");
 

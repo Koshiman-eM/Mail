@@ -30,7 +30,7 @@
  *   決済する (理由 reversal、約定は時間切れと同じ 決済側の気配 ∓ 約定ずれ)。足は呼び出し側 (engine) が hub の確定足をそのまま渡す
  *   (hub は全戦略の時間足と転換で決済の時間足を持つので、1m 以外もリサンプルしない)。その時間足の足が無い・エントリーより新しい足しか無いときは判定しない。
  *   損切り・利確・読みの管理 (ティックごと) が先。reversalTf の無い古い記録・無効のときは従来どおり。
- * - 決済を自分で管理する戦略 (options.managesOwnExit が true を返す戦略 id。Strategy.managesOwnExit = trend_4h): 実際の建玉と同じく
+ * - 決済を自分で管理する戦略 (options.managesOwnExit が true を返す戦略 id。Strategy.managesOwnExit = trend_4h・mid_trend_follow): 実際の建玉と同じく
  *   読みの管理・転換で決済・建値ストップを使わない (損切り・利確・maxHoldMs の時間切れだけ。戦略の決済シグナルは仮想トレードでは再現しない)。
  * - 建値ストップ (options.breakeven の triggerR > 0。src/engine/breakeven.ts): 実際の建玉と同じ規則。気配の仲値が entryMid から
  *   triggerR × 1R 有利に動いたら、保護ストップを往復コスト込みの建値 (エントリーの約定 (仲値 ± 半スプレッド ± 約定ずれ)・

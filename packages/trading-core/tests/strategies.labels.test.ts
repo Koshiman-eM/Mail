@@ -45,11 +45,15 @@ describe("戦略の表示名 (表示専用。id は変えない)", () => {
     expect(strategyLabelWithId("unknown_x")).toBe("unknown_x");
     expect(strategyLabelWithId("short_breakout")).toBe("短期・ブレイクアウト (1 時間足) [short_breakout]");
     // 廃止した戦略 (古い記録の腕・取引) は id のまま表示する
-    for (const id of ["mid_trend_follow", "long_momentum", "meme_momentum"]) {
+    for (const id of ["long_momentum", "meme_momentum"]) {
       expect(strategyLabel(id)).toBe(id);
       expect(strategyLabelWithId(id)).toBe(id);
     }
     expect(armLabel("long_momentum|trend_up|crypto")).toBe("long_momentum / 上昇トレンド / crypto");
+    // 戻した mid_trend_follow は表示名に戻る (腕のキー・id は同じ)。中期の 2 戦略は表示名で見分けられる
+    expect(strategyLabelWithId("mid_trend_follow")).toBe("中期・EMA+MACD トレンド (4 時間足) [mid_trend_follow]");
+    expect(strategyLabelWithId("trend_4h")).toBe("中期・ブレイクアウト トレンド (4 時間足) [trend_4h]");
+    expect(armLabel("mid_trend_follow|trend_up|crypto")).toBe("中期・EMA+MACD トレンド (4 時間足) / 上昇トレンド / crypto");
     expect(Object.keys(STRATEGY_LABELS).sort()).toEqual(ALL_STRATEGIES.map((s) => s.id).sort());
   });
 

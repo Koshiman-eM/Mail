@@ -143,7 +143,8 @@ describe("backtest コマンド", () => {
     expect(one[0].metrics).toBeDefined();
     const all = await runBacktestCommand({ strategy: "all", days: 1, source: "synthetic", seed: 1 });
     expect(all.map((r) => r.strategyId)).toContain("pullback_15m");
-    expect(all).toHaveLength(12);
+    expect(all).toHaveLength(13);
+    expect(all.map((r) => r.strategyId)).toContain("mid_trend_follow");
     expect(all.find((r) => r.strategyId === "scalp_obi")?.note).toMatch(/板情報/);
     const table = formatBacktestRows(all);
     expect(table).toContain("勝率");

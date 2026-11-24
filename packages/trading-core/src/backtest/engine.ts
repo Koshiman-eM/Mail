@@ -67,7 +67,7 @@ import type { BacktestOptions, BacktestResult, BacktestStats, IntelSource, Sizer
  *     ストップ = 往復コスト込みの建値 (エントリー手数料/単位 + 決済の taker・固定手数料 (1 単位換算) + 半スプレッド)。
  *   - バー i の損切りの判定の後に発動するので、ストップはバー i+1 から効く (先読みしない)。一度上げたら戻さない。
  *     実効のストップは当初・トレーリング・読みの管理の保護ストップ・建値ストップのうち最もきついもの。理由は trailing (breakevenStopExit)。
- * 決済を自分で管理する戦略 (strategy.managesOwnExit。trend_4h): opts.maxHoldMinutes・thesis・breakeven・reversal を使わない
+ * 決済を自分で管理する戦略 (strategy.managesOwnExit。trend_4h・mid_trend_follow): opts.maxHoldMinutes・thesis・breakeven・reversal を使わない
  *   (当初の損切り・戦略の決済シグナル・シグナルの maxHoldMs の時間切れ・トレーリングは従来どおり)。
  * 転換で決済 (opts.reversal。省略・無効・戦略が対象外なら従来どおり。ライブの REVERSAL_* と同じ src/engine/reversalExit.ts の規則):
  *   - 判定の時間足 (REVERSAL_EXIT_TF。lower = 主時間足の 1 つ下、same = 主時間足) が確定したバー i の終値で、
@@ -212,7 +212,7 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
   /** 約定ごとの固定手数料 (Jupiter のネットワーク手数料。クオート通貨建て。無ければ 0 = 従来どおり) */
   const fixedFee = D(fixedFeeOf(instrument));
   const limitOpts = opts.limitOrders;
-  // 決済を自分で管理する戦略 (Strategy.managesOwnExit。trend_4h): 最大保有の上限・読みの管理・建値ストップ・転換で決済を掛けない
+  // 決済を自分で管理する戦略 (Strategy.managesOwnExit。trend_4h・mid_trend_follow): 最大保有の上限・読みの管理・建値ストップ・転換で決済を掛けない
   // (ライブの PositionManager・engine・仮想トレードと同じ。当初の損切り・戦略の決済シグナル・maxHoldBars の時間切れは従来どおり)
   const ownExit = strategy.managesOwnExit === true;
   // 最大保有 (ライブの MAX_HOLD_MINUTES と同じ前提)。無効なら undefined (シグナルのまま)

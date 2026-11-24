@@ -5,11 +5,12 @@ import { scalpRebound } from "./scalpRebound";
 import { pullback15m, pullback5m, scalpPullback } from "./scalpPullback";
 import { shortBreakout, shortEmaTrend, shortRsiRevert } from "./short";
 import { trend4h } from "./trend";
+import { midTrendFollow } from "./mid";
 import { applyStructure, type StructureSettings } from "../structure/settings";
 
 /**
- * 全戦略 (登録順 = スキャルピング → 短期 → 中期)。廃止した戦略 (中期・長期・ミーム) は src/strategies/retired.ts
- * (保有中の建玉・学習データ・古い .env の互換のための情報だけ)
+ * 全戦略 (登録順 = スキャルピング → 短期 → 中期)。中期は trend_4h と、廃止から戻した mid_trend_follow (同じ id で学習データを引き継ぐ)。
+ * 廃止した戦略 (長期・ミーム) は src/strategies/retired.ts (保有中の建玉・学習データ・古い .env の互換のための情報だけ)
  */
 export const ALL_STRATEGIES: readonly Strategy[] = [
   scalpObi,
@@ -24,6 +25,7 @@ export const ALL_STRATEGIES: readonly Strategy[] = [
   pullback5m,
   pullback15m,
   trend4h,
+  midTrendFollow,
 ];
 
 /**

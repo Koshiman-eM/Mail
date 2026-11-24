@@ -97,12 +97,18 @@ describe("OBSERVE_ONLY_STRATEGIES (観測専用の戦略)", () => {
     expect(loadConfig({ OBSERVE_ONLY_STRATEGIES: "" }).env.OBSERVE_ONLY_STRATEGIES).toEqual([]);
     expect(loadConfig({ OBSERVE_ONLY_STRATEGIES: "  " }).env.OBSERVE_ONLY_STRATEGIES).toEqual([]);
   });
-  it("古い .env の廃止した戦略 id (mid_trend_follow など) は起動を止めずに読み込み、警告する (未登録の id とは文言を分ける)", () => {
+  it("古い .env の廃止した戦略 id (long_momentum など) は起動を止めずに読み込み、警告する (未登録の id とは文言を分ける)", () => {
     const ids = ALL_STRATEGIES.map((s) => s.id);
-    const env = loadConfig({ OBSERVE_ONLY_STRATEGIES: "scalp_rebound,mid_trend_follow,long_momentum" }).env;
-    expect(env.OBSERVE_ONLY_STRATEGIES).toEqual(["scalp_rebound", "mid_trend_follow", "long_momentum"]);
+    const env = loadConfig({ OBSERVE_ONLY_STRATEGIES: "scalp_rebound,long_momentum,meme_momentum" }).env;
+    expect(env.OBSERVE_ONLY_STRATEGIES).toEqual(["scalp_rebound", "long_momentum", "meme_momentum"]);
     expect(strategyIdListWarnings("OBSERVE_ONLY_STRATEGIES", env.OBSERVE_ONLY_STRATEGIES, ids)).toEqual([
-      "OBSERVE_ONLY_STRATEGIES に廃止した戦略 id があります (無視されます): mid_trend_follow, long_momentum",
+      "OBSERVE_ONLY_STRATEGIES に廃止した戦略 id があります (無視されます): long_momentum, meme_momentum",
+    ]);
+    // mid_trend_follow は同じ id で戻した (登録している戦略): 古い .env に残っていても警告しない
+    const old = loadConfig({ OBSERVE_ONLY_STRATEGIES: "scalp_rebound,mid_trend_follow,long_momentum" }).env;
+    expect(old.OBSERVE_ONLY_STRATEGIES).toEqual(["scalp_rebound", "mid_trend_follow", "long_momentum"]);
+    expect(strategyIdListWarnings("OBSERVE_ONLY_STRATEGIES", old.OBSERVE_ONLY_STRATEGIES, ids)).toEqual([
+      "OBSERVE_ONLY_STRATEGIES に廃止した戦略 id があります (無視されます): long_momentum",
     ]);
     expect(strategyIdListWarnings("OBSERVE_ONLY_STRATEGIES", ["scalp_rebound", "scalp_rebond", "meme_momentum"], ids)).toEqual([
       "OBSERVE_ONLY_STRATEGIES に廃止した戦略 id があります (無視されます): meme_momentum",

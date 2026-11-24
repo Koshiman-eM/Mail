@@ -80,11 +80,14 @@ describe("trend_4h: 登録と既定値", () => {
     expect(trend4h.warmup).toBe(trendWarmupBars(20, 50, 6));
     expect(trend4h.warmup).toBeGreaterThanOrEqual(Math.max(20, 50 + 6) + 20);
     expect(DEFAULT_STRUCTURE_TARGETS).not.toContain("trend_4h");
-    expect(strategyLabel("trend_4h")).toBe("中期・トレンドフォロー (4 時間足)");
+    expect(strategyLabel("trend_4h")).toBe("中期・ブレイクアウト トレンド (4 時間足)");
     expect(managesOwnExit("trend_4h")).toBe(true);
     expect(managesOwnExit("short_breakout")).toBe(false);
+    // 戻した mid_trend_follow も自前の決済 (廃止前の動き)
+    expect(managesOwnExit("mid_trend_follow")).toBe(true);
     // 未知・廃止した id は従来どおり (false)
-    expect(managesOwnExit("mid_trend_follow")).toBe(false);
+    expect(managesOwnExit("long_momentum")).toBe(false);
+    expect(managesOwnExit("meme_momentum")).toBe(false);
     expect(managesOwnExit("nope")).toBe(false);
     expect(managesOwnExit(undefined)).toBe(false);
   });

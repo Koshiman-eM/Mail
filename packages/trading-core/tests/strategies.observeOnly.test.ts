@@ -50,10 +50,10 @@ describe("observeOnlyWarnings", () => {
 
   it("未登録・廃止した id (クラス付きでも)・使えない資産クラス・id の無い指定を警告する", () => {
     const w = observeOnlyWarnings(
-      "OBSERVE_ONLY_STRATEGIES", ["short_ema_trend:fx", "short_ema_trnd:meme", "mid_trend_follow:crypto", "scalp_micro:memes", ":meme"], KNOWN, ["crypto", "meme"],
+      "OBSERVE_ONLY_STRATEGIES", ["short_ema_trend:fx", "short_ema_trnd:meme", "long_momentum:crypto", "scalp_micro:memes", ":meme"], KNOWN, ["crypto", "meme"],
     );
     expect(w).toEqual([
-      "OBSERVE_ONLY_STRATEGIES に廃止した戦略 id があります (無視されます): mid_trend_follow",
+      "OBSERVE_ONLY_STRATEGIES に廃止した戦略 id があります (無視されます): long_momentum",
       "OBSERVE_ONLY_STRATEGIES に未登録の戦略 id があります (無視されます): short_ema_trnd",
       "OBSERVE_ONLY_STRATEGIES に使えない資産クラスの指定があります (無視されます。使えるのは crypto / meme): short_ema_trend:fx, scalp_micro:memes",
       "OBSERVE_ONLY_STRATEGIES に戦略 id の無い指定があります (無視されます): :meme",

@@ -126,7 +126,8 @@ describe("buildRuntime", () => {
     expect(rt.instruments.map((i) => i.symbol)).toEqual(["BTC/USDT", "PEPE/USDT"]);
     expect(rt.feeds).toHaveLength(1);
     expect(rt.feeds[0]).toBeInstanceOf(ClosedCandleCacheFeed);
-    expect(rt.timeframes).toEqual(["1m", "5m", "15m", "1h", "4h"]);
+    // 1d は相場構造のフィルター (既定で mid_trend_follow を対象にする) の 4h の上位足 (MTF)
+    expect(rt.timeframes).toEqual(["1m", "5m", "15m", "1h", "4h", "1d"]);
     expect(rt.brokerSet.paper).toBeInstanceOf(PaperBroker);
     expect(rt.ai).toBeUndefined();
   });
@@ -165,7 +166,7 @@ describe("buildRuntime", () => {
         MAX_EXPOSURE_FX: "5", MAX_EXPOSURE_STOCK: "-1",
         OBSERVE_ONLY_STRATEGIES: "scalp_rebound,mid_trend_follow,long_momentum",
         STRUCTURE_STRATEGIES: "scalp_micro,mid_trend_follow,meme_momentum",
-        REVERSAL_EXIT_STRATEGIES: "short_breakout,long_momentum",
+        REVERSAL_EXIT_STRATEGIES: "short_breakout,mid_trend_follow,long_momentum",
       }),
       { clock: mkClock(), store: new MemoryStore(), intelSources: [], ai: null, syntheticHistoryMs: 86_400_000, logger },
     );
@@ -174,9 +175,11 @@ describe("buildRuntime", () => {
     expect(warns.some((w) => w.startsWith("VENUES の gmo, oanda, alpaca, dex は廃止した取引先のため無視します"))).toBe(true);
     expect(warns.filter((w) => w.startsWith("廃止した取引先の WATCHLIST の銘柄を無視します"))).toHaveLength(3); // gmo・alpaca・dex
     expect(warns.filter((w) => /^WATCHLIST の ".*" は廃止した資産クラス/.test(w))).toHaveLength(3); // fx 2 件・stock 1 件
-    expect(warns).toContain("OBSERVE_ONLY_STRATEGIES に廃止した戦略 id があります (無視されます): mid_trend_follow, long_momentum");
-    expect(warns).toContain("STRUCTURE_STRATEGIES に廃止した戦略 id があります (無視されます): mid_trend_follow, meme_momentum");
+    expect(warns).toContain("OBSERVE_ONLY_STRATEGIES に廃止した戦略 id があります (無視されます): long_momentum");
+    expect(warns).toContain("STRUCTURE_STRATEGIES に廃止した戦略 id があります (無視されます): meme_momentum");
     expect(warns).toContain("REVERSAL_EXIT_STRATEGIES に廃止した戦略 id があります (再起動前に建てたその戦略の建玉にだけ効きます): long_momentum");
+    // mid_trend_follow は同じ id で戻した (登録している戦略): どの一覧に書いても警告しない
+    expect(warns.filter((w) => w.includes("mid_trend_follow"))).toEqual([]);
   });
 
   it("古い .env の VENUES=gmo だけ: ccxt (CCXT_EXCHANGE、既定 bitbank) の相場の paper で起動する (gmo の WATCHLIST は無視)", async () => {

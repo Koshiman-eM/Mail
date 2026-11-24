@@ -149,9 +149,11 @@ export const DEFAULT_OBSERVE_ONLY_STRATEGIES = "scalp_rebound,short_ema_trend:me
 /**
  * 相場構造 (ダウ理論) のフィルターを掛ける戦略の既定値 (トレンド・ブレイク系だけ)。
  * 逆張り (scalp_vwap_revert, short_rsi_revert)・板 (scalp_obi)・下降中の反発買い (scalp_rebound) は、
- * 目線と逆向きに入ること自体が設計なので対象外 (src/structure/settings.ts)
+ * 目線と逆向きに入ること自体が設計なので対象外 (src/structure/settings.ts)。
+ * mid_trend_follow は廃止前 (commit 299e971 より前) と同じく対象 (戻した戦略の動きと学習データの前提をそろえる)。
+ * trend_4h は自前の EMA の傾きを持つので対象外
  */
-export const DEFAULT_STRUCTURE_STRATEGIES = "scalp_momentum_burst,scalp_micro,short_ema_trend,short_breakout";
+export const DEFAULT_STRUCTURE_STRATEGIES = "scalp_momentum_burst,scalp_micro,short_ema_trend,short_breakout,mid_trend_follow";
 
 /** 列挙値の環境変数 (大文字小文字は問わない)。未設定・空は def。それ以外は起動を止める */
 const choice = <T extends string>(key: string, values: readonly T[], def: T) =>

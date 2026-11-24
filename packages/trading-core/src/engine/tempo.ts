@@ -73,7 +73,7 @@ export function isHoldLimitedHorizon(horizon: string | undefined): boolean {
 
 /**
  * 戦略が最大保有 (MAX_HOLD_MINUTES) で新規エントリーしない (観測専用の hold_limit にする) か。
- * 決済を自分で管理する戦略 (Strategy.managesOwnExit。trend_4h) は最大保有の上限を受けないので、時間軸が中期・長期でも対象外
+ * 決済を自分で管理する戦略 (Strategy.managesOwnExit。trend_4h・mid_trend_follow) は最大保有の上限を受けないので、時間軸が中期・長期でも対象外
  */
 export function isHoldLimitedStrategy(s: { horizon: string; managesOwnExit?: true }): boolean {
   return s.managesOwnExit !== true && isHoldLimitedHorizon(s.horizon);

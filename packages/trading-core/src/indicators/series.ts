@@ -107,6 +107,22 @@ export function rsiLast(values: readonly number[], period = 14): number {
   return last(rsi(values, period));
 }
 
+export interface MacdResult {
+  macd: number[];
+  signal: number[];
+  hist: number[];
+}
+
+/** MACD。シグナル線は MACD 線の有効区間に対する EMA (mid_trend_follow が使う) */
+export function macd(values: readonly number[], fast = 12, slow = 26, signal = 9): MacdResult {
+  const ef = ema(values, fast);
+  const es = ema(values, slow);
+  const line = values.map((_, i) => ef[i] - es[i]);
+  const sig = ema(line, signal);
+  const hist = line.map((m, i) => m - sig[i]);
+  return { macd: line, signal: sig, hist };
+}
+
 // ───────────────────────── ボラティリティ・レンジ ─────────────────────────
 
 /** True Range。先頭は high - low */

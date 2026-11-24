@@ -1,5 +1,5 @@
 /**
- * エンジン統合 (paper): 決済を自分で管理する戦略 (Strategy.managesOwnExit。trend_4h) の建玉には
+ * エンジン統合 (paper): 決済を自分で管理する戦略 (Strategy.managesOwnExit。trend_4h・mid_trend_follow) の建玉には
  * 建値ストップ・転換で決済・読みの管理・最大保有の上限 (MAX_HOLD_MINUTES) を掛けない。当初の損切り・RiskManager は掛ける。
  * 台本どおりの 1m 足と気配を返す feed (オフライン)。
  */
@@ -71,6 +71,33 @@ describe("エンジン (paper): 決済を自分で管理する戦略", () => {
     await close(w);
   }, 60_000);
 
+  it("標準のトレーリング (シグナルの trailingStopPct。mid_trend_follow が使う) は掛かる: 上乗せが全部有効でも trailing で決済", async () => {
+    // probe に 1% のトレーリングを付ける (mid_trend_follow は trailAtr × ATR の幅をシグナルに付ける。trend_4h は付けない)
+    const base = ownProbe();
+    const trailing: Strategy = {
+      ...base,
+      evaluate(ctx) {
+        const s = base.evaluate(ctx);
+        return s && s.direction !== "flat" ? { ...s, trailingStopPct: 0.01 } : s;
+      },
+    };
+    const w = await runtime(scenarioBars(LONG_PROFIT, TAIL), trailing, { MAX_HOLD_MINUTES: "5" });
+    for (let s = 0; s < 8 && w.rt.engine.positions.list().length === 0; s++) await w.tickTo(barTs(H) + 1_000 + s * 5_000);
+    const p = w.rt.engine.positions.list()[0];
+    expect(w.rt.engine.positions.planOf(p.id)).toMatchObject({ trailingStopPct: 0.01, maxHoldMs: 120 * M });
+    await run(w, H + 1, H + LONG_PROFIT.length + TAIL.length - 1);
+    const [t] = w.store.listTrades();
+    expect(t.exitReason).toBe("trailing");
+    // 高値 (104 台) から 1% 下 = 含み益で決済 (当初の損切り 97 まで持たない)
+    expect(t.exitPrice).toBeGreaterThan(102.5);
+    expect(t.breakevenStopExit).toBeUndefined();
+    expect(t.thesisStopExit).toBeUndefined();
+    expect(t.thesisOutcome).toBeUndefined();
+    expect(w.store.listAudit({ type: "position.reversal_exit" })).toHaveLength(0);
+    expect(w.store.listAudit({ type: "position.breakeven_armed" })).toHaveLength(0);
+    await close(w);
+  }, 60_000);
+
   it("同じ設定でも通常の戦略 (managesOwnExit なし) は従来どおり上乗せが掛かる (前提の確認)", async () => {
     const w = await runtime(scenarioBars(LONG_PROFIT, TAIL), probe(), { MAX_HOLD_MINUTES: "5" });
     for (let s = 0; s < 8 && w.rt.engine.positions.list().length === 0; s++) await w.tickTo(barTs(H) + 1_000 + s * 5_000);
@@ -105,14 +132,18 @@ describe("エンジン (paper): 決済を自分で管理する戦略", () => {
 });
 
 describe("status: 決済を自分で管理する戦略の表示", () => {
-  it("戦略一覧の trend_4h に「自前の決済 (…)」を出し、ほかの戦略には出さない", async () => {
+  it("戦略一覧の trend_4h・mid_trend_follow に「自前の決済 (…)」を出し、ほかの戦略には出さない", async () => {
     const { strategyStatusLines, OWN_EXIT_TAG } = await import("../src/cli");
     const lines = strategyStatusLines(loadConfig({ NODE_ENV: "test", DB_PATH: "memory" }));
     expect(OWN_EXIT_TAG).toBe("自前の決済 (建値ストップ・転換で決済・読みの管理・最大保有の上限は適用しない)");
     const trend = lines.find((l) => l.includes("[trend_4h]"))!;
-    expect(trend).toContain("中期・トレンドフォロー (4 時間足) [trend_4h] / 中期");
+    expect(trend).toContain("中期・ブレイクアウト トレンド (4 時間足) [trend_4h] / 中期");
     expect(trend).toContain(OWN_EXIT_TAG);
-    expect(lines.filter((l) => l.includes(OWN_EXIT_TAG))).toHaveLength(1);
-    expect(lines[0]).toContain("12 本");
+    // 戻した mid_trend_follow も自前の決済
+    const mid = lines.find((l) => l.includes("[mid_trend_follow]"))!;
+    expect(mid).toContain("中期・EMA+MACD トレンド (4 時間足) [mid_trend_follow] / 中期");
+    expect(mid).toContain(OWN_EXIT_TAG);
+    expect(lines.filter((l) => l.includes(OWN_EXIT_TAG))).toHaveLength(2);
+    expect(lines[0]).toContain("13 本");
   });
 });

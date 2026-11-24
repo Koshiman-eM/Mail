@@ -93,15 +93,15 @@ describe("エンジン: 観測専用の戦略", () => {
     const open = rt.engine.shadow!.list();
     expect(open).toHaveLength(1);
     expect(open[0].reason).toBe("observe_only");
-    // 観測専用でない戦略は通常どおり発注する (廃止した中長期の戦略の id も既定では特別扱いしない)
-    for (const id of ["short_ema_trend", "mid_trend_follow"]) {
+    // 観測専用でない戦略は通常どおり発注する (廃止した中長期の戦略の id も、戻した mid_trend_follow も既定では特別扱いしない)
+    for (const id of ["short_ema_trend", "long_momentum", "mid_trend_follow"]) {
       const { run: r } = await setup([buyer(id)], {});
       expect(await r(START, START + 3 * MIN), id).toBeGreaterThanOrEqual(1);
     }
   });
 
   it("起動時: OBSERVE_ONLY_STRATEGIES に廃止した戦略 id があれば警告をログに出して無視する (既定なら出さない)", async () => {
-    for (const [env, expected] of [[{ OBSERVE_ONLY_STRATEGIES: "scalp_rebound,mid_trend_follow,long_momentum" }, true], [{}, false]] as const) {
+    for (const [env, expected] of [[{ OBSERVE_ONLY_STRATEGIES: "scalp_rebound,long_momentum,meme_momentum" }, true], [{}, false], [{ OBSERVE_ONLY_STRATEGIES: "scalp_rebound,mid_trend_follow" }, false]] as const) {
       const logs: string[] = [];
       const base = createLogger("test");
       const logger = { ...base, warn: (m: string) => void logs.push(m) };
@@ -109,7 +109,10 @@ describe("エンジン: 観測専用の戦略", () => {
         loadConfig({ NODE_ENV: "test", VENUES: "synthetic", DB_PATH: "memory", BASE_CURRENCY: "JPY", ...env }),
         { clock: { now: () => START }, store: new MemoryStore(), intelSources: [], ai: null, seed: 3, syntheticHistoryMs: 86_400_000, strategies: [], logger },
       );
-      expect(logs.includes("OBSERVE_ONLY_STRATEGIES に廃止した戦略 id があります (無視されます): mid_trend_follow, long_momentum"), JSON.stringify(env)).toBe(expected);
+      expect(logs.includes("OBSERVE_ONLY_STRATEGIES に廃止した戦略 id があります (無視されます): long_momentum, meme_momentum"), JSON.stringify(env)).toBe(expected);
+      // 戻した mid_trend_follow は廃止・未登録のどちらとしても警告しない
+      expect(logs.filter((m) => m.includes("mid_trend_follow")), JSON.stringify(env)).toEqual([]);
+      expect(logs.filter((m) => m.startsWith("OBSERVE_ONLY_STRATEGIES")).length > 0, JSON.stringify(env)).toBe(expected);
       rt.close();
     }
   });

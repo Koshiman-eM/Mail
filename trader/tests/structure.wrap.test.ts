@@ -327,10 +327,11 @@ describe("設定と一覧への適用", () => {
     expect(env.STRUCTURE_STOP_ATR_BUFFER).toBe(0.3);
     const list = configuredStrategies(structureSettingsFromEnv(env));
     const wrapped = list.filter(isStructureWrapped).map((s) => s.id).sort();
+    // mid_trend_follow は廃止前と同じく対象 (戻した戦略)。trend_4h は自前の EMA の傾きを持つので対象外
     expect(wrapped).toEqual(
-      ["scalp_micro", "scalp_momentum_burst", "short_breakout", "short_ema_trend"].sort(),
+      ["mid_trend_follow", "scalp_micro", "scalp_momentum_burst", "short_breakout", "short_ema_trend"].sort(),
     );
-    for (const id of ["scalp_obi", "scalp_vwap_revert", "short_rsi_revert", "scalp_rebound"]) {
+    for (const id of ["scalp_obi", "scalp_vwap_revert", "short_rsi_revert", "scalp_rebound", "trend_4h"]) {
       expect(list.find((s) => s.id === id)).toBe(getStrategy(id));
     }
     expect(list.map((s) => s.id)).toEqual(ALL_STRATEGIES.map((s) => s.id));
@@ -377,9 +378,13 @@ describe("組み立て (buildRuntime)", () => {
     const on = await buildRuntime(loadConfig(base), {
       clock, store: new MemoryStore(), intelSources: [], ai: null, seed: 3, syntheticHistoryMs: 2 * 86_400_000,
     });
-    expect(on.engine.strategies.filter(isStructureWrapped).length).toBe(4);
-    // hub の時間足は上位足を含む (従来と同じ一覧に収まる)
-    expect(on.timeframes).toEqual(rt.timeframes);
+    expect(on.engine.strategies.filter(isStructureWrapped).length).toBe(5);
+    // hub の時間足は上位足を含む。従来の一覧に無いのは mid_trend_follow (4h) の上位足 1d だけ
+    expect(on.timeframes).toEqual([...rt.timeframes, "1d"]);
+    // ラップしても決済を自分で管理する戦略のまま
+    const mid = on.engine.strategies.find((s) => s.id === "mid_trend_follow")!;
+    expect(isStructureWrapped(mid)).toBe(true);
+    expect(mid.managesOwnExit).toBe(true);
   });
 
   it("フィルターで通さなかったシグナルは strategy_filter:structure_* の仮想トレードとしてだけ記録される", async () => {

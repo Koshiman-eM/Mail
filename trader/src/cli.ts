@@ -1239,7 +1239,7 @@ function observeScopeTag(rules: ReturnType<typeof parseObserveOnly>, id: string)
   return scope === undefined ? "" : scope === "全クラス" ? "観測専用" : `観測専用 (${scope})`;
 }
 
-/** 決済を自分で管理する戦略 (Strategy.managesOwnExit。trend_4h) の status の表示 */
+/** 決済を自分で管理する戦略 (Strategy.managesOwnExit。trend_4h・mid_trend_follow) の status の表示 */
 export const OWN_EXIT_TAG = "自前の決済 (建値ストップ・転換で決済・読みの管理・最大保有の上限は適用しない)";
 
 export function strategyStatusLines(config: AppConfig): string[] {

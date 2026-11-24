@@ -7,6 +7,7 @@ import {
   bollinger,
   donchian,
   ema,
+  macd,
   percentileRank,
   rsi,
   rsiLast,
@@ -55,6 +56,16 @@ describe("オシレーター", () => {
     const up = Array.from({ length: 30 }, (_, i) => 100 + i);
     expect(rsiLast(up, 14)).toBe(100);
     expect(rsiLast(up.slice().reverse(), 14)).toBe(0);
+  });
+  it("MACD = EMA(fast) - EMA(slow)、hist = MACD - signal", () => {
+    const xs = Array.from({ length: 60 }, (_, i) => 100 + Math.sin(i / 5) * 3 + i * 0.1);
+    const m = macd(xs, 12, 26, 9);
+    const ef = ema(xs, 12);
+    const es = ema(xs, 26);
+    expect(m.macd[40]).toBeCloseTo(ef[40] - es[40]);
+    expect(Number.isNaN(m.signal[25 + 7])).toBe(true);
+    expect(Number.isFinite(m.signal[25 + 8])).toBe(true);
+    expect(m.hist[50]).toBeCloseTo(m.macd[50] - m.signal[50]);
   });
 });
 

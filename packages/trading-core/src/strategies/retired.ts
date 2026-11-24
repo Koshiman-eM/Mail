@@ -1,5 +1,6 @@
 /**
- * 廃止した戦略 (mid_trend_follow・long_momentum・meme_momentum)。
+ * 廃止した戦略 (long_momentum・meme_momentum)。
+ * mid_trend_follow は 2026-11 に同じ id のまま戻した (src/strategies/mid.ts。登録している戦略なのでここには載せない)。
  *
  * 戦略そのもの (評価のコード) は削除した。ここに残すのは、DB に残っているもの (学習データ・仮想トレード・
  * 再起動前に建てた建玉) と古い .env を壊さずに扱うための最小限の情報だけ。
@@ -17,7 +18,6 @@ export interface RetiredStrategyInfo {
 }
 
 export const RETIRED_STRATEGIES: Readonly<Record<string, RetiredStrategyInfo>> = {
-  mid_trend_follow: { primaryTimeframe: "4h", horizon: "mid" },
   long_momentum: { primaryTimeframe: "1d", horizon: "long" },
   meme_momentum: { primaryTimeframe: "1m", horizon: "scalp" },
 };
