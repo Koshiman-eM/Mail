@@ -38,9 +38,10 @@ const TRADER_SHAPE = {
   GECKO_CALLS_PER_MIN: ranged("GECKO_CALLS_PER_MIN", 10, 1, 30),
   /**
    * 固定の監視銘柄 (カンマ区切り。mint のアドレスか symbol。symbol は tokens/v2/search で mint を引く)。
-   * SOL・JUP は資産クラス crypto、それ以外は meme。既定 SOL,JUP,BONK,WIF,POPCAT,MEW
+   * 主要銘柄 (SOL・JUP・cbBTC・WBTC・WETH・JTO・PYTH・RAY。src/market/jupiter/discovery.ts の MAJOR_TOKENS) は資産クラス crypto、
+   * それ以外は meme。既定 SOL,JUP,cbBTC,WBTC,WETH,JTO,PYTH,RAY,BONK,WIF,POPCAT,MEW (src/engine/jupiterWatch.ts の DEFAULT_JUPITER_TOKENS と同じ)
    */
-  JUPITER_TOKENS: str("SOL,JUP,BONK,WIF,POPCAT,MEW"),
+  JUPITER_TOKENS: str("SOL,JUP,cbBTC,WBTC,WETH,JTO,PYTH,RAY,BONK,WIF,POPCAT,MEW"),
   /** ミームコインの自動探索 (toptrending / toporganicscore の 1h → 選別 → 監視銘柄に期限つきで追加。既定 true) */
   JUPITER_DISCOVERY: bool("JUPITER_DISCOVERY", true),
   /** 自動探索の間隔 (分、5〜1440、既定 20) */

@@ -31,6 +31,23 @@ export interface CcxtFeedOptions {
   quoteFilter?: string[];
   /** 現在時刻 (テスト用。既定 Date.now) */
   now?: () => number;
+  /** fetchOHLCV の 1 回の本数の上限 (既定は CCXT_OHLCV_MAX_LIMIT の取引所の値。無ければ切り詰めない) */
+  ohlcvMaxLimit?: number;
+}
+
+/**
+ * 取引所の fetchOHLCV の 1 回の本数の上限 (公開 API の仕様。ccxt も多くは自分で切り詰めるが、超えると拒否する取引所もあるので先に切り詰める)。
+ * 足りない分はバックテストのページング (fetchCandlesPaged: since を進めて続きを取る) が取る。
+ * kraken は since によらず直近 720 本しか返さない (長い履歴には向かない)
+ */
+export const CCXT_OHLCV_MAX_LIMIT: Readonly<Record<string, number>> = {
+  binance: 1000, bybit: 1000, okx: 300, kraken: 720, coinbase: 300, bitget: 1000, kucoin: 1500, gate: 1000, mexc: 1000,
+};
+
+/** ccxt に登録された取引所の id の一覧 (読み込むだけ。通信しない) */
+export function ccxtExchangeIds(): string[] {
+  const ccxt = createRequire(import.meta.url)("ccxt") as { exchanges?: unknown };
+  return Array.isArray(ccxt.exchanges) ? (ccxt.exchanges as string[]) : [];
 }
 
 const toNumber = (v: unknown): number | undefined => {
@@ -106,7 +123,9 @@ export class CcxtFeed implements MarketDataFeed {
   static create(exchangeId: string, opts: CcxtFeedOptions = {}): CcxtFeed {
     const ccxt = createRequire(import.meta.url)("ccxt") as Record<string, any>;
     const Ctor = ccxt[exchangeId];
-    if (typeof Ctor !== "function") throw new Error(`ccxt に取引所 ${exchangeId} がありません`);
+    if (typeof Ctor !== "function" || (Array.isArray(ccxt.exchanges) && !ccxt.exchanges.includes(exchangeId))) {
+      throw new Error(`ccxt に取引所 ${exchangeId} がありません`);
+    }
     return new CcxtFeed(new Ctor({ enableRateLimit: true }) as CcxtLike, opts);
   }
 
@@ -140,7 +159,8 @@ export class CcxtFeed implements MarketDataFeed {
         symbol, tf, limit, since,
       );
     }
-    const rows = await this.exchange.fetchOHLCV(symbol, t, since, limit);
+    const cap = this.opts.ohlcvMaxLimit ?? CCXT_OHLCV_MAX_LIMIT[this.exchange.id];
+    const rows = await this.exchange.fetchOHLCV(symbol, t, since, cap !== undefined && cap > 0 ? Math.min(limit, cap) : limit);
     return rows
       .map((r) => ({ ts: Number(r[0]), open: Number(r[1]), high: Number(r[2]), low: Number(r[3]), close: Number(r[4]), volume: Number(r[5] ?? 0) }))
       .filter((c) => Number.isFinite(c.close))

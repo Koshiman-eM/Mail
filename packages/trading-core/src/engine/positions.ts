@@ -228,6 +228,12 @@ export interface PositionManagerDeps {
    * 建値ストップ (BREAKEVEN_TRIGGER_R。src/engine/breakeven.ts)。省略・0 なら発動しない (保存済みの建値ストップは引き続き守る)
    */
   breakeven?: BreakevenSettings;
+  /**
+   * 建玉の持ち主の戦略が決済を自分で管理するか (Strategy.managesOwnExit。engine が戦略 id で引く。未知・廃止した id は false)。
+   * true の建玉には建値ストップを発動せず、読みの管理を使わない (時間切れは従来どおり maxHoldMs)。
+   * 当初の損切り・利確・保存済みのトレーリング (延長後の保護ストップ・建値ストップが既にあればそれも) は従来どおり守る
+   */
+  managesOwnExit?: (strategyId: string) => boolean;
 }
 
 /** 旧キー (mode なし)。paper 用として扱う */
@@ -477,6 +483,15 @@ export class PositionManager {
     return out;
   }
 
+  /** 持ち主の戦略が決済を自分で管理する建玉か (Strategy.managesOwnExit) */
+  ownExit(p: Pick<OpenTrade, "strategyId">): boolean {
+    try {
+      return this.deps.managesOwnExit?.(p.strategyId) === true;
+    } catch {
+      return false;
+    }
+  }
+
   // ───────── 建値ストップ ─────────
 
   /** 発動済みの建値ストップ (発動していなければ undefined)。保存した値をそのまま使う (緩めない) */
@@ -494,6 +509,8 @@ export class PositionManager {
   private armBreakeven(p: OpenTrade, quote: Pick<Quote, "bid" | "ask">, now: number): boolean {
     const s = this.deps.breakeven;
     if (!breakevenEnabled(s)) return false;
+    // 決済を自分で管理する戦略の建玉には掛けない
+    if (this.ownExit(p)) return false;
     const plan = this.plans[p.id];
     if (!plan || plan.breakeven) return false;
     if (!(quote.bid > 0) || !(quote.ask > 0) || !(quote.ask >= quote.bid)) return false;
@@ -532,6 +549,8 @@ export class PositionManager {
   private thesisOf(p: OpenTrade): { ms: number; risk: number; plan: ExitPlan } | undefined {
     const plan = this.plans[p.id];
     if (!plan) return undefined;
+    // 決済を自分で管理する戦略の建玉は読みの管理を使わない (従来の maxHoldMs の時間切れ)
+    if (this.ownExit(p)) return undefined;
     const risk = initialRiskPerUnit(p.entryPrice, p.initialStop);
     const ms = activeThesisMs(this.deps.thesis, plan.expectedMs, plan.maxHoldMs, risk);
     return ms === undefined ? undefined : { ms, risk, plan };

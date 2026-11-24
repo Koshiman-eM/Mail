@@ -3,7 +3,8 @@
  *
  * - screenTokens: Jupiter のトークン情報 (JupiterToken) を設定の条件で選ぶ。不合格の銘柄にはすべての理由 (日本語) を付ける。
  *   値が不明 (応答に無い) な条件は不合格に倒す (fail-closed)。isSus は true のときだけ付く想定なので、無ければ疑いなしとみなす。
- *   主要銘柄 (SOL・USDC・JUP など、excludeMints) はミームではないので除く。合格は入力の順 (trending の順位) のまま maxTokens 件まで。
+ *   主要銘柄 (SOL・USDC・JUP など、excludeMints) はミームではないので除く。主要銘柄の名前 (BTC・ETH・SOL など) を名乗る
+ *   別の mint のトークンは「なりすまし」(impersonation) として除く (例: BTC/USDC と表示されるミームを 8% の損切りで取引していた)。合格は入力の順 (trending の順位) のまま maxTokens 件まで。
  * - mergeWatchlist: 固定の監視銘柄 (期限なし) と、選別で合格した銘柄 (自動追加。最後に合格してから ttlMs で期限切れ) を合わせる。
  *   保有中の銘柄 (keepMints) は期限切れでも外さない (建玉の管理を続けるため)。
  * - 既定の銘柄の mint は確信のあるものだけ。いずれも `runJupiterCheck` (check.ts) で symbol と照合すること (要確認)。
@@ -15,14 +16,72 @@ export interface KnownToken {
   symbol: string;
   /** check で symbol を照合する対象 (既定の一覧はすべて要確認) */
   verify: boolean;
+  /**
+   * Jupiter のトークン情報で使われうる別の symbol (例: Wormhole の WETH は "ETH" と表示されうる)。
+   * check の照合でも一致とみなし、なりすましの判定 (impersonationFor) でもこの名前を守る
+   */
+  aliases?: readonly string[];
 }
 
-/** 主要銘柄 (ミームではない)。mint は要確認 (check で照合する) */
+/**
+ * 主要銘柄 (ミームではない。資産クラス crypto。USDC・USDT はクオート・ステーブルなので監視しない)。
+ * mint は要確認 (`jupiter check` で symbol と照合する)。SOL・USDC・JUP 以外 (USDT・cbBTC・WBTC・WETH・JTO・PYTH・RAY) は
+ * 2026-11 に追加した (要確認: 公式の資料・エクスプローラーでの照合は未了。check で mint ↔ symbol を確かめること)
+ */
 export const MAJOR_TOKENS: readonly KnownToken[] = [
   { mint: "So11111111111111111111111111111111111111112", symbol: "SOL", verify: true },
   { mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", symbol: "USDC", verify: true },
   { mint: "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN", symbol: "JUP", verify: true },
+  // 要確認: Tether USD (Solana)
+  { mint: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCecvJdx6zM", symbol: "USDT", verify: true },
+  // 要確認: Coinbase Wrapped BTC
+  { mint: "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij", symbol: "cbBTC", verify: true, aliases: ["BTC"] },
+  // 要確認: Wrapped BTC (Wormhole / Portal)
+  { mint: "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh", symbol: "WBTC", verify: true, aliases: ["BTC"] },
+  // 要確認: Wrapped Ether (Wormhole / Portal)。Jupiter では "ETH" と表示されうる
+  { mint: "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs", symbol: "WETH", verify: true, aliases: ["ETH"] },
+  // 要確認: Jito
+  { mint: "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL", symbol: "JTO", verify: true },
+  // 要確認: Pyth Network
+  { mint: "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3", symbol: "PYTH", verify: true },
+  // 要確認: Raydium
+  { mint: "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R", symbol: "RAY", verify: true },
 ];
+
+/** 監視しない主要銘柄 (クオート・ステーブル) の symbol */
+export const NON_TRADED_MAJOR_SYMBOLS: readonly string[] = ["USDC", "USDT"];
+
+/** 既定で監視する主要銘柄 (crypto) の symbol (JUPITER_TOKENS の既定。登録順) */
+export const DEFAULT_MAJOR_WATCH_SYMBOLS: readonly string[] = MAJOR_TOKENS.map((t) => t.symbol).filter((s) => !NON_TRADED_MAJOR_SYMBOLS.includes(s));
+
+/** symbol の比較用の正規化 (先頭の "$" を除き、大文字にする。WIF は "$WIF" で登録されている) */
+export function normalizeTokenSymbol(s: string): string {
+  return s.trim().replace(/^[$]+/, "").toUpperCase();
+}
+
+/** 主要銘柄の名前 (symbol と aliases の正規化) → 本物の mint の集合 */
+const PROTECTED_SYMBOLS: ReadonlyMap<string, ReadonlySet<string>> = (() => {
+  const m = new Map<string, Set<string>>();
+  for (const t of MAJOR_TOKENS) {
+    for (const name of [t.symbol, ...(t.aliases ?? [])]) {
+      const k = normalizeTokenSymbol(name);
+      if (!m.has(k)) m.set(k, new Set());
+      m.get(k)!.add(t.mint);
+    }
+  }
+  return m;
+})();
+
+/**
+ * 主要銘柄の名前を名乗る別のトークンか (なりすまし)。symbol を正規化 (先頭の "$" を除き大文字) して、主要銘柄の symbol・別名
+ * (BTC・ETH・SOL・JUP・USDC・USDT・cbBTC・WBTC・WETH・JTO・PYTH・RAY) と完全に一致し、mint が本物と違えば true。
+ * 前後に文字を足した名前 (例 "BTC2"・"XBTC") は対象外 (完全一致だけ。先頭の "W"・"cb" も外さない)
+ */
+export function isImpersonation(mint: string, symbol: string | undefined): boolean {
+  if (!symbol) return false;
+  const real = PROTECTED_SYMBOLS.get(normalizeTokenSymbol(symbol));
+  return real !== undefined && !real.has(mint);
+}
 
 export const SOL_MINT = MAJOR_TOKENS[0].mint;
 export const USDC_MINT = MAJOR_TOKENS[1].mint;
@@ -74,12 +133,13 @@ export const DEFAULT_DISCOVERY_SETTINGS: Readonly<DiscoverySettings> = {
 };
 
 export type RejectCode =
-  | "excluded" | "duplicate" | "liquidity" | "holders" | "age" | "organic" | "mint_authority" | "freeze_authority"
+  | "excluded" | "impersonation" | "duplicate" | "liquidity" | "holders" | "age" | "organic" | "mint_authority" | "freeze_authority"
   | "top_holders" | "sus" | "unverified" | "max_tokens";
 
 /** 理由の種類の日本語の表示名 */
 export const REJECT_CODE_LABELS: Record<RejectCode, string> = {
   excluded: "除外銘柄",
+  impersonation: "主要銘柄の名前を名乗る別のトークン",
   duplicate: "重複",
   liquidity: "流動性不足",
   holders: "保有者数不足",
@@ -112,6 +172,8 @@ export function rejectionsFor(t: JupiterToken, s: DiscoverySettings, now: number
   const out: Rejection[] = [];
   const add = (code: RejectCode, detail: string) => out.push({ code, label: `${REJECT_CODE_LABELS[code]}: ${detail}` });
   if (s.excludeMints.includes(t.mint)) add("excluded", "主要銘柄・除外の一覧にある");
+  const imp = impersonationRejection(t.mint, t.symbol);
+  if (imp) out.push(imp);
   if (t.liquidity === undefined) add("liquidity", "流動性が不明");
   else if (t.liquidity < s.minLiquidityUsd) add("liquidity", `${usd(t.liquidity)} < ${usd(s.minLiquidityUsd)}`);
   if (t.holderCount === undefined) add("holders", "保有者数が不明");
@@ -133,6 +195,12 @@ export function rejectionsFor(t: JupiterToken, s: DiscoverySettings, now: number
   if (s.rejectSus && t.audit.isSus === true) add("sus", "Jupiter の監査で isSus");
   if (s.verifiedOnly && t.isVerified !== true) add("unverified", t.isVerified === false ? "検証済みではない" : "検証の状態が不明");
   return out;
+}
+
+/** なりすまし (isImpersonation) の不合格の理由 (なりすましでなければ undefined) */
+export function impersonationRejection(mint: string, symbol: string | undefined): Rejection | undefined {
+  if (!symbol || !isImpersonation(mint, symbol)) return undefined;
+  return { code: "impersonation", label: `${REJECT_CODE_LABELS.impersonation}: ${symbol} (mint ${mint} は本物の ${normalizeTokenSymbol(symbol)} ではない)` };
 }
 
 /** 選別する (純粋関数)。合格は入力の順に maxTokens 件まで */

@@ -11,7 +11,7 @@ import type { ParamValidator, ValidationFold, ValidationRun } from "../learning/
 import type { MarketHub } from "../market/hub";
 import { fetchCandlesPaged, baseTimeframeOf } from "./backtestCommand";
 import { intelBiasFor } from "./context";
-import { isHoldLimitedHorizon } from "./tempo";
+import { isHoldLimitedStrategy } from "./tempo";
 
 const log = createLogger("learningHooks");
 const DAY = 86_400_000;
@@ -212,7 +212,7 @@ export function createParamValidator(o: ValidatorOptions): ParamValidator {
         ...(o.riskPerTrade !== undefined ? { riskPerTrade: o.riskPerTrade } : {}),
         ...(o.maxPositionPct !== undefined ? { maxPositionPct: o.maxPositionPct } : {}),
         ...(o.limitOrders ? { limitOrders: o.limitOrders } : {}),
-        ...(o.maxHoldMinutes !== undefined && o.maxHoldMinutes > 0 && !isHoldLimitedHorizon(s.horizon) ? { maxHoldMinutes: o.maxHoldMinutes } : {}),
+        ...(o.maxHoldMinutes !== undefined && o.maxHoldMinutes > 0 && !isHoldLimitedStrategy(s) ? { maxHoldMinutes: o.maxHoldMinutes } : {}),
         ...(o.thesis ? { thesis: o.thesis } : {}),
         ...(o.reversal ? { reversal: o.reversal } : {}),
         ...(o.breakeven ? { breakeven: o.breakeven } : {}),

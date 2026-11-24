@@ -32,7 +32,7 @@ describe("backtest --source jupiter (GeckoTerminal の足)", () => {
     if (rows[0].metrics && rows[0].metrics.trades > 0) expect(rows[0].metrics.fees).toBeGreaterThan(0);
   });
 
-  it("7 日分の 1m を全部返す (クライアントの足のキャッシュ (3000 本) で切り詰めない)。履歴が短ければ分かりやすい例外", async () => {
+  it("7 日分の 1m を全部返す (クライアントの足のキャッシュ (3000 本) で切り詰めない)。履歴が短ければ警告して取れた分を返す", async () => {
     const clock = fakeClock(T0);
     const mock = createJupiterMock({ now: clock.now });
     const gecko = new GeckoTerminalClient({ fetchImpl: mock.fetchImpl, now: clock.now, sleep: clock.sleep, callsPerMinute: 6000, burst: 100, retries: 0 });
@@ -51,8 +51,23 @@ describe("backtest --source jupiter (GeckoTerminal の足)", () => {
       return { body };
     }, clock.now);
     const g2 = new GeckoTerminalClient({ fetchImpl: short.fetchImpl, now: clock.now, sleep: clock.sleep, callsPerMinute: 6000, burst: 100, retries: 0 });
-    const f2 = new GeckoHistoryFeed(g2, inst, poolOf(BONK), clock.now);
-    await expect(fetchCandlesPaged(f2, inst.symbol, "1m", from, T0)).rejects.toThrow(/履歴が要求より短い/);
+    const warns: string[] = [];
+    const f2 = new GeckoHistoryFeed(g2, inst, poolOf(BONK), clock.now, undefined, (m) => warns.push(m));
+    const part = await fetchCandlesPaged(f2, inst.symbol, "1m", from, T0);
+    expect(warns).toHaveLength(1);
+    expect(warns[0]).toMatch(/履歴が要求より短い/);
+    expect(warns[0]).toContain("取れた分だけで計算します");
+    expect(part).toHaveLength(2 * 1440);
+    expect(part[0].ts).toBe(T0 - 2 * 86_400_000);
+    // 1 本も無ければ例外
+    const none = createMockFetch(async (call) => {
+      const r = await mock.fetchImpl(call.url);
+      const body = (await r.json()) as { data: { attributes: { ohlcv_list: number[][] } } };
+      body.data.attributes.ohlcv_list = [];
+      return { body };
+    }, clock.now);
+    const g3 = new GeckoTerminalClient({ fetchImpl: none.fetchImpl, now: clock.now, sleep: clock.sleep, callsPerMinute: 6000, burst: 100, retries: 0 });
+    await expect(fetchCandlesPaged(new GeckoHistoryFeed(g3, inst, poolOf(BONK), clock.now), inst.symbol, "1m", from, T0)).rejects.toThrow(/履歴を取得できません/);
   });
 
   it("jupiter check の引数 (サブコマンドは check だけ)", async () => {

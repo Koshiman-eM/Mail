@@ -30,6 +30,8 @@
  *   決済する (理由 reversal、約定は時間切れと同じ 決済側の気配 ∓ 約定ずれ)。足は呼び出し側 (engine) が hub の確定足をそのまま渡す
  *   (hub は全戦略の時間足と転換で決済の時間足を持つので、1m 以外もリサンプルしない)。その時間足の足が無い・エントリーより新しい足しか無いときは判定しない。
  *   損切り・利確・読みの管理 (ティックごと) が先。reversalTf の無い古い記録・無効のときは従来どおり。
+ * - 決済を自分で管理する戦略 (options.managesOwnExit が true を返す戦略 id。Strategy.managesOwnExit = trend_4h): 実際の建玉と同じく
+ *   読みの管理・転換で決済・建値ストップを使わない (損切り・利確・maxHoldMs の時間切れだけ。戦略の決済シグナルは仮想トレードでは再現しない)。
  * - 建値ストップ (options.breakeven の triggerR > 0。src/engine/breakeven.ts): 実際の建玉と同じ規則。気配の仲値が entryMid から
  *   triggerR × 1R 有利に動いたら、保護ストップを往復コスト込みの建値 (エントリーの約定 (仲値 ± 半スプレッド ± 約定ずれ)・
  *   往復の手数料・発動時の半スプレッド) へ引き上げる (breakevenArmedAt / breakevenStop。一度上げたら戻さない)。
@@ -75,6 +77,11 @@ export interface ShadowOptions {
   holdingCost?: HoldingCostModel;
   /** 保有コストのモデルに渡す mode (既定 paper) */
   holdingCostMode?: TradingMode;
+  /**
+   * 戦略 id の持ち主が決済を自分で管理するか (Strategy.managesOwnExit。engine が渡す)。true の仮想トレードは
+   * 読みの管理・転換で決済・建値ストップを使わない (損切り・利確・maxHoldMs の時間切れは従来どおり)。省略時は従来どおり
+   */
+  managesOwnExit?: (strategyId: string) => boolean;
 }
 
 export const DEFAULT_SHADOW_OPTIONS: ShadowOptions = {
@@ -274,6 +281,15 @@ export class ShadowTracker {
     };
   }
 
+  /** 持ち主の戦略が決済を自分で管理するか (options.managesOwnExit。無ければ false) */
+  private ownExit(strategyId: string): boolean {
+    try {
+      return this.opts.managesOwnExit?.(strategyId) === true;
+    } catch {
+      return false;
+    }
+  }
+
   /** 未決済の仮想トレード (複製) */
   list(): ShadowOpen[] {
     return this.open.map((o) => ({ ...o }));
@@ -325,10 +341,12 @@ export class ShadowTracker {
       return false;
     }
     const tpOk = finite(sig.takeProfit) && (long ? sig.takeProfit > entryPrice : sig.takeProfit < entryPrice);
+    // 決済を自分で管理する戦略 (managesOwnExit) は読みの管理・転換で決済を使わない (実際の建玉と同じ)
+    const ownExit = this.ownExit(sig.strategyId);
     // 読みの期限 (シグナルの expectedMs、無ければ最大保有。読みの管理が有効なときだけ)。既定の保有上限 (defaultMaxHoldMs) は読みの期限にしない
-    const thesisMs = this.opts.thesis?.enabled === true ? resolveThesisMs(sig.expectedMs, sig.maxHoldMs) : undefined;
+    const thesisMs = !ownExit && this.opts.thesis?.enabled === true ? resolveThesisMs(sig.expectedMs, sig.maxHoldMs) : undefined;
     // 転換で決済の時間足 (有効で戦略が対象のときだけ記録する)
-    const reversalTf = input.exitTimeframe && TIMEFRAME_MS[input.exitTimeframe] && reversalAppliesTo(this.opts.reversal, sig.strategyId) ? input.exitTimeframe : undefined;
+    const reversalTf = !ownExit && input.exitTimeframe && TIMEFRAME_MS[input.exitTimeframe] && reversalAppliesTo(this.opts.reversal, sig.strategyId) ? input.exitTimeframe : undefined;
     const o: ShadowOpen = {
       id: `sh_${now.toString(36)}_${randomUUID().slice(0, 8)}`,
       mode: this.mode,
@@ -433,7 +451,7 @@ export class ShadowTracker {
       // 転換で決済: 戦略の主時間足の確定足 (有効で、記録時に時間足を保存した仮想トレードだけ)
       let revCandles: readonly Candle[] | undefined;
       try {
-        if (o.reversalTf && opts.candlesOf && reversalAppliesTo(this.opts.reversal, o.strategyId)) revCandles = opts.candlesOf(o.symbol, o.reversalTf);
+        if (o.reversalTf && opts.candlesOf && reversalAppliesTo(this.opts.reversal, o.strategyId) && !this.ownExit(o.strategyId)) revCandles = opts.candlesOf(o.symbol, o.reversalTf);
       } catch (e) {
         this.onError?.("shadow.candles", e);
       }
@@ -594,7 +612,7 @@ export class ShadowTracker {
         o.thesisStop = tighterStop(o.direction, o.thesisStop, thesisTrailStop(pricing, o.thesisPeak ?? Number.NaN, thesis.trailR));
       }
       // 建値ストップの発動 (今の気配の仲値で判定。この判定ではストップを判定しない = 次の判定から効く)
-      if (o.breakevenStop === undefined && breakevenEnabled(this.opts.breakeven) && breakevenTriggered(this.opts.breakeven, o.direction, o.entryMid, o.risk, mid)) {
+      if (o.breakevenStop === undefined && breakevenEnabled(this.opts.breakeven) && !this.ownExit(o.strategyId) && breakevenTriggered(this.opts.breakeven, o.direction, o.entryMid, o.risk, mid)) {
         const st = breakevenStopPrice({
           direction: o.direction, entryPrice: entryFill, entryFeePerUnit: Math.max(0, o.takerFeeRate) * entryFill,
           exitFeeRate: Math.max(0, o.takerFeeRate), halfSpreadRate: mid > 0 ? half / mid : 0,

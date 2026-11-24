@@ -24,7 +24,7 @@
 ## モジュールの地図 (`src/`)
 - `core/`: 型 (`types.ts`)、資産クラスの語彙とプロファイル (`assetClasses.ts`)、設定 (`config.ts`: `defineAppConfig`・`CoreEnv`・`AppConfig<E>`・`envHelpers`・`z`・`resolveMode`・リスク項目の定義)、decimal、往復コスト (`costs.ts`)、手数料率 (`fees.ts`)、保有コスト (`holdingCost.ts`)、取引時間 (`calendar.ts`)、空売りの再現 (`short.ts`)、HTTP・ロガー・Claude 呼び出し (`ai.ts`)
 - `indicators/`, `regime/`, `structure/` (ダウ理論のフィルター): 指標・相場環境・相場構造
-- `strategies/`: 11 戦略 (scalp 6 / short 5) と登録 (`registry.ts`: `ALL_STRATEGIES`・`configuredStrategies`・`withAssetClasses`・`selectStrategies`)、廃止した戦略の互換 (`retired.ts`)
+- `strategies/`: 12 戦略 (scalp 6 / short 5 / mid 1: `trend.ts` の `trend_4h`) と登録 (`registry.ts`: `ALL_STRATEGIES`・`configuredStrategies`・`withAssetClasses`・`selectStrategies`・`managesOwnExit`)、廃止した戦略の互換 (`retired.ts`)
 - `market/`: `MarketHub`、足 (`candles.ts`・`fileCandles.ts`)、合成フィード (`feeds/synthetic.ts`)
 - `execution/`: `PaperBroker` (`paper.ts`)、`BrokerSet` (`brokerSet.ts`: `createPaperBrokerSet`・`liveBrokerSet`)、`assertLive` (`guard.ts`)
 - `risk/`: `RiskManager` (`manager.ts`)、ダッシュボードの上書き (`settings.ts`)、再開要求
@@ -50,6 +50,7 @@
 - **simulate** (`engine/simulate.ts`): `runSimulation({factory, ...})`。`SimulationRuntimeFactory` = loadConfig・simulationEnv・guardedDbPaths・buildRuntime。
 - **backtest の取得元** (`engine/backtestCommand.ts`): `synthetic` / `feed` + `registerBacktestSource({name, label, open, marketOnly})`。
 - **予想の多重検定**: `ForecastOptions.liveGroups` (グループ数。既定 3 × 4 = 12)。
+- **決済を自分で管理する戦略** (`Strategy.managesOwnExit?: true`。いまは `trend_4h`): その戦略が持ち主の建玉・仮想トレードには建値ストップ・転換で決済・読みの管理 (代わりに maxHold の時間切れ)・`MAX_HOLD_MINUTES` の上限 (と hold_limit の観測専用。`tempo.ts` の `isHoldLimitedStrategy`) を掛けない。当初の損切り・戦略の決済シグナル・maxHoldBars・RiskManager と新規エントリーの判定は従来どおり。PositionManager は deps の `managesOwnExit(strategyId)`、仮想トレードは `ShadowOptions.managesOwnExit`、バックテストは `strategy.managesOwnExit` (検証・コマンドも同じ経路)、engine は `managesOwnExit(id, this.strategies)` (registry。未知・廃止した id は false = 従来どおり)。試験 `tests/strategies.trend4h.test.ts`。
 
 ## 資産クラスと trader の互換で残っているもの (暗号資産寄りの部分)
 - `core/short.ts` の `NO_SHORT_VENUES = ["jupiter"]` と `dex*`: DEX の銘柄は paper でも空売りを再現しない。古い paper のスナップショットの銘柄定義に印が無いので venue 名で判定している (FX・株式の venue には影響しない)。

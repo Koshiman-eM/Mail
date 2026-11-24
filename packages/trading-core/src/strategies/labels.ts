@@ -24,6 +24,7 @@ export const STRATEGY_LABELS: Record<string, string> = {
   short_breakout: "短期・ブレイクアウト (1 時間足)",
   pullback_5m: "短期・押し目買い / 戻り売り (5 分足)",
   pullback_15m: "短期・押し目買い / 戻り売り (15 分足)",
+  trend_4h: "中期・トレンドフォロー (4 時間足)",
 };
 
 /** 戦略の表示名。未知の id は id そのまま */
@@ -36,7 +37,7 @@ export function strategyLabelWithId(id: string): string {
   return id in STRATEGY_LABELS ? `${STRATEGY_LABELS[id]} [${id}]` : id;
 }
 
-/** 時間軸 (Horizon) の表示名 (中期・長期の戦略は廃止したが、古い記録の表示のために残す) */
+/** 時間軸 (Horizon) の表示名 (長期の戦略は廃止したが、古い記録の表示のために残す。中期は trend_4h) */
 export const HORIZON_LABELS: Record<string, string> = { scalp: "超短期", short: "短期", mid: "中期", long: "長期" };
 
 /** 時間軸の表示名。未知の値はそのまま */

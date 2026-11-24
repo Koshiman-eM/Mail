@@ -4,10 +4,11 @@ import { scalpMicro } from "./scalpMicro";
 import { scalpRebound } from "./scalpRebound";
 import { pullback15m, pullback5m, scalpPullback } from "./scalpPullback";
 import { shortBreakout, shortEmaTrend, shortRsiRevert } from "./short";
+import { trend4h } from "./trend";
 import { applyStructure, type StructureSettings } from "../structure/settings";
 
 /**
- * 全戦略 (登録順 = スキャルピング → 短期)。廃止した戦略 (中期・長期・ミーム) は src/strategies/retired.ts
+ * 全戦略 (登録順 = スキャルピング → 短期 → 中期)。廃止した戦略 (中期・長期・ミーム) は src/strategies/retired.ts
  * (保有中の建玉・学習データ・古い .env の互換のための情報だけ)
  */
 export const ALL_STRATEGIES: readonly Strategy[] = [
@@ -22,6 +23,7 @@ export const ALL_STRATEGIES: readonly Strategy[] = [
   shortBreakout,
   pullback5m,
   pullback15m,
+  trend4h,
 ];
 
 /**
@@ -56,6 +58,16 @@ const BY_ID = new Map(ALL_STRATEGIES.map((s) => [s.id, s]));
 /** ID から戦略を取得 (未登録なら undefined) */
 export function getStrategy(id: string): Strategy | undefined {
   return BY_ID.get(id);
+}
+
+/**
+ * 戦略 id の持ち主が決済を自分で管理するか (Strategy.managesOwnExit)。建玉・仮想トレードの持ち主の戦略を id で引く
+ * (渡した一覧 → 登録戦略の順)。未知の id・廃止した戦略の id は false (従来どおり汎用の決済の上乗せを掛ける)
+ */
+export function managesOwnExit(strategyId: string | undefined, strategies: readonly Strategy[] = ALL_STRATEGIES): boolean {
+  if (!strategyId) return false;
+  const s = strategies.find((x) => x.id === strategyId) ?? BY_ID.get(strategyId);
+  return s?.managesOwnExit === true;
 }
 
 /** 既定パラメータに上書きを合成し、paramBounds の範囲へクランプする */

@@ -142,7 +142,8 @@ export function hubTimeframesFor(
   for (const s of strategies) {
     if (!s.assetClasses.some((c) => classes.has(c))) continue;
     for (const tf of [...s.timeframes, s.primaryTimeframe]) tfs.add(tf);
-    if (reversalAppliesTo(reversal, s.id)) tfs.add(reversalTimeframeFor(reversal, s.primaryTimeframe));
+    // 決済を自分で管理する戦略 (managesOwnExit) は転換で決済を使わないので、その時間足は要らない
+    if (s.managesOwnExit !== true && reversalAppliesTo(reversal, s.id)) tfs.add(reversalTimeframeFor(reversal, s.primaryTimeframe));
   }
   return [...tfs].sort((a, b) => TIMEFRAME_MS[a] - TIMEFRAME_MS[b]);
 }

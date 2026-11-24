@@ -85,6 +85,7 @@ describe("registry", () => {
       "short_breakout",
       "pullback_5m",
       "pullback_15m",
+      "trend_4h",
     ]);
     // 廃止した戦略は登録しない
     for (const id of ["mid_trend_follow", "long_momentum", "meme_momentum"]) expect(getStrategy(id)).toBeUndefined();
@@ -102,7 +103,9 @@ describe("registry", () => {
     expect(ALL_STRATEGIES.every((s) => s.assetClasses.every((c) => c === "crypto" || c === "meme"))).toBe(true);
     // 押し目買い・戻り売りの 5 分足・15 分足は crypto の短期だけ
     expect(strategiesFor("crypto", "short").map((s) => s.id)).toEqual(["short_ema_trend", "short_rsi_revert", "short_breakout", "pullback_5m", "pullback_15m"]);
-    expect(ALL_STRATEGIES.filter((s) => s.horizon === "mid" || s.horizon === "long")).toEqual([]);
+    // 中期は trend_4h だけ (crypto のみ・決済を自分で管理する)。長期は無い
+    expect(ALL_STRATEGIES.filter((s) => s.horizon === "mid" || s.horizon === "long").map((s) => s.id)).toEqual(["trend_4h"]);
+    expect(ALL_STRATEGIES.filter((s) => s.managesOwnExit).map((s) => s.id)).toEqual(["trend_4h"]);
   });
 
   it("resolveParams は既定値に合成し範囲へクランプする", () => {

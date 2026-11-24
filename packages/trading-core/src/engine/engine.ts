@@ -31,7 +31,7 @@ import { detectRegime, regimeOptionsFor } from "../regime/detect";
 import { clearResumeRequest, peekResumeRequest } from "../risk/resumeRequest";
 import { costBps, type EntryParams, type RiskManager, type RiskPosition } from "../risk/manager";
 import { volumeWindowUnknown } from "../strategies/common";
-import { ALL_STRATEGIES, resolveParams } from "../strategies/registry";
+import { ALL_STRATEGIES, managesOwnExit, resolveParams } from "../strategies/registry";
 import { RETIRED_STRATEGIES } from "../strategies/retired";
 import {
   activeBlackout, emptyBrief, intelBiasFor, liquidityUsdFor, normalizeReason, planRegimeTimeframe,
@@ -44,7 +44,7 @@ import {
   type PendingStatus,
 } from "./orders";
 import { DEFAULT_ORDER_POLICY, PositionManager, type EntryResult, type OrderPolicy, type SyncResult, type ThesisView } from "./positions";
-import { clampMaxHoldMs, isHoldLimitedHorizon, TempoController, tempoSeedTimestamps, tempoStatusView, type TempoStatusView } from "./tempo";
+import { clampMaxHoldMs, isHoldLimitedStrategy, TempoController, tempoSeedTimestamps, tempoStatusView, type TempoStatusView } from "./tempo";
 import { thesisSettingsFromEnv, type ThesisSettings } from "./thesis";
 import { breakevenSettingsFromEnv, type BreakevenSettings } from "./breakeven";
 import {
@@ -584,6 +584,8 @@ export class TradingEngine {
       // 読みの管理: 期限で答え合わせをして決済・延長する (無効なら従来の時間切れ)
       thesis: this.thesis,
       breakeven: this.breakeven,
+      // 決済を自分で管理する戦略 (Strategy.managesOwnExit) の建玉には建値ストップ・読みの管理を掛けない
+      managesOwnExit: (id) => this.ownExit(id),
     });
     const { enabled: shadowEnabled, ...shadowOpts } = o.shadow ?? {};
     if (shadowEnabled !== false) {
@@ -592,7 +594,10 @@ export class TradingEngine {
         mode: deps.brokerSet.mode,
         // 仮想トレードも実際の建玉と同じ読みの管理・転換で決済で決済する (腕の学習をそろえるため)
         // 保有コストのモデル (shadow.holdingCost。省略時は再現の空売りの借入コストだけ) には実際の発注先の mode を渡す
-        options: { thesis: this.thesis, breakeven: this.breakeven, reversal: this.reversal, holdingCostMode: deps.brokerSet.mode, ...shadowOpts },
+        options: {
+          thesis: this.thesis, breakeven: this.breakeven, reversal: this.reversal, holdingCostMode: deps.brokerSet.mode,
+          managesOwnExit: (id: string) => this.ownExit(id), ...shadowOpts,
+        },
         onClosed: (t) => this.onShadowClosed(t),
         onError: (where, e) => this.warnThrottled(where, this.clock.now(), "仮想トレードの処理に失敗 (取引は継続)", { error: redactedErrMsg(e) }),
       });
@@ -800,6 +805,7 @@ export class TradingEngine {
   private warnThesisLive(now: number): void {
     if (this.mode !== "live" || !this.thesis.enabled) return;
     const managed = this.positions.list().filter((p) => {
+      if (this.ownExit(p.strategyId)) return false;
       const plan = this.positions.planOf(p.id);
       return (plan.maxHoldMs ?? 0) > 0 || (plan.expectedMs ?? 0) > 0;
     });
@@ -1614,7 +1620,16 @@ export class TradingEngine {
 
   /** MAX_HOLD_MINUTES が有効なとき、中期・長期の戦略は新規エントリーしない (仮想トレード hold_limit としてだけ記録する) */
   private holdLimited(s: Strategy): boolean {
-    return this.maxHoldMs !== undefined && isHoldLimitedHorizon(s.horizon);
+    // 決済を自分で管理する戦略 (managesOwnExit) は最大保有の上限を受けないので対象外
+    return this.maxHoldMs !== undefined && isHoldLimitedStrategy(s);
+  }
+
+  /**
+   * 戦略 id の持ち主が決済を自分で管理するか (Strategy.managesOwnExit。この engine の一覧 → 登録戦略で引く。
+   * 未知・廃止した id は false = 従来どおり建値ストップ・転換で決済・読みの管理・最大保有の上限を掛ける)
+   */
+  private ownExit(strategyId: string): boolean {
+    return managesOwnExit(strategyId, this.strategies);
   }
 
   /**
@@ -1624,6 +1639,8 @@ export class TradingEngine {
    */
   private clampHold(sig: Signal): Signal {
     if (this.maxHoldMs === undefined || sig.direction === "flat") return sig;
+    // 決済を自分で管理する戦略 (managesOwnExit) は戦略の maxHoldBars のまま
+    if (this.ownExit(sig.strategyId)) return sig;
     const next = clampMaxHoldMs(sig.maxHoldMs, this.maxHoldMs);
     const exp = sig.expectedMs !== undefined && Number.isFinite(sig.expectedMs) && sig.expectedMs > 0 ? Math.min(sig.expectedMs, this.maxHoldMs) : sig.expectedMs;
     return next === sig.maxHoldMs && exp === sig.expectedMs ? sig : { ...sig, maxHoldMs: next, ...(exp !== undefined ? { expectedMs: exp } : {}) };
@@ -2128,6 +2145,8 @@ export class TradingEngine {
    */
   private async reversalExit(inst: Instrument, view: MarketView, pos: OpenTrade, ctx: TickCtx, signalTried: boolean): Promise<void> {
     if (!reversalAppliesTo(this.reversal, pos.strategyId)) return;
+    // 決済を自分で管理する戦略 (managesOwnExit) の建玉は転換で決済しない (戦略自身の決済シグナルで決済する)
+    if (this.ownExit(pos.strategyId)) return;
     // 持ち主の戦略の主時間足 (廃止した戦略の建玉は src/strategies/retired.ts の値)。分からなければ判定しない
     const primaryTf = this.primaryTimeframeOf(pos.strategyId);
     if (!primaryTf) return;

@@ -7,10 +7,10 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { loadConfig, removedEnvWarnings, type AppConfig } from "./appConfig";
-import type { MarketDataFeed, Store, TradeRecord } from "./core/types";
+import type { Instrument, MarketDataFeed, Store, TradeRecord } from "./core/types";
 import { isLoopbackHost, startDashboard, type DashboardServer } from "./dashboard/server";
 import {
-  backtestSourceNames, backtestSourceSpec, formatBacktestRows, registerBacktestSource, runBacktestCommand, type BacktestSource,
+  backtestSourceNames, backtestSourceSpec, formatBacktestRows, registerBacktestSource, runBacktestCommand, type BacktestRow, type BacktestSource,
   type BacktestSourceSpec,
 } from "./engine/backtestCommand";
 import { compareFootnotes, formatCompareRows, runStructureCompare } from "./engine/structureCompare";
@@ -41,7 +41,11 @@ import { createDefaultSources } from "./intel/defaultSources";
 import type { IntelSource } from "./intel/sources/common";
 import { TradeJournal } from "./learning/journal";
 import { LearningService } from "./learning/service";
-import { CcxtFeed } from "./market/feeds/ccxt";
+import { CcxtFeed, ccxtExchangeIds } from "./market/feeds/ccxt";
+import { BACKTEST_COST_MODELS, describeInstrumentCosts, JUPITER_BACKTEST_ASSUMED_LIQUIDITY_USD, jupiterCostInstrument, type BacktestCostModel } from "./engine/backtestCosts";
+import {
+  aggregateAcrossSymbols, coverageWarning, formatAggregateRows, formatFoldRows, formatPeriod, type SymbolStrategyResult,
+} from "@trading/core/engine/backtestValidation";
 import { GeckoHistoryFeed } from "./market/feeds/geckoHistory";
 import { jupiterInstrument, JUPITER_VENUE } from "./market/feeds/jupiter";
 import { JupiterClient } from "./market/jupiter/client";
@@ -54,7 +58,7 @@ import { requestResume } from "./risk/resumeRequest";
 import { riskOverrideLines } from "./risk/settings";
 import { createStore } from "./storage";
 import { ReadOnlyOverlayStore } from "./storage/readonly";
-import { ALL_STRATEGIES, configuredStrategies, getStrategy } from "./strategies/registry";
+import { ALL_STRATEGIES, configuredStrategies, getStrategy, managesOwnExit } from "./strategies/registry";
 import { structureSettingsFromEnv } from "./structure/settings";
 import { TIMEFRAME_MS, type ExitReason, type Timeframe } from "./core/types";
 import { horizonLabel, strategyLabel, strategyLabelWithId } from "./strategies/labels";
@@ -170,10 +174,61 @@ export interface BacktestArgs {
   structureCompare?: true;
   /** pivotN 4 / 6 / 10 の頑健性 (structureCompare と併用) */
   pivotSweep?: true;
-  /** 比較の区間数 (既定 5) */
+  /** 区間数 (比較は既定 5。通常のバックテストは --folds N を指定したときだけ区間別の成績を出す) */
   folds?: number;
   /** --source jupiter のトークン (mint か symbol。既定 SOL) */
   token?: string;
+  /** --source ccxt の取引所 (この実行だけ CCXT_EXCHANGE を上書き。公開 API の足だけ・キーなし) */
+  exchange?: string;
+  /** 複数銘柄 (--symbols A,B。ccxt・synthetic) */
+  symbols?: string[];
+  /** 複数トークン (--tokens A,B。jupiter) */
+  tokens?: string[];
+  /** コストの前提 (--cost-model。省略 = native) */
+  costModel?: BacktestCostModel;
+}
+
+/** カンマ区切りの一覧 (空白を除き、重複を除く) */
+function listFlag(flags: ParsedArgs["flags"], name: string): string[] | undefined {
+  if (flags[name] === undefined) return undefined;
+  const items = [...new Set(stringFlag(flags, name, "").split(",").map((s) => s.trim()).filter(Boolean))];
+  if (items.length === 0) throw new CliError(`--${name} に 1 つ以上指定してください (カンマ区切り)`);
+  return items;
+}
+
+/** backtest の追加の引数 (--exchange / --symbols / --tokens / --cost-model / 通常の --folds) */
+function parseBacktestExtras(flags: ParsedArgs["flags"], source: string, compare: boolean): Partial<BacktestArgs> {
+  const out: Partial<BacktestArgs> = {};
+  if (flags.exchange !== undefined) {
+    if (source !== "ccxt") throw new CliError("--exchange は --source ccxt と一緒に指定してください");
+    const ex = stringFlag(flags, "exchange", "").toLowerCase();
+    if (!ccxtExchangeIds().includes(ex)) throw new CliError(`--exchange は ccxt の取引所の id です (例: binance / bybit / okx / kraken / coinbase / bitbank)。未知の取引所: ${ex}`);
+    out.exchange = ex;
+  }
+  const symbols = listFlag(flags, "symbols");
+  if (symbols) {
+    if (source === "jupiter") throw new CliError("--source jupiter では --symbols ではなく --tokens A,B を指定してください");
+    if (flags.symbol !== undefined) throw new CliError("--symbol と --symbols は同時に指定できません");
+    out.symbols = symbols;
+  }
+  const tokens = listFlag(flags, "tokens");
+  if (tokens) {
+    if (source !== "jupiter") throw new CliError("--tokens は --source jupiter と一緒に指定してください");
+    if (flags.token !== undefined) throw new CliError("--token と --tokens は同時に指定できません");
+    out.tokens = tokens;
+  }
+  if ((symbols || tokens) && compare) throw new CliError("--structure-compare は 1 銘柄だけです (--symbol / --token を指定してください)");
+  if (flags["cost-model"] !== undefined) {
+    const cm = stringFlag(flags, "cost-model", "");
+    if (!(BACKTEST_COST_MODELS as readonly string[]).includes(cm)) throw new CliError(`--cost-model は ${BACKTEST_COST_MODELS.join(" / ")} のどれかです`);
+    out.costModel = cm as BacktestCostModel;
+  }
+  if (!compare && flags.folds !== undefined) {
+    const folds = numberFlag(flags, "folds", 0, { min: 0, max: 20, integer: true });
+    if (folds === 1) throw new CliError("--folds は 0 (区間別なし) か 2 以上にしてください");
+    if (folds >= 2) out.folds = folds;
+  }
+  return out;
 }
 
 export function parseBacktestArgs(flags: ParsedArgs["flags"]): BacktestArgs {
@@ -200,6 +255,7 @@ export function parseBacktestArgs(flags: ParsedArgs["flags"]): BacktestArgs {
     ...(compare ? { structureCompare: true as const, folds: numberFlag(flags, "folds", 5, { min: 2, max: 20, integer: true }) } : {}),
     ...(sweep ? { pivotSweep: true as const } : {}),
     ...(token ? { token } : {}),
+    ...parseBacktestExtras(flags, source, compare),
   };
 }
 
@@ -245,6 +301,10 @@ export const HELP = `自己学習型の仮想通貨自動売買ツール
   backtest --strategy <ID|all> [--symbol SYM] [--days 30] [--source synthetic|ccxt|jupiter] [--token <mint|symbol>] [--seed 1]
                               バックテスト (ccxt は CCXT_EXCHANGE の履歴、jupiter は GeckoTerminal の足 (--token、既定 SOL)。
                               STRUCTURE_* の構造フィルター込み。jupiter は成行だけ・コストは代わりのスリッページ + ネットワーク手数料)
+                              [--exchange binance] ccxt の取引所をこの実行だけ上書き (公開 API の足だけ)
+                              [--symbols A,B] / [--tokens A,B] 銘柄ごとに回して合計 (等加重) も表示。保有 (buy & hold) と比べる
+                              [--cost-model native|jupiter] jupiter = 取得元によらず Jupiter のコスト (USD 建てのみ・成行だけ)
+                              [--folds N] 区間別 (N 等分) の取引数・合計R・勝率・PF
   backtest --structure-compare [--strategy <ID|all>] [--pivot-sweep] [--folds 5] [その他は backtest と同じ]
                               相場構造のフィルターの比較 (A: ラップなし 〜 G: conservative 版) を区間検証で表示
   regime --symbol SYM [--hours 3] [--tf 1m,15m,1h,4h] [--step 5]
@@ -590,33 +650,59 @@ async function cmdSimulate(flags: ParsedArgs["flags"], io: Io): Promise<number> 
   return 0;
 }
 
-async function cmdBacktest(flags: ParsedArgs["flags"], io: Io): Promise<number> {
+/** backtest の差し替え (テスト用): 設定・ccxt / jupiter の feed・現在時刻 */
+export interface BacktestCliDeps {
+  config?: AppConfig;
+  /** ccxt の feed (既定 CcxtFeed.create。公開 API の足だけ・キーなし) */
+  ccxtFeed?: (exchangeId: string) => MarketDataFeed;
+  /** jupiter の feed (既定 GeckoTerminal の最良のプール)。onWarn は履歴が要求より短いときの警告 */
+  jupiterFeed?: (token: string, onWarn: (msg: string) => void) => Promise<{ feed: MarketDataFeed; symbol: string }>;
+  now?: number;
+}
+
+/** 日をまたぐ程度のずれは警告しない (取引所の最初・最後の足の端数) */
+const COVERAGE_TOLERANCE_MS = 86_400_000;
+
+export async function cmdBacktest(flags: ParsedArgs["flags"], io: Io, deps: BacktestCliDeps = {}): Promise<number> {
   const a = parseBacktestArgs(flags);
-  const config = loadConfig();
+  const config = deps.config ?? loadConfig();
   // 足の取得元: synthetic (コア) か、trader が登録した ccxt / jupiter (TRADER_BACKTEST_SOURCES)
   const spec = a.source === "synthetic" ? undefined : backtestSourceSpec<BacktestSourceCtx>(a.source);
   if (a.source !== "synthetic" && !spec) throw new CliError(`未知の --source: ${a.source}`);
-  const ctx: BacktestSourceCtx = { config, args: a, io };
-  const opened = spec ? await spec.open(ctx) : undefined;
-  const feed: MarketDataFeed | undefined = opened?.feed;
-  const symbol = opened?.symbol ?? a.symbol ?? "SYN/USDT";
+  const ctx: BacktestSourceCtx = { config, args: a, io, deps, feeds: new Map() };
   const structure = structureSettingsFromEnv(config.env);
-  const sourceLabel = spec ? spec.label(ctx) : `合成データ (シード ${a.seed})`;
-  const common = {
+  const sourceLabel = spec ? spec.label(ctx) : `合成データ (シード ${a.seed}${(a.symbols?.length ?? 0) > 1 ? "、銘柄ごとに +1" : ""})`;
+  // コストの前提: --cost-model jupiter は取得元によらず Jupiter のコスト (手数料率 0・ネットワーク手数料・主要銘柄の代わりのモデル) で成行だけ
+  const jupiterCost = a.costModel === "jupiter";
+  const js = jupiterCost ? jupiterSettingsFromEnv(config.env) : undefined;
+  const adjustInstrument = js ? (inst: Instrument) => jupiterCostInstrument(inst, { quoteSizeUsd: js.quoteSizeUsd, networkFeeUsd: js.networkFeeUsd }) : undefined;
+  const marketOnly = spec?.marketOnly === true || jupiterCost;
+  // 対象の銘柄 (複数なら銘柄ごとに同じ戦略を回し、最後に合計を出す)
+  const targets: (string | undefined)[] = a.symbols ?? a.tokens ?? [a.source === "jupiter" ? a.token : a.symbol];
+  const openTarget = async (target: string | undefined, i: number) => {
+    const args: BacktestArgs = target === undefined ? a : a.source === "jupiter" ? { ...a, token: target } : { ...a, symbol: target };
+    const opened = spec ? await spec.open({ ...ctx, args }) : undefined;
+    return { feed: opened?.feed, symbol: opened?.symbol ?? target ?? "SYN/USDT", seed: a.source === "synthetic" ? a.seed + i : a.seed };
+  };
+  const common = (t: { feed: MarketDataFeed | undefined; symbol: string; seed: number }) => ({
     ...a,
-    symbol,
-    ...(feed ? { feed } : {}),
+    symbol: t.symbol,
+    seed: t.seed,
+    ...(t.feed ? { feed: t.feed } : {}),
+    ...(deps.now !== undefined ? { now: deps.now } : {}),
     minEdgeToCostRatio: config.risk.minEdgeToCostRatio,
     riskPerTrade: config.risk.riskPerTrade,
     maxPositionPct: config.risk.maxPositionPct,
     // 指値 (maker) の前提を実運用 (LIMIT_ENTRY / LIMIT_TAKE_PROFIT。利確の指値は現在の mode で有効なときだけ) に合わせる。
-    // Jupiter は成行 (スワップ) だけなので指値なし
-    ...(spec?.marketOnly ? {} : { limitOrders: limitOrdersFromEnv(config.env, config.mode) }),
-  };
+    // Jupiter (取得元・コストの前提) は成行 (スワップ) だけなので指値なし
+    ...(marketOnly ? {} : { limitOrders: limitOrdersFromEnv(config.env, config.mode) }),
+    ...(adjustInstrument ? { adjustInstrument } : {}),
+  });
   if (a.structureCompare) {
+    const t = await openTarget(targets[0], 0);
     const folds = a.folds ?? 5;
-    const rows = await runStructureCompare({ ...common, settings: structure, folds, ...(a.pivotSweep ? { pivotSweep: true } : {}) });
-    io.out(`相場構造のフィルターの比較: ${symbol} / ${a.days} 日 / ${sourceLabel} / ${folds} 区間 / pivotN ${a.pivotSweep ? "4・6・10" : structure.config.pivotN}`);
+    const rows = await runStructureCompare({ ...common(t), settings: structure, folds, ...(a.pivotSweep ? { pivotSweep: true } : {}) });
+    io.out(`相場構造のフィルターの比較: ${t.symbol} / ${a.days} 日 / ${sourceLabel} / ${folds} 区間 / pivotN ${a.pivotSweep ? "4・6・10" : structure.config.pivotN}`);
     io.out(formatCompareRows(rows));
     compareFootnotes({ folds, ...(a.pivotSweep ? { pivotSweep: true } : {}) }).forEach((l) => io.out(l));
     return 0;
@@ -629,18 +715,80 @@ async function cmdBacktest(flags: ParsedArgs["flags"], io: Io): Promise<number> 
   const reversal = reversalSettingsFromEnv(config.env);
   // 建値ストップ (BREAKEVEN_TRIGGER_R) も実運用と同じ規則にする
   const breakeven = breakevenSettingsFromEnv(config.env);
-  const rows = await runBacktestCommand({
-    ...common, strategies: configuredStrategies(structure), ...(maxHold !== undefined ? { maxHoldMinutes: maxHold } : {}), thesis, reversal, breakeven,
-  });
+  const targetLabel = targets.map((t) => t ?? (a.source === "synthetic" ? "SYN/USDT" : "既定の銘柄")).join(", ");
   io.out(
-    `バックテスト: ${symbol} / ${a.days} 日 / ${sourceLabel} / 構造フィルター ${structure.mode === "filter" ? "あり" : "なし"}` +
+    `バックテスト: ${targetLabel} / ${a.days} 日 / ${sourceLabel} / 構造フィルター ${structure.mode === "filter" ? "あり" : "なし"}` +
       (maxHold !== undefined ? ` / 最大保有 ${maxHold} 分` : "") +
       ` / 読みの管理 ${thesis.enabled ? "有効" : "無効"} / 転換で決済 ${reversal.enabled ? "有効" : "無効"}` +
-      ` / 建値ストップ ${breakevenEnabled(breakeven) ? `${breakeven.triggerR}R で発動` : "無効"}`,
+      ` / 建値ストップ ${breakevenEnabled(breakeven) ? `${breakeven.triggerR}R で発動` : "無効"}` +
+      (a.folds ? ` / ${a.folds} 区間` : ""),
   );
-  io.out(formatBacktestRows(rows));
-  io.out("※ 損益はクオート通貨建て (初期評価額 1,000,000)。期間の前にウォームアップ用の足を付けています。");
+  io.out(
+    jupiterCost
+      ? `コストの前提: Jupiter 相当 (--cost-model jupiter): 手数料率 0 / ネットワーク手数料 ${js!.networkFeeUsd} USD/約定 / ` +
+          `スプレッド = 主要銘柄の代わりのモデルの片道 bps × 2 (流動性 $${JUPITER_BACKTEST_ASSUMED_LIQUIDITY_USD.toLocaleString("en-US")} を仮定、基準の約定代金 $${js!.quoteSizeUsd}) / ` +
+          "スリッページ 0 / 成行だけ (指値なし)・空売りなし" + (a.source === "jupiter" ? " (--source jupiter の銘柄は運用と同じ銘柄定義のまま)" : "")
+      : `コストの前提: 取得元の銘柄定義 (--cost-model native)${marketOnly ? " / 成行だけ (指値なし)" : " / 指値は LIMIT_ENTRY に従う"}`,
+  );
+  const results: SymbolStrategyResult[] = [];
+  const now = deps.now ?? Date.now();
+  for (const [i, target] of targets.entries()) {
+    const t = await openTarget(target, i);
+    const rows = await runBacktestCommand({
+      ...common(t), strategies: configuredStrategies(structure), ...(maxHold !== undefined ? { maxHoldMinutes: maxHold } : {}), thesis, reversal, breakeven,
+    });
+    printBacktestSymbol(io, t.symbol, rows, a.source === "synthetic" ? undefined : now);
+    for (const r of rows) {
+      if (!r.metrics || !r.trades || !r.equityCurve) continue;
+      results.push({
+        symbol: t.symbol, strategyId: r.strategyId, initialEquity: r.initialEquity ?? 1_000_000, trades: r.trades, equityCurve: r.equityCurve,
+        ...(r.benchmark ? { benchmark: r.benchmark } : {}),
+      });
+    }
+  }
+  if (targets.length > 1) {
+    io.out("");
+    io.out(`■ ${targets.length} 銘柄の合計 (戦略ごと。リターン・最大DD は各銘柄を同じ重みで合成した評価額曲線、PF は損益を各銘柄の初期評価額に対する比率にして合算。保有も同じ合成)`);
+    io.out(formatAggregateRows(aggregateAcrossSymbols(results)));
+  }
+  io.out("※ 損益はクオート通貨建て (初期評価額 1,000,000)。期間の前にウォームアップ用の足を付けています。保有 = 同じ期間の最初の始値で買って最後の終値まで持った場合 (最大DD は終値)。");
   return 0;
+}
+
+/** 1 銘柄の結果 (実際の期間・保有の成績・コストの前提・戦略の表・区間別) */
+function printBacktestSymbol(io: Io, symbol: string, rows: BacktestRow[], now: number | undefined): void {
+  const head = rows.find((r) => r.period);
+  const p = head?.period;
+  const b = head?.benchmark;
+  io.out("");
+  io.out(
+    `■ ${symbol}` + (p ? `  期間 ${formatPeriod(p)}` : "") +
+      (b ? `  保有 (buy & hold): ${b.returnPct >= 0 ? "+" : ""}${fmtPct(b.returnPct)} / 最大DD ${fmtPct(b.maxDrawdown)}` : ""),
+  );
+  const inst = rows.find((r) => r.instrument)?.instrument;
+  if (inst) io.out(`  コスト: ${describeInstrumentCosts(inst)}`);
+  if (now !== undefined) {
+    const warned = new Set<string>();
+    for (const r of rows) {
+      if (!r.period) continue;
+      const baseMs = TIMEFRAME_MS[r.baseTimeframe];
+      const w = coverageWarning(r.period, Math.floor(now / baseMs) * baseMs, Math.max(COVERAGE_TOLERANCE_MS, 2 * baseMs));
+      if (w && !warned.has(w)) {
+        warned.add(w);
+        io.err(`警告: ${symbol} (${r.baseTimeframe}): ${w}`);
+        io.out(`  ※ ${w}`);
+      }
+    }
+  }
+  io.out(formatBacktestRows(rows, { benchmark: true }));
+  const withFolds = rows.filter((r) => r.folds && r.folds.length > 0);
+  if (withFolds.length > 0) {
+    io.out(`  区間別 (${withFolds[0].folds!.length} 区間。通しの結果を期間で等分して切り出し、取引は決済時刻で数える。建玉・評価額は区間をまたいで持ち越す):`);
+    for (const r of withFolds) {
+      io.out(`  ${strategyLabelWithId(r.strategyId)}`);
+      io.out(formatFoldRows(r.folds!));
+    }
+  }
 }
 
 /** trader が登録する backtest の足の取得元の文脈 */
@@ -648,24 +796,44 @@ interface BacktestSourceCtx {
   config: AppConfig;
   args: BacktestArgs;
   io: Io;
+  deps?: BacktestCliDeps;
+  /** 取引所ごとの ccxt の feed (複数銘柄で銘柄一覧を取り直さない) */
+  feeds?: Map<string, MarketDataFeed>;
 }
 
-/** trader の backtest の足の取得元: ccxt (CCXT_EXCHANGE の足)・jupiter (GeckoTerminal の最良のプールの足。成行だけ) */
+/** --source ccxt の取引所 (--exchange があればそれ、無ければ CCXT_EXCHANGE) */
+export function backtestExchangeOf(config: AppConfig, args: Pick<BacktestArgs, "exchange">): string {
+  return args.exchange ?? config.env.CCXT_EXCHANGE;
+}
+
+/** 円建ての取引所 (既定の銘柄を BTC/JPY にする) */
+const JPY_EXCHANGES = ["bitflyer", "bitbank", "coincheck", "zaif"];
+
+/** trader の backtest の足の取得元: ccxt (--exchange か CCXT_EXCHANGE の足)・jupiter (GeckoTerminal の最良のプールの足。成行だけ) */
 const TRADER_BACKTEST_SOURCES: BacktestSourceSpec<BacktestSourceCtx>[] = [
   {
     name: "ccxt",
-    label: ({ config }) => `ccxt ${config.env.CCXT_EXCHANGE}`,
-    async open({ config, args, io }) {
-      io.out(`ccxt (${config.env.CCXT_EXCHANGE}) から履歴を取得します...`);
-      const feed = CcxtFeed.create(config.env.CCXT_EXCHANGE);
-      const symbol = args.symbol ?? (["bitflyer", "bitbank", "coincheck", "zaif"].includes(config.env.CCXT_EXCHANGE) ? "BTC/JPY" : "BTC/USDT");
+    label: ({ config, args }) => `ccxt ${backtestExchangeOf(config, args)}`,
+    async open({ config, args, io, deps, feeds }) {
+      const ex = backtestExchangeOf(config, args);
+      let feed = feeds?.get(ex);
+      if (!feed) {
+        io.out(`ccxt (${ex}) から履歴を取得します (公開 API の足だけ・キーなし)...`);
+        feed = deps?.ccxtFeed ? deps.ccxtFeed(ex) : CcxtFeed.create(ex);
+        feeds?.set(ex, feed);
+      }
+      const symbol = args.symbol ?? (JPY_EXCHANGES.includes(ex) ? "BTC/JPY" : "BTC/USDT");
       return { feed, symbol };
     },
   },
   {
     name: "jupiter",
     label: () => "Jupiter (GeckoTerminal の足)",
-    open: ({ config, args, io }) => jupiterBacktestFeed(config, args.token ?? "SOL", args.days, io),
+    open: ({ config, args, io, deps }) => {
+      const token = args.token ?? "SOL";
+      const onWarn = (m: string) => io.err(`警告: ${m}`);
+      return deps?.jupiterFeed ? deps.jupiterFeed(token, onWarn) : jupiterBacktestFeed(config, token, args.days, io, onWarn);
+    },
     marketOnly: true,
   },
 ];
@@ -673,9 +841,12 @@ for (const spec of TRADER_BACKTEST_SOURCES) registerBacktestSource(spec);
 
 /**
  * backtest --source jupiter: トークン (mint か symbol) を解決し、GeckoTerminal の最良のプールの足を返す feed を作る。
- * 銘柄定義は運用と同じ jupiterInstrument (コスト = 代わりのスリッページのモデル + ネットワーク手数料、指値なし)
+ * 銘柄定義は運用と同じ jupiterInstrument (コスト = 代わりのスリッページのモデル + ネットワーク手数料、指値なし)。
+ * 履歴が --days より短ければ onWarn で知らせて取れた分で続ける (実際の期間はバックテストの結果に出す)
  */
-async function jupiterBacktestFeed(config: AppConfig, token: string, days: number, io: Io): Promise<{ feed: MarketDataFeed; symbol: string }> {
+async function jupiterBacktestFeed(
+  config: AppConfig, token: string, days: number, io: Io, onWarn: (msg: string) => void,
+): Promise<{ feed: MarketDataFeed; symbol: string }> {
   const js = jupiterSettingsFromEnv(config.env);
   const client = new JupiterClient({ ...(js.apiKey ? { apiKey: js.apiKey } : {}), ...(js.ratePerSec !== undefined ? { ratePerSec: js.ratePerSec } : {}) });
   const specs = await resolveFixedTokens(client, [token], (m, d) => io.err(`警告: ${m}${d ? ` ${JSON.stringify(d)}` : ""}`));
@@ -690,7 +861,7 @@ async function jupiterBacktestFeed(config: AppConfig, token: string, days: numbe
     `Jupiter: ${inst.symbol} (${inst.assetClass}, mint ${spec.mint}) / プール ${pool.name ?? pool.address} / ` +
       `GeckoTerminal から履歴を取得します (1m の基準足なら約 ${pages} 回、${js.geckoCallsPerMin} 回/分で約 ${Math.ceil(pages / js.geckoCallsPerMin)} 分)...`,
   );
-  return { feed: new GeckoHistoryFeed(gecko, inst, pool.address), symbol: inst.symbol };
+  return { feed: new GeckoHistoryFeed(gecko, inst, pool.address, Date.now, undefined, onWarn), symbol: inst.symbol };
 }
 
 /** jupiter check: Jupiter・GeckoTerminal・frankfurter の応答の形を確かめる (読み取りだけ。キーは表示しない) */
@@ -1068,6 +1239,9 @@ function observeScopeTag(rules: ReturnType<typeof parseObserveOnly>, id: string)
   return scope === undefined ? "" : scope === "全クラス" ? "観測専用" : `観測専用 (${scope})`;
 }
 
+/** 決済を自分で管理する戦略 (Strategy.managesOwnExit。trend_4h) の status の表示 */
+export const OWN_EXIT_TAG = "自前の決済 (建値ストップ・転換で決済・読みの管理・最大保有の上限は適用しない)";
+
 export function strategyStatusLines(config: AppConfig): string[] {
   const observe = parseObserveOnly(config.env.OBSERVE_ONLY_STRATEGIES ?? []);
   const structure = structureSettingsFromEnv(config.env);
@@ -1080,6 +1254,7 @@ export function strategyStatusLines(config: AppConfig): string[] {
     const tags = [
       observeScopeTag(observe, s.id), filtering.has(s.id) ? "構造フィルター対象" : "",
       jupiterOnly && s.requiresBook ? "板が必要: Jupiter では動きません" : "",
+      s.managesOwnExit ? OWN_EXIT_TAG : "",
     ].filter(Boolean);
     out.push(`  ${strategyLabelWithId(s.id)} / ${horizonLabel(s.horizon)}${tags.length ? ` / ${tags.join("・")}` : ""}`);
   }
@@ -1130,7 +1305,9 @@ function cmdStatus(io: Io): number {
     for (const p of open) {
       // 読みの期限 (読みの管理を使う建玉だけ): 期限の時刻と 監視中 / 延長中 (延長中は上限の時刻)
       const plan = plans[p.id];
-      const ms = plan ? activeThesisMs(thesis, plan.expectedMs, plan.maxHoldMs, initialRiskPerUnit(p.entryPrice, p.initialStop)) : undefined;
+      // 決済を自分で管理する戦略の建玉は読みの管理を使わない (最大保有の時間切れだけ)
+      const ownExit = managesOwnExit(p.strategyId);
+      const ms = plan && !ownExit ? activeThesisMs(thesis, plan.expectedMs, plan.maxHoldMs, initialRiskPerUnit(p.entryPrice, p.initialStop)) : undefined;
       const th = ms === undefined
         ? ""
         : plan?.thesis?.extendedAt !== undefined
@@ -1138,7 +1315,8 @@ function cmdStatus(io: Io): number {
           : ` / 読みの期限 ${fmtTime(p.entryTs + ms)} (監視中)`;
       // 建値ストップ (発動済みの建玉だけ)
       const be = plan?.breakeven ? ` / 建値ストップ ${plan.breakeven.stop} (${fmtTime(plan.breakeven.armedAt)} に発動)` : "";
-      io.out(`  ${p.symbol} ${p.direction === "long" ? "買い" : "売り"} ${p.qty} @ ${p.entryPrice} (${strategyLabel(p.strategyId)}, ${fmtTime(p.entryTs)})${th}${be}`);
+      const own = ownExit ? ` / 自前の決済${plan?.maxHoldMs ? ` (最大保有 ${fmtTime(p.entryTs + plan.maxHoldMs)} まで)` : ""}` : "";
+      io.out(`  ${p.symbol} ${p.direction === "long" ? "買い" : "売り"} ${p.qty} @ ${p.entryPrice} (${strategyLabel(p.strategyId)}, ${fmtTime(p.entryTs)})${th}${be}${own}`);
     }
     const pending = new PendingOrders({ store, mode }).list();
     if (pending.length) {

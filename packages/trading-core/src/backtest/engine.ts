@@ -67,6 +67,8 @@ import type { BacktestOptions, BacktestResult, BacktestStats, IntelSource, Sizer
  *     ストップ = 往復コスト込みの建値 (エントリー手数料/単位 + 決済の taker・固定手数料 (1 単位換算) + 半スプレッド)。
  *   - バー i の損切りの判定の後に発動するので、ストップはバー i+1 から効く (先読みしない)。一度上げたら戻さない。
  *     実効のストップは当初・トレーリング・読みの管理の保護ストップ・建値ストップのうち最もきついもの。理由は trailing (breakevenStopExit)。
+ * 決済を自分で管理する戦略 (strategy.managesOwnExit。trend_4h): opts.maxHoldMinutes・thesis・breakeven・reversal を使わない
+ *   (当初の損切り・戦略の決済シグナル・シグナルの maxHoldMs の時間切れ・トレーリングは従来どおり)。
  * 転換で決済 (opts.reversal。省略・無効・戦略が対象外なら従来どおり。ライブの REVERSAL_* と同じ src/engine/reversalExit.ts の規則):
  *   - 判定の時間足 (REVERSAL_EXIT_TF。lower = 主時間足の 1 つ下、same = 主時間足) が確定したバー i の終値で、
  *     エントリー後に確定した押し安値 (売りは戻り高値。REVERSAL_EXIT_FALLBACK なら無いときエントリーした足の安値・高値) を終値が越えたかを判定し、
@@ -196,7 +198,7 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
     if (ms < baseMs || ms % baseMs !== 0) throw new Error(`基準足 ${baseTf} から ${tf} は作れません`);
   }
   // 転換で決済の判定の時間足 (戦略へ渡す view には入れない。基準足から作れなければ主時間足)
-  const revTf = opts.reversal ? reversalBacktestTimeframe(opts.reversal, primary, baseTf) : primary;
+  const revTf = opts.reversal && strategy.managesOwnExit !== true ? reversalBacktestTimeframe(opts.reversal, primary, baseTf) : primary;
   const revMs = TIMEFRAME_MS[revTf];
   const seriesTfs = tfs.includes(revTf) ? tfs : [...tfs, revTf];
 
@@ -210,16 +212,19 @@ export function runBacktest(opts: BacktestOptions): BacktestResult {
   /** 約定ごとの固定手数料 (Jupiter のネットワーク手数料。クオート通貨建て。無ければ 0 = 従来どおり) */
   const fixedFee = D(fixedFeeOf(instrument));
   const limitOpts = opts.limitOrders;
+  // 決済を自分で管理する戦略 (Strategy.managesOwnExit。trend_4h): 最大保有の上限・読みの管理・建値ストップ・転換で決済を掛けない
+  // (ライブの PositionManager・engine・仮想トレードと同じ。当初の損切り・戦略の決済シグナル・maxHoldBars の時間切れは従来どおり)
+  const ownExit = strategy.managesOwnExit === true;
   // 最大保有 (ライブの MAX_HOLD_MINUTES と同じ前提)。無効なら undefined (シグナルのまま)
-  const holdLimitMs = opts.maxHoldMinutes !== undefined && Number.isFinite(opts.maxHoldMinutes) && opts.maxHoldMinutes > 0
+  const holdLimitMs = !ownExit && opts.maxHoldMinutes !== undefined && Number.isFinite(opts.maxHoldMinutes) && opts.maxHoldMinutes > 0
     ? Math.round(opts.maxHoldMinutes * 60_000)
     : undefined;
   const limitTp = limitOpts?.takeProfit === true;
-  const thesis = opts.thesis ?? THESIS_DISABLED;
+  const thesis = !ownExit ? (opts.thesis ?? THESIS_DISABLED) : THESIS_DISABLED;
   // 建値ストップ (有効なときだけ。無ければ従来どおり)
-  const breakeven = breakevenEnabled(opts.breakeven) ? opts.breakeven : undefined;
+  const breakeven = !ownExit && breakevenEnabled(opts.breakeven) ? opts.breakeven : undefined;
   // 転換で決済 (有効で、この戦略が対象のときだけ。無ければ従来どおり)
-  const reversal = opts.reversal && reversalAppliesTo(opts.reversal, strategy.id) ? opts.reversal : undefined;
+  const reversal = !ownExit && opts.reversal && reversalAppliesTo(opts.reversal, strategy.id) ? opts.reversal : undefined;
   if (reversal) stats.reversalExits = 0;
   /** シグナルの読みの期限 (最大保有で丸める。無ければ undefined = maxHoldMs を期限にする) */
   const expectedOf = (sig: Signal): number | undefined =>

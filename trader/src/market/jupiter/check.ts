@@ -10,7 +10,7 @@
  */
 import { redactedErrMsg } from "../../core/http";
 import type { JupiterClient } from "./client";
-import { DEFAULT_MEME_TOKENS, MAJOR_TOKENS, SOL_MINT, USDC_MINT, type KnownToken } from "./discovery";
+import { DEFAULT_MEME_TOKENS, MAJOR_TOKENS, normalizeTokenSymbol, SOL_MINT, USDC_MINT, type KnownToken } from "./discovery";
 import type { GeckoTerminalClient } from "./gecko";
 import { JupiterShapeError } from "./parse";
 import { fetchPrices } from "./price";
@@ -28,6 +28,7 @@ export const JUPITER_UNVERIFIED_ITEMS: readonly string[] = [
   "GeckoTerminal の無料枠の上限 (1 分あたり 5〜30 回の記述。既定 10 回/分)、ohlcv_list は新しい順・取引の無い足は含まれない",
   "GeckoTerminal の before_timestamp の境界 (含む・含まない) は ts の重複除去でどちらでも動く",
   "既定の銘柄の mint (下の照合の結果を確認する)",
+  "2026-11 に足した主要銘柄 (USDT・cbBTC・WBTC (Wormhole)・WETH (Wormhole)・JTO・PYTH・RAY) の mint と、既知の decimals (cbBTC 8・WBTC 8・WETH 8・JTO 9・PYTH 6・RAY 6)",
 ];
 
 export interface JupiterCheckStep {
@@ -108,8 +109,8 @@ export async function runJupiterCheck(client: JupiterClient, gecko: GeckoTermina
       const issues: string[] = [];
       for (const k of known) {
         const actual = bySym.get(k.mint);
-        const norm = (s: string) => s.replace(/^[$]+/, "").toUpperCase(); // WIF は "$WIF" で登録されている
-        const ok = actual !== undefined && norm(actual) === norm(k.symbol);
+        // WIF は "$WIF" で登録されている。別名 (Wormhole の WETH の "ETH" など) も一致とみなす
+        const ok = actual !== undefined && [k.symbol, ...(k.aliases ?? [])].some((x) => normalizeTokenSymbol(x) === normalizeTokenSymbol(actual));
         tokenVerification.push({ mint: k.mint, expected: k.symbol, ...(actual !== undefined ? { actual } : {}), ok });
         if (!ok) issues.push(`${k.symbol} (${k.mint}): ${actual === undefined ? "見つからない" : `symbol が ${actual}`}`);
       }

@@ -41,8 +41,8 @@ export {
   type FallbackSlippageSettings, type FillContext, type FillEstimate, type QuoteProvider, type QuoteRequest, type RouteLeg, type SwapQuote,
 } from "./quote";
 export {
-  DEFAULT_DISCOVERY_SETTINGS, DEFAULT_MEME_TOKENS, DEFAULT_WATCH_TTL_MS, MAJOR_TOKENS, mergeWatchlist, REJECT_CODE_LABELS, rejectionsFor,
-  screenTokens, SOL_MINT, USDC_MINT,
+  DEFAULT_DISCOVERY_SETTINGS, DEFAULT_MAJOR_WATCH_SYMBOLS, DEFAULT_MEME_TOKENS, DEFAULT_WATCH_TTL_MS, impersonationRejection, isImpersonation, MAJOR_TOKENS,
+  mergeWatchlist, normalizeTokenSymbol, REJECT_CODE_LABELS, rejectionsFor, screenTokens, SOL_MINT, USDC_MINT,
   type DiscoverySettings, type KnownToken, type RejectCode, type Rejection, type ScreenResult, type WatchEntry, type WatchlistMergeOptions,
   type WatchlistMergeResult, type WatchSource,
 } from "./discovery";

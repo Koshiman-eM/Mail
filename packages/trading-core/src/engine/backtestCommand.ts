@@ -5,13 +5,14 @@
 import { generateCandles, syntheticInstrument } from "../backtest/synthetic";
 import { runBacktest } from "../backtest/engine";
 import type { BacktestMetrics, BacktestOptions } from "../backtest/types";
-import { TIMEFRAME_MS, type Candle, type Instrument, type MarketDataFeed, type Strategy, type Timeframe } from "../core/types";
+import { TIMEFRAME_MS, type Candle, type EquityPoint, type Instrument, type MarketDataFeed, type Strategy, type Timeframe, type TradeRecord } from "../core/types";
 import { mergeCandles } from "../market/candles";
 import { enabledAssetClasses } from "../core/assetClasses";
 import { ALL_STRATEGIES, getStrategy } from "../strategies/registry";
 import { fmtNum, fmtPct, formatTable } from "./report";
-import { isHoldLimitedHorizon } from "./tempo";
+import { isHoldLimitedStrategy } from "./tempo";
 import { horizonLabel, strategyLabel } from "../strategies/labels";
+import { buyAndHold, foldSummaries, totalR, type BacktestPeriod, type BuyAndHold, type FoldSummary } from "./backtestValidation";
 
 const DAY = 86_400_000;
 /** 合成データの開始時刻 (再現性のため固定) */
@@ -46,6 +47,13 @@ export interface BacktestCommandOptions {
   reversal?: BacktestOptions["reversal"];
   /** 建値ストップ (実運用の BREAKEVEN_TRIGGER_R に合わせる。省略で従来どおり) */
   breakeven?: BacktestOptions["breakeven"];
+  /**
+   * 銘柄定義の差し替え (コストの前提を変える。例: trader の --cost-model jupiter)。取得元の銘柄定義 (合成データは戦略ごと) に掛ける。
+   * 前提に合わない銘柄なら例外にしてよい (足を取る前に呼ぶ)
+   */
+  adjustInstrument?: (inst: Instrument) => Instrument;
+  /** 区間別の成績 (通しの結果を期間で folds 等分して切り出す。0・省略・1 なら出さない) */
+  folds?: number;
 }
 
 export interface BacktestRow {
@@ -55,6 +63,20 @@ export interface BacktestRow {
   bars: number;
   metrics?: BacktestMetrics;
   note?: string;
+  /** 実際にトレードの対象にした期間 (足があれば) */
+  period?: BacktestPeriod;
+  /** 同じ期間の保有 (buy & hold) */
+  benchmark?: BuyAndHold;
+  /** 合計 R */
+  totalR?: number;
+  /** 区間別の成績 (folds を指定したとき) */
+  folds?: FoldSummary[];
+  /** 銘柄定義 (コストの表示用) */
+  instrument?: Instrument;
+  /** 取引と評価額曲線 (複数銘柄の合計用) */
+  trades?: TradeRecord[];
+  equityCurve?: EquityPoint[];
+  initialEquity?: number;
 }
 
 /** 戦略の全時間足を作れる最小の時間足 */
@@ -78,9 +100,12 @@ export async function fetchCandlesPaged(
 ): Promise<Candle[]> {
   const ms = TIMEFRAME_MS[tf];
   const limit = opts.pageLimit ?? 1000;
+  // ページの上限: 取引所の 1 回の上限 (feed が limit を切り詰める。例 okx 100) が小さくても長い期間を取り切れるよう、
+  // 1 ページ 50 本でも足りる回数にする (進まない・0 本ならその時点で止まる)
+  const maxPages = opts.maxPages ?? Math.max(500, Math.ceil((until - from) / ms / 50) + 10);
   let since = from;
   let out: Candle[] = [];
-  for (let page = 0; page < (opts.maxPages ?? 500) && since < until; page++) {
+  for (let page = 0; page < maxPages && since < until; page++) {
     const rows = (await feed.fetchCandles(symbol, tf, limit, since)).filter((c) => c.ts >= since && c.ts + ms <= until);
     if (rows.length === 0) break;
     out = mergeCandles(out, rows, Number.MAX_SAFE_INTEGER);
@@ -132,6 +157,8 @@ export interface BacktestData {
   instrument: Instrument;
   /** この時刻以降の足からトレードする (それより前はウォームアップ) */
   tradeFromTs: number;
+  /** 要求した開始時刻 (履歴が短いと tradeFromTs はこれより遅い) */
+  requestedFromTs?: number;
 }
 
 /** 取得元ごとの共有状態 (同じ基準足の履歴を戦略ごとに取り直さない) */
@@ -143,7 +170,9 @@ export interface BacktestDataLoader {
  * バックテスト用の足を用意する。期間 days の前に主時間足で (leadBars ?? warmup + 50) 本分のウォームアップを付ける。
  * synthetic は固定の開始時刻から生成 (シード固定)、ccxt は feed から [until - 期間 - ウォームアップ, until) をページングで取得する。
  */
-export async function createBacktestDataLoader(o: Pick<BacktestCommandOptions, "symbol" | "days" | "source" | "seed" | "feed" | "now">): Promise<BacktestDataLoader> {
+export async function createBacktestDataLoader(
+  o: Pick<BacktestCommandOptions, "symbol" | "days" | "source" | "seed" | "feed" | "now" | "adjustInstrument">,
+): Promise<BacktestDataLoader> {
   if (!(o.days > 0)) throw new Error("--days は正の数を指定してください");
   const periodMs = o.days * DAY;
   const now = o.now ?? Date.now();
@@ -154,6 +183,7 @@ export async function createBacktestDataLoader(o: Pick<BacktestCommandOptions, "
     const sym = o.symbol ?? "BTC/USDT";
     feedInst = (await o.feed.listInstruments()).find((i) => i.symbol === sym);
     if (!feedInst) throw new Error(`取引所に銘柄がありません: ${sym}`);
+    if (o.adjustInstrument) feedInst = o.adjustInstrument(feedInst);
   }
   return {
     async load(s: Strategy, leadBars?: number): Promise<BacktestData> {
@@ -167,15 +197,19 @@ export async function createBacktestDataLoader(o: Pick<BacktestCommandOptions, "
         cache.set(key, candles);
         // アプリが使う資産クラスのうち戦略が対応する最初のもの (trader は crypto 優先)
         const cls = enabledAssetClasses().find((c) => s.assetClasses.includes(c)) ?? s.assetClasses[0];
-        const instrument = syntheticInstrument({ symbol: o.symbol ?? "SYN/USDT", assetClass: cls });
-        return { base, candles, instrument, tradeFromTs: BACKTEST_SYNTHETIC_START + warmupMs };
+        const synInst = syntheticInstrument({ symbol: o.symbol ?? "SYN/USDT", assetClass: cls });
+        const instrument = o.adjustInstrument ? o.adjustInstrument(synInst) : synInst;
+        return { base, candles, instrument, tradeFromTs: BACKTEST_SYNTHETIC_START + warmupMs, requestedFromTs: BACKTEST_SYNTHETIC_START + warmupMs };
       }
       const until = Math.floor(now / baseMs) * baseMs;
       const from = until - periodMs - warmupMs;
       const key = `${o.source}|${base}|${from}`;
       const candles = cache.get(key) ?? (await fetchCandlesPaged(o.feed!, feedInst!.symbol, base, from, until));
       cache.set(key, candles);
-      return { base, candles, instrument: feedInst!, tradeFromTs: until - periodMs };
+      // 履歴が要求より短い (上場が新しい・取引所の履歴の先頭) ときは、取れた最初の足からウォームアップしてからトレードする
+      const requestedFromTs = until - periodMs;
+      const tradeFromTs = candles.length > 0 ? Math.max(requestedFromTs, candles[0].ts + warmupMs) : requestedFromTs;
+      return { base, candles, instrument: feedInst!, tradeFromTs, requestedFromTs };
     },
   };
 }
@@ -194,12 +228,14 @@ export async function runBacktestCommand(o: BacktestCommandOptions): Promise<Bac
       rows.push({ strategyId: s.id, horizon: s.horizon, baseTimeframe: base, bars: 0, note: "板情報が必要なため履歴バックテストの対象外" });
       continue;
     }
-    const { candles, instrument, tradeFromTs } = await loader.load(s);
+    const { candles, instrument, tradeFromTs, requestedFromTs } = await loader.load(s);
     if (candles.length === 0) {
       rows.push({ strategyId: s.id, horizon: s.horizon, baseTimeframe: base, bars: 0, note: "足を取得できませんでした" });
       continue;
     }
+    const initialEquity = 1_000_000;
     const r = runBacktest({
+      initialEquity,
       strategy: s,
       instrument,
       candles,
@@ -209,15 +245,22 @@ export async function runBacktestCommand(o: BacktestCommandOptions): Promise<Bac
       ...(o.riskPerTrade !== undefined ? { riskPerTrade: o.riskPerTrade } : {}),
       ...(o.maxPositionPct !== undefined ? { maxPositionPct: o.maxPositionPct } : {}),
       ...(o.limitOrders ? { limitOrders: o.limitOrders } : {}),
-      ...(holdOn && !isHoldLimitedHorizon(s.horizon) ? { maxHoldMinutes: o.maxHoldMinutes } : {}),
+      ...(holdOn && !isHoldLimitedStrategy(s) ? { maxHoldMinutes: o.maxHoldMinutes } : {}),
       ...(o.thesis ? { thesis: o.thesis } : {}),
       ...(o.reversal ? { reversal: o.reversal } : {}),
       ...(o.breakeven ? { breakeven: o.breakeven } : {}),
     });
     const notes = [
       ...(r.metrics.trades === 0 ? [r.stats.evaluations === 0 ? "ウォームアップ不足" : "シグナルなし"] : []),
-      ...(holdOn && isHoldLimitedHorizon(s.horizon) ? [`最大保有 ${o.maxHoldMinutes} 分のため運用では発注しない (仮想トレードのみ)`] : []),
+      ...(holdOn && isHoldLimitedStrategy(s) ? [`最大保有 ${o.maxHoldMinutes} 分のため運用では発注しない (仮想トレードのみ)`] : []),
     ];
+    const baseMs = TIMEFRAME_MS[base];
+    const firstTraded = candles.find((c) => c.ts >= tradeFromTs);
+    const period: BacktestPeriod | undefined = firstTraded
+      ? { requestedFrom: requestedFromTs ?? tradeFromTs, from: firstTraded.ts, to: candles[candles.length - 1].ts + baseMs }
+      : undefined;
+    const benchmark = buyAndHold(candles, tradeFromTs, baseMs);
+    const folds = period && o.folds !== undefined && o.folds >= 2 ? foldSummaries(r, period.from, period.to, o.folds) : undefined;
     rows.push({
       strategyId: s.id,
       horizon: s.horizon,
@@ -225,22 +268,42 @@ export async function runBacktestCommand(o: BacktestCommandOptions): Promise<Bac
       bars: candles.length,
       metrics: r.metrics,
       ...(notes.length ? { note: notes.join(" / ") } : {}),
+      ...(period ? { period } : {}),
+      ...(benchmark ? { benchmark } : {}),
+      totalR: totalR(r.trades),
+      ...(folds ? { folds } : {}),
+      instrument,
+      trades: r.trades,
+      equityCurve: r.equityCurve,
+      initialEquity,
     });
   }
   return rows;
 }
 
 
-export function formatBacktestRows(rows: BacktestRow[]): string {
+/**
+ * 戦略ごとの表。benchmark: true で合計 R と同じ期間の保有 (buy & hold) のリターン・最大DD の列を足す
+ * (トレンドフォローを単に持っていた場合と比べる)
+ */
+export function formatBacktestRows(rows: BacktestRow[], opts: { benchmark?: boolean } = {}): string {
+  const bench = opts.benchmark === true;
   return formatTable(
-    ["戦略", "時間軸", "基準足", "本数", "取引数", "勝率", "純損益", "リターン", "最大DD", "PF", "期待値R", "シャープ", "手数料", "備考"],
+    [
+      "戦略", "時間軸", "基準足", "本数", "取引数", "勝率", "純損益", "リターン", "最大DD", "PF", "期待値R",
+      ...(bench ? ["合計R"] : []), "シャープ", "手数料", ...(bench ? ["保有リターン", "保有DD"] : []), "備考",
+    ],
     rows.map((r) => {
       const m = r.metrics;
+      const b = r.benchmark;
       return [
         strategyLabel(r.strategyId), horizonLabel(r.horizon), r.baseTimeframe, r.bars,
         m ? m.trades : "-", m ? fmtPct(m.winRate, 1) : "-", m ? fmtNum(m.netPnl, 0) : "-", m ? fmtPct(m.returnPct) : "-",
-        m ? fmtPct(m.maxDrawdown) : "-", m ? m.profitFactor.toFixed(2) : "-", m ? m.expectancyR.toFixed(3) : "-", m ? m.sharpe.toFixed(2) : "-",
-        m ? fmtNum(m.fees, 0) : "-", r.note ?? "",
+        m ? fmtPct(m.maxDrawdown) : "-", m ? m.profitFactor.toFixed(2) : "-", m ? m.expectancyR.toFixed(3) : "-",
+        ...(bench ? [m && r.totalR !== undefined ? r.totalR.toFixed(2) : "-"] : []),
+        m ? m.sharpe.toFixed(2) : "-", m ? fmtNum(m.fees, 0) : "-",
+        ...(bench ? [b ? fmtPct(b.returnPct) : "-", b ? fmtPct(b.maxDrawdown) : "-"] : []),
+        r.note ?? "",
       ];
     }),
   );

@@ -359,6 +359,16 @@ export interface Strategy {
    * シグナルが entry.type === "limit" で価格を持つときは、そちらを優先する
    */
   entryOrder?: "market" | "limit";
+  /**
+   * 決済を自分で管理する戦略 (trend_4h など。中期のトレンドフォローで、保有を数日〜数週間に伸ばすため)。
+   * この戦略が持ち主の建玉・仮想トレードには、汎用の決済の上乗せを掛けない: 建値ストップ (BREAKEVEN_TRIGGER_R)・
+   * 転換で決済 (REVERSAL_EXIT)・読みの管理 (THESIS_EXIT。代わりに従来の maxHold の時間切れ)・最大保有の上限 (MAX_HOLD_MINUTES。
+   * isHoldLimitedHorizon による観測専用の扱いもしない)。
+   * 掛けるもの: 当初の損切り、戦略自身の決済シグナル (トレーリング・チャネル割れ)、戦略の maxHoldBars の時間切れ、RiskManager
+   * (日次損失・ドローダウンのキルスイッチ・上限) と新規エントリーのすべての判定。
+   * エンジン・バックテスト・パラメータ検証・仮想トレードで同じ。復元した建玉は持ち主の戦略を id で引く (未知・廃止した id は従来どおり)
+   */
+  managesOwnExit?: true;
   /** 純粋関数。副作用なし・同じ入力なら同じ出力 */
   evaluate(ctx: StrategyContext): Signal | null;
 }

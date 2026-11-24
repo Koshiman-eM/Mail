@@ -2,12 +2,14 @@
  * Jupiter の監視銘柄: 固定の銘柄 (JUPITER_TOKENS) の解決と、ミームコインの自動探索 (JUPITER_DISCOVERY)。
  *
  * - 固定の銘柄: mint のアドレスか symbol (既定の一覧 MAJOR_TOKENS・DEFAULT_MEME_TOKENS の symbol、それ以外は tokens/v2/search で引く)。
- *   SOL・JUP (主要銘柄) は資産クラス crypto、それ以外は meme。decimals・流動性は tokens/v2/search から (取れなければ既定の銘柄だけ既知の decimals)。
+ *   主要銘柄 (MAJOR_TOKENS: SOL・JUP・cbBTC・WBTC・WETH・JTO・PYTH・RAY) は資産クラス crypto、それ以外は meme。decimals・流動性は tokens/v2/search から (取れなければ既定の銘柄だけ既知の decimals)。
  * - 自動探索 (JUPITER_DISCOVERY_MINUTES ごと): toptrending/1h と toporganicscore/1h → screenTokens (JUPITER_DISCOVERY_* の設定。
  *   空ならモジュールの既定値) → mergeWatchlist (期限 JUPITER_DISCOVERY_TTL_HOURS、保有中・保留中の注文のある銘柄は外さない)。
  *   追加・削除は実行中の hub・feed・PaperBroker に反映し (onAdd / onRemove)、kv `jupiter:watch:<mode>` に保存、監査ログ
  *   `jupiter.watch_add` / `jupiter.watch_remove` (外した理由と、選別に落ちていればその理由)・`jupiter.discovery` (不合格の理由の集計)。
- * - 自動追加した銘柄が後で選別に落ちたら (監査の変化・流動性の低下など)、新規エントリーを止める (feed.setEntryBlock)。
+ * - 主要銘柄の名前 (BTC・ETH・SOL・JUP・USDC・USDT・cbBTC・WBTC・WETH・JTO・PYTH・RAY。先頭の "$" を除き大文字で完全一致) を名乗る
+ *   別の mint のトークンは「なりすまし」(impersonation) として自動追加しない。監視中のものは下の screen_failed で新規を止める (起動時も)。
+ * - 自動追加した銘柄が後で選別に落ちたら (監査の変化・流動性の低下・なりすまし)、新規エントリーを止める (feed.setEntryBlock)。
  *   保有中の建玉は通常どおり管理・決済する。再び合格すれば止めるのをやめる。監査ログ `jupiter.watch_screen_failed` / `jupiter.watch_screen_ok`。
  * - 起動時は kv の一覧から期限内の自動追加の銘柄 (と、期限切れでも保有中の銘柄) を戻す。
  */
@@ -17,8 +19,8 @@ import type { Env } from "../appConfig";
 import type { AssetClass, Instrument, Store, TradingMode } from "../core/types";
 import type { JupiterClient } from "../market/jupiter/client";
 import {
-  DEFAULT_DISCOVERY_SETTINGS, DEFAULT_MEME_TOKENS, DEFAULT_WATCH_TTL_MS, MAJOR_TOKENS, mergeWatchlist, rejectionsFor, screenTokens, USDC_MINT,
-  type DiscoverySettings, type Rejection, type WatchEntry,
+  DEFAULT_DISCOVERY_SETTINGS, DEFAULT_MAJOR_WATCH_SYMBOLS, DEFAULT_MEME_TOKENS, DEFAULT_WATCH_TTL_MS, impersonationRejection, MAJOR_TOKENS, mergeWatchlist,
+  rejectionsFor, screenTokens, USDC_MINT, type DiscoverySettings, type Rejection, type WatchEntry,
 } from "../market/jupiter/discovery";
 import { isSolanaAddress } from "../market/jupiter/parse";
 import { effectivePricePollMs } from "../market/jupiter/price";
@@ -28,7 +30,7 @@ import type { JupiterFeed, JupiterTokenSpec } from "../market/feeds/jupiter";
 
 export const jupiterWatchKey = (mode: TradingMode) => `jupiter:watch:${mode}`;
 
-/** 主要銘柄 (資産クラス crypto)。USDC はクオートなので監視しない */
+/** 主要銘柄 (資産クラス crypto: SOL・JUP・cbBTC・WBTC・WETH・JTO・PYTH・RAY など)。USDC はクオートなので監視しない */
 const MAJOR_MINTS = new Set(MAJOR_TOKENS.filter((t) => t.mint !== USDC_MINT).map((t) => t.mint));
 
 /** 既定の銘柄の decimals (tokens/v2/search が取れないときだけ使う。要確認: jupiter check) */
@@ -39,7 +41,20 @@ const KNOWN_DECIMALS: Readonly<Record<string, number>> = {
   EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm: 6, // WIF
   "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr": 9, // POPCAT
   MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5: 5, // MEW
+  // 2026-11 に足した主要銘柄 (要確認: jupiter check で mint と合わせて確かめる。通常は tokens/v2/search の値を使う)
+  cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij: 8, // cbBTC (要確認)
+  "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh": 8, // WBTC (Wormhole。要確認)
+  "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs": 8, // WETH (Wormhole。要確認)
+  jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL: 9, // JTO (要確認)
+  HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3: 6, // PYTH (要確認)
+  "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R": 6, // RAY (要確認)
 };
+
+/**
+ * JUPITER_TOKENS の既定: 主要銘柄 (crypto: SOL・JUP・cbBTC・WBTC・WETH・JTO・PYTH・RAY) と既定のミームコイン (meme)。
+ * src/appConfig.ts の既定と同じ値 (試験で一致を確かめる)
+ */
+export const DEFAULT_JUPITER_TOKENS = [...DEFAULT_MAJOR_WATCH_SYMBOLS, ...DEFAULT_MEME_TOKENS.map((t) => t.symbol)].join(",");
 
 export interface JupiterSettings {
   apiKey?: string;
@@ -75,7 +90,7 @@ export function jupiterSettingsFromEnv(env: Partial<JupiterEnv>): JupiterSetting
     ...(env.JUPITER_RPS !== undefined ? { ratePerSec: env.JUPITER_RPS } : {}),
     pollMs: pick(env.JUPITER_POLL_MS, 2_500),
     geckoCallsPerMin: pick(env.GECKO_CALLS_PER_MIN, 10),
-    tokens: (env.JUPITER_TOKENS ?? "SOL,JUP,BONK,WIF,POPCAT,MEW").split(",").map((x) => x.trim()).filter(Boolean),
+    tokens: (env.JUPITER_TOKENS ?? DEFAULT_JUPITER_TOKENS).split(",").map((x) => x.trim()).filter(Boolean),
     discovery: env.JUPITER_DISCOVERY ?? true,
     discoveryEveryMs: pick(env.JUPITER_DISCOVERY_MINUTES, 20) * 60_000,
     ttlMs: env.JUPITER_DISCOVERY_TTL_HOURS !== undefined ? env.JUPITER_DISCOVERY_TTL_HOURS * 3_600_000 : DEFAULT_WATCH_TTL_MS,
@@ -119,7 +134,12 @@ const assetClassOf = (mint: string): AssetClass => (MAJOR_MINTS.has(mint) ? "cry
  * decimals・流動性も tokens/v2/search から (失敗したら既定の銘柄だけ KNOWN_DECIMALS)
  */
 export async function resolveFixedTokens(client: JupiterClient, items: readonly string[], warn: (m: string, d?: Record<string, unknown>) => void): Promise<JupiterTokenSpec[]> {
-  const known = new Map([...MAJOR_TOKENS, ...DEFAULT_MEME_TOKENS].map((t) => [t.symbol.toUpperCase(), t.mint]));
+  // 既定の一覧の symbol (と主要銘柄の別名: BTC → cbBTC、ETH → WETH。先に書いた方)。主要銘柄の名前は検索に回さない
+  // (検索の上位がなりすましのトークンでありうるため)
+  const known = new Map<string, string>();
+  for (const t of [...MAJOR_TOKENS, ...DEFAULT_MEME_TOKENS]) {
+    for (const name of [t.symbol, ...(t.aliases ?? [])]) if (!known.has(name.toUpperCase())) known.set(name.toUpperCase(), t.mint);
+  }
   const mints: string[] = [];
   const unknownSymbols: string[] = [];
   for (const raw of items) {
@@ -157,7 +177,9 @@ export async function resolveFixedTokens(client: JupiterClient, items: readonly 
   for (const mint of uniq) {
     const t = info.get(mint);
     const decimals = t?.decimals ?? KNOWN_DECIMALS[mint];
-    const symbol = t?.symbol ?? [...MAJOR_TOKENS, ...DEFAULT_MEME_TOKENS].find((k) => k.mint === mint)?.symbol;
+    // 主要銘柄は既定の一覧の symbol を使う (API の表示名 (例 WETH の "ETH") に左右されずシンボルを安定させる)。それ以外は従来どおり API が先
+    const major = MAJOR_TOKENS.find((k) => k.mint === mint)?.symbol;
+    const symbol = major ?? t?.symbol ?? DEFAULT_MEME_TOKENS.find((k) => k.mint === mint)?.symbol;
     if (decimals === undefined || !symbol) {
       warn("decimals・symbol が分からない銘柄を外します", { mint });
       continue;
@@ -284,7 +306,16 @@ export class JupiterWatchManager {
       if (fixedBy.has(k.mint) || restored.some((e) => e.mint === k.mint) || !added.has(k.mint)) continue;
       restored.push({ mint: k.mint, symbol: k.symbol, source: "discovered", decimals: k.decimals, lastSeenAt: now, addedAt: now, expiresAt: now });
     }
-    for (const e of restored) if (e.screenBlock) feed.setEntryBlock(e.mint, e.screenBlock.reason);
+    for (const e of restored) {
+      // 主要銘柄の名前を名乗る別のトークン (なりすまし) は、前回の選別の結果によらず新規エントリーを止める (建玉は管理を続ける)
+      const imp = impersonationRejection(e.mint, e.symbol);
+      if (imp && !e.screenBlock?.codes.includes("impersonation")) {
+        const codes = [...new Set([...(e.screenBlock?.codes ?? []), "impersonation"])].sort();
+        e.screenBlock = { codes, reason: `選別に落ちたため新規エントリーしません: ${imp.label}` };
+        this.d.store.audit({ ts: now, type: "jupiter.watch_screen_failed", data: { mint: e.mint, symbol: e.instSymbol ?? e.symbol, codes, reasons: [imp.label] } });
+      }
+      if (e.screenBlock) feed.setEntryBlock(e.mint, e.screenBlock.reason);
+    }
     this.entries = [
       ...this.d.fixed.map((f): StoredWatchEntry => ({ mint: f.mint, symbol: f.symbol, source: "fixed", decimals: f.decimals })),
       ...restored,
@@ -361,14 +392,19 @@ export class JupiterWatchManager {
       if (e.source !== "discovered") continue;
       const inst = feed.instrumentOf(e.mint);
       const tok = infoBy.get(e.mint) ?? feed.tokenInfo(e.mint);
-      if (!tok) {
+      // 主要銘柄の名前を名乗る別のトークン (なりすまし) は、トークン情報が無くても保存した symbol で判定する
+      const imp = tok ? undefined : impersonationRejection(e.mint, e.symbol);
+      if (!tok && !imp) {
         if (e.screenBlock) {
           feed.setEntryBlock(e.mint, e.screenBlock.reason);
           if (inst) screenFailed.push(inst.symbol);
         }
         continue;
       }
-      const reasons = rejectionsFor(tok, screen, now).filter((r) => r.code !== "excluded");
+      const reasons = tok ? rejectionsFor(tok, screen, now).filter((r) => r.code !== "excluded") : [imp!];
+      // 保存した symbol (自動追加した時の名前) でもなりすましを見る (トークン情報の symbol が後で変わっても止める)
+      const savedImp = tok ? impersonationRejection(e.mint, e.symbol) : undefined;
+      if (savedImp && !reasons.some((r) => r.code === "impersonation")) reasons.push(savedImp);
       const symbol = inst?.symbol ?? e.instSymbol ?? e.symbol ?? e.mint;
       if (reasons.length > 0) {
         const codes = [...new Set(reasons.map((r) => r.code as string))].sort();
