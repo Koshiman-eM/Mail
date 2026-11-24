@@ -6,7 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 const args = process.argv.slice(2);
 const dbIdx = args.indexOf("--db");
 const dbPath = dbIdx >= 0 ? args[dbIdx + 1] : "./data/trader.db";
-const ids = args.filter((a, i) => !a.startsWith("--") && i !== dbIdx + 1);
+const ids = args.filter((a, i) => !a.startsWith("--") && !(dbIdx >= 0 && i === dbIdx + 1));
 if (!ids.length) {
   console.log("使い方: node scripts/diagStrategy.mjs <戦略 id> [<戦略 id> ...] [--db パス]");
   process.exit(1);
