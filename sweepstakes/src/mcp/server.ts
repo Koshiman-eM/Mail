@@ -26,6 +26,7 @@ const INSTRUCTIONS = `懸賞の収集・採点・Webフォーム自動応募 (�
 - enter_campaign / run_web_forms は既定で dry-run (送信しない) です。submit=true は利用者が明示的に送信を指示したときだけ指定してください。
 - collect_sweepstakes / run_web_forms はジョブを開始してジョブ ID を返します。結果は get_job で確認してください (数分〜数十分かかります)。
 - X / Instagram / 仮想通貨クエストの操作 (フォロー・RT・ウォレット署名など) は自動化しません。get_todo の手順を利用者に伝え、完了後に mark_done で記録します。
+- 収集・応募は定期実行 (CLI) とも排他です。「他の処理が実行中」と返った場合は時間を置いて再実行してください。
 - CAPTCHA・規約で自動応募禁止・重複・日次上限などで見送られた場合は、その理由を利用者に伝えてください。回避はしません。`;
 
 export interface McpEnv {
@@ -234,6 +235,8 @@ async function main(): Promise<void> {
   };
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
+  // Windows: コンソールの Ctrl+Break。SIGTERM は Windows では届かない (タスク停止は強制終了になり、ロックは stale 判定で回収される)
+  if (process.platform === "win32") process.on("SIGBREAK", () => shutdown("SIGBREAK"));
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

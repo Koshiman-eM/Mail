@@ -1,5 +1,6 @@
 // 時間のかかる処理 (収集・一括応募など) のメモリ内ジョブ管理
-// ブラウザ操作・収集は同時に 1 ジョブまで (排他ロック)。
+// ブラウザ操作・収集は同時に 1 ジョブまで (プロセス内の排他)。
+// 他プロセス (CLI の定期実行など) との排他は start の lock オプション (core のファイルロック) で行う。
 import { randomUUID } from "node:crypto";
 
 export type JobStatus = "running" | "succeeded" | "failed";
@@ -27,6 +28,19 @@ export class JobBusyError extends Error {
 
 const MAX_LOG = 200;
 
+/** start の lock で渡す、取得済みロック (解放関数だけを使う) */
+export interface Releasable {
+  release(): void;
+}
+
+export interface JobStartOptions {
+  /**
+   * プロセス間ロックの取得関数。プロセス内の busy 判定の後に同期的に呼ばれ、
+   * 例外 (LockBusyError など) ならジョブを作らずにそのまま投げる。ジョブ終了時に release される。
+   */
+  lock?: () => Releasable;
+}
+
 export interface JobManagerOptions {
   /** 完了済みジョブの保持数 */
   keepFinished?: number;
@@ -53,8 +67,9 @@ export class JobManager {
    * 排他ジョブを開始する。既に実行中なら JobBusyError。
    * run には進捗ログ関数が渡される。
    */
-  start<T>(kind: string, run: (log: (msg: string) => void) => Promise<T>): Job<T> {
+  start<T>(kind: string, run: (log: (msg: string) => void) => Promise<T>, opts: JobStartOptions = {}): Job<T> {
     if (this.active) throw new JobBusyError(this.active);
+    const lock = opts.lock?.();
     let resolveDone!: () => void;
     const done = new Promise<void>((r) => (resolveDone = r));
     const job: Job<T> = {
@@ -88,6 +103,11 @@ export class JobManager {
         },
       )
       .finally(() => {
+        try {
+          lock?.release();
+        } catch {
+          // 解放失敗はジョブの結果に影響させない (stale 判定で回収される)
+        }
         job.finishedAt = this.now().toISOString();
         if (this.active === (job as Job)) this.active = null;
         this.trim();

@@ -1,5 +1,5 @@
 // MCP サーバーの結合テスト (127.0.0.1 のランダムポートのみ。実在サイトには一切アクセスしない)
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -7,6 +7,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { FetchLike } from "../src/collectors/http.js";
+import { acquireLock, LockBusyError } from "../src/core/lock.js";
 import type { SweepContext } from "../src/core/service.js";
 import { FailureLimiter, tokenEquals, validateServerToken } from "../src/mcp/auth.js";
 import { JobManager } from "../src/mcp/jobs.js";
@@ -361,6 +362,51 @@ describe("ジョブ", () => {
     const next = await call(client, "run_web_forms", { limit: 1 });
     expect(next.isError, textOf(next)).toBeFalsy();
     await waitJob(client, next.structuredContent!.jobId);
+    currentFetch = mockKoubo(requested);
+  });
+
+  it("他プロセス (CLI の定期実行) がファイルロックを保持中なら即エラー、ジョブ実行中は MCP がロックを保持する", async () => {
+    const lockPath = ctx.config.lockPath!;
+    const client = await bearer();
+    // 別プロセスが保持中 (自分の pid は生存しているので stale にならない)
+    const other = acquireLock(lockPath, { purpose: "run", heartbeatMs: 0 });
+    try {
+      const before = deps.jobs.list().length;
+      for (const [name, args] of [
+        ["collect_sweepstakes", { source: "koubo" }],
+        ["run_web_forms", {}],
+      ] as const) {
+        const r = await call(client, name, args);
+        expect(r.isError).toBe(true);
+        expect(textOf(r)).toContain("他の処理が実行中");
+      }
+      const c = addCampaign(ctx, { url: `${forms.baseUrl}/forms/basic.html?filelock`, title: "ファイルロック中" });
+      const ent = await call(client, "enter_campaign", { id: c.id });
+      expect(ent.isError).toBe(true);
+      expect(textOf(ent)).toContain("他の処理が実行中");
+      // ジョブは作られていない
+      expect(deps.jobs.list().length).toBe(before);
+      expect(deps.jobs.running).toBeNull();
+    } finally {
+      other.release();
+    }
+
+    // MCP のジョブ実行中はロックファイルが存在し、CLI 側の取得は失敗する。完了後は解放される
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const inner = mockKoubo([]);
+    currentFetch = async (url, init) => {
+      await gate;
+      return inner(url, init);
+    };
+    const first = await call(client, "collect_sweepstakes", { source: "koubo", categories: ["all"], maxDetails: 1 });
+    expect(first.isError, textOf(first)).toBeFalsy();
+    expect(existsSync(lockPath)).toBe(true);
+    expect(() => acquireLock(lockPath, { heartbeatMs: 0 })).toThrow(LockBusyError);
+    release();
+    const done = await waitJob(client, first.structuredContent!.jobId);
+    expect(done.structuredContent!.status, textOf(done)).toBe("succeeded");
+    expect(existsSync(lockPath)).toBe(false);
     currentFetch = mockKoubo(requested);
   });
 

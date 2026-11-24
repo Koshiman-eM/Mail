@@ -10,6 +10,7 @@ import { PROFILE_KEYS } from "../core/profile.js";
 import { QuestInputError } from "../core/quest.js";
 import { FLAG_LABELS } from "../core/score.js";
 import {
+  acquireBrowserLock,
   addQuest,
   collectFromSources,
   COLLECTOR_SOURCES,
@@ -29,7 +30,8 @@ import {
 import { kindLabel } from "../core/todo.js";
 import { CAMPAIGN_KINDS, QUEST_DISTRIBUTIONS, QUEST_REWARD_TYPES, type Campaign, type CampaignKind, type CampaignStatus } from "../core/types.js";
 import { formatQuestMetrics } from "../questCli.js";
-import { JobBusyError, type Job, type JobManager } from "./jobs.js";
+import { LockBusyError } from "../core/lock.js";
+import { JobBusyError, type Job, type JobManager, type JobStartOptions } from "./jobs.js";
 import { ProfileValidationError, updateProfile, type ProfilePatch, type ProfileStore } from "./profileStore.js";
 
 export interface ToolDeps {
@@ -78,7 +80,7 @@ async function guarded(fn: () => CallToolResult | Promise<CallToolResult>): Prom
   try {
     return await fn();
   } catch (e) {
-    if (e instanceof JobBusyError) return fail(e.message);
+    if (e instanceof JobBusyError || e instanceof LockBusyError) return fail(e.message);
     if (e instanceof ProfileValidationError || e instanceof QuestInputError) return fail(e.message);
     return fail(`エラー: ${e instanceof Error ? e.message : String(e)}`);
   }
@@ -200,14 +202,21 @@ function jobStartedText(job: Job, what: string): string {
 }
 
 /** ジョブ用に ctx.log を差し替えたコンテキスト */
+/** ジョブ内で使うコンテキスト。ブラウザロックは JobManager が取得済みなので取り直さない */
 function jobCtx(ctx: SweepContext, log: (m: string) => void): SweepContext {
   return {
     ...ctx,
+    browserLockHeld: true,
     log: (m) => {
       log(m);
       ctx.log(m);
     },
   };
+}
+
+/** JobManager.start に渡す、プロセス間ロック (CLI の定期実行との排他) の取得 */
+function browserLock(ctx: SweepContext, purpose: string): JobStartOptions {
+  return { lock: () => acquireBrowserLock(ctx, purpose) };
 }
 
 const id = z.number().int().positive().describe("キャンペーン ID (list_campaigns / get_todo / quest_list に表示される #番号)");
@@ -267,7 +276,7 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
         const job = jobs.start<JobOutput>("collect", async (log) => {
           const s = await collectFromSources(jobCtx(ctx, log), [source], { listPaths, maxDetails, fetch: deps.collectFetch });
           return { text: collectText(s), data: { ...s } };
-        });
+        }, browserLock(ctx, "collect"));
         return ok(jobStartedText(job, "収集"), { jobId: job.id, status: job.status });
       }),
   );
@@ -316,7 +325,7 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
         const job = jobs.start<JobOutput>("enter", async (log) => {
           const r = await enter(jobCtx(ctx, log), campaignId, { submit });
           return { text: (submit ? "" : "[dry-run] 送信はしていません\n") + enterText(r), data: enterData(r) };
-        });
+        }, browserLock(ctx, "enter"));
         let timer: NodeJS.Timeout | undefined;
         const timedOut = await Promise.race([
           job.done.then(() => false),
@@ -352,7 +361,7 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
         const job = jobs.start<JobOutput>("run_web_forms", async (log) => {
           const results = await runAll(jobCtx(ctx, log), { submit, limit });
           return { text: runSummaryText(results, submit), data: { submit, results: results.map(enterData) } };
-        });
+        }, browserLock(ctx, "run"));
         return ok(jobStartedText(job, submit ? "Webフォーム一括応募 (送信あり)" : "Webフォーム一括応募 (dry-run)"), { jobId: job.id, status: job.status });
       }),
   );

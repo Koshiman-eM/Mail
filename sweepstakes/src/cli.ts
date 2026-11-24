@@ -14,6 +14,7 @@ import {
   history,
   kindLabel,
   listCampaigns,
+  LockBusyError,
   mark,
   runAll,
   todo,
@@ -22,6 +23,9 @@ import {
   type EnterResult,
 } from "./core/index.js";
 import { formatQuestMetrics, QUEST_USAGE, runQuestCommand } from "./questCli.js";
+
+/** ロック取得失敗 (他の処理が実行中) の終了コード (EX_TEMPFAIL) */
+const EXIT_LOCK_BUSY = 75;
 
 const USAGE = `懸賞自動応募ツール
 
@@ -46,7 +50,10 @@ ${QUEST_USAGE.replace(/^/gm, "  ")}
 
 環境変数: SWEEP_DB, SWEEP_PROFILE, SWEEP_SCREENSHOT_DIR, SWEEP_MIN_INTERVAL_SEC,
           SWEEP_MAX_INTERVAL_SEC, SWEEP_DAILY_LIMIT, SWEEP_HEADLESS, SWEEP_CHROMIUM_PATH,
-          SWEEP_USDJPY
+          SWEEP_USDJPY, SWEEP_LOCK_PATH, SWEEP_TIMEZONE
+          (npm run sweep / npm run mcp はカレントの .env があれば読み込む)
+
+終了コード: 0 成功 / 1 エラー / ${EXIT_LOCK_BUSY} 他の処理 (定期実行・MCP のジョブ) が収集・応募中
 `;
 
 const STATUS_LABEL: Record<string, string> = {
@@ -230,6 +237,7 @@ main(process.argv.slice(2)).then(
   (code) => process.exit(code),
   (e: unknown) => {
     console.error(`エラー: ${(e as Error).message}`);
-    process.exit(1);
+    // 他の処理 (定期実行 / MCP サーバーのジョブ) がブラウザ操作・収集中。定期実行のスクリプトはこの終了コードで「見送り」と判断する
+    process.exit(e instanceof LockBusyError ? EXIT_LOCK_BUSY : 1);
   },
 );

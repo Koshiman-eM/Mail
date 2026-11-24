@@ -1,5 +1,5 @@
 // MCP から profile.json を読み書きする (部分更新・形式検証・アトミック書き込み)
-import { chmodSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, basename } from "node:path";
 import { PROFILE_KEYS, validateProfile } from "../core/profile.js";
 import type { Profile } from "../core/types.js";
@@ -20,7 +20,39 @@ export interface ProfileStore {
   write(p: Partial<Profile>): void;
 }
 
-/** ファイルベースの ProfileStore (書き込みは一時ファイル → rename、権限 0600) */
+const RETRYABLE_RENAME = new Set(["EPERM", "EACCES", "EBUSY"]);
+
+/**
+ * 一時ファイルを本来のパスへ置き換える。
+ * Windows でも rename は既存ファイルを上書きできる (MoveFileEx + REPLACE_EXISTING) が、
+ * ウイルス対策ソフト・エディタ・インデクサが対象を一瞬開いていると EPERM / EACCES / EBUSY で失敗するため、
+ * 少し待って再試行する。最終的に失敗したら一時ファイルを消して例外を投げる。
+ */
+export function replaceFileSync(tmp: string, dest: string, opts: { retries?: number; delayMs?: number; rename?: typeof renameSync } = {}): void {
+  const retries = opts.retries ?? (process.platform === "win32" ? 10 : 0);
+  const delayMs = opts.delayMs ?? 50;
+  const rename = opts.rename ?? renameSync;
+  for (let i = 0; ; i++) {
+    try {
+      rename(tmp, dest);
+      return;
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code ?? "";
+      if (i >= retries || !RETRYABLE_RENAME.has(code)) {
+        rmSync(tmp, { force: true });
+        throw e;
+      }
+      // 同期 API なので Atomics.wait で短く待つ
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs * (i + 1));
+    }
+  }
+}
+
+/**
+ * ファイルベースの ProfileStore (書き込みは一時ファイル → rename、権限 0600)。
+ * Windows では mode / chmod は読み取り専用属性にしか効かない (0600 は書き込み可なので実害なし)。
+ * アクセス制御はユーザープロファイル配下に置くことで NTFS の ACL に任せる。
+ */
 export function fileProfileStore(path: string): ProfileStore {
   return {
     read() {
@@ -33,7 +65,7 @@ export function fileProfileStore(path: string): ProfileStore {
       const tmp = join(dirname(path), `.${basename(path)}.${process.pid}.tmp`);
       writeFileSync(tmp, JSON.stringify(p, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
       chmodSync(tmp, 0o600);
-      renameSync(tmp, path);
+      replaceFileSync(tmp, path);
     },
   };
 }

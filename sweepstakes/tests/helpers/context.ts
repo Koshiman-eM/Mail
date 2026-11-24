@@ -33,7 +33,9 @@ export function launchTestBrowser() {
 
 export function makeTestContext(overrides: Partial<Config> = {}, extra: Partial<SweepContext> = {}): SweepContext {
   const screenshotDir = mkdtempSync(join(tmpdir(), "sweep-shots-"));
-  const config: Config = { ...loadConfig({}), dbPath: ":memory:", screenshotDir, minIntervalSec: 0, maxIntervalSec: 0, ...overrides };
+  // ロックファイルはテストごとの一時ディレクトリに作る (リポジトリの data/ を汚さない)
+  const lockPath = join(mkdtempSync(join(tmpdir(), "sweep-lock-")), "browser.lock");
+  const config: Config = { ...loadConfig({}), dbPath: ":memory:", screenshotDir, minIntervalSec: 0, maxIntervalSec: 0, lockPath, ...overrides };
   return createContext({
     config,
     store: new Store(":memory:"),

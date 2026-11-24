@@ -11,5 +11,6 @@ export * from "./formFiller.js";
 export * from "./todo.js";
 export * from "./quest.js";
 export * from "./service.js";
+export * from "./lock.js";
 export * from "../collectors/http.js";
 export * from "../collectors/koubo.js";

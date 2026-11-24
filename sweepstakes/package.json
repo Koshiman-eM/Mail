@@ -11,11 +11,11 @@
     "sweep": "./bin/sweep.mjs"
   },
   "scripts": {
-    "sweep": "node --disable-warning=ExperimentalWarning --import tsx src/cli.ts",
+    "sweep": "node --env-file-if-exists=.env --disable-warning=ExperimentalWarning --import tsx src/cli.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
-    "mcp": "node --disable-warning=ExperimentalWarning --import tsx src/mcp/server.ts"
+    "mcp": "node --env-file-if-exists=.env --disable-warning=ExperimentalWarning --import tsx src/mcp/server.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.2",

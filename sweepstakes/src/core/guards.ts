@@ -145,6 +145,36 @@ export function startOfLocalDay(now: Date): Date {
   return new Date(now.getFullYear(), now.getMonth(), now.getDate());
 }
 
+/** 指定タイムゾーンでの時差 (ms。壁時計 - UTC) */
+function tzOffsetMs(at: Date, timeZone: string): number {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(at);
+  const n = (t: string) => Number(parts.find((p) => p.type === t)?.value);
+  const wall = Date.UTC(n("year"), n("month") - 1, n("day"), n("hour"), n("minute"), n("second"));
+  return wall - Math.floor(at.getTime() / 1000) * 1000;
+}
+
+/**
+ * 指定タイムゾーン (例 Asia/Tokyo) での当日 0 時。
+ * OS のタイムゾーンや TZ 環境変数 (Windows では効かない場合がある) に依存しない。
+ */
+export function startOfDayInTimeZone(now: Date, timeZone: string): Date {
+  const off = tzOffsetMs(now, timeZone);
+  const wall = new Date(now.getTime() + off);
+  const midnightWall = Date.UTC(wall.getUTCFullYear(), wall.getUTCMonth(), wall.getUTCDate());
+  // 夏時間のある地域向けに、0 時時点の時差で補正する
+  const guess = new Date(midnightWall - off);
+  return new Date(midnightWall - tzOffsetMs(guess, timeZone));
+}
+
 // ---------------------------------------------------------------------------
 // 必須欄
 // ---------------------------------------------------------------------------

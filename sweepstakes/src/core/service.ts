@@ -6,7 +6,8 @@ import type { Collector } from "./collector.js";
 import { loadConfig, type Config } from "./config.js";
 import { Store } from "./db.js";
 import { attemptEntry, type AttemptResult, type FilledField } from "./formFiller.js";
-import { duplicateGuard, rateLimitGuard, startOfLocalDay } from "./guards.js";
+import { duplicateGuard, rateLimitGuard, startOfDayInTimeZone } from "./guards.js";
+import { acquireLock, type LockHandle } from "./lock.js";
 import { loadProfile } from "./profile.js";
 import {
   applyQuestPatch,
@@ -37,6 +38,34 @@ export interface SweepContext {
   /** 指定時はこのホスト以外への通信を遮断 (テスト用) */
   allowedHosts?: string[];
   log: (msg: string) => void;
+  /**
+   * 呼び出し側 (MCP の JobManager など) が既にブラウザロックを取得済みなら true。
+   * service 関数はロックを取り直さない (二重取得によるデッドロック・自己 busy 防止)
+   */
+  browserLockHeld?: boolean;
+}
+
+/**
+ * ブラウザ操作・収集用のプロセス間ロックを取得する (config.lockPath が null なら何もしないハンドル)。
+ * 他プロセス (CLI の定期実行 / MCP サーバー) が実行中なら LockBusyError を即座に投げる。
+ */
+export function acquireBrowserLock(ctx: SweepContext, purpose: string): LockHandle {
+  if (!ctx.config.lockPath) {
+    const info = { pid: process.pid, host: "", purpose, startedAt: ctx.now().toISOString(), token: "" };
+    return { path: "", info, release: () => undefined };
+  }
+  return acquireLock(ctx.config.lockPath, { purpose });
+}
+
+/** ブラウザロックを保持した状態で fn を実行する (取得済みのコンテキストなら取り直さない) */
+export async function withBrowserLock<T>(ctx: SweepContext, purpose: string, fn: () => Promise<T>): Promise<T> {
+  if (ctx.browserLockHeld) return fn();
+  const h = acquireBrowserLock(ctx, purpose);
+  try {
+    return await fn();
+  } finally {
+    h.release();
+  }
 }
 
 export function createContext(overrides: Partial<SweepContext> & { config?: Config } = {}): SweepContext {
@@ -53,6 +82,7 @@ export function createContext(overrides: Partial<SweepContext> & { config?: Conf
       overrides.launchBrowser ??
       (() => chromium.launch({ headless: config.headless, ...(config.chromiumPath ? { executablePath: config.chromiumPath } : {}) })),
     allowedHosts: overrides.allowedHosts,
+    browserLockHeld: overrides.browserLockHeld,
     log: overrides.log ?? (() => undefined),
   };
 }
@@ -70,7 +100,11 @@ export interface CollectSummary {
   errors: string[];
 }
 
-export async function collect(ctx: SweepContext, collectors: Collector[]): Promise<CollectSummary> {
+export function collect(ctx: SweepContext, collectors: Collector[]): Promise<CollectSummary> {
+  return withBrowserLock(ctx, "collect", () => collectUnlocked(ctx, collectors));
+}
+
+async function collectUnlocked(ctx: SweepContext, collectors: Collector[]): Promise<CollectSummary> {
   const sum: CollectSummary = { total: 0, added: 0, updated: 0, excluded: 0, expired: 0, errors: [] };
   const now = ctx.now();
   for (const col of collectors) {
@@ -314,7 +348,11 @@ export interface EnterOptions {
   browser?: Browser;
 }
 
-export async function enter(ctx: SweepContext, campaignId: number, opts: EnterOptions = {}): Promise<EnterResult> {
+export function enter(ctx: SweepContext, campaignId: number, opts: EnterOptions = {}): Promise<EnterResult> {
+  return withBrowserLock(ctx, "enter", () => enterUnlocked(ctx, campaignId, opts));
+}
+
+async function enterUnlocked(ctx: SweepContext, campaignId: number, opts: EnterOptions): Promise<EnterResult> {
   const submit = opts.submit === true;
   const c = ctx.store.getCampaign(campaignId);
   if (!c) throw new Error(`キャンペーン #${campaignId} が見つかりません`);
@@ -345,7 +383,7 @@ export async function enter(ctx: SweepContext, campaignId: number, opts: EnterOp
 
   // レート制限 (実送信時のみ)
   if (submit) {
-    const stats = ctx.store.submissionStats(startOfLocalDay(now));
+    const stats = ctx.store.submissionStats(startOfDayInTimeZone(now, ctx.config.timeZone));
     const rl = rateLimitGuard({
       now,
       submittedToday: stats.count,
@@ -381,7 +419,11 @@ export async function enter(ctx: SweepContext, campaignId: number, opts: EnterOp
 }
 
 /** 応募可能な web_form を一括処理する。日次上限に達したら停止 (limit 指定時はスコア上位から最大 limit 件) */
-export async function runAll(ctx: SweepContext, opts: { submit?: boolean; limit?: number } = {}): Promise<EnterResult[]> {
+export function runAll(ctx: SweepContext, opts: { submit?: boolean; limit?: number } = {}): Promise<EnterResult[]> {
+  return withBrowserLock(ctx, "run", () => runAllUnlocked(ctx, opts));
+}
+
+async function runAllUnlocked(ctx: SweepContext, opts: { submit?: boolean; limit?: number }): Promise<EnterResult[]> {
   const now = ctx.now();
   const filtered = ctx.store
     .listCampaigns({ kind: "web_form", status: "active" })
@@ -396,7 +438,7 @@ export async function runAll(ctx: SweepContext, opts: { submit?: boolean; limit?
   try {
     for (const c of candidates) {
       ctx.log(`#${c.id} ${c.title} を処理中...`);
-      const r = await enter(ctx, c.id, { submit: opts.submit, browser });
+      const r = await enterUnlocked(ctx, c.id, { submit: opts.submit, browser });
       results.push(r);
       if (r.status === "deferred") break;
     }
