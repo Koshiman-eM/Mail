@@ -114,3 +114,43 @@ console.table(
     adx: fx(x.adx, 0),
   })),
 );
+
+// ───────── 仮想トレード (見送り・観測専用) でも損切り幅 % の差を確かめる (件数を増やすため) ─────────
+// 仮想トレードは features を持たないので、損切り幅 % (|仲値 − 損切り| / 仲値) だけで比べる
+{
+  const sh = db
+    .prepare("SELECT data FROM shadow_trades WHERE mode='paper' AND strategyId=? AND exitTs>=?")
+    .all(strategy, since)
+    .map((r) => JSON.parse(r.data))
+    .filter((s) => s.direction === "long" && s.entryMid > 0 && s.stopLoss > 0 && fin(s.netR))
+    .map((s) => ({ s, cls: s.assetClass, stopPct: (Math.abs(s.entryMid - s.stopLoss) / s.entryMid) * 100, R: s.netR, win: s.netR > 0 }));
+  console.log(`\n--- 仮想トレード (見送り・観測専用。${strategy} の買い) ${sh.length} 件: 損切り幅 % 別 ---`);
+  const edges = [0, 2, 3.5, 5, 8, Infinity];
+  for (const cls of [...new Set(sh.map((x) => x.cls))]) {
+    const g = sh.filter((x) => x.cls === cls);
+    console.log(`${cls}: ${g.length} 件 / 勝率 ${pct(g.filter((x) => x.win).length / g.length)} / 平均 ${fx(avg(g.map((x) => x.R)))}R`);
+    for (let i = 0; i < edges.length - 1; i++) {
+      const b = g.filter((x) => x.stopPct >= edges[i] && x.stopPct < edges[i + 1]);
+      if (!b.length) continue;
+      console.log(`  損切り幅 ${edges[i]}〜${edges[i + 1] === Infinity ? "" : edges[i + 1]}%: ${b.length} 件 / 勝率 ${pct(b.filter((x) => x.win).length / b.length)} / 平均 ${fx(avg(b.map((x) => x.R)))}R`);
+    }
+    const reasons = {};
+    for (const x of g) {
+      const k = String(x.s.reason).replace(/[0-9.]+/g, "#").slice(0, 30);
+      (reasons[k] ??= []).push(x.R);
+    }
+    for (const [k, r] of Object.entries(reasons).sort((a, b) => b[1].length - a[1].length).slice(0, 5)) {
+      console.log(`  理由 ${k}: ${r.length} 件 / 平均 ${fx(avg(r))}R`);
+    }
+  }
+  // 実取引も同じ区切りで (比べやすいように)
+  console.log(`\n--- 実取引: 損切り幅 % 別 (同じ区切り) ---`);
+  for (const cls of Object.keys(byCls)) {
+    const g = byCls[cls];
+    for (let i = 0; i < edges.length - 1; i++) {
+      const b = g.filter((x) => x.stopPct >= edges[i] && x.stopPct < edges[i + 1]);
+      if (!b.length) continue;
+      console.log(`  ${cls} 損切り幅 ${edges[i]}〜${edges[i + 1] === Infinity ? "" : edges[i + 1]}%: ${b.length} 件 / 勝率 ${pct(b.filter((x) => x.win).length / b.length)} / 平均 ${fx(avg(b.map((x) => x.R)))}R`);
+    }
+  }
+}
