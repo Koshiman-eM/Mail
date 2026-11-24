@@ -106,7 +106,7 @@
 - 相場構造のフィルターの既定の対象です (廃止前と同じ。上位足は日足。Jupiter のように日足を取らない取引先では 4 時間足から確定分だけ集約します)。
 - 更新前に建てた `mid_trend_follow` の建玉は、再び戦略自身の決済シグナルで決済します。`OBSERVE_ONLY_STRATEGIES` などに `mid_trend_follow` が残っていても、もう警告しません (書いてあればその設定どおりに効きます。古い既定の `OBSERVE_ONLY_STRATEGIES=scalp_rebound,mid_trend_follow,long_momentum` のままなら観測専用です)。
 - 比べ方の例: `npm run backtest -- --strategy mid_trend_follow --source ccxt --exchange binance --symbols SOL/USDT,BTC/USDT,ETH/USDT --days 1000 --folds 5` と、同じ引数の `--strategy trend_4h`。
-`scalp_rebound` と、ミームコインでの `short_ema_trend` は既定で観測専用 (`OBSERVE_ONLY_STRATEGIES=scalp_rebound,short_ema_trend:meme`) です。新しいシグナルは発注せず、仮想トレード (理由 `observe_only`) としてだけ記録します。すでに持っている建玉は、観測専用にしてもこれまでどおり損切り・利確・戦略の決済シグナルなどで管理・決済します。実際に取引させるときは `OBSERVE_ONLY_STRATEGIES` からその ID を外します (空にすると全戦略が取引します)。
+`scalp_rebound` と、ミームコインでの `short_ema_trend` は既定で観測専用 (`OBSERVE_ONLY_STRATEGIES=scalp_rebound,short_ema_trend:meme,mid_trend_follow`) です。新しいシグナルは発注せず、仮想トレード (理由 `observe_only`) としてだけ記録します。すでに持っている建玉は、観測専用にしてもこれまでどおり損切り・利確・戦略の決済シグナルなどで管理・決済します。実際に取引させるときは `OBSERVE_ONLY_STRATEGIES` からその ID を外します (空にすると全戦略が取引します)。
 - `<ID>` だけならすべての資産クラス、`<ID>:<資産クラス>` (`crypto` / `meme`) ならその資産クラスの銘柄だけが観測専用です。`short_ema_trend:meme` は、ミームの上昇トレンドで急騰後の天井を買って負け続けたため、ミームだけ発注を止めています (暗号資産 (SOL など) では従来どおり取引します)。
 - 未登録の ID・使えない資産クラス (例 `short_ema_trend:fx`) は起動時と `npm run status` で警告して無視します。`npm run status` には解釈した設定 (例「scalp_rebound (全クラス), short_ema_trend (meme のみ)」) を表示します。
 

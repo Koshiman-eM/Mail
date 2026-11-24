@@ -87,14 +87,20 @@ describe("エンジン: 観測専用の戦略", () => {
     expect(await run(START, START + 3 * MIN)).toBeGreaterThanOrEqual(1);
   });
 
-  it("既定 (未設定) では scalp_rebound だけが観測専用", async () => {
+  it("既定 (未設定) では scalp_rebound と mid_trend_follow が観測専用 (short_ema_trend は meme だけ)", async () => {
     const { rt, run } = await setup([buyer("scalp_rebound")], {});
     expect(await run(START, START + 3 * MIN)).toBe(0);
     const open = rt.engine.shadow!.list();
     expect(open).toHaveLength(1);
     expect(open[0].reason).toBe("observe_only");
-    // 観測専用でない戦略は通常どおり発注する (廃止した中長期の戦略の id も、戻した mid_trend_follow も既定では特別扱いしない)
-    for (const id of ["short_ema_trend", "long_momentum", "mid_trend_follow"]) {
+    // 戻した mid_trend_follow は既定で観測専用 (実データの検証で負けたため)
+    {
+      const { rt: rm, run: r } = await setup([buyer("mid_trend_follow")], {});
+      expect(await r(START, START + 3 * MIN)).toBe(0);
+      expect(rm.engine.shadow!.list()[0]?.reason).toBe("observe_only");
+    }
+    // 観測専用でない戦略は通常どおり発注する (廃止した中長期の戦略の id も既定では特別扱いしない)
+    for (const id of ["short_ema_trend", "long_momentum"]) {
       const { run: r } = await setup([buyer(id)], {});
       expect(await r(START, START + 3 * MIN), id).toBeGreaterThanOrEqual(1);
     }

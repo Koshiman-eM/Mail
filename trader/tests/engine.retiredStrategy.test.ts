@@ -134,7 +134,8 @@ describe("廃止した戦略の建玉の復元", () => {
         };
       },
     };
-    const first = await runtime(store, START, {}, [contrarian], 20);
+    // mid_trend_follow は既定で観測専用 (実データの検証で負けたため) なので、建玉を作る段階だけ外す
+    const first = await runtime(store, START, { OBSERVE_ONLY_STRATEGIES: "scalp_rebound" }, [contrarian], 20);
     const t = await first.run(START, START + 5 * MIN, () => first.rt.engine.positions.list().length > 0);
     const [held] = first.rt.engine.positions.list();
     expect(held?.strategyId).toBe(id);
@@ -145,7 +146,8 @@ describe("廃止した戦略の建玉の復元", () => {
     const arm = armStateKey("paper", armKey(id, "range", "crypto"));
     store.kvSet(arm, { key: armKey(id, "range", "crypto"), alpha: 3, beta: 2, n: 4, sumR: 1, sumR2: 2, ewmaR: 0.2, ewmaVarR: 0.5, updatedAt: START });
 
-    // 戻した後のバージョン (登録した戦略。opts.strategies なし)。MAX_HOLD_MINUTES=240 でも切らない・観測専用にしない
+    // 戻した後のバージョン (登録した戦略。opts.strategies なし)。MAX_HOLD_MINUTES=240 でも切らない。
+    // 既定の観測専用 (mid_trend_follow を含む) は新規だけを止め、保有中の建玉は戦略の決済シグナルで管理を続ける
     const second = await runtime(store, t + 15_000, { MAX_HOLD_MINUTES: "240" }, undefined, 20);
     expect(getStrategy(id)?.managesOwnExit).toBe(true);
     await second.rt.engine.init();

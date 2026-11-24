@@ -156,8 +156,8 @@ describe("mid_trend_follow: 登録と既定値 (廃止前と同じ id・パラ�
     // MAX_HOLD_MINUTES があっても hold_limit の観測専用にしない
     expect(isHoldLimitedStrategy(midTrendFollow)).toBe(false);
     expect(strategyLabel("mid_trend_follow")).toBe("中期・EMA+MACD トレンド (4 時間足)");
-    // 既定では観測専用ではない
-    expect(DEFAULT_OBSERVE_ONLY_STRATEGIES.split(",").map((x) => x.split(":")[0])).not.toContain("mid_trend_follow");
+    // 既定では観測専用 (実データの検証で負けたため。仮想トレードで観測は続ける)
+    expect(DEFAULT_OBSERVE_ONLY_STRATEGIES.split(",")).toContain("mid_trend_follow");
   });
 
   it("廃止した戦略の一覧から外した (long_momentum・meme_momentum は廃止のまま)。環境変数の一覧に書いても警告しない", () => {

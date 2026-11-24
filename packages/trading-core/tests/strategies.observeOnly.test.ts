@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { formatObserveOnly, isObserveOnly, observeOnlyScope, observeOnlyWarnings, parseObserveOnly } from "../src/strategies/observeOnly";
 import { DEFAULT_OBSERVE_ONLY_STRATEGIES } from "../src/core/config";
 
-const KNOWN = ["scalp_rebound", "short_ema_trend", "scalp_micro"];
+const KNOWN = ["scalp_rebound", "short_ema_trend", "scalp_micro", "mid_trend_follow"];
 
 describe("parseObserveOnly / isObserveOnly", () => {
   it("id だけは全資産クラス、id:クラス はそのクラスだけ", () => {
@@ -15,14 +15,16 @@ describe("parseObserveOnly / isObserveOnly", () => {
     expect(isObserveOnly(r, "scalp_micro", "meme")).toBe(false);
   });
 
-  it("既定は scalp_rebound (全クラス) と short_ema_trend の meme だけ", () => {
+  it("既定は scalp_rebound・mid_trend_follow (全クラス) と short_ema_trend の meme だけ", () => {
     const r = parseObserveOnly(DEFAULT_OBSERVE_ONLY_STRATEGIES.split(","), ["crypto", "meme"]);
     expect(isObserveOnly(r, "short_ema_trend", "meme")).toBe(true);
     expect(isObserveOnly(r, "short_ema_trend", "crypto")).toBe(false);
     expect(isObserveOnly(r, "scalp_rebound", "crypto")).toBe(true);
-    expect(formatObserveOnly(r)).toBe("観測専用 (OBSERVE_ONLY_STRATEGIES): scalp_rebound (全クラス), short_ema_trend (meme のみ)");
+    expect(formatObserveOnly(r)).toBe("観測専用 (OBSERVE_ONLY_STRATEGIES): scalp_rebound (全クラス), mid_trend_follow (全クラス), short_ema_trend (meme のみ)");
     expect(observeOnlyScope(r, "short_ema_trend")).toBe("meme のみ");
     expect(observeOnlyScope(r, "scalp_rebound")).toBe("全クラス");
+    // mid_trend_follow は実データの検証 (binance 4h 約 1000 日) で負けたため既定で観測専用
+    expect(isObserveOnly(r, "mid_trend_follow", "crypto")).toBe(true);
     expect(observeOnlyScope(r, "scalp_micro")).toBeUndefined();
   });
 

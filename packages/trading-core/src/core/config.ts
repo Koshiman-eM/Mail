@@ -144,7 +144,7 @@ const idList = (def: string) =>
  * 要素は `<戦略 id>` (全資産クラス) か `<戦略 id>:<資産クラス>` (そのクラスだけ。src/strategies/observeOnly.ts)。
  * 観測専用でも保有中の建玉は従来どおり管理・決済する (止めるのは新規エントリーだけ)
  */
-export const DEFAULT_OBSERVE_ONLY_STRATEGIES = "scalp_rebound,short_ema_trend:meme";
+export const DEFAULT_OBSERVE_ONLY_STRATEGIES = "scalp_rebound,short_ema_trend:meme,mid_trend_follow";
 
 /**
  * 相場構造 (ダウ理論) のフィルターを掛ける戦略の既定値 (トレンド・ブレイク系だけ)。
@@ -248,7 +248,7 @@ const coreStaticShape = {
   MEME_MIN_LIQUIDITY_USD: num(250_000),
   /**
    * 観測専用の戦略 id (カンマ区切り)。評価とシグナルの生成は通常どおり行うが、新規エントリーは発注せず
-   * 仮想トレード (reason "observe_only") としてだけ記録する。既定は scalp_rebound,short_ema_trend:meme。
+   * 仮想トレード (reason "observe_only") としてだけ記録する。既定は scalp_rebound,short_ema_trend:meme,mid_trend_follow。
    * `<id>:<資産クラス>` はそのクラスの銘柄だけを観測専用にする (`<id>` だけなら全クラス)。
    * 保有中の建玉は従来どおり管理・決済する。空文字なら観測専用なし。未登録 (廃止した戦略を含む) の id・使えない資産クラスの指定は
    * 起動時に警告して無視する
