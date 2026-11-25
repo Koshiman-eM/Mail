@@ -1,0 +1,25 @@
+# 懸賞ツール MCP サーバー用 Caddyfile
+# sweep.example.com を自分のドメインに差し替えてください (setup.sh は SWEEP_DOMAIN で自動置換)。
+# DNS の A レコードをこのサーバーのパブリック IP に向け、80/443 を開けておけば Let's Encrypt で自動 HTTPS になります。
+# 配置: /etc/caddy/Caddyfile
+#
+# 注意: アクセスログ (log ディレクティブ) を有効にすると /mcp/<token> 方式のトークンが URL ごと記録されます。
+#       有効にする場合は Bearer ヘッダー方式だけを使うか、ログのパスを伏せる設定にしてください。
+
+sweep.example.com {
+	@sweep path /mcp /mcp/* /healthz
+	handle @sweep {
+		reverse_proxy 127.0.0.1:8787 {
+			# ストリーミング応答をバッファしない
+			flush_interval -1
+		}
+	}
+	handle {
+		respond "not found" 404
+	}
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+	}
+}

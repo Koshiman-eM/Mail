@@ -1,0 +1,30 @@
+# Cloudflare Tunnel (名前付きトンネル) の設定例
+# 配置: %USERPROFILE%\.cloudflared\config.yml (start-tunnel.ps1 / register-tasks.ps1 -Tunnel の既定の場所)
+#
+# 前提: Cloudflare に登録済み (ネームサーバーを Cloudflare に向けた) ドメインが必要。
+#   winget install --id Cloudflare.cloudflared
+#   cloudflared tunnel login                              # ブラウザでドメインを選んで許可 → cert.pem が作られる
+#   cloudflared tunnel create sweep                       # トンネル作成 → <UUID>.json (認証情報) が作られる
+#   cloudflared tunnel route dns sweep sweep.example.com  # DNS (CNAME) を登録
+#   (このファイルをコピーして <UUID> / ユーザー名 / ドメインを書き換える)
+#   cloudflared tunnel --config %USERPROFILE%\.cloudflared\config.yml ingress validate
+#   cloudflared tunnel run sweep                           # 動作確認。常用は register-tasks.ps1 -Tunnel
+#
+# 注意:
+# - <UUID>.json と cert.pem はトンネルの秘密情報。共有・コミットしない
+# - PC 側でポートを開ける必要はない (cloudflared から Cloudflare へ外向きに接続する)。
+#   MCP サーバーは 127.0.0.1 だけで待ち受けたままにする (SWEEP_MCP_HOST=127.0.0.1)
+# - URL パス方式 (https://sweep.example.com/mcp/<トークン>) を使うと、トークンが URL に含まれるため
+#   Cloudflare 側のログ・分析 (Logpush / Analytics 等) やクライアントの履歴に残り得る。
+#   可能なら Authorization: Bearer ヘッダー方式を使う
+
+tunnel: <UUID>
+credentials-file: C:\Users\<ユーザー名>\.cloudflared\<UUID>.json
+
+ingress:
+  # MCP (/mcp, /mcp/<token>) と /healthz だけを転送する
+  - hostname: sweep.example.com
+    path: ^/(mcp(/.*)?|healthz)$
+    service: http://127.0.0.1:8787
+  # それ以外 (他のパス・他のホスト名) は 404
+  - service: http_status:404

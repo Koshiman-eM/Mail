@@ -1,0 +1,449 @@
+// コア機能の公開 API。CLI や将来の MCP サーバーはこの関数群を呼ぶだけにする。
+import { chromium, type Browser } from "playwright";
+import { KouboCollector } from "../collectors/koubo.js";
+import { PoliteFetcher, type FetchLike } from "../collectors/http.js";
+import type { Collector } from "./collector.js";
+import { loadConfig, type Config } from "./config.js";
+import { Store } from "./db.js";
+import { attemptEntry, type AttemptResult, type FilledField } from "./formFiller.js";
+import { duplicateGuard, rateLimitGuard, startOfDayInTimeZone } from "./guards.js";
+import { acquireLock, type LockHandle } from "./lock.js";
+import { loadProfile } from "./profile.js";
+import {
+  applyQuestPatch,
+  buildQuestCampaignInput,
+  extractQuestPageInfo,
+  FETCHED_TEXT_MAX,
+  questInputFromCampaign,
+  questMetricsOf,
+  sortQuests,
+  validateQuestFields,
+  type QuestInput,
+  type QuestListItem,
+  type QuestPatch,
+} from "./quest.js";
+import { evaluateCampaign, FLAG_LABELS, isExpired, NEEDS_REVIEW_FLAG, type QuestMetrics } from "./score.js";
+import { buildTodoList, type TodoItem } from "./todo.js";
+import type { Campaign, CampaignKind, CampaignStatus, Entry, EntryStatus, Profile } from "./types.js";
+
+export interface SweepContext {
+  store: Store;
+  config: Config;
+  /** プロフィール (遅延読み込み可) */
+  profile: () => Profile;
+  now: () => Date;
+  sleep: (ms: number) => Promise<void>;
+  random: () => number;
+  launchBrowser: () => Promise<Browser>;
+  /** 指定時はこのホスト以外への通信を遮断 (テスト用) */
+  allowedHosts?: string[];
+  log: (msg: string) => void;
+  /**
+   * 呼び出し側 (MCP の JobManager など) が既にブラウザロックを取得済みなら true。
+   * service 関数はロックを取り直さない (二重取得によるデッドロック・自己 busy 防止)
+   */
+  browserLockHeld?: boolean;
+}
+
+/**
+ * ブラウザ操作・収集用のプロセス間ロックを取得する (config.lockPath が null なら何もしないハンドル)。
+ * 他プロセス (CLI の定期実行 / MCP サーバー) が実行中なら LockBusyError を即座に投げる。
+ */
+export function acquireBrowserLock(ctx: SweepContext, purpose: string): LockHandle {
+  if (!ctx.config.lockPath) {
+    const info = { pid: process.pid, host: "", purpose, startedAt: ctx.now().toISOString(), token: "" };
+    return { path: "", info, release: () => undefined };
+  }
+  return acquireLock(ctx.config.lockPath, { purpose });
+}
+
+/** ブラウザロックを保持した状態で fn を実行する (取得済みのコンテキストなら取り直さない) */
+export async function withBrowserLock<T>(ctx: SweepContext, purpose: string, fn: () => Promise<T>): Promise<T> {
+  if (ctx.browserLockHeld) return fn();
+  const h = acquireBrowserLock(ctx, purpose);
+  try {
+    return await fn();
+  } finally {
+    h.release();
+  }
+}
+
+export function createContext(overrides: Partial<SweepContext> & { config?: Config } = {}): SweepContext {
+  const config = overrides.config ?? loadConfig();
+  let cached: Profile | undefined;
+  return {
+    store: overrides.store ?? new Store(config.dbPath),
+    config,
+    profile: overrides.profile ?? (() => (cached ??= loadProfile(config.profilePath))),
+    now: overrides.now ?? (() => new Date()),
+    sleep: overrides.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))),
+    random: overrides.random ?? Math.random,
+    launchBrowser:
+      overrides.launchBrowser ??
+      (() => chromium.launch({ headless: config.headless, ...(config.chromiumPath ? { executablePath: config.chromiumPath } : {}) })),
+    allowedHosts: overrides.allowedHosts,
+    browserLockHeld: overrides.browserLockHeld,
+    log: overrides.log ?? (() => undefined),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// collect
+// ---------------------------------------------------------------------------
+
+export interface CollectSummary {
+  total: number;
+  added: number;
+  updated: number;
+  excluded: number;
+  expired: number;
+  errors: string[];
+}
+
+export function collect(ctx: SweepContext, collectors: Collector[]): Promise<CollectSummary> {
+  return withBrowserLock(ctx, "collect", () => collectUnlocked(ctx, collectors));
+}
+
+async function collectUnlocked(ctx: SweepContext, collectors: Collector[]): Promise<CollectSummary> {
+  const sum: CollectSummary = { total: 0, added: 0, updated: 0, excluded: 0, expired: 0, errors: [] };
+  const now = ctx.now();
+  for (const col of collectors) {
+    let items;
+    try {
+      items = await col.fetch();
+    } catch (e) {
+      sum.errors.push(`${col.name}: ${(e as Error).message}`);
+      continue;
+    }
+    for (const item of items) {
+      const ev = evaluateCampaign(item, now);
+      const { created } = ctx.store.upsertCampaign(ev, now);
+      sum.total++;
+      if (created) sum.added++;
+      else sum.updated++;
+      if (ev.status === "excluded") sum.excluded++;
+      if (ev.status === "expired") sum.expired++;
+    }
+  }
+  return sum;
+}
+
+/** 実在サイトの収集元 */
+export const COLLECTOR_SOURCES = ["koubo"] as const;
+export type CollectorSource = (typeof COLLECTOR_SOURCES)[number];
+
+export interface SourceCollectorOptions {
+  /** 一覧の取得元パス (koubo: 既定は /category/present/all → 各サブカテゴリ) */
+  listPaths?: string[];
+  /** 詳細ページ取得の上限 */
+  maxDetails?: number;
+  /** テスト用に fetch を差し替える */
+  fetch?: FetchLike;
+}
+
+/** 収集元名から Collector を作る (待機・乱数・時刻はコンテキストのものを使う) */
+export function createSourceCollector(ctx: SweepContext, source: string, opts: SourceCollectorOptions = {}): Collector {
+  switch (source) {
+    case "koubo":
+      return new KouboCollector({
+        listPaths: opts.listPaths,
+        maxDetails: opts.maxDetails,
+        fetch: opts.fetch,
+        sleep: ctx.sleep,
+        random: ctx.random,
+        now: ctx.now,
+        log: ctx.log,
+      });
+    default:
+      throw new Error(`不明な収集元です: ${source} (${COLLECTOR_SOURCES.join(" / ")})`);
+  }
+}
+
+/** 実在サイトから収集する (CLI / 将来の MCP から利用) */
+export function collectFromSources(ctx: SweepContext, sources: string[], opts: SourceCollectorOptions = {}): Promise<CollectSummary> {
+  return collect(
+    ctx,
+    sources.map((s) => createSourceCollector(ctx, s, opts)),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// list / todo / mark / history
+// ---------------------------------------------------------------------------
+
+export function listCampaigns(ctx: SweepContext, opts: { kind?: CampaignKind; status?: CampaignStatus } = {}): Campaign[] {
+  return ctx.store.listCampaigns(opts);
+}
+
+export function todo(ctx: SweepContext): TodoItem[] {
+  return buildTodoList(ctx.store.listCampaigns(), ctx.store.listEntries({ limit: 100_000 }), ctx.now());
+}
+
+/** 手動タスクを完了として記録する */
+export function mark(ctx: SweepContext, campaignId: number, note = "手動で完了"): Entry {
+  const c = ctx.store.getCampaign(campaignId);
+  if (!c) throw new Error(`キャンペーン #${campaignId} が見つかりません`);
+  return ctx.store.addEntry(campaignId, "done_manual", note, ctx.now());
+}
+
+export interface HistoryItem extends Entry {
+  title: string;
+  url: string;
+  kind: CampaignKind | "?";
+}
+
+export function history(ctx: SweepContext, opts: { limit?: number } = {}): HistoryItem[] {
+  return ctx.store.listEntries({ limit: opts.limit ?? 50 }).map((e) => {
+    const c = ctx.store.getCampaign(e.campaignId);
+    return { ...e, title: c?.title ?? "(削除済み)", url: c?.url ?? "", kind: c?.kind ?? "?" };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 仮想通貨クエストの手動登録 (CLI / MCP の入口)
+// 自動収集はしない。ウォレット署名・トランザクション・SNS 操作の自動化も行わない。
+// ---------------------------------------------------------------------------
+
+export interface AddQuestOptions {
+  /** true のときだけ URL を 1 回取得してタイトル補完・本文の詐欺チェックを行う */
+  fetch?: boolean;
+  /** テスト用に fetch を差し替える */
+  fetchImpl?: FetchLike;
+}
+
+export interface QuestResult {
+  campaign: Campaign;
+  created: boolean;
+  /** 換算不能・取得失敗などの警告 */
+  warnings: string[];
+  /** 採点の根拠 (致命的リスクによる除外理由を含む) */
+  reasons: string[];
+  /** 詐欺チェックの詳細 */
+  scamDetails: string[];
+  metrics: QuestMetrics | null;
+  /** excluded の場合の理由 (表示用) */
+  excludedReason?: string;
+}
+
+function questResult(
+  ctx: SweepContext,
+  ev: ReturnType<typeof evaluateCampaign>,
+  warnings: string[],
+): QuestResult {
+  const { campaign, created } = ctx.store.upsertCampaign(ev, ctx.now());
+  const res: QuestResult = {
+    campaign,
+    created,
+    warnings,
+    reasons: ev.reasons,
+    scamDetails: ev.scamDetails,
+    metrics: questMetricsOf(campaign),
+  };
+  if (campaign.status === "excluded") {
+    const labels = campaign.riskFlags.map((f) => FLAG_LABELS[f] ?? f).join(", ");
+    res.excludedReason = labels || ev.reasons.join(" / "); // 詳細は scamDetails
+  }
+  return res;
+}
+
+/**
+ * 仮想通貨クエストを登録する (kind=crypto_quest, source=manual)。同じ URL があれば上書き更新。
+ * 致命的な詐欺フラグがあっても登録はし、status=excluded にする。
+ */
+export async function addQuest(ctx: SweepContext, input: QuestInput, opts: AddQuestOptions = {}): Promise<QuestResult> {
+  if (!input || typeof input.url !== "string" || !input.url.trim()) throw new Error("url は必須です");
+  const q = { ...input, url: input.url.trim() };
+  validateQuestFields(q);
+  const warnings: string[] = [];
+  const rewardType = q.rewardType ?? "other";
+  const distribution = q.distribution ?? "raffle";
+  if (!q.rewardType) warnings.push("rewardType 未指定のため other として登録しました");
+  if (!q.distribution) warnings.push("distribution 未指定のため raffle (抽選) として計算しました");
+
+  let fetchedText: string | null = null;
+  let fetchedAt: string | null = null;
+  let title = q.title;
+  if (opts.fetch) {
+    const fetcher = new PoliteFetcher({ fetch: opts.fetchImpl, sleep: ctx.sleep, random: ctx.random, log: ctx.log });
+    try {
+      const html = await fetcher.get(q.url);
+      const info = extractQuestPageInfo(html);
+      if (!title && info.title) title = info.title;
+      fetchedText = [info.title, info.description, info.text].filter(Boolean).join("\n").slice(0, FETCHED_TEXT_MAX) || null;
+      fetchedAt = ctx.now().toISOString();
+    } catch (e) {
+      warnings.push(`ページを取得できませんでした (取得なしで登録します): ${(e as Error).message}`);
+    }
+  }
+
+  const built = buildQuestCampaignInput(
+    { ...q, title, rewardType, distribution },
+    { usdJpy: ctx.config.usdJpy, fetchedText, fetchedAt },
+  );
+  warnings.push(...built.warnings);
+  return questResult(ctx, evaluateCampaign(built.input, ctx.now()), warnings);
+}
+
+const SCAM_CHECK_FLAGS: ReadonlySet<string> = new Set([
+  "typosquat_domain",
+  "seed_phrase_request",
+  "unlimited_approval",
+  "approval_request",
+  "unknown_platform",
+]);
+
+/** 登録済みクエストを部分更新して再採点する (undefined は変更なし、null は値を消す。URL は変更不可) */
+export function updateQuest(ctx: SweepContext, id: number, patch: QuestPatch): QuestResult {
+  const c = ctx.store.getCampaign(id);
+  if (!c) throw new Error(`キャンペーン #${id} が見つかりません`);
+  if (c.kind !== "crypto_quest") throw new Error(`#${id} は仮想通貨クエストではありません (${c.kind})`);
+  if ("url" in (patch as Record<string, unknown>)) throw new Error("URL は変更できません (別のクエストとして add してください)");
+  validateQuestFields(patch);
+  const merged = applyQuestPatch(questInputFromCampaign(c), patch);
+  const meta = c.conditions.quest;
+  // 換算レートは現在の SWEEP_USDJPY を優先し、未設定なら登録時のレートを使う
+  const built = buildQuestCampaignInput(merged, {
+    usdJpy: ctx.config.usdJpy ?? meta?.usdJpy ?? null,
+    fetchedText: c.conditions.terms ?? null,
+    fetchedAt: meta?.fetchedAt ?? null,
+  });
+  // 収集元の手順・タグなどは保持する
+  const { notes: _oldNotes, ...restConditions } = c.conditions;
+  void _oldNotes;
+  const input = {
+    ...built.input,
+    source: c.source,
+    conditions: { ...restConditions, ...built.input.conditions },
+    // 詐欺チェック由来のフラグは再計算するので外し、それ以外 (収集元が付けたもの) は保持
+    riskFlags: c.riskFlags.filter((f) => !SCAM_CHECK_FLAGS.has(f)),
+  };
+  return questResult(ctx, evaluateCampaign(input, ctx.now()), built.warnings);
+}
+
+/** 仮想通貨クエスト一覧 (対象 → その他、時給の高い順、価値不明は末尾) */
+export function listQuests(ctx: SweepContext): QuestListItem[] {
+  return sortQuests(ctx.store.listCampaigns({ kind: "crypto_quest" }).map((c) => ({ campaign: c, metrics: questMetricsOf(c) })));
+}
+
+// ---------------------------------------------------------------------------
+// enter / run
+// ---------------------------------------------------------------------------
+
+export type EnterStatus = EntryStatus | "dry_run" | "deferred";
+
+export interface EnterResult {
+  campaignId: number;
+  title: string;
+  status: EnterStatus;
+  reason: string;
+  /** DB に記録したか (dry-run や重複・上限による見送りは記録しない) */
+  recorded: boolean;
+  filled: FilledField[];
+  screenshotPath?: string;
+}
+
+export interface EnterOptions {
+  submit?: boolean;
+  /** run から呼ぶ場合に共有するブラウザ */
+  browser?: Browser;
+}
+
+export function enter(ctx: SweepContext, campaignId: number, opts: EnterOptions = {}): Promise<EnterResult> {
+  return withBrowserLock(ctx, "enter", () => enterUnlocked(ctx, campaignId, opts));
+}
+
+async function enterUnlocked(ctx: SweepContext, campaignId: number, opts: EnterOptions): Promise<EnterResult> {
+  const submit = opts.submit === true;
+  const c = ctx.store.getCampaign(campaignId);
+  if (!c) throw new Error(`キャンペーン #${campaignId} が見つかりません`);
+  const base = { campaignId, title: c.title, filled: [] as FilledField[] };
+  const now = ctx.now();
+  const result = (status: EnterStatus, reason: string, extra: Partial<EnterResult> = {}): EnterResult => {
+    let recorded = false;
+    if (submit && status !== "dry_run" && status !== "deferred") {
+      ctx.store.addEntry(campaignId, status, reason, ctx.now());
+      recorded = true;
+    }
+    return { ...base, status, reason, recorded, ...extra };
+  };
+
+  if (c.kind !== "web_form") {
+    return { ...base, status: "skipped", reason: `${c.kind} は自動応募の対象外です (todo で手順を確認し、完了後に mark してください)`, recorded: false };
+  }
+  // 応募先 URL 未確認 (収集元の掲載ページのまま) は自動応募しない
+  if (c.riskFlags.includes(NEEDS_REVIEW_FLAG)) {
+    return { ...base, status: "skipped", reason: "応募先 URL が未確認です (収集元の掲載ページで応募先を確認してください)", recorded: false };
+  }
+  // 重複応募
+  const dup = duplicateGuard(ctx.store.listEntries({ campaignId }));
+  if (!dup.ok) return { ...base, status: "skipped", reason: dup.reason!, recorded: false };
+  // 締切・除外
+  if (isExpired(c.deadline, now)) return { ...base, status: "skipped", reason: "締切を過ぎています", recorded: false };
+  if (c.status === "excluded") return { ...base, status: "skipped", reason: `除外対象です (${c.riskFlags.join(", ")})`, recorded: false };
+
+  // レート制限 (実送信時のみ)
+  if (submit) {
+    const stats = ctx.store.submissionStats(startOfDayInTimeZone(now, ctx.config.timeZone));
+    const rl = rateLimitGuard({
+      now,
+      submittedToday: stats.count,
+      lastSubmittedAt: stats.lastSubmittedAt,
+      dailyLimit: ctx.config.dailyLimit,
+      minIntervalSec: ctx.config.minIntervalSec,
+      maxIntervalSec: ctx.config.maxIntervalSec,
+      random: ctx.random,
+    });
+    if (!rl.allowed) return { ...base, status: "deferred", reason: rl.reason!, recorded: false };
+    if (rl.waitMs > 0) {
+      ctx.log(`送信間隔を空けるため ${Math.ceil(rl.waitMs / 1000)} 秒待機します...`);
+      await ctx.sleep(rl.waitMs);
+    }
+  }
+
+  const browser = opts.browser ?? (await ctx.launchBrowser());
+  let r: AttemptResult;
+  try {
+    const stamp = ctx.now().toISOString().replace(/[:.]/g, "-");
+    r = await attemptEntry(browser, c.url, ctx.profile(), {
+      submit,
+      screenshotDir: ctx.config.screenshotDir,
+      screenshotName: `${c.id}-${stamp}`,
+      timeoutMs: ctx.config.navigationTimeoutMs,
+      allowedHosts: ctx.allowedHosts,
+      extraTermsText: c.conditions.terms,
+    });
+  } finally {
+    if (!opts.browser) await browser.close();
+  }
+  return result(r.outcome, r.reason, { filled: r.filled, screenshotPath: r.screenshotPath });
+}
+
+/** 応募可能な web_form を一括処理する。日次上限に達したら停止 (limit 指定時はスコア上位から最大 limit 件) */
+export function runAll(ctx: SweepContext, opts: { submit?: boolean; limit?: number } = {}): Promise<EnterResult[]> {
+  return withBrowserLock(ctx, "run", () => runAllUnlocked(ctx, opts));
+}
+
+async function runAllUnlocked(ctx: SweepContext, opts: { submit?: boolean; limit?: number }): Promise<EnterResult[]> {
+  const now = ctx.now();
+  const filtered = ctx.store
+    .listCampaigns({ kind: "web_form", status: "active" })
+    .filter((c) => !isExpired(c.deadline, now))
+    .filter((c) => !c.riskFlags.includes(NEEDS_REVIEW_FLAG))
+    // 何らかの記録 (送信済み・要手動・規約で見送り・失敗) があるものは一括実行の対象外。個別に enter で再試行する
+    .filter((c) => ctx.store.listEntries({ campaignId: c.id, limit: 1 }).length === 0);
+  const candidates = opts.limit !== undefined ? filtered.slice(0, Math.max(0, opts.limit)) : filtered;
+  const results: EnterResult[] = [];
+  if (!candidates.length) return results;
+  const browser = await ctx.launchBrowser();
+  try {
+    for (const c of candidates) {
+      ctx.log(`#${c.id} ${c.title} を処理中...`);
+      const r = await enterUnlocked(ctx, c.id, { submit: opts.submit, browser });
+      results.push(r);
+      if (r.status === "deferred") break;
+    }
+  } finally {
+    await browser.close();
+  }
+  return results;
+}

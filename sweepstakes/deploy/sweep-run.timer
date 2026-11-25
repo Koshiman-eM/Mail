@@ -1,0 +1,14 @@
+# 収集と Webフォーム一括応募を 1 日 3 回 (日本時間 8 時 / 13 時 / 19 時ごろ) 実行する
+[Unit]
+Description=Run sweepstakes collect and web-form run a few times a day
+
+[Timer]
+OnCalendar=*-*-* 08,13,19:00:00 Asia/Tokyo
+# 毎回同じ時刻にならないようずらす
+RandomizedDelaySec=30min
+# 停止中に予定時刻を過ぎた場合は起動後に 1 回実行
+Persistent=true
+Unit=sweep-run.service
+
+[Install]
+WantedBy=timers.target

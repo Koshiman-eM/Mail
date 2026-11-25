@@ -1,0 +1,39 @@
+# 定期実行: 収集 → Webフォーム一括応募 (SWEEP_AUTO_SUBMIT=1 のときだけ送信。それ以外は dry-run)
+# sweep-run.timer から起動される
+[Unit]
+Description=Sweepstakes collect and web-form run
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=sweep
+Group=sweep
+WorkingDirectory=/opt/sweep
+EnvironmentFile=/etc/sweep/env
+Environment=NODE_ENV=production
+ExecStart=/opt/sweep/deploy/sweep-run.sh
+# 送信間隔の待機があるため長めに取る
+TimeoutStartSec=3h
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ReadWritePaths=/opt/sweep/data
+UMask=0077
+MemoryMax=1500M
